@@ -49,12 +49,12 @@ class FlussLakeAppendBatch(
     FlussOffsetInitializers.stoppingOffsetsInitializer(true, options, flussConfig)
   }
 
-  private lazy val planned: (Array[InputPartition], Boolean) = doPlan()
+  private lazy val (partitions, isFallback) = doPlan()
 
-  override def planInputPartitions(): Array[InputPartition] = planned._1
+  override def planInputPartitions(): Array[InputPartition] = partitions
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    if (planned._2) {
+    if (isFallback) {
       new FlussAppendPartitionReaderFactory(tablePath, projection, options, flussConfig)
     } else {
       new FlussLakeAppendPartitionReaderFactory(

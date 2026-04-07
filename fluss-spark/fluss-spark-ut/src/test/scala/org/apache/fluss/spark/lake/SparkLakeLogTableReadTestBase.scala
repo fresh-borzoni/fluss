@@ -17,22 +17,78 @@
 
 package org.apache.fluss.spark.lake
 
-import org.apache.fluss.config.ConfigOptions
+import org.apache.fluss.config.{ConfigOptions, Configuration}
+import org.apache.fluss.flink.tiering.LakeTieringJobBuilder
+import org.apache.fluss.flink.tiering.source.TieringSourceOptions
+import org.apache.fluss.metadata.{DataLakeFormat, TableBucket}
 import org.apache.fluss.spark.FlussSparkTestBase
 import org.apache.fluss.spark.SparkConnectorOptions.BUCKET_NUMBER
 
+import org.apache.flink.api.common.RuntimeExecutionMode
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.spark.sql.Row
+
+import java.time.Duration
 
 /**
  * Base class for lake-enabled log table read tests. Subclasses provide the lake format config and
- * implement tiering via [[tierToLake]].
+ * lake catalog configuration.
  */
 abstract class SparkLakeLogTableReadTestBase extends FlussSparkTestBase {
 
   protected var warehousePath: String = _
 
+  /** The lake format used by this test. */
+  protected def dataLakeFormat: DataLakeFormat
+
+  /** Lake catalog configuration specific to the format. */
+  protected def lakeCatalogConf: Configuration
+
+  private val TIERING_PARALLELISM = 2
+  private val CHECKPOINT_INTERVAL_MS = 1000L
+  private val POLL_INTERVAL: Duration = Duration.ofMillis(500L)
+  private val SYNC_TIMEOUT: Duration = Duration.ofMinutes(2)
+  private val SYNC_POLL_INTERVAL_MS = 500L
+
   /** Tier all pending data for the given table to the lake. */
-  protected def tierToLake(tableName: String): Unit
+  protected def tierToLake(tableName: String): Unit = {
+    val tableId = loadFlussTable(createTablePath(tableName)).getTableInfo.getTableId
+
+    val execEnv = StreamExecutionEnvironment.getExecutionEnvironment
+    execEnv.setRuntimeMode(RuntimeExecutionMode.STREAMING)
+    execEnv.setParallelism(TIERING_PARALLELISM)
+    execEnv.enableCheckpointing(CHECKPOINT_INTERVAL_MS)
+
+    val flussConfig = new Configuration(flussServer.getClientConfig)
+    flussConfig.set(TieringSourceOptions.POLL_TIERING_TABLE_INTERVAL, POLL_INTERVAL)
+
+    val jobClient = LakeTieringJobBuilder
+      .newBuilder(
+        execEnv,
+        flussConfig,
+        lakeCatalogConf,
+        new Configuration(),
+        dataLakeFormat.toString)
+      .build()
+
+    try {
+      val tableBucket = new TableBucket(tableId, 0)
+      val deadline = System.currentTimeMillis() + SYNC_TIMEOUT.toMillis
+      var synced = false
+      while (!synced && System.currentTimeMillis() < deadline) {
+        try {
+          val replica = flussServer.waitAndGetLeaderReplica(tableBucket)
+          synced = replica.getLogTablet.getLakeTableSnapshotId >= 0
+        } catch {
+          case _: Exception =>
+        }
+        if (!synced) Thread.sleep(SYNC_POLL_INTERVAL_MS)
+      }
+      assert(synced, s"Bucket $tableBucket not synced to lake within $SYNC_TIMEOUT")
+    } finally {
+      jobClient.cancel().get()
+    }
+  }
 
   override protected def withTable(tableNames: String*)(f: => Unit): Unit = {
     try {
