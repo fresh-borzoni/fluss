@@ -1,5 +1,5 @@
 ---
-slug: fluss-rust-sdk
+slug: why-fluss-chose-rust-for-multi-language-sdk
 title: "Why Apache Fluss Chose Rust for Its Multi-Language SDK"
 authors: [yuxia, keithlee, anton]
 image: ./assets/fluss_rust/banner.jpg
