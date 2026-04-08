@@ -154,6 +154,37 @@ abstract class SparkLakeLogTableReadTestBase extends FlussSparkTestBase {
     }
   }
 
+  test("Spark Lake Read: log table lake-only projection on timestamp column") {
+    withTable("t_lake_timestamp") {
+      sql(s"""
+             |CREATE TABLE $DEFAULT_DATABASE.t_lake_timestamp (
+             |  id INT,
+             |  ts TIMESTAMP,
+             |  name STRING)
+             | TBLPROPERTIES (
+             |  '${ConfigOptions.TABLE_DATALAKE_ENABLED.key()}' = true,
+             |  '${ConfigOptions.TABLE_DATALAKE_FRESHNESS.key()}' = '1s',
+             |  '${BUCKET_NUMBER.key()}' = 1)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO $DEFAULT_DATABASE.t_lake_timestamp VALUES
+             |(1, TIMESTAMP "2026-01-01 12:00:00", "alpha"),
+             |(2, TIMESTAMP "2026-01-02 12:00:00", "beta"),
+             |(3, TIMESTAMP "2026-01-03 12:00:00", "gamma")
+             |""".stripMargin)
+
+      tierToLake("t_lake_timestamp")
+
+      checkAnswer(
+        sql(s"SELECT ts FROM $DEFAULT_DATABASE.t_lake_timestamp ORDER BY ts"),
+        Row(java.sql.Timestamp.valueOf("2026-01-01 12:00:00")) ::
+          Row(java.sql.Timestamp.valueOf("2026-01-02 12:00:00")) ::
+          Row(java.sql.Timestamp.valueOf("2026-01-03 12:00:00")) :: Nil
+      )
+    }
+  }
+
   test("Spark Lake Read: log table union read (lake + log tail)") {
     withTable("t_union") {
       sql(s"""

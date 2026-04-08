@@ -42,10 +42,12 @@ class FlussLakeAppendPartitionReaderFactory(
     source
   }
 
+  private lazy val projectedRowType: RowType = rowType.project(projection)
+
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     partition match {
       case lake: FlussLakeInputPartition =>
-        new FlussLakePartitionReader(tablePath, rowType, lake, lakeSource)
+        new FlussLakePartitionReader(tablePath, projectedRowType, lake, lakeSource)
       case log: FlussAppendInputPartition =>
         new FlussAppendPartitionReader(tablePath, projection, log, flussConfig)
       case _ =>
