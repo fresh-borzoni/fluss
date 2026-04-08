@@ -95,7 +95,7 @@ Looking ahead, Arrow also makes [Apache DataFusion](https://datafusion.apache.or
 
 Suppose a Flink job consumes CDC from Postgres, computes user features, and writes them into a Fluss primary key table. A Python scoring service needs to look up those features before running a model. With the Python binding, that's a few lines:
 
-```python
+```python title="Python"
 from fluss import FlussConnection, Config, TablePath
 
 conn = await FlussConnection.create(Config({"bootstrap.servers": "fluss:9123"}))
@@ -111,7 +111,7 @@ The lookup goes through the same Protobuf RPC and hits the same KV store on the 
 
 On the write side, consider an IoT gateway written in C++ that pushes sensor readings into a Fluss log table. It can't afford to block on each record, so it queues them and lets the Rust core handle batching and delivery:
 
-```cpp
+```cpp title="C++"
 fluss::AppendWriter writer;
 table.NewAppend().CreateWriter(writer);
 
