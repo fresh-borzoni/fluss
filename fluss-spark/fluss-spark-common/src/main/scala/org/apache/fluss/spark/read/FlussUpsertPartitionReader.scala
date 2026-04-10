@@ -24,13 +24,15 @@ import org.apache.fluss.config.Configuration
 import org.apache.fluss.memory.MemorySegment
 import org.apache.fluss.metadata.{TableBucket, TablePath}
 import org.apache.fluss.record.LogRecord
-import org.apache.fluss.row.{encode, InternalRow, KeyValueRow}
+import org.apache.fluss.row.{encode, InternalRow => FlussInternalRow, KeyValueRow}
 import org.apache.fluss.spark.SparkFlussConf
+import org.apache.fluss.spark.row.DataConverter
 import org.apache.fluss.spark.utils.LogChangesIterator
 import org.apache.fluss.types.{DataField, RowType}
 import org.apache.fluss.utils.CloseableIterator
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.InternalRow
 
 import java.util.Comparator
 
@@ -50,6 +52,12 @@ class FlussUpsertPartitionReader(
     flussConfig: Configuration)
   extends FlussPartitionReader(tablePath, flussConfig)
   with Logging {
+
+  private lazy val projectedRowType = rowType.project(projectionWithPks)
+
+  override protected def convertToSparkRow(flussRow: FlussInternalRow): InternalRow = {
+    DataConverter.toSparkInternalRow(flussRow, projectedRowType)
+  }
 
   private val readOptimized = flussConfig.get(SparkFlussConf.READ_OPTIMIZED_OPTION)
   private val tableBucket: TableBucket = flussPartition.tableBucket
@@ -79,7 +87,7 @@ class FlussUpsertPartitionReader(
 
   private var snapshotScanner: BatchScanner = _
   private var logScanner: LogScanner = _
-  private var mergedIterator: Iterator[InternalRow] = _
+  private var mergedIterator: Iterator[FlussInternalRow] = _
 
   // initialize scanners
   initialize()
@@ -111,8 +119,8 @@ class FlussUpsertPartitionReader(
         tableInfo.isDefaultBucketKey)
 
     // Create comparators based on primary key
-    val comparator = new Comparator[InternalRow] {
-      override def compare(o1: InternalRow, o2: InternalRow): Int = {
+    val comparator = new Comparator[FlussInternalRow] {
+      override def compare(o1: FlussInternalRow, o2: FlussInternalRow): Int = {
         val key1 = keyEncoder.encodeKey(o1)
         val key2 = keyEncoder.encodeKey(o2)
         MemorySegment.wrap(key1).compare(MemorySegment.wrap(key2), 0, 0, key1.length)
@@ -160,7 +168,7 @@ class FlussUpsertPartitionReader(
 
       // Convert snapshot iterator to LogRecord iterator for SortMergeReader
       new CloseableIterator[LogRecord] {
-        private var currentBatch: java.util.Iterator[InternalRow] = _
+        private var currentBatch: java.util.Iterator[FlussInternalRow] = _
         private var hasMoreBatches = true
 
         override def hasNext: Boolean = {
@@ -200,9 +208,9 @@ class FlussUpsertPartitionReader(
       createSnapshotIterator()
     }
 
-    // Create the SortMergeReader
+    // null: scanners already project rows; passing projectionWithPks here double-projects
     val sortMergeReader = new SortMergeReader(
-      projectionWithPks,
+      null,
       pkProjection,
       snapshotIterators,
       comparator,

@@ -255,6 +255,53 @@ class SparkPrimaryKeyTableReadTest extends FlussSparkTestBase {
     }
   }
 
+  test("Spark Read: primary key table projection with type-dependent columns") {
+    withTable("t") {
+      val tablePath = createTablePath("t")
+      sql(s"""
+             |CREATE TABLE $DEFAULT_DATABASE.t (
+             |pk INT,
+             |ts TIMESTAMP,
+             |name STRING,
+             |arr ARRAY<INT>,
+             |struct_col STRUCT<col1: INT, col2: STRING>,
+             |ts_ltz TIMESTAMP_LTZ
+             |) TBLPROPERTIES("primary.key" = "pk", "bucket.num" = 1)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO $DEFAULT_DATABASE.t VALUES
+             |(1, TIMESTAMP "2026-01-01 12:00:00", "a", ARRAY(1, 2), STRUCT(10, 'x'),
+             | TIMESTAMP "2026-01-01 12:00:00"),
+             |(2, TIMESTAMP "2026-01-02 12:00:00", "b", ARRAY(3, 4), STRUCT(20, 'y'),
+             | TIMESTAMP "2026-01-02 12:00:00")
+             |""".stripMargin)
+
+      // Log-only: projection reorders type-dependent columns (PK not in projection)
+      checkAnswer(
+        sql(s"SELECT arr, ts, struct_col FROM $DEFAULT_DATABASE.t ORDER BY ts"),
+        Row(Seq(1, 2), java.sql.Timestamp.valueOf("2026-01-01 12:00:00"), Row(10, "x")) ::
+          Row(Seq(3, 4), java.sql.Timestamp.valueOf("2026-01-02 12:00:00"), Row(20, "y")) :: Nil
+      )
+
+      // Trigger snapshot, then test with snapshot + log merge
+      flussServer.triggerAndWaitSnapshot(tablePath)
+
+      sql(s"""
+             |INSERT INTO $DEFAULT_DATABASE.t VALUES
+             |(1, TIMESTAMP "2026-03-01 12:00:00", "a_updated", ARRAY(10, 20), STRUCT(100, 'xx'),
+             | TIMESTAMP "2026-03-01 12:00:00")
+             |""".stripMargin)
+
+      // Snapshot + log: projection with type-dependent columns at shifted ordinals
+      checkAnswer(
+        sql(s"SELECT ts_ltz, arr, name FROM $DEFAULT_DATABASE.t ORDER BY name"),
+        Row(java.sql.Timestamp.valueOf("2026-03-01 12:00:00"), Seq(10, 20), "a_updated") ::
+          Row(java.sql.Timestamp.valueOf("2026-01-02 12:00:00"), Seq(3, 4), "b") :: Nil
+      )
+    }
+  }
+
   private def genInputPartition(
       tablePath: TablePath,
       partitionName: String): Array[FlussUpsertInputPartition] = {
