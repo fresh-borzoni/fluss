@@ -110,7 +110,10 @@ services:
         s3.endpoint: http://rustfs:9000
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
+        s3.region: us-east-1
         s3.path.style.access: true
+        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
         datalake.paimon.warehouse: s3://fluss/paimon
@@ -135,8 +138,10 @@ services:
         s3.endpoint: http://rustfs:9000
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
+        s3.region: us-east-1
         s3.path.style.access: true
-        kv.snapshot.interval: 0s
+        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
         datalake.paimon.warehouse: s3://fluss/paimon
@@ -327,7 +332,10 @@ services:
         s3.endpoint: http://rustfs:9000
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
+        s3.region: us-east-1
         s3.path.style.access: true
+        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: iceberg
         datalake.iceberg.catalog-impl: org.apache.iceberg.jdbc.JdbcCatalog
         datalake.iceberg.name: fluss_catalog
@@ -356,12 +364,14 @@ services:
         zookeeper.address: zookeeper:2181
         bind.listeners: FLUSS://tablet-server:9123
         data.dir: /tmp/fluss/data
-        kv.snapshot.interval: 0s
         remote.data.dir: s3://fluss/remote-data
         s3.endpoint: http://rustfs:9000
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
+        s3.region: us-east-1
         s3.path.style.access: true
+        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: iceberg
         datalake.iceberg.catalog-impl: org.apache.iceberg.jdbc.JdbcCatalog
         datalake.iceberg.name: fluss_catalog
