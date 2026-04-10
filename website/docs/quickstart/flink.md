@@ -94,7 +94,7 @@ services:
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
         s3.path-style-access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
   tablet-server:
     image: apache/fluss:$FLUSS_DOCKER_VERSION$
@@ -113,7 +113,7 @@ services:
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
         s3.path-style-access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
   zookeeper:
     restart: always

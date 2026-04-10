@@ -111,8 +111,8 @@ services:
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
-        s3.path.style.access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
@@ -139,8 +139,8 @@ services:
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
-        s3.path.style.access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: paimon
         datalake.paimon.metastore: filesystem
@@ -333,8 +333,8 @@ services:
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
-        s3.path.style.access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: iceberg
         datalake.iceberg.catalog-impl: org.apache.iceberg.jdbc.JdbcCatalog
@@ -369,8 +369,8 @@ services:
         s3.access-key: rustfsadmin
         s3.secret-key: rustfsadmin
         s3.region: us-east-1
-        s3.path.style.access: true
-        s3.assumed.role.arn: arn:aws:iam::0:role/rustfsadmin
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/rustfsadmin
         s3.assumed.role.sts.endpoint: http://rustfs:9000
         datalake.format: iceberg
         datalake.iceberg.catalog-impl: org.apache.iceberg.jdbc.JdbcCatalog
