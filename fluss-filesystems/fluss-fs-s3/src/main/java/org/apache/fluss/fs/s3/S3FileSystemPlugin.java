@@ -45,6 +45,8 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
 
     private static final String ACCESS_KEY_ID = "fs.s3a.access.key";
 
+    private static final String ROLE_ARN_KEY = "fs.s3a.assumed.role.arn";
+
     private static final String[][] MIRRORED_CONFIG_KEYS = {
         {"fs.s3a.access-key", "fs.s3a.access.key"},
         {"fs.s3a.secret-key", "fs.s3a.secret.key"},
@@ -122,7 +124,15 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
     }
 
     private void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
-        if (hadoopConfig.get(ACCESS_KEY_ID) == null) {
+        boolean hasStaticKeys = hadoopConfig.get(ACCESS_KEY_ID) != null;
+        boolean hasRoleArn = hadoopConfig.get(ROLE_ARN_KEY) != null;
+
+        if (hasStaticKeys || hasRoleArn) {
+            LOG.info(
+                    hasStaticKeys
+                            ? "Using provided static credentials."
+                            : "Using default AWS credential chain with AssumeRole.");
+        } else {
             if (Objects.equals(getScheme(), "s3")) {
                 S3DelegationTokenReceiver.updateHadoopConfig(hadoopConfig);
             } else if (Objects.equals(getScheme(), "s3a")) {
@@ -131,11 +141,8 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
                 throw new IllegalArgumentException("Unsupported scheme: " + getScheme());
             }
             LOG.info(
-                    "{} is not set, using credential provider {}.",
-                    ACCESS_KEY_ID,
+                    "Using credential provider {} for delegated tokens.",
                     hadoopConfig.get(PROVIDER_CONFIG_NAME));
-        } else {
-            LOG.info("{} is set, using provided access key id and secret.", ACCESS_KEY_ID);
         }
     }
 }
