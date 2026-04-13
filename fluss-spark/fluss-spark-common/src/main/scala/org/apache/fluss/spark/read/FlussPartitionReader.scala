@@ -69,7 +69,9 @@ abstract class FlussPartitionReader(tablePath: TablePath, flussConfig: Configura
     convertToSparkRow(scanRecord.getRow)
   }
 
+  protected def projectedRowType: RowType
+
   protected def convertToSparkRow(flussRow: FlussInternalRow): InternalRow = {
-    DataConverter.toSparkInternalRow(flussRow, rowType)
+    DataConverter.toSparkInternalRow(flussRow, projectedRowType)
   }
 }

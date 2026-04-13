@@ -26,13 +26,11 @@ import org.apache.fluss.metadata.{TableBucket, TablePath}
 import org.apache.fluss.record.LogRecord
 import org.apache.fluss.row.{encode, InternalRow => FlussInternalRow, KeyValueRow}
 import org.apache.fluss.spark.SparkFlussConf
-import org.apache.fluss.spark.row.DataConverter
 import org.apache.fluss.spark.utils.LogChangesIterator
 import org.apache.fluss.types.{DataField, RowType}
 import org.apache.fluss.utils.CloseableIterator
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.InternalRow
 
 import java.util.Comparator
 
@@ -53,11 +51,7 @@ class FlussUpsertPartitionReader(
   extends FlussPartitionReader(tablePath, flussConfig)
   with Logging {
 
-  private lazy val projectedRowType = rowType.project(projectionWithPks)
-
-  override protected def convertToSparkRow(flussRow: FlussInternalRow): InternalRow = {
-    DataConverter.toSparkInternalRow(flussRow, projectedRowType)
-  }
+  override protected lazy val projectedRowType: RowType = rowType.project(projectionWithPks)
 
   private val readOptimized = flussConfig.get(SparkFlussConf.READ_OPTIMIZED_OPTION)
   private val tableBucket: TableBucket = flussPartition.tableBucket
