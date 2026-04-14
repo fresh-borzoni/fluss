@@ -17,6 +17,7 @@
 
 package org.apache.fluss.fs.s3;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigBuilder;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FileSystem;
@@ -44,6 +45,7 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
     private static final String HADOOP_CONFIG_PREFIX = "fs.s3a.";
 
     private static final String ACCESS_KEY_ID = "fs.s3a.access.key";
+    private static final String ACCESS_KEY_SECRET = "fs.s3a.secret.key";
 
     private static final String ROLE_ARN_KEY = "fs.s3a.assumed.role.arn";
 
@@ -123,8 +125,11 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
         return fsUri;
     }
 
-    private void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
-        boolean hasStaticKeys = hadoopConfig.get(ACCESS_KEY_ID) != null;
+    @VisibleForTesting
+    void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
+        boolean hasStaticKeys =
+                hadoopConfig.get(ACCESS_KEY_ID) != null
+                        && hadoopConfig.get(ACCESS_KEY_SECRET) != null;
         boolean hasRoleArn = hadoopConfig.get(ROLE_ARN_KEY) != null;
 
         if (hasStaticKeys || hasRoleArn) {

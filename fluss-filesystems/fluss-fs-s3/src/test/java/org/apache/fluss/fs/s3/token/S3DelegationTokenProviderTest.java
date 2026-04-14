@@ -41,7 +41,7 @@ class S3DelegationTokenProviderTest {
         conf.set("fs.s3a.region", "us-east-1");
 
         assertThatThrownBy(() -> new S3DelegationTokenProvider("s3", conf))
-                .isInstanceOf(NullPointerException.class)
+                .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("fs.s3a.assumed.role.arn must be set");
     }
 }
