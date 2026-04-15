@@ -17,13 +17,13 @@
 
 package org.apache.fluss.fs.s3;
 
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.s3.token.DynamicTemporaryAWSCredentialsProvider;
 import org.apache.fluss.fs.s3.token.S3DelegationTokenReceiver;
 import org.apache.fluss.fs.token.Credentials;
 import org.apache.fluss.fs.token.CredentialsJsonSerde;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 
-import org.apache.hadoop.conf.Configuration;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
@@ -37,12 +37,13 @@ class S3FileSystemPluginTest {
 
     @Test
     void testServerModeWithStaticKeys() {
-        Configuration hadoopConfig = new Configuration();
-        hadoopConfig.set("fs.s3a.access.key", "testAccessKey");
-        hadoopConfig.set("fs.s3a.secret.key", "testSecretKey");
+        Configuration flussConfig = new Configuration();
+        flussConfig.setString("fs.s3a.access.key", "testAccessKey");
+        flussConfig.setString("fs.s3a.secret.key", "testSecretKey");
 
         S3FileSystemPlugin plugin = new S3FileSystemPlugin();
-        plugin.setCredentialProvider(hadoopConfig);
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                plugin.buildHadoopConfiguration(flussConfig);
 
         String providers = hadoopConfig.get(PROVIDER_CONFIG, "");
         assertThat(providers).doesNotContain(DynamicTemporaryAWSCredentialsProvider.NAME);
@@ -50,11 +51,13 @@ class S3FileSystemPluginTest {
 
     @Test
     void testServerModeWithRoleArnOnly() {
-        Configuration hadoopConfig = new Configuration();
-        hadoopConfig.set("fs.s3a.assumed.role.arn", "arn:aws:iam::123456789012:role/test-role");
+        Configuration flussConfig = new Configuration();
+        flussConfig.setString(
+                "fs.s3a.assumed.role.arn", "arn:aws:iam::123456789012:role/test-role");
 
         S3FileSystemPlugin plugin = new S3FileSystemPlugin();
-        plugin.setCredentialProvider(hadoopConfig);
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                plugin.buildHadoopConfiguration(flussConfig);
 
         String providers = hadoopConfig.get(PROVIDER_CONFIG, "");
         assertThat(providers).doesNotContain(DynamicTemporaryAWSCredentialsProvider.NAME);
@@ -73,10 +76,11 @@ class S3FileSystemPluginTest {
         S3DelegationTokenReceiver receiver = new S3DelegationTokenReceiver();
         receiver.onNewTokensObtained(token);
 
-        Configuration hadoopConfig = new Configuration();
+        Configuration flussConfig = new Configuration();
 
         S3FileSystemPlugin plugin = new S3FileSystemPlugin();
-        plugin.setCredentialProvider(hadoopConfig);
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                plugin.buildHadoopConfiguration(flussConfig);
 
         String providers = hadoopConfig.get(PROVIDER_CONFIG, "");
         assertThat(providers).contains(DynamicTemporaryAWSCredentialsProvider.NAME);

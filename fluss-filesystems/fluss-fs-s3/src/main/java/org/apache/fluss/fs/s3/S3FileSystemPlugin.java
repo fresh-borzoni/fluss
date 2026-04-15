@@ -62,16 +62,20 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
 
     @Override
     public FileSystem create(URI fsUri, Configuration flussConfig) throws IOException {
-        org.apache.hadoop.conf.Configuration hadoopConfig =
-                mirrorCertainHadoopConfig(getHadoopConfiguration(flussConfig));
-
-        // set credential provider
-        setCredentialProvider(hadoopConfig);
+        org.apache.hadoop.conf.Configuration hadoopConfig = buildHadoopConfiguration(flussConfig);
 
         // create the Hadoop FileSystem
         org.apache.hadoop.fs.FileSystem fs = new S3AFileSystem();
         fs.initialize(getInitURI(fsUri, hadoopConfig), hadoopConfig);
         return new S3FileSystem(getScheme(), fs, hadoopConfig);
+    }
+
+    @VisibleForTesting
+    org.apache.hadoop.conf.Configuration buildHadoopConfiguration(Configuration flussConfig) {
+        org.apache.hadoop.conf.Configuration hadoopConfig =
+                mirrorCertainHadoopConfig(getHadoopConfiguration(flussConfig));
+        setCredentialProvider(hadoopConfig);
+        return hadoopConfig;
     }
 
     org.apache.hadoop.conf.Configuration getHadoopConfiguration(Configuration flussConfig) {
@@ -125,8 +129,7 @@ public class S3FileSystemPlugin implements FileSystemPlugin {
         return fsUri;
     }
 
-    @VisibleForTesting
-    void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
+    private void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
         boolean hasStaticKeys =
                 hadoopConfig.get(ACCESS_KEY_ID) != null
                         && hadoopConfig.get(ACCESS_KEY_SECRET) != null;

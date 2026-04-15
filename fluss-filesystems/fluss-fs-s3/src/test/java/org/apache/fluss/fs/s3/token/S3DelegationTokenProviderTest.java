@@ -44,4 +44,15 @@ class S3DelegationTokenProviderTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("fs.s3a.assumed.role.arn must be set");
     }
+
+    @Test
+    void testPartialStaticCredentialsThrows() {
+        Configuration conf = new Configuration();
+        conf.set("fs.s3a.region", "us-east-1");
+        conf.set("fs.s3a.access.key", "testAccessKey");
+
+        assertThatThrownBy(() -> new S3DelegationTokenProvider("s3", conf))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must both be set or both be unset");
+    }
 }
