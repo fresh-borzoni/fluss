@@ -42,7 +42,7 @@ class S3DelegationTokenProviderTest {
 
         assertThatThrownBy(() -> new S3DelegationTokenProvider("s3", conf))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("fs.s3a.assumed.role.arn must be set");
+                .hasMessageContaining("Role ARN must be set");
     }
 
     @Test

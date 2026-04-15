@@ -41,7 +41,6 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
-import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** Delegation token provider for S3 Hadoop filesystems. */
 public class S3DelegationTokenProvider {
@@ -68,7 +67,7 @@ public class S3DelegationTokenProvider {
     public S3DelegationTokenProvider(String scheme, Configuration conf) {
         this.scheme = scheme;
         this.region = conf.get(REGION_KEY);
-        checkNotNull(region, "Region is not set.");
+        checkArgument(region != null, "Region is not set.");
         this.accessKey = conf.get(ACCESS_KEY_ID);
         this.secretKey = conf.get(ACCESS_KEY_SECRET);
         this.roleArn = conf.get(ROLE_ARN_KEY);
@@ -76,11 +75,11 @@ public class S3DelegationTokenProvider {
 
         checkArgument(
                 (accessKey == null) == (secretKey == null),
-                "fs.s3a.access.key and fs.s3a.secret.key must both be set or both be unset.");
+                "S3 access key and secret key must both be set or both be unset.");
         if (accessKey == null) {
             checkArgument(
                     roleArn != null,
-                    ROLE_ARN_KEY + " must be set when static credentials are not provided.");
+                    "Role ARN must be set when static credentials are not provided.");
         }
 
         this.additionInfos = new HashMap<>();
