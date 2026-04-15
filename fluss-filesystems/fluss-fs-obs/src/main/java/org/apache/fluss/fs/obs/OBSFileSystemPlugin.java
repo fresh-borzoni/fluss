@@ -38,8 +38,8 @@ public class OBSFileSystemPlugin implements FileSystemPlugin {
     public static final String SCHEME = "obs";
 
     /**
-     * In order to simplify, we make fluss obs configuration keys same with hadoop obs module. So,
-     * we add all configuration key with prefix `fs.obs` in fluss conf to hadoop conf
+     * Fluss config prefixes that are mapped to the Hadoop config prefix. Users may configure with
+     * either the short prefix or the full Hadoop prefix.
      */
     private static final String[] FLUSS_CONFIG_PREFIXES = {"obs.", "fs.obs."};
 

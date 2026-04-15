@@ -51,8 +51,8 @@ public class OSSFileSystemPlugin implements FileSystemPlugin {
     public static final String SCHEME = "oss";
 
     /**
-     * In order to simplify, we make fluss oss configuration keys same with hadoop oss module. So,
-     * we add all configuration key with prefix `fs.oss` in fluss conf to hadoop conf
+     * Fluss config prefixes that are mapped to the Hadoop config prefix. Users may configure with
+     * either the short prefix or the full Hadoop prefix.
      */
     private static final String[] FLUSS_CONFIG_PREFIXES = {"oss.", "fs.oss."};
 

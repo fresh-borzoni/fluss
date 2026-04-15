@@ -58,7 +58,7 @@ abstract class AzureFileSystemPlugin implements FileSystemPlugin {
         // create the Azure Hadoop FileSystem
         org.apache.hadoop.fs.FileSystem fs = new AzureBlobFileSystem();
         fs.initialize(getInitURI(fsUri, hadoopConfig), hadoopConfig);
-        return new AzureFileSystem(getScheme(), fs, flussConfig);
+        return new AzureFileSystem(getScheme(), fs, hadoopConfig);
     }
 
     private void setCredentialProvider(org.apache.hadoop.conf.Configuration hadoopConfig) {
