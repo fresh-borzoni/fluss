@@ -231,6 +231,7 @@
     table tr td {
         padding: 0.65rem 0.8125rem;
         border-color: #dfe5f0;
+        word-break: break-word;
     }
     a {
         color: var(--ifm-color-primary);
