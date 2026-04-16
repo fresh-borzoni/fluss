@@ -11,6 +11,10 @@ sidebar_position: 1
 
 This guide explains how to configure Fluss to use Lakekeeper as its Iceberg catalog. For general Iceberg integration details (table mapping, data types, limitations), see [Iceberg](../formats/iceberg.md).
 
+## Quick Start with Docker Compose
+
+A complete Docker Compose example including Fluss, the tiering service, and Lakekeeper is available in the [Lakekeeper examples](https://github.com/lakekeeper/lakekeeper/tree/main/examples/fluss) directory. It demonstrates table creation, data ingestion, tiering, and querying with DuckDB via the REST catalog.
+
 ## How It Works
 
 When Fluss is configured with Lakekeeper as its Iceberg REST catalog:
@@ -23,7 +27,7 @@ When Fluss is configured with Lakekeeper as its Iceberg REST catalog:
 
 ### Running Lakekeeper Instance
 
-You need a running Lakekeeper instance with a warehouse configured. Refer to the [Lakekeeper Getting Started](https://docs.lakekeeper.io/getting-started/) guide for deployment instructions.
+You need a running Lakekeeper instance with a warehouse configured. Refer to the [Lakekeeper Getting Started](https://docs.lakekeeper.io/docs/nightly/getting-started/) guide for deployment instructions.
 
 After deploying Lakekeeper, create a warehouse that points to your object storage (e.g., S3):
 
@@ -56,7 +60,7 @@ curl -X POST http://<lakekeeper-host>:8181/management/v1/warehouse \
     }'
 ```
 
-> **NOTE**: Adjust the `storage-profile` and `storage-credential` to match your storage backend. Lakekeeper supports S3, GCS, Azure, and local storage. See [Lakekeeper Storage](https://docs.lakekeeper.io) for details.
+> **NOTE**: Adjust the `storage-profile` and `storage-credential` to match your storage backend. Lakekeeper supports S3, GCS, Azure, and local storage. See [Lakekeeper Storage](https://docs.lakekeeper.io/docs/nightly/storage/) for details.
 
 ## Configure Fluss with Lakekeeper
 
@@ -140,3 +144,4 @@ For details on union reads, streaming reads, and reading with other engines, see
 - [Iceberg Integration](../formats/iceberg.md) - Table mapping, data types, supported catalog types, and limitations
 - [Lakehouse Storage](maintenance/tiered-storage/lakehouse-storage.md) - General tiered storage setup
 - [Lakekeeper Documentation](https://docs.lakekeeper.io) - Deploying and managing Lakekeeper
+- [Lakekeeper Fluss Engine Docs](https://docs.lakekeeper.io/docs/nightly/engines/#apache-fluss) - Lakekeeper-side configuration reference
