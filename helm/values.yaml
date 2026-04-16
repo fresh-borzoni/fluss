@@ -46,6 +46,8 @@ tablet:
   extraVolumes: []
   extraVolumeMounts: []
   initContainers: []
+  extraEnv: []
+  envFrom: []
 
 coordinator:
   numberOfReplicas: 1
@@ -56,6 +58,8 @@ coordinator:
   extraVolumes: []
   extraVolumeMounts: []
   initContainers: []
+  extraEnv: []
+  envFrom: []
 
 # Fluss listener configurations
 listeners:
