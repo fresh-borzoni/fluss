@@ -57,8 +57,8 @@ public class AzureDelegationTokenProvider {
 
         LOG.info("Setting the endpoint key " + endpointKey);
 
-        if (conf.get(endpointKey) != null) {
-            additionInfos.put(endpointKey, conf.get(endpointKey));
+        if (authEndpoint != null) {
+            additionInfos.put(endpointKey, authEndpoint);
         }
     }
 
