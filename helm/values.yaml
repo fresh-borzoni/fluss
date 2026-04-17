@@ -48,6 +48,12 @@ tablet:
   initContainers: []
   extraEnv: []
   envFrom: []
+  podAnnotations: {}
+  podLabels: {}
+  podDisruptionBudget:
+    enabled: false
+    # minAvailable: 1
+    # maxUnavailable: 1
 
 coordinator:
   numberOfReplicas: 1
@@ -60,6 +66,12 @@ coordinator:
   initContainers: []
   extraEnv: []
   envFrom: []
+  podAnnotations: {}
+  podLabels: {}
+  podDisruptionBudget:
+    enabled: false
+    # minAvailable: 1
+    # maxUnavailable: 1
 
 # Fluss listener configurations
 listeners:
