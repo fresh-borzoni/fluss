@@ -24,11 +24,11 @@ metadata:
   labels:
   {{- include "fluss.labels" . | nindent 4 }}
 spec:
-  {{- with .Values.coordinator.podDisruptionBudget.minAvailable }}
-  minAvailable: {{ . }}
+  {{- if hasKey .Values.coordinator.podDisruptionBudget "minAvailable" }}
+  minAvailable: {{ .Values.coordinator.podDisruptionBudget.minAvailable }}
   {{- end }}
-  {{- with .Values.coordinator.podDisruptionBudget.maxUnavailable }}
-  maxUnavailable: {{ . }}
+  {{- if hasKey .Values.coordinator.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ .Values.coordinator.podDisruptionBudget.maxUnavailable }}
   {{- end }}
   selector:
     matchLabels:

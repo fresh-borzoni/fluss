@@ -213,3 +213,73 @@ tests:
       - equal:
           path: spec.selector.matchLabels["app.kubernetes.io/component"]
           value: coordinator
+
+---
+
+suite: pdb-validation
+templates:
+  - templates/NOTES.txt
+
+tests:
+  - it: should fail when both minAvailable and maxUnavailable are set on tablet
+    set:
+      tablet.podDisruptionBudget:
+        enabled: true
+        minAvailable: 2
+        maxUnavailable: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "cannot set both minAvailable and maxUnavailable"
+
+  - it: should fail when neither minAvailable nor maxUnavailable is set on tablet
+    set:
+      tablet.podDisruptionBudget:
+        enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "must set either minAvailable or maxUnavailable when enabled"
+
+  - it: should fail when both minAvailable and maxUnavailable are set on coordinator
+    set:
+      coordinator.podDisruptionBudget:
+        enabled: true
+        minAvailable: 1
+        maxUnavailable: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "cannot set both minAvailable and maxUnavailable"
+
+  - it: should fail when neither minAvailable nor maxUnavailable is set on coordinator
+    set:
+      coordinator.podDisruptionBudget:
+        enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "must set either minAvailable or maxUnavailable when enabled"
+
+---
+
+suite: pdb-zero-values
+templates:
+  - templates/pdb-tablet.yaml
+
+tests:
+  - it: should render tablet PDB with minAvailable set to zero
+    set:
+      tablet.podDisruptionBudget:
+        enabled: true
+        minAvailable: 0
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 0
+
+  - it: should render tablet PDB with maxUnavailable set to zero
+    set:
+      tablet.podDisruptionBudget:
+        enabled: true
+        maxUnavailable: 0
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 0
