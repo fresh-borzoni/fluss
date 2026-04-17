@@ -19,8 +19,11 @@ package org.apache.fluss.spark.read
 
 import org.apache.fluss.config.{Configuration => FlussConfiguration}
 import org.apache.fluss.metadata.{TableInfo, TablePath}
+import org.apache.fluss.predicate.Predicate
+import org.apache.fluss.spark.utils.SparkPredicateConverter
 
-import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownRequiredColumns}
+import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownFilters, SupportsPushDownRequiredColumns}
+import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -34,16 +37,43 @@ trait FlussScanBuilder extends ScanBuilder with SupportsPushDownRequiredColumns 
   }
 }
 
+/** Filter pushdown mixin: converts what it can, returns all filters as residual. */
+trait FlussSupportsPushDownFilters extends FlussScanBuilder with SupportsPushDownFilters {
+
+  def tableInfo: TableInfo
+
+  protected var pushedPredicate: Option[Predicate] = None
+  protected var acceptedFilters: Array[Filter] = Array.empty
+
+  override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+    val (predicate, accepted) =
+      SparkPredicateConverter.convertFilters(tableInfo.getRowType, filters.toSeq)
+    pushedPredicate = predicate
+    acceptedFilters = accepted.toArray
+    // Fluss's server-side filter is batch-level only; Spark must re-apply for row-exact results.
+    filters
+  }
+
+  override def pushedFilters(): Array[Filter] = acceptedFilters
+}
+
 /** Fluss Append Scan Builder. */
 class FlussAppendScanBuilder(
     tablePath: TablePath,
-    tableInfo: TableInfo,
+    val tableInfo: TableInfo,
     options: CaseInsensitiveStringMap,
     flussConfig: FlussConfiguration)
-  extends FlussScanBuilder {
+  extends FlussSupportsPushDownFilters {
 
   override def build(): Scan = {
-    FlussAppendScan(tablePath, tableInfo, requiredSchema, options, flussConfig)
+    FlussAppendScan(
+      tablePath,
+      tableInfo,
+      requiredSchema,
+      pushedPredicate,
+      acceptedFilters.toSeq,
+      options,
+      flussConfig)
   }
 }
 

@@ -48,7 +48,7 @@ class FlussLakeAppendBatch(
 
   override def createReaderFactory(): PartitionReaderFactory = {
     if (isFallback) {
-      new FlussAppendPartitionReaderFactory(tablePath, projection, options, flussConfig)
+      new FlussAppendPartitionReaderFactory(tablePath, projection, null, options, flussConfig)
     } else {
       new FlussLakePartitionReaderFactory(
         tableInfo.getProperties.toMap,

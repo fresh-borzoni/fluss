@@ -260,7 +260,7 @@ class FlussAppendMicroBatchStream(
     checkpointLocation) {
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    new FlussAppendPartitionReaderFactory(tablePath, projection, options, flussConfig)
+    new FlussAppendPartitionReaderFactory(tablePath, projection, null, options, flussConfig)
   }
 
   override def planInputPartitions(start: Offset, end: Offset): Array[InputPartition] = {

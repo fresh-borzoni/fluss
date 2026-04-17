@@ -19,11 +19,13 @@ package org.apache.fluss.spark.read
 
 import org.apache.fluss.config.Configuration
 import org.apache.fluss.metadata.{TableInfo, TablePath}
+import org.apache.fluss.predicate.Predicate
 import org.apache.fluss.spark.SparkConversions
 import org.apache.fluss.spark.read.lake.{FlussLakeAppendBatch, FlussLakeUpsertBatch}
 
 import org.apache.spark.sql.connector.read.{Batch, Scan}
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
+import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -43,12 +45,14 @@ case class FlussAppendScan(
     tablePath: TablePath,
     tableInfo: TableInfo,
     requiredSchema: Option[StructType],
+    pushedPredicate: Option[Predicate],
+    pushedSparkFilters: Seq[Filter],
     options: CaseInsensitiveStringMap,
     flussConfig: Configuration)
   extends FlussScan {
 
   override def toBatch: Batch = {
-    new FlussAppendBatch(tablePath, tableInfo, readSchema, options, flussConfig)
+    new FlussAppendBatch(tablePath, tableInfo, readSchema, pushedPredicate, options, flussConfig)
   }
 
   override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
@@ -59,6 +63,12 @@ case class FlussAppendScan(
       options,
       flussConfig,
       checkpointLocation)
+  }
+
+  override def description(): String = {
+    val base = super.description()
+    if (pushedSparkFilters.isEmpty) base
+    else s"$base [PushedFilters: ${pushedSparkFilters.mkString("[", ", ", "]")}]"
   }
 }
 
