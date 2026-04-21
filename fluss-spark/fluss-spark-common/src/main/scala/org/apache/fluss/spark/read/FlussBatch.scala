@@ -160,7 +160,7 @@ class FlussAppendBatch(
     new FlussAppendPartitionReaderFactory(
       tablePath,
       projection,
-      pushedPredicate.orNull,
+      pushedPredicate,
       options,
       flussConfig)
   }

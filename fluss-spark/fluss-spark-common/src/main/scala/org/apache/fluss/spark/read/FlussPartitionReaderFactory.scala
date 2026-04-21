@@ -25,13 +25,11 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
-import javax.annotation.Nullable
-
 /** Factory for creating partition readers to read data from Fluss. */
 class FlussAppendPartitionReaderFactory(
     tablePath: TablePath,
     projection: Array[Int],
-    @Nullable pushedPredicate: Predicate,
+    pushedPredicate: Option[Predicate],
     options: CaseInsensitiveStringMap,
     flussConfig: Configuration)
   extends PartitionReaderFactory {

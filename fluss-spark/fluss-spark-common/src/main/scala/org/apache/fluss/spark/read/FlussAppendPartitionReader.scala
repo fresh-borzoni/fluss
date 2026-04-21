@@ -23,13 +23,11 @@ import org.apache.fluss.metadata.{TableBucket, TablePath}
 import org.apache.fluss.predicate.Predicate
 import org.apache.fluss.types.RowType
 
-import javax.annotation.Nullable
-
 /** Partition reader that reads log data from a single Fluss table bucket. */
 class FlussAppendPartitionReader(
     tablePath: TablePath,
     projection: Array[Int],
-    @Nullable pushedPredicate: Predicate,
+    pushedPredicate: Option[Predicate],
     flussPartition: FlussAppendInputPartition,
     flussConfig: Configuration)
   extends FlussPartitionReader(tablePath, flussConfig) {
@@ -40,7 +38,7 @@ class FlussAppendPartitionReader(
   private val partitionId = tableBucket.getPartitionId
   private val bucketId = tableBucket.getBucket
   private val logScanner =
-    table.newScan().project(projection).filter(pushedPredicate).createLogScanner()
+    table.newScan().project(projection).filter(pushedPredicate.orNull).createLogScanner()
 
   // Iterator for current batch of records
   private var currentRecords: java.util.Iterator[ScanRecord] = java.util.Collections.emptyIterator()

@@ -51,7 +51,7 @@ class FlussLakePartitionReaderFactory(
           projection,
           flussConfig)
       case logSplit: FlussAppendInputPartition =>
-        new FlussAppendPartitionReader(tablePath, projection, null, logSplit, flussConfig)
+        new FlussAppendPartitionReader(tablePath, projection, None, logSplit, flussConfig)
       case mixedSplit: FlussLakeUpsertInputPartition =>
         new FlussLakeUpsertPartitionReader(
           tablePath,
