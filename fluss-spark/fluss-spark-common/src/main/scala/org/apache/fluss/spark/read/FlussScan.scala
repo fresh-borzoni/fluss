@@ -19,13 +19,13 @@ package org.apache.fluss.spark.read
 
 import org.apache.fluss.config.Configuration
 import org.apache.fluss.metadata.{TableInfo, TablePath}
-import org.apache.fluss.predicate.Predicate
+import org.apache.fluss.predicate.{Predicate => FlussPredicate}
 import org.apache.fluss.spark.SparkConversions
 import org.apache.fluss.spark.read.lake.{FlussLakeAppendBatch, FlussLakeUpsertBatch}
 
+import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.connector.read.{Batch, Scan}
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream
-import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -45,8 +45,8 @@ case class FlussAppendScan(
     tablePath: TablePath,
     tableInfo: TableInfo,
     requiredSchema: Option[StructType],
-    pushedPredicate: Option[Predicate],
-    pushedSparkFilters: Seq[Filter],
+    pushedPredicate: Option[FlussPredicate],
+    pushedSparkPredicates: Seq[Predicate],
     options: CaseInsensitiveStringMap,
     flussConfig: Configuration)
   extends FlussScan {
@@ -67,8 +67,8 @@ case class FlussAppendScan(
 
   override def description(): String = {
     val base = super.description()
-    if (pushedSparkFilters.isEmpty) base
-    else s"$base [PushedFilters: ${pushedSparkFilters.mkString("[", ", ", "]")}]"
+    if (pushedSparkPredicates.isEmpty) base
+    else s"$base [PushedPredicates: ${pushedSparkPredicates.mkString("[", ", ", "]")}]"
   }
 }
 

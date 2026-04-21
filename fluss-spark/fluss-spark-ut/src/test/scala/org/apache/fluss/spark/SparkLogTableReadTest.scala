@@ -20,8 +20,8 @@ package org.apache.fluss.spark
 import org.apache.fluss.spark.read.FlussAppendScan
 
 import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.connector.expressions.filter.Predicate
 import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2ScanRelation}
-import org.apache.spark.sql.sources.Filter
 import org.assertj.core.api.Assertions.assertThat
 
 class SparkLogTableReadTest extends FlussSparkTestBase {
@@ -290,7 +290,7 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
       val query =
         sql(s"SELECT * FROM $DEFAULT_DATABASE.t WHERE amount = 603 ORDER BY orderId")
       checkAnswer(query, Row(800L, 23L, 603, "addr3") :: Nil)
-      assertPushedFilterTypes(query, Set("EqualTo"))
+      assertPushedNames(query, Set("="))
     }
   }
 
@@ -302,7 +302,7 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
         query,
         Row(900L, 24L, 604, "addr4") ::
           Row(1000L, 25L, 605, "addr5") :: Nil)
-      assertPushedFilterTypes(query, Set("GreaterThanOrEqual"))
+      assertPushedNames(query, Set(">="))
     }
   }
 
@@ -317,8 +317,8 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
         Row(700L, 22L, 602, "addr2") ::
           Row(800L, 23L, 603, "addr3") ::
           Row(900L, 24L, 604, "addr4") :: Nil)
-      val pushed = pushedFilters(query).map(_.getClass.getSimpleName)
-      assert(pushed.contains("GreaterThanOrEqual") && pushed.contains("LessThan"))
+      val pushed = pushedPredicates(query).map(_.name())
+      assert(pushed.contains(">=") && pushed.contains("<"))
     }
   }
 
@@ -327,16 +327,16 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
       val query =
         sql(s"SELECT COUNT(*) FROM $DEFAULT_DATABASE.t WHERE address IS NOT NULL")
       checkAnswer(query, Row(5L) :: Nil)
-      assertPushedFilterTypes(query, Set("IsNotNull"))
+      assertPushedNames(query, Set("IS_NOT_NULL"))
     }
   }
 
-  test("Spark Read: filter pushdown — LIKE 'prefix%' is pushed as StringStartsWith") {
+  test("Spark Read: filter pushdown — LIKE 'prefix%' is pushed as STARTS_WITH") {
     withSampleTable {
       val query =
         sql(s"SELECT orderId FROM $DEFAULT_DATABASE.t WHERE address LIKE 'addr%' ORDER BY orderId")
       checkAnswer(query, Row(600L) :: Row(700L) :: Row(800L) :: Row(900L) :: Row(1000L) :: Nil)
-      assertPushedFilterTypes(query, Set("StringStartsWith"))
+      assertPushedNames(query, Set("STARTS_WITH"))
     }
   }
 
@@ -347,9 +347,9 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
                          |WHERE address IN ('addr1', 'addr3')
                          |ORDER BY orderId""".stripMargin)
       checkAnswer(query, Row(600L) :: Row(800L) :: Nil)
-      val pushed = pushedFilters(query).map(_.getClass.getSimpleName)
-      // Spark may rewrite small INs as EqualTo/Or.
-      assertThat(pushed.exists(name => name == "In" || name == "EqualTo" || name == "Or")).isTrue
+      val pushed = pushedPredicates(query).map(_.name())
+      // Spark may rewrite small INs as =/OR.
+      assertThat(pushed.exists(name => name == "IN" || name == "=" || name == "OR")).isTrue
     }
   }
 
@@ -361,8 +361,8 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
         query,
         Row(700L, 22L, 602, "addr2") ::
           Row(900L, 24L, 604, "addr4") :: Nil)
-      val pushed = pushedFilters(query).map(_.getClass.getSimpleName)
-      assertThat(pushed.exists(_ == "EqualTo")).isFalse
+      val pushed = pushedPredicates(query).map(_.name())
+      assertThat(pushed.exists(_ == "=")).isFalse
     }
   }
 
@@ -376,8 +376,8 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
         query,
         Row(700L, 22L, 602, "addr2") ::
           Row(900L, 24L, 604, "addr4") :: Nil)
-      val pushed = pushedFilters(query).map(_.getClass.getSimpleName)
-      assert(pushed.contains("GreaterThanOrEqual"))
+      val pushed = pushedPredicates(query).map(_.name())
+      assert(pushed.contains(">="))
     }
   }
 
@@ -400,12 +400,12 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
       val byDate =
         sql(s"SELECT id FROM $DEFAULT_DATABASE.typed WHERE dt = DATE '2026-01-02'")
       checkAnswer(byDate, Row(2) :: Nil)
-      assertPushedFilterTypes(byDate, Set("EqualTo"))
+      assertPushedNames(byDate, Set("="))
 
       val byTs = sql(s"""SELECT id FROM $DEFAULT_DATABASE.typed
                         |WHERE ts >= TIMESTAMP_NTZ '2026-01-02 00:00:00'""".stripMargin)
       checkAnswer(byTs, Row(2) :: Row(3) :: Nil)
-      assertPushedFilterTypes(byTs, Set("GreaterThanOrEqual"))
+      assertPushedNames(byTs, Set(">="))
     }
   }
 
@@ -427,7 +427,7 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
       val query =
         sql(s"SELECT orderId, amount, dt FROM $DEFAULT_DATABASE.t WHERE amount = 603")
       checkAnswer(query, Row(800L, 603, "2026-01-02") :: Nil)
-      assertPushedFilterTypes(query, Set("EqualTo"))
+      assertPushedNames(query, Set("="))
     }
   }
 
@@ -448,9 +448,8 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
     body
   }
 
-  private def pushedFilters(df: DataFrame): Array[Filter] = {
-    // Walk both plans — AQE can hide the v2 scan under a query-stage relation.
-    df.queryExecution.executedPlan.foreach(_ => ())
+  private def pushedPredicates(df: DataFrame): Array[Predicate] = {
+    // AQE hides the scan under an adaptive wrapper in executedPlan, so check optimizedPlan too.
     val scans =
       df.queryExecution.executedPlan.collect {
         case b: BatchScanExec => b.scan
@@ -458,15 +457,15 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
         case DataSourceV2ScanRelation(_, scan, _, _, _) => scan
       }
     scans
-      .collect { case f: FlussAppendScan => f.pushedSparkFilters }
+      .collect { case f: FlussAppendScan => f.pushedSparkPredicates }
       .flatten
       .toArray
   }
 
-  private def assertPushedFilterTypes(df: DataFrame, expected: Set[String]): Unit = {
-    val pushed = pushedFilters(df).map(_.getClass.getSimpleName).toSet
+  private def assertPushedNames(df: DataFrame, expected: Set[String]): Unit = {
+    val pushed = pushedPredicates(df).map(_.name()).toSet
     assert(
       expected.exists(pushed.contains),
-      s"Expected any of $expected in pushed filters, got $pushed")
+      s"Expected any of $expected in pushed predicates, got $pushed")
   }
 }

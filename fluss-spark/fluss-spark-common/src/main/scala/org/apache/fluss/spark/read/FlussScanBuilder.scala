@@ -19,11 +19,11 @@ package org.apache.fluss.spark.read
 
 import org.apache.fluss.config.{Configuration => FlussConfiguration}
 import org.apache.fluss.metadata.{TableInfo, TablePath}
-import org.apache.fluss.predicate.Predicate
+import org.apache.fluss.predicate.{Predicate => FlussPredicate}
 import org.apache.fluss.spark.utils.SparkPredicateConverter
 
-import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownFilters, SupportsPushDownRequiredColumns}
-import org.apache.spark.sql.sources.Filter
+import org.apache.spark.sql.connector.expressions.filter.Predicate
+import org.apache.spark.sql.connector.read.{Scan, ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -37,24 +37,24 @@ trait FlussScanBuilder extends ScanBuilder with SupportsPushDownRequiredColumns 
   }
 }
 
-/** Filter pushdown mixin: converts what it can, returns all filters as residual. */
-trait FlussSupportsPushDownFilters extends FlussScanBuilder with SupportsPushDownFilters {
+/** Predicate pushdown mixin: converts what it can, returns all predicates as residual. */
+trait FlussSupportsPushDownV2Filters extends FlussScanBuilder with SupportsPushDownV2Filters {
 
   def tableInfo: TableInfo
 
-  protected var pushedPredicate: Option[Predicate] = None
-  protected var acceptedFilters: Array[Filter] = Array.empty
+  protected var pushedPredicate: Option[FlussPredicate] = None
+  protected var acceptedPredicates: Array[Predicate] = Array.empty[Predicate]
 
-  override def pushFilters(filters: Array[Filter]): Array[Filter] = {
+  override def pushPredicates(predicates: Array[Predicate]): Array[Predicate] = {
     val (predicate, accepted) =
-      SparkPredicateConverter.convertFilters(tableInfo.getRowType, filters.toSeq)
+      SparkPredicateConverter.convertPredicates(tableInfo.getRowType, predicates.toSeq)
     pushedPredicate = predicate
-    acceptedFilters = accepted.toArray
+    acceptedPredicates = accepted.toArray
     // Fluss's server-side filter is batch-level only; Spark must re-apply for row-exact results.
-    filters
+    predicates
   }
 
-  override def pushedFilters(): Array[Filter] = acceptedFilters
+  override def pushedPredicates(): Array[Predicate] = acceptedPredicates
 }
 
 /** Fluss Append Scan Builder. */
@@ -63,7 +63,7 @@ class FlussAppendScanBuilder(
     val tableInfo: TableInfo,
     options: CaseInsensitiveStringMap,
     flussConfig: FlussConfiguration)
-  extends FlussSupportsPushDownFilters {
+  extends FlussSupportsPushDownV2Filters {
 
   override def build(): Scan = {
     FlussAppendScan(
@@ -71,7 +71,7 @@ class FlussAppendScanBuilder(
       tableInfo,
       requiredSchema,
       pushedPredicate,
-      acceptedFilters.toSeq,
+      acceptedPredicates.toSeq,
       options,
       flussConfig)
   }
