@@ -54,6 +54,31 @@ tablet:
     enabled: false
     # minAvailable: 1
     # maxUnavailable: 1
+  # Pod scheduling configuration
+  affinity: {}
+  # Example: spread tablet server pods across availability zones and nodes.
+  # If multiple Fluss releases share the cluster, also scope by instance via
+  # `app.kubernetes.io/instance: <release-name>` to avoid cross-release anti-affinity.
+  # affinity:
+  #   podAntiAffinity:
+  #     preferredDuringSchedulingIgnoredDuringExecution:
+  #       - weight: 100
+  #         podAffinityTerm:
+  #           topologyKey: topology.kubernetes.io/zone
+  #           labelSelector:
+  #             matchLabels:
+  #               app.kubernetes.io/name: fluss
+  #               app.kubernetes.io/component: tablet
+  #       - weight: 50
+  #         podAffinityTerm:
+  #           topologyKey: kubernetes.io/hostname
+  #           labelSelector:
+  #             matchLabels:
+  #               app.kubernetes.io/name: fluss
+  #               app.kubernetes.io/component: tablet
+  nodeSelector: {}
+  tolerations: []
+  topologySpreadConstraints: []
 
 coordinator:
   numberOfReplicas: 1
@@ -72,6 +97,10 @@ coordinator:
     enabled: false
     # minAvailable: 1
     # maxUnavailable: 1
+  affinity: {}
+  nodeSelector: {}
+  tolerations: []
+  topologySpreadConstraints: []
 
 # Fluss listener configurations
 listeners:

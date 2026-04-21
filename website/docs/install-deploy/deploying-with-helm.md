@@ -240,6 +240,19 @@ It is recommended to set these explicitly in production.
 |-----------|-------------|---------|
 | `tablet.numberOfReplicas` | Number of TabletServer replicas to deploy | `3` |
 
+### Scheduling Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `tablet.affinity` | Affinity rules for TabletServer pods | `{}` |
+| `tablet.nodeSelector` | Node selector for TabletServer pods | `{}` |
+| `tablet.tolerations` | Tolerations for TabletServer pods | `[]` |
+| `tablet.topologySpreadConstraints` | Topology spread constraints for TabletServer pods | `[]` |
+| `coordinator.affinity` | Affinity rules for CoordinatorServer pods | `{}` |
+| `coordinator.nodeSelector` | Node selector for CoordinatorServer pods | `{}` |
+| `coordinator.tolerations` | Tolerations for CoordinatorServer pods | `[]` |
+| `coordinator.topologySpreadConstraints` | Topology spread constraints for CoordinatorServer pods | `[]` |
+
 ### Storage Parameters
 
 | Parameter | Description | Default |
@@ -486,6 +499,73 @@ configurationOverrides:
   data.dir: "/data/fluss"
   remote.data.dir: "s3://my-bucket/fluss-data"
 ```
+
+### Pod Scheduling
+
+By default, Kubernetes may schedule all tablet server pods on the same node. With replication factor 3, a single node failure could take out all replicas simultaneously, causing data loss for segments not yet tiered to remote storage.
+
+Use pod anti-affinity to spread tablet server pods across availability zones and nodes:
+
+```yaml
+tablet:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: fluss
+                app.kubernetes.io/component: tablet
+        - weight: 50
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: fluss
+                app.kubernetes.io/component: tablet
+```
+
+This configuration prioritizes zone-level spreading (weight 100) while also avoiding co-location on the same node (weight 50). For stricter guarantees, use `requiredDuringSchedulingIgnoredDuringExecution` instead — but note that pods will stay pending if no suitable node is available.
+
+If multiple Fluss releases share the cluster, also scope the selector by instance via `app.kubernetes.io/instance: <release-name>` to avoid cross-release anti-affinity.
+
+Alternatively, use `topologySpreadConstraints` for even distribution across failure domains:
+
+```yaml
+tablet:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: fluss
+          app.kubernetes.io/component: tablet
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: fluss
+          app.kubernetes.io/component: tablet
+```
+
+You can also pin pods to specific nodes using `nodeSelector` or allow scheduling on tainted nodes with `tolerations`:
+
+```yaml
+tablet:
+  nodeSelector:
+    workload: fluss
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: fluss
+      effect: NoSchedule
+```
+
+The same scheduling fields are available for coordinator servers under `coordinator.affinity`, `coordinator.nodeSelector`, `coordinator.tolerations`, and `coordinator.topologySpreadConstraints`.
 
 ### Loading Filesystem Plugins via Init Containers
 
