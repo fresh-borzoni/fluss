@@ -57,8 +57,8 @@ tablet:
   # Pod scheduling configuration
   affinity: {}
   # Example: spread tablet server pods across availability zones and nodes.
-  # If multiple Fluss releases share the cluster, also scope by instance via
-  # `app.kubernetes.io/instance: <release-name>` to avoid cross-release anti-affinity.
+  # Replace `<release-name>` below with your Helm release name (the value
+  # passed to `helm install <release-name>`) before uncommenting.
   # affinity:
   #   podAntiAffinity:
   #     preferredDuringSchedulingIgnoredDuringExecution:
@@ -67,14 +67,14 @@ tablet:
   #           topologyKey: topology.kubernetes.io/zone
   #           labelSelector:
   #             matchLabels:
-  #               app.kubernetes.io/name: fluss
+  #               app.kubernetes.io/instance: <release-name>
   #               app.kubernetes.io/component: tablet
   #       - weight: 50
   #         podAffinityTerm:
   #           topologyKey: kubernetes.io/hostname
   #           labelSelector:
   #             matchLabels:
-  #               app.kubernetes.io/name: fluss
+  #               app.kubernetes.io/instance: <release-name>
   #               app.kubernetes.io/component: tablet
   nodeSelector: {}
   tolerations: []
