@@ -192,6 +192,7 @@ The following table lists the configurable parameters of the Fluss chart, and th
 | `security.client.sasl.plain.users` | Client listener username and password pairs for PLAIN | `[]` |
 | `security.internal.sasl.plain.username` | Internal listener PLAIN username | `""` |
 | `security.internal.sasl.plain.password` | Internal listener PLAIN password | `""` |
+| `security.internal.sasl.plain.existingSecret` | Reference to a pre-existing Secret for internal SASL credentials | `{}` |
 
 Only `plain` mechanism is supported for now. An empty string disables the SASL authentication, and maps to the `PLAINTEXT` protocol.
 
@@ -210,6 +211,154 @@ It is recommended to set these explicitly in production.
 | `security.zookeeper.sasl.plain.username` | ZooKeeper SASL username | `""` |
 | `security.zookeeper.sasl.plain.password` | ZooKeeper SASL password | `""` |
 | `security.zookeeper.sasl.plain.loginModuleClass` | JAAS login module class for ZooKeeper | `org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.server.auth.DigestLoginModule` |
+| `security.zookeeper.sasl.plain.existingSecret` | Reference to a pre-existing Secret for ZooKeeper SASL credentials | `{}` |
+
+#### Sourcing SASL Credentials from a Pre-existing Secret
+
+To keep SASL passwords out of `values.yaml` and the Helm release storage, reference a Secret managed separately — e.g., via External Secrets Operator, Sealed Secrets, or a CI pipeline.
+
+For internal and ZooKeeper listeners, set `existingSecret` on the listener:
+
+```yaml
+security:
+  internal:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-internal-sasl   # required
+          usernameKey: username       # optional, defaults to "username"
+          passwordKey: password       # optional, defaults to "password"
+  zookeeper:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-zk-sasl
+```
+
+Client users follow the same shape as internal/ZooKeeper listeners: each entry is either a literal `{username, password}` pair or an `existingSecret` reference that sources both fields from a Secret.
+
+```yaml
+security:
+  client:
+    sasl:
+      mechanism: plain
+      plain:
+        users:
+          - username: alice
+            password: alice-literal-password   # literal — visible in values.yaml
+          - existingSecret:                    # or resolved at pod startup
+              name: fluss-client-sasl-bob
+              usernameKey: username            # optional, defaults to "username"
+              passwordKey: password            # optional, defaults to "password"
+```
+
+Whenever JAAS is required, the chart renders a ConfigMap (`<release>-fluss-sasl-jaas-config`) containing a `jaas.conf` *template* with `${FLUSS_JAAS_…}` placeholders — no credentials. An init container mounts that template, runs `envsubst` with credentials supplied via env vars (either literal `value:` entries from `values.yaml` or `valueFrom.secretKeyRef` to a pre-existing Secret), and writes the resolved `jaas.conf` to an in-memory `emptyDir` that the main Fluss container reads.
+
+- Literal and Secret-sourced credentials can be mixed across listeners.
+- When every credential comes from a Secret, no plaintext password lives in the Helm release.
+- The init container reuses the main Fluss image (already present on the node), keeping zero extra image dependencies.
+
+##### Example: External Secrets Operator
+
+If you use [External Secrets Operator](https://external-secrets.io) to sync credentials from an upstream secret manager (AWS Secrets Manager, Vault, GCP Secret Manager, etc.), the flow is: upstream → `ExternalSecret` CR → a Kubernetes `Secret` → the chart.
+
+For internal listener credentials stored at `prod/fluss/internal` in AWS Secrets Manager with fields `username` and `password`:
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-internal-sasl
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-internal-sasl
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/internal
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/internal
+        property: password
+```
+
+Then in `values.yaml`:
+
+```yaml
+security:
+  internal:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-internal-sasl
+```
+
+For the multi-user client listener, provision one Secret per user with `username` and `password` keys:
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-client-sasl-alice
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-client-sasl-alice
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/clients/alice
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/clients/alice
+        property: password
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-client-sasl-bob
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-client-sasl-bob
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: password
+```
+
+```yaml
+security:
+  client:
+    sasl:
+      mechanism: plain
+      plain:
+        users:
+          - existingSecret: { name: fluss-client-sasl-alice }
+          - existingSecret: { name: fluss-client-sasl-bob }
+```
+
+The same pattern works with Sealed Secrets, HashiCorp Vault Agent Injector (producing a native Secret), or any other controller that lands credentials in a `Secret` — the chart only cares about the final `Secret`, not how it got there.
 
 ### Metrics Parameters
 

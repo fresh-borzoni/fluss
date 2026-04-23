@@ -62,9 +62,14 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tablet.initContainers }}
+      {{- if or (include "fluss.security.jaas.required" .) .Values.tablet.initContainers }}
       initContainers:
+        {{- if include "fluss.security.jaas.required" . }}
+        {{- include "fluss.security.jaas.initContainer" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.tablet.initContainers }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}-tablet
@@ -153,9 +158,7 @@ spec:
           emptyDir: {}
         {{- end }}
         {{- if (include "fluss.security.jaas.required" .) }}
-        - name: sasl-config
-          secret:
-            secretName: {{ include "fluss.security.jaas.configName" . }}
+        {{- include "fluss.security.jaas.volumes" . | nindent 8 }}
         {{- end }}
         {{- with .Values.tablet.extraVolumes }}
         {{- toYaml . | nindent 8 }}
