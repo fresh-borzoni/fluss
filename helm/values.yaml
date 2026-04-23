@@ -116,14 +116,16 @@ security:
       # "" | plain
       mechanism: ""
       plain:
-        # Each user sets `password` (literal) or `passwordSecretRef` (from Secret), not both.
+        # Each entry is either a literal {username, password} pair or an
+        # `existingSecret` reference that sources both from a Secret (same shape
+        # as internal/zookeeper). Mixing within one entry is not allowed.
         users: []
         # - username: alice
         #   password: alice-pass
-        # - username: bob
-        #   passwordSecretRef:
-        #     name: fluss-client-sasl
-        #     key: bob-password
+        # - existingSecret:
+        #     name: fluss-client-sasl-bob
+        #     usernameKey: username
+        #     passwordKey: password
 
   internal:
     sasl:

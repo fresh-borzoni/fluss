@@ -51,13 +51,22 @@ Usage:
 {{- /* client */ -}}
 {{- if and (include "fluss.security.sasl.plain.enabled" .) (eq $clientMechanism "plain") }}
 {{- range $idx, $user := .Values.security.client.sasl.plain.users | default (list) }}
-- name: {{ include "fluss.security.sasl.plain.client.envVarName" $idx }}
-{{- $userRef := $user.passwordSecretRef | default (dict) }}
-{{- if and $userRef.name $userRef.key }}
+{{- $ref := $user.existingSecret | default (dict) }}
+- name: {{ include "fluss.security.sasl.plain.client.envVarName" (dict "field" "username" "idx" $idx) }}
+{{- if $ref.name }}
   valueFrom:
     secretKeyRef:
-      name: {{ $userRef.name }}
-      key: {{ $userRef.key }}
+      name: {{ $ref.name }}
+      key: {{ $ref.usernameKey | default "username" }}
+{{- else }}
+  value: {{ $user.username | quote }}
+{{- end }}
+- name: {{ include "fluss.security.sasl.plain.client.envVarName" (dict "field" "password" "idx" $idx) }}
+{{- if $ref.name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $ref.name }}
+      key: {{ $ref.passwordKey | default "password" }}
 {{- else }}
   value: {{ $user.password | quote }}
 {{- end }}

@@ -237,7 +237,7 @@ security:
           name: fluss-zk-sasl
 ```
 
-For client listener users, each user entry can carry either a literal `password` or a `passwordSecretRef` pointing at a specific Secret key:
+Client users follow the same shape as internal/ZooKeeper listeners: each entry is either a literal `{username, password}` pair or an `existingSecret` reference that sources both fields from a Secret.
 
 ```yaml
 security:
@@ -248,10 +248,10 @@ security:
         users:
           - username: alice
             password: alice-literal-password   # literal — visible in values.yaml
-          - username: bob
-            passwordSecretRef:                 # or resolved at pod startup
-              name: fluss-client-sasl
-              key: bob-password
+          - existingSecret:                    # or resolved at pod startup
+              name: fluss-client-sasl-bob
+              usernameKey: username            # optional, defaults to "username"
+              passwordKey: password            # optional, defaults to "password"
 ```
 
 Whenever JAAS is required, the chart renders a ConfigMap (`<release>-fluss-sasl-jaas-config`) containing a `jaas.conf` *template* with `${FLUSS_JAAS_…}` placeholders — no credentials. An init container mounts that template, runs `envsubst` with credentials supplied via env vars (either literal `value:` entries from `values.yaml` or `valueFrom.secretKeyRef` to a pre-existing Secret), and writes the resolved `jaas.conf` to an in-memory `emptyDir` that the main Fluss container reads.
@@ -301,29 +301,50 @@ security:
           name: fluss-internal-sasl
 ```
 
-For the multi-user client listener, store each user's password as a distinct key in your secret manager and reference them individually:
+For the multi-user client listener, provision one Secret per user with `username` and `password` keys:
 
 ```yaml
 apiVersion: external-secrets.io/v1beta1
 kind: ExternalSecret
 metadata:
-  name: fluss-client-users
+  name: fluss-client-sasl-alice
 spec:
   refreshInterval: 1h
   secretStoreRef:
     name: aws-secretsmanager
     kind: SecretStore
   target:
-    name: fluss-client-users
+    name: fluss-client-sasl-alice
   data:
-    - secretKey: alice-password
+    - secretKey: username
       remoteRef:
-        key: prod/fluss/clients
-        property: alice
-    - secretKey: bob-password
+        key: prod/fluss/clients/alice
+        property: username
+    - secretKey: password
       remoteRef:
-        key: prod/fluss/clients
-        property: bob
+        key: prod/fluss/clients/alice
+        property: password
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-client-sasl-bob
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-client-sasl-bob
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: password
 ```
 
 ```yaml
@@ -333,10 +354,8 @@ security:
       mechanism: plain
       plain:
         users:
-          - username: alice
-            passwordSecretRef: { name: fluss-client-users, key: alice-password }
-          - username: bob
-            passwordSecretRef: { name: fluss-client-users, key: bob-password }
+          - existingSecret: { name: fluss-client-sasl-alice }
+          - existingSecret: { name: fluss-client-sasl-bob }
 ```
 
 The same pattern works with Sealed Secrets, HashiCorp Vault Agent Injector (producing a native Secret), or any other controller that lands credentials in a `Secret` — the chart only cares about the final `Secret`, not how it got there.

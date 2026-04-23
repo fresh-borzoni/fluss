@@ -43,7 +43,7 @@ data:
     client.FlussServer {
        org.apache.fluss.security.auth.sasl.plain.PlainLoginModule required
 {{- range $idx, $user := .Values.security.client.sasl.plain.users | default (list) }}
-       user_{{ $user.username }}="${FLUSS_JAAS_CLIENT_PASSWORD_{{ $idx }}}"
+       user_${FLUSS_JAAS_CLIENT_USERNAME_{{ $idx }}}="${FLUSS_JAAS_CLIENT_PASSWORD_{{ $idx }}}"
 {{- end }};
     };
 {{- end }}

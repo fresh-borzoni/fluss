@@ -118,9 +118,9 @@ Usage:
 {{- end -}}
 
 {{/*
-Validates that the client PLAIN mechanism block contains the required users.
-Each user must set `username` plus exactly one of `password` (literal) or
-`passwordSecretRef` (Secret reference with both name and key).
+Validates security.client.sasl.plain.users. Each entry is either a literal
+{username, password} pair OR {existingSecret: {name, usernameKey?, passwordKey?}}.
+Mixing the two shapes within one entry is not allowed.
 Returns an error message if invalid, empty string otherwise.
 Usage:
   include "fluss.security.sasl.validateClientPlainUsers" .
@@ -134,21 +134,16 @@ Usage:
   {{- else -}}
     {{- $errs := list -}}
     {{- range $idx, $user := $users -}}
-      {{- if empty $user.username -}}
-        {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d] must set username" $idx) -}}
-      {{- end -}}
-      {{- $hasLiteral := not (empty $user.password) -}}
-      {{- $ref := $user.passwordSecretRef | default (dict) -}}
-      {{- $refNameSet := not (empty $ref.name) -}}
-      {{- $refKeySet := not (empty $ref.key) -}}
-      {{- $hasRef := and $refNameSet $refKeySet -}}
-      {{- if and $hasLiteral (or $refNameSet $refKeySet) -}}
-        {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d] cannot set both password and passwordSecretRef" $idx) -}}
-      {{- else if and (not $hasLiteral) (not $hasRef) -}}
-        {{- if or $refNameSet $refKeySet -}}
-          {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d].passwordSecretRef requires both name and key" $idx) -}}
-        {{- else -}}
-          {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d] must set either password or passwordSecretRef" $idx) -}}
+      {{- $ref := $user.existingSecret | default (dict) -}}
+      {{- $hasLiteral := or (not (empty $user.username)) (not (empty $user.password)) -}}
+      {{- $hasRef := not (empty $ref.name) -}}
+      {{- if and $hasLiteral $hasRef -}}
+        {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d] cannot set username/password and existingSecret" $idx) -}}
+      {{- else if $hasRef -}}
+        {{/* existingSecret path — name is the only required field */}}
+      {{- else -}}
+        {{- if or (empty $user.username) (empty $user.password) -}}
+          {{- $errs = append $errs (printf "security.client.sasl.plain.users[%d] must set both username and password (or existingSecret)" $idx) -}}
         {{- end -}}
       {{- end -}}
     {{- end -}}
@@ -366,11 +361,12 @@ Usage:
 {{- end -}}
 
 {{/*
-Returns the env-var name for a client user password at a given index.
+Returns the env-var name for a client user credential field at a given index.
 Usage:
-  include "fluss.security.sasl.plain.client.envVarName" 2   => FLUSS_JAAS_CLIENT_PASSWORD_2
+  include "fluss.security.sasl.plain.client.envVarName" (dict "field" "username" "idx" 2)
+  =>  FLUSS_JAAS_CLIENT_USERNAME_2
 */}}
 {{- define "fluss.security.sasl.plain.client.envVarName" -}}
-{{- printf "FLUSS_JAAS_CLIENT_PASSWORD_%d" (int .) -}}
+{{- printf "FLUSS_JAAS_CLIENT_%s_%d" (upper .field) (int .idx) -}}
 {{- end -}}
 
