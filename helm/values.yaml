@@ -116,7 +116,14 @@ security:
       # "" | plain
       mechanism: ""
       plain:
+        # Each user sets `password` (literal) or `passwordSecretRef` (from Secret), not both.
         users: []
+        # - username: alice
+        #   password: alice-pass
+        # - username: bob
+        #   passwordSecretRef:
+        #     name: fluss-client-sasl
+        #     key: bob-password
 
   internal:
     sasl:
@@ -125,6 +132,12 @@ security:
       plain:
         username: ""
         password: ""
+        # When set, overrides literal username/password above.
+        existingSecret: {}
+        # existingSecret:
+        #   name: fluss-internal-sasl
+        #   usernameKey: username
+        #   passwordKey: password
 
   zookeeper:
     sasl:
@@ -134,6 +147,16 @@ security:
         username: ""
         password: ""
         loginModuleClass: "org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.server.auth.DigestLoginModule"
+        # When set, overrides literal username/password above.
+        existingSecret: {}
+        # existingSecret:
+        #   name: fluss-zk-sasl
+        #   usernameKey: username
+        #   passwordKey: password
+
+  # JAAS config is rendered at pod startup by an init container that reads a
+  # template ConfigMap and substitutes credentials from env. The init container
+  # reuses the main Fluss image (already available on the node).
 
 metrics:
   reporters: ""
