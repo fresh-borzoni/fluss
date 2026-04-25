@@ -381,6 +381,24 @@ class SparkLogTableReadTest extends FlussSparkTestBase {
     }
   }
 
+  test("Spark Read: filter pushdown is skipped for non-ARROW log format") {
+    withTable("indexed") {
+      sql(s"""
+             |CREATE TABLE $DEFAULT_DATABASE.indexed (
+             |  orderId BIGINT,
+             |  amount  INT
+             |) TBLPROPERTIES('table.log.format' = 'indexed')""".stripMargin)
+      sql(s"""
+             |INSERT INTO $DEFAULT_DATABASE.indexed VALUES
+             |(600L, 601), (700L, 602), (800L, 603)""".stripMargin)
+
+      val query =
+        sql(s"SELECT * FROM $DEFAULT_DATABASE.indexed WHERE amount = 602 ORDER BY orderId")
+      checkAnswer(query, Row(700L, 602) :: Nil)
+      assert(pushedPredicates(query).isEmpty)
+    }
+  }
+
   test("Spark Read: filter pushdown — DATE and TIMESTAMP_NTZ literals") {
     withTable("typed") {
       sql(s"""

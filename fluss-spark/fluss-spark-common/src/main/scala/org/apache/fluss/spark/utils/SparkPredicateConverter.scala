@@ -29,7 +29,7 @@ import org.apache.spark.unsafe.types.UTF8String
 import java.lang.{Boolean => JBoolean, Byte => JByte, Double => JDouble, Float => JFloat, Long => JLong, Short => JShort}
 import java.time.LocalDate
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 /**
  * Unsupported predicates yield `None`; callers must re-apply all — Fluss pushdown is batch-level,
@@ -136,6 +136,8 @@ object SparkPredicateConverter {
     val idx = fieldIndex(builder, predicate)
     val fieldType = rowType.getTypeAt(idx)
     val literals = predicate.children().drop(1).map(literalFrom(fieldType, _)).toSeq
+    // PredicateBuilder.in rejects an empty list with IllegalArgumentException.
+    if (literals.isEmpty) throw new UnsupportedExpression
     builder.in(idx, literals.asJava)
   }
 

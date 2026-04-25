@@ -18,7 +18,7 @@
 package org.apache.fluss.spark.read
 
 import org.apache.fluss.config.{Configuration => FlussConfiguration}
-import org.apache.fluss.metadata.{TableInfo, TablePath}
+import org.apache.fluss.metadata.{LogFormat, TableInfo, TablePath}
 import org.apache.fluss.predicate.{Predicate => FlussPredicate}
 import org.apache.fluss.spark.utils.SparkPredicateConverter
 
@@ -46,11 +46,14 @@ trait FlussSupportsPushDownV2Filters extends FlussScanBuilder with SupportsPushD
   protected var acceptedPredicates: Array[Predicate] = Array.empty[Predicate]
 
   override def pushPredicates(predicates: Array[Predicate]): Array[Predicate] = {
-    val (predicate, accepted) =
-      SparkPredicateConverter.convertPredicates(tableInfo.getRowType, predicates.toSeq)
-    pushedPredicate = predicate
-    acceptedPredicates = accepted.toArray
-    // Fluss's server-side filter is batch-level only; Spark must re-apply for row-exact results.
+    // Server-side batch filter only supports ARROW; other log formats reject it.
+    if (tableInfo.getTableConfig.getLogFormat == LogFormat.ARROW) {
+      val (predicate, accepted) =
+        SparkPredicateConverter.convertPredicates(tableInfo.getRowType, predicates.toSeq)
+      pushedPredicate = predicate
+      acceptedPredicates = accepted.toArray
+    }
+    // Server-side filter is batch-level only; Spark must re-apply for row-exact results.
     predicates
   }
 
