@@ -15,12 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.remote;
+package org.apache.fluss.remote;
 
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.remote.RemoteLogSegment;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -33,7 +31,7 @@ import java.util.stream.Collectors;
 
 /**
  * A remote log manifest is an immutable list of current {@link RemoteLogSegment} which can
- * represent a snapshot of {@link RemoteLogTablet}.
+ * represent a snapshot of a remote log tablet.
  */
 public class RemoteLogManifest {
     private final PhysicalTablePath physicalTablePath;
@@ -122,7 +120,6 @@ public class RemoteLogManifest {
         return tableBucket;
     }
 
-    @VisibleForTesting
     public List<RemoteLogSegment> getRemoteLogSegmentList() {
         return remoteLogSegmentList;
     }

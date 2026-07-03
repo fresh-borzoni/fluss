@@ -15,11 +15,10 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.remote;
+package org.apache.fluss.remote;
 
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
-import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;

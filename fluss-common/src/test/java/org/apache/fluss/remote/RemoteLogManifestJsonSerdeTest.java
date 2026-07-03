@@ -15,18 +15,17 @@
  * limitations under the License.
  */
 
-package org.apache.fluss.server.log.remote;
+package org.apache.fluss.remote;
 
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
 
 import java.util.Arrays;
 import java.util.UUID;
 
-/** Tests of {@link org.apache.fluss.server.log.remote.RemoteLogManifestJsonSerde}. */
+/** Tests of {@link RemoteLogManifestJsonSerde}. */
 class RemoteLogManifestJsonSerdeTest extends JsonSerdeTestBase<RemoteLogManifest> {
     private static final PhysicalTablePath TABLE_PATH1 =
             PhysicalTablePath.of(TablePath.of("db", "mytable"));
