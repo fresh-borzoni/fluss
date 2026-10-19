@@ -413,6 +413,17 @@ impl FlussTestingClusterBuilder {
             image = image.with_mapped_port(plain_port, ContainerPort::Tcp(plain_port));
         }
 
+        // The coordinator writes the lake table when one is enabled, so it
+        // needs the same view of the data directory as the tablet servers.
+        if let Some(ref remote_data_dir) = self.remote_data_dir {
+            use testcontainers::core::Mount;
+            std::fs::create_dir_all(remote_data_dir)
+                .expect("Failed to create remote data directory for mount");
+            let host_path = remote_data_dir.to_string_lossy().to_string();
+            let container_path = remote_data_dir.to_string_lossy().to_string();
+            image = image.with_mount(Mount::bind_mount(host_path, container_path));
+        }
+
         image.start().await.unwrap()
     }
 

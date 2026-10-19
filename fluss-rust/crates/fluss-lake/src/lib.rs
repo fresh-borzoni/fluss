@@ -1,0 +1,51 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Engine-neutral bounded lake and log read kernel for Apache Fluss.
+//!
+//! Union read is a bounded batch query. Results are delivered lazily as a
+//! finite stream of Arrow record batches.
+
+mod bucket_pruning;
+mod context;
+mod executor;
+mod facade;
+#[cfg(feature = "paimon")]
+mod paimon;
+mod pk_overlay;
+mod plan;
+mod planner;
+mod planning;
+mod predicate;
+mod pruning;
+// Engine-neutral pruning predicate, kept here rather than in the client:
+// only the lake planner uses it, and the client's `predicate` module already
+// means something else.
+pub mod pruning_predicate;
+mod split;
+mod split_descriptor;
+mod union_read;
+
+#[cfg(feature = "kv-snapshot")]
+pub use executor::read_kv_snapshot_bucket;
+pub use facade::{FlussLakeReader, FlussLakeScan, FlussLakeTable};
+pub use union_read::{
+    CURRENT_FLUSS_LAKE_SPLIT_VERSION, FlussLakeComparisonOp, FlussLakeError,
+    FlussLakeExecutionContext, FlussLakeLiteral, FlussLakePartitionIdentity,
+    FlussLakePinnedBoundary, FlussLakePinnedRange, FlussLakePlanStatistics, FlussLakePredicate,
+    FlussLakeReadMode, FlussLakeReadPlan, FlussLakeReadSplit, FlussLakeReadStatistics,
+    FlussLakeRecordBatchStream, FlussLakeResult,
+};
