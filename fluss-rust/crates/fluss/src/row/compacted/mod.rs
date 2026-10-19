@@ -20,6 +20,7 @@ mod compacted_key_writer;
 mod compacted_row;
 mod compacted_row_reader;
 mod compacted_row_writer;
+mod indexed_compacted_row;
 
 pub use compacted_key_writer::CompactedKeyWriter;
 #[allow(unused_imports)]
@@ -28,3 +29,4 @@ pub use compacted_row::{CompactedRow, calculate_bit_set_width_in_bytes};
 pub use compacted_row_reader::{CompactedRowDeserializer, CompactedRowReader};
 #[allow(unused_imports)]
 pub use compacted_row_writer::CompactedRowWriter;
+pub use indexed_compacted_row::IndexedCompactedRow;

@@ -40,6 +40,8 @@ storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-s3 = ["opendal/services-s3"]
 storage-oss = ["opendal/services-oss"]
+# Reading kv snapshots (RocksDB checkpoints) builds RocksDB, so it is opt-in.
+kv-snapshot = ["dep:rocksdb"]
 integration_tests = []
 
 [dependencies]
@@ -70,6 +72,7 @@ opendal = "0.55.0"
 url = "2.5.7"
 uuid = { version = "1.10", features = ["v4"] }
 tempfile = "3.23.0"
+rocksdb = { version = "0.24", optional = true, default-features = false, features = ["lz4", "zstd", "snappy", "bindgen-runtime"] }
 snafu = "0.8.3"
 scopeguard = "1.2.0"
 delegate = "0.13.5"

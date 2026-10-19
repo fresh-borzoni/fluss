@@ -93,7 +93,10 @@ fn build_remote_fs_props(
     );
 
     if let Some(token) = &credentials.security_token {
+        // OSS names it security_token, S3 session_token; without the latter a temporary
+        // (STS) key reaches S3 with no token and every request is rejected.
         props.insert("security_token".to_string(), token.clone());
+        props.insert("session_token".to_string(), token.clone());
     }
 
     for (key, value) in addition_infos {
@@ -274,7 +277,7 @@ impl SecurityTokenManager {
 
     /// Fetch token from server.
     /// Returns the props and expiration time if available.
-    async fn fetch_token(
+    pub(crate) async fn fetch_token(
         rpc_client: &Arc<RpcClient>,
         metadata: &Arc<Metadata>,
     ) -> Result<(HashMap<String, String>, Option<i64>)> {
@@ -429,6 +432,7 @@ mod tests {
         assert_eq!(props.get("access_key_secret"), Some(&"sk".to_string()));
         assert_eq!(props.get("access_key_secret"), Some(&"sk".to_string()));
         assert_eq!(props.get("security_token"), Some(&"token".to_string()));
+        assert_eq!(props.get("session_token"), Some(&"token".to_string()));
         assert_eq!(
             props.get("enable_virtual_host_style"),
             Some(&"false".to_string())

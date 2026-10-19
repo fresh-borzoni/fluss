@@ -257,7 +257,7 @@ impl<'a> CompactedRowReader<'a> {
         }
     }
 
-    fn initial_position(&self) -> usize {
+    pub(crate) fn initial_position(&self) -> usize {
         self.offset + self.header_size_in_bytes
     }
 
