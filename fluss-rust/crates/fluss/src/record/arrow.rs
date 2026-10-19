@@ -30,8 +30,8 @@ use arrow::{
     array::RecordBatch,
     buffer::Buffer,
     ipc::{
-        CompressionType,
-        reader::{StreamReader, read_record_batch},
+        Block, CompressionType, MetadataVersion,
+        reader::{FileDecoder, StreamReader, read_record_batch},
         root_as_message,
         writer::StreamWriter,
     },
@@ -47,6 +47,7 @@ use std::{
     collections::HashMap,
     io::{Cursor, Write},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use super::log_record_batch::*;
@@ -631,6 +632,48 @@ pub trait ToArrow {
 ///
 /// Returns `Err(arrow_error)` on errors
 /// - `arrow_error`: Error details e.g. malformed, too short or bad continuation marker.
+static SKIP_ARROW_VALIDATION: AtomicBool = AtomicBool::new(false);
+
+/// Skips Arrow array validation (UTF-8, offsets, null counts) when decoding fetched log batches.
+///
+/// Process-wide opt-in for engines that trust the cluster's writers: a malformed batch then
+/// yields arrays that break Arrow's invariants instead of a decode error.
+pub fn set_skip_arrow_validation(skip: bool) {
+    SKIP_ARROW_VALIDATION.store(skip, Ordering::Relaxed);
+}
+
+fn decode_record_batch(
+    data: &Bytes,
+    batch_metadata: arrow::ipc::RecordBatch<'_>,
+    body_buffer: &Buffer,
+    schema: SchemaRef,
+    version: &MetadataVersion,
+) -> Result<RecordBatch> {
+    if !SKIP_ARROW_VALIDATION.load(Ordering::Relaxed) {
+        return Ok(read_record_batch(
+            body_buffer,
+            batch_metadata,
+            schema,
+            &HashMap::new(),
+            None,
+            version,
+        )?);
+    }
+    // FileDecoder is the public decoder that can skip validation; a block spanning the
+    // whole message lets it read one stream message as it would a file block.
+    let metadata_size = LittleEndian::read_u32(&data[4..8]) as usize;
+    let body_start = 8 + ((metadata_size + 7) & !7);
+    // SAFETY: the engine opted in via `set_skip_arrow_validation` for trusted writers.
+    let decoder = unsafe { FileDecoder::new(schema, *version).with_skip_validation(true) };
+    let block = Block::new(0, body_start as i32, (data.len() - body_start) as i64);
+    let batch = decoder
+        .read_record_batch(&block, &Buffer::from(data.clone()))?
+        .ok_or(ParseError(String::from(
+            "IPC message holds no record batch",
+        )))?;
+    Ok(batch)
+}
+
 fn parse_ipc_message(
     data: &Bytes,
 ) -> Result<(
@@ -1451,12 +1494,11 @@ impl ReadContext {
             }
         };
 
-        let record_batch = read_record_batch(
-            &body_buffer,
+        let record_batch = decode_record_batch(
+            &data,
             batch_metadata,
+            &body_buffer,
             resolve_schema,
-            &HashMap::new(),
-            None,
             &version,
         )?;
 
@@ -1499,12 +1541,11 @@ impl ReadContext {
     pub(crate) fn record_batch_for_remote_log(&self, data: Bytes) -> Result<Option<RecordBatch>> {
         let (batch_metadata, body_buffer, version) = parse_ipc_message(&data)?;
 
-        let record_batch = read_record_batch(
-            &body_buffer,
+        let record_batch = decode_record_batch(
+            &data,
             batch_metadata,
+            &body_buffer,
             self.full_schema.clone(),
-            &HashMap::new(),
-            None,
             &version,
         )?;
 

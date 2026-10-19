@@ -1055,6 +1055,7 @@ impl LogScannerInner {
         let _poll_guard = PollGuard::new(self);
         let start = Instant::now();
         let deadline = start + timeout;
+        let positions = self.log_scanner_status.get_all_subscriptions();
 
         loop {
             let batches = self.poll_for_batches().await?;
@@ -1062,6 +1063,13 @@ impl LogScannerInner {
             if !batches.is_empty() {
                 self.log_fetcher.send_fetches().await?;
                 return Ok(batches);
+            }
+
+            // A fetch the server filtered whole moves a bucket's position without yielding a
+            // batch. Return so that a bounded caller can see the bucket reached its stop offset,
+            // instead of waiting out the timeout for batches that will never come.
+            if self.log_scanner_status.get_all_subscriptions() != positions {
+                return Ok(Vec::new());
             }
 
             let now = Instant::now();
