@@ -1580,6 +1580,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluss-native-ffi"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "fluss-lake",
+ "fluss-rs",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fluss-rs"
 version = "1.0.0"
 dependencies = [
