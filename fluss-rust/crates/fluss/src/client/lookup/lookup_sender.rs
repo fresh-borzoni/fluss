@@ -38,13 +38,18 @@ use tokio::task::JoinSet;
 
 type ServerId = i32;
 
-type BatchesByLeader<T> = HashMap<ServerId, HashMap<TableBucket, LookupBatch<T>>>;
+/// A bucket and, for a historical lookup, the expired partition asked for: several expired
+/// partitions can share one bucket of the historical system partition.
+type BatchKey = (TableBucket, Option<String>);
+
+type BatchesByLeader<T> = HashMap<ServerId, HashMap<BatchKey, LookupBatch<T>>>;
 type PrimaryBatches = BatchesByLeader<Option<Vec<u8>>>;
 type PrefixBatches = BatchesByLeader<Vec<Vec<u8>>>;
 
 struct BucketResponse<V> {
     partition_id: Option<PartitionId>,
     bucket_id: BucketId,
+    original_partition_name: Option<String>,
     error_code: Option<i32>,
     error_message: Option<String>,
     values: Vec<V>,
@@ -82,6 +87,7 @@ impl LookupProtocol for Primary {
         response.buckets_resp.into_iter().map(|r| BucketResponse {
             partition_id: r.partition_id,
             bucket_id: r.bucket_id,
+            original_partition_name: r.original_partition_name,
             error_code: r.error_code,
             error_message: r.error_message,
             values: r.values.into_iter().map(|pb| pb.values).collect(),
@@ -107,6 +113,7 @@ impl LookupProtocol for Prefix {
         response.buckets_resp.into_iter().map(|r| BucketResponse {
             partition_id: r.partition_id,
             bucket_id: r.bucket_id,
+            original_partition_name: None,
             error_code: r.error_code,
             error_message: r.error_message,
             values: r.value_lists.into_iter().map(|pb| pb.values).collect(),
@@ -163,17 +170,30 @@ struct LookupDispatcher {
 
 struct LookupBatch<T> {
     table_bucket: TableBucket,
+    original_partition_name: Option<String>,
     lookups: Vec<LookupQuery<T>>,
     keys: Vec<Bytes>,
 }
 
 impl<T> LookupBatch<T> {
-    fn new(table_bucket: TableBucket) -> Self {
+    fn new((table_bucket, original_partition_name): BatchKey) -> Self {
         Self {
             table_bucket,
+            original_partition_name,
             lookups: Vec::new(),
             keys: Vec::new(),
         }
+    }
+
+    fn key(&self) -> BatchKey {
+        (
+            self.table_bucket.clone(),
+            self.original_partition_name.clone(),
+        )
+    }
+
+    fn is_historical(&self) -> bool {
+        self.original_partition_name.is_some()
     }
 
     fn add_lookup(&mut self, lookup: LookupQuery<T>) {
@@ -211,19 +231,20 @@ impl<T> LookupBatch<T> {
         }
     }
 
-    fn keys_tuple(&mut self) -> BucketLookupKeys {
+    fn take_keys(&mut self) -> BucketLookupKeys {
         // All lookups of a bucket share one routing count.
         let routing_bucket_count = self
             .lookups
             .first()
             .map(|lookup| lookup.routing_bucket_count())
             .filter(|count| *count > 0);
-        (
-            self.table_bucket.bucket_id(),
-            self.table_bucket.partition_id(),
+        BucketLookupKeys {
+            bucket_id: self.table_bucket.bucket_id(),
+            partition_id: self.table_bucket.partition_id(),
             routing_bucket_count,
-            std::mem::take(&mut self.keys),
-        )
+            original_partition_name: self.original_partition_name.clone(),
+            keys: std::mem::take(&mut self.keys),
+        }
     }
 }
 
@@ -344,11 +365,17 @@ impl LookupDispatcher {
                 .iter()
                 .copied()
                 .collect();
+            let mut deleted_partitions = HashSet::new();
             if let Err(e) = self
                 .metadata
-                .update_tables_metadata(&table_paths_refs, &HashSet::new(), partition_ids)
+                .update_tables_metadata(&table_paths_refs, &HashSet::new(), partition_ids.clone())
                 .await
             {
+                if e.api_error() == Some(FlussError::PartitionNotExists) {
+                    deleted_partitions = self
+                        .deleted_partitions(&table_paths_refs, &partition_ids)
+                        .await;
+                }
                 warn!("Failed to update metadata for unknown leader tables: {}", e);
             } else {
                 debug!(
@@ -360,8 +387,19 @@ impl LookupDispatcher {
             // Re-group with fresh cluster state; dispatch what resolved, re-enqueue the rest.
             let retry = self.group_by_leader(unknowns);
             groups.merge_batches(retry.groups);
-            for item in retry.unknowns {
-                self.re_enqueue_lookup(item);
+            // Like the Java client: a lookup whose partition the refresh confirmed deleted fails with
+            // PartitionNotExists, so that a lookuper can route it by partition name again, instead of
+            // being queued forever with the bucket of a partition that is gone.
+            for mut lookup in retry.unknowns {
+                match lookup.table_bucket().partition_id() {
+                    Some(partition_id) if deleted_partitions.contains(&partition_id) => {
+                        lookup.complete_with_error(Error::partition_not_exist(format!(
+                            "Partition {partition_id} of table {} no longer exists",
+                            lookup.table_path()
+                        )));
+                    }
+                    _ => self.re_enqueue_lookup(lookup),
+                }
             }
 
             // Nothing to dispatch even after refresh — back off to avoid a tight RPC loop.
@@ -387,6 +425,28 @@ impl LookupDispatcher {
         Ok(())
     }
 
+    /// Which of `partition_ids` the cluster says no longer exist. Asked one at a time, because a
+    /// refresh naming a deleted partition fails as a whole without saying which one it was.
+    async fn deleted_partitions(
+        &self,
+        table_paths: &HashSet<&TablePath>,
+        partition_ids: &[PartitionId],
+    ) -> HashSet<PartitionId> {
+        let mut deleted = HashSet::new();
+        for &partition_id in partition_ids {
+            if let Err(e) = self
+                .metadata
+                .update_tables_metadata(table_paths, &HashSet::new(), vec![partition_id])
+                .await
+            {
+                if e.api_error() == Some(FlussError::PartitionNotExists) {
+                    deleted.insert(partition_id);
+                }
+            }
+        }
+        deleted
+    }
+
     fn group_by_leader(&self, lookups: Vec<QueuedLookup>) -> GroupingResult {
         let cluster = self.metadata.get_cluster();
         let mut primary: PrimaryBatches = HashMap::new();
@@ -397,6 +457,10 @@ impl LookupDispatcher {
 
         for query in lookups {
             let table_bucket = query.table_bucket().clone();
+            let batch_key = (
+                table_bucket.clone(),
+                query.original_partition_name().cloned(),
+            );
 
             let leader = match cluster.leader_for(&table_bucket) {
                 Some(leader) => leader.id(),
@@ -419,16 +483,16 @@ impl LookupDispatcher {
                     primary
                         .entry(leader)
                         .or_default()
-                        .entry(table_bucket.clone())
-                        .or_insert_with(|| LookupBatch::new(table_bucket))
+                        .entry(batch_key.clone())
+                        .or_insert_with(|| LookupBatch::new(batch_key))
                         .add_lookup(q);
                 }
                 QueuedLookup::Prefix(q) => {
                     prefix
                         .entry(leader)
                         .or_default()
-                        .entry(table_bucket.clone())
-                        .or_insert_with(|| LookupBatch::new(table_bucket))
+                        .entry(batch_key.clone())
+                        .or_insert_with(|| LookupBatch::new(batch_key))
                         .add_lookup(q);
                 }
             }
@@ -448,26 +512,36 @@ impl LookupDispatcher {
     /// Sends `destination` one request per table, each on a task of its own in `requests`, so a
     /// server that is slow to answer holds up only the lookups sent to it. Returns once every
     /// request has started; while all in-flight permits are taken, it waits for one.
+    ///
+    /// Like the Java client, normal and historical lookups go in separate requests: the server takes
+    /// a request as historical when its first bucket names an original partition.
     async fn send_requests<P: LookupProtocol>(
         self: &Arc<Self>,
         destination: ServerId,
-        batches_by_bucket: HashMap<TableBucket, LookupBatch<P::Value>>,
+        batches_by_bucket: HashMap<BatchKey, LookupBatch<P::Value>>,
         requests: &mut JoinSet<()>,
     ) where
         LookupQuery<P::Value>: Into<QueuedLookup>,
     {
-        for (table_id, mut batches) in group_by_table(batches_by_bucket) {
-            let permit = match self.acquire_inflight_permit(&mut batches).await {
-                Some(p) => p,
-                None => continue,
-            };
-            let dispatcher = Arc::clone(self);
-            requests.spawn(async move {
-                dispatcher
-                    .send_table_lookup::<P>(table_id, destination, batches)
-                    .await;
-                drop(permit);
-            });
+        for (table_id, batches) in group_by_table(batches_by_bucket) {
+            let (historical, normal): (Vec<_>, Vec<_>) =
+                batches.into_iter().partition(|b| b.is_historical());
+            for mut batches in [normal, historical] {
+                if batches.is_empty() {
+                    continue;
+                }
+                let permit = match self.acquire_inflight_permit(&mut batches).await {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let dispatcher = Arc::clone(self);
+                requests.spawn(async move {
+                    dispatcher
+                        .send_table_lookup::<P>(table_id, destination, batches)
+                        .await;
+                    drop(permit);
+                });
+            }
         }
     }
 
@@ -526,7 +600,7 @@ impl LookupDispatcher {
             Some(conn) => conn,
             None => return,
         };
-        let keys_by_bucket: Vec<_> = batches.iter_mut().map(|b| b.keys_tuple()).collect();
+        let keys_by_bucket: Vec<_> = batches.iter_mut().map(|b| b.take_keys()).collect();
         let request = P::build_request(table_id, keys_by_bucket);
 
         match connection.request(request).await {
@@ -577,15 +651,18 @@ impl LookupDispatcher {
                 bucket_resp.partition_id,
                 bucket_resp.bucket_id,
             );
-            let Some(&idx) = bucket_to_index.get(&table_bucket) else {
+            let batch_key = (table_bucket, bucket_resp.original_partition_name);
+            let Some(&idx) = bucket_to_index.get(&batch_key) else {
                 error!(
-                    "Received {} response for unknown bucket {} from server {}",
+                    "Received {} response for unknown bucket {} ({:?}) from server {}",
                     P::OP_NAME,
-                    table_bucket,
+                    batch_key.0,
+                    batch_key.1,
                     destination
                 );
                 continue;
             };
+            let table_bucket = batch_key.0;
             processed[idx] = true;
             let batch = &mut batches[idx];
 
@@ -659,11 +736,18 @@ impl LookupDispatcher {
         let mut retried = 0usize;
         let mut failed = 0usize;
         let table_bucket = batch.table_bucket.clone();
+        let throttled = error.api_error() == Some(FlussError::HistoricalPartitionThrottled);
 
         for mut lookup in batch.lookups.drain(..) {
             if is_retriable && lookup.retries() < self.max_retries && !lookup.is_done() {
+                // A server throttling historical lookups is told apart from a stale route: the
+                // retry waits, so the lake reads it is shedding are not sent straight back.
+                let delay = throttled.then(|| historical_throttle_backoff(lookup.retries()));
                 lookup.increment_retries();
-                self.re_enqueue_lookup(lookup.into());
+                match delay {
+                    Some(delay) => self.re_enqueue_lookup_after(lookup.into(), delay),
+                    None => self.re_enqueue_lookup(lookup.into()),
+                }
                 retried += 1;
             } else {
                 lookup.complete_with_error(copy_error(error));
@@ -671,7 +755,7 @@ impl LookupDispatcher {
             }
         }
 
-        if retried > 0 {
+        if retried > 0 && !throttled {
             warn!(
                 "Lookup error for bucket {}, retrying {} lookups: {}",
                 table_bucket, retried, error
@@ -695,24 +779,48 @@ impl LookupDispatcher {
             });
         }
     }
+
+    fn re_enqueue_lookup_after(&self, lookup: QueuedLookup, delay: Duration) {
+        let re_enqueue_tx = self.re_enqueue_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(e) = re_enqueue_tx.send(lookup) {
+                let mut failed_lookup = e.0;
+                failed_lookup.complete_with_error(Error::UnexpectedError {
+                    message: "Failed to re-enqueue lookup: channel closed".to_string(),
+                    source: None,
+                });
+            }
+        });
+    }
 }
 
 fn group_by_table<T>(
-    batches_by_bucket: HashMap<TableBucket, LookupBatch<T>>,
+    batches_by_bucket: HashMap<BatchKey, LookupBatch<T>>,
 ) -> HashMap<TableId, Vec<LookupBatch<T>>> {
     let mut out: HashMap<TableId, Vec<LookupBatch<T>>> = HashMap::new();
-    for (table_bucket, batch) in batches_by_bucket {
+    for ((table_bucket, _), batch) in batches_by_bucket {
         out.entry(table_bucket.table_id()).or_default().push(batch);
     }
     out
 }
 
-fn build_bucket_index<T>(batches: &[LookupBatch<T>]) -> HashMap<TableBucket, usize> {
+fn build_bucket_index<T>(batches: &[LookupBatch<T>]) -> HashMap<BatchKey, usize> {
     batches
         .iter()
         .enumerate()
-        .map(|(idx, batch)| (batch.table_bucket.clone(), idx))
+        .map(|(idx, batch)| (batch.key(), idx))
         .collect()
+}
+
+/// The Java client's backoff for throttled historical lookups: 100 ms doubling up to 5 s, with
+/// 20% jitter.
+fn historical_throttle_backoff(retries: i32) -> Duration {
+    const INITIAL_MS: f64 = 100.0;
+    const MAX_MS: f64 = 5000.0;
+    let term = INITIAL_MS * 2f64.powi(retries.clamp(0, 16));
+    let jitter = rand::random_range(0.8..1.2);
+    Duration::from_millis((term * jitter).min(MAX_MS) as u64)
 }
 
 fn bucket_error(error_code: Option<i32>, error_message: Option<String>) -> Option<ApiError> {
@@ -756,10 +864,12 @@ fn copy_error(error: &Error) -> Error {
 mod tests {
     use super::*;
     use crate::client::lookup::{LookupQueue, PrimaryLookupQuery};
-    use crate::proto::PbLookupRespForBucket;
+    use crate::cluster::ServerType;
+    use crate::proto::{ApiVersionsResponse, PbApiVersion, PbLookupRespForBucket, PbValue};
     use crate::test_utils::build_cluster_arc_with_port;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
 
     const TABLE_ID: TableId = 1;
@@ -808,7 +918,7 @@ mod tests {
     fn fail_with_bucket_error(sender: &LookupSender, error_code: i32) -> Error {
         let table_bucket = TableBucket::new(TABLE_ID, 0);
         let (result_tx, mut result_rx) = oneshot::channel();
-        let mut batch = LookupBatch::new(table_bucket.clone());
+        let mut batch = LookupBatch::new((table_bucket.clone(), None));
         batch.add_lookup(LookupQuery::new(
             table_path(),
             table_bucket,
@@ -879,7 +989,7 @@ mod tests {
         let mut sender = sender(3);
         let (query, result_rx) = lookup(0);
         drop(result_rx);
-        let mut batch = LookupBatch::new(query.table_bucket().clone());
+        let mut batch = LookupBatch::new((query.table_bucket().clone(), None));
         batch.add_lookup(query);
         let error = Error::UnexpectedError {
             message: "connection reset".to_string(),
@@ -986,5 +1096,227 @@ mod tests {
         .await
         .expect("the client closed its connection")
         .unwrap();
+    }
+
+    /// Answers the connection handshake, then returns the request id of the next lookup.
+    async fn read_lookup_request(stream: &mut TcpStream) -> i32 {
+        loop {
+            let len = stream.read_i32().await.expect("request length");
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).await.expect("request");
+            let api_key = i16::from_be_bytes(payload[..2].try_into().unwrap());
+            let request_id = i32::from_be_bytes(payload[4..8].try_into().unwrap());
+            if api_key == 1017 {
+                return request_id;
+            }
+            assert_eq!(api_key, 1000, "expected ApiVersions or Lookup");
+            let versions = ApiVersionsResponse {
+                api_versions: [1000, 1017]
+                    .map(|api_key| PbApiVersion {
+                        api_key,
+                        min_version: 0,
+                        max_version: 0,
+                    })
+                    .to_vec(),
+                server_type: Some(ServerType::TabletServer.to_type_id()),
+            };
+            respond(stream, request_id, versions).await;
+        }
+    }
+
+    async fn respond(stream: &mut TcpStream, request_id: i32, response: impl Message) {
+        let body = response.encode_to_vec();
+        stream
+            .write_i32((5 + body.len()) as i32)
+            .await
+            .expect("response length");
+        stream.write_u8(0).await.expect("success response type");
+        stream.write_i32(request_id).await.expect("request id");
+        stream.write_all(&body).await.expect("response body");
+    }
+
+    fn found(value: &[u8]) -> LookupResponse {
+        LookupResponse {
+            buckets_resp: vec![PbLookupRespForBucket {
+                bucket_id: 0,
+                values: vec![PbValue {
+                    values: Some(value.to_vec()),
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn submit(
+        lookup_tx: &mpsc::Sender<QueuedLookup>,
+    ) -> oneshot::Receiver<Result<Option<Vec<u8>>>> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let lookup = LookupQuery::new(
+            table_path(),
+            TableBucket::new(TABLE_ID, 0),
+            1,
+            Bytes::from_static(b"key"),
+            result_tx,
+        );
+        lookup_tx.try_send(lookup.into()).expect("queued");
+        result_rx
+    }
+
+    /// Like `read_lookup_request`, and also decodes the request.
+    async fn read_lookup(stream: &mut TcpStream) -> (i32, crate::proto::LookupRequest) {
+        loop {
+            let len = stream.read_i32().await.expect("request length");
+            let mut payload = vec![0u8; len as usize];
+            stream.read_exact(&mut payload).await.expect("request");
+            let api_key = i16::from_be_bytes(payload[..2].try_into().unwrap());
+            let request_id = i32::from_be_bytes(payload[4..8].try_into().unwrap());
+            if api_key == 1017 {
+                let request =
+                    crate::proto::LookupRequest::decode(&payload[8..]).expect("lookup request");
+                return (request_id, request);
+            }
+            let versions = ApiVersionsResponse {
+                api_versions: [1000, 1017]
+                    .map(|api_key| PbApiVersion {
+                        api_key,
+                        min_version: 0,
+                        max_version: 0,
+                    })
+                    .to_vec(),
+                server_type: Some(ServerType::TabletServer.to_type_id()),
+            };
+            respond(stream, request_id, versions).await;
+        }
+    }
+
+    /// The server takes a request as historical when its first bucket names an original
+    /// partition, so a round holding both kinds sends two requests; within the historical one,
+    /// expired partitions sharing a bucket are answered apart by name.
+    #[tokio::test]
+    async fn historical_lookups_go_in_their_own_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let cluster = build_cluster_arc_with_port(&table_path(), TABLE_ID, 1, port as u32);
+        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let (queue, lookup_tx, re_enqueue_tx) =
+            LookupQueue::new(8, 8, 200, metadata.subscribe_cluster_changes());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut sender = LookupSender::new(metadata, queue, re_enqueue_tx, 4, 3, shutdown_rx);
+        let running = tokio::spawn(async move { sender.run().await });
+
+        let submit_named = |key: &'static [u8], partition: Option<&str>| {
+            let (result_tx, result_rx) = oneshot::channel();
+            let lookup = LookupQuery::<Option<Vec<u8>>>::new(
+                table_path(),
+                TableBucket::new(TABLE_ID, 0),
+                1,
+                Bytes::from_static(key),
+                result_tx,
+            )
+            .with_original_partition_name(partition.map(str::to_string));
+            lookup_tx.try_send(lookup.into()).expect("queued");
+            result_rx
+        };
+        // Connect first, so that the two requests below share the connection rather than race to
+        // open one each, which this one-connection server would not see.
+        let warm_up = submit_named(b"warm-up", None);
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let (warm_up_id, _) = read_lookup(&mut stream).await;
+        respond(&mut stream, warm_up_id, found(b"warm-up row")).await;
+        assert_eq!(
+            warm_up.await.unwrap().unwrap(),
+            Some(b"warm-up row".to_vec())
+        );
+
+        let live = submit_named(b"live", None);
+        let older = submit_named(b"older", Some("2026101510"));
+        let newer = submit_named(b"newer", Some("2026101611"));
+
+        let mut requests = [
+            read_lookup(&mut stream).await,
+            read_lookup(&mut stream).await,
+        ];
+        requests.sort_by_key(|(_, r)| r.buckets_req[0].original_partition_name.is_some());
+        let (live_id, live_request) = &requests[0];
+        let (historical_id, historical_request) = &requests[1];
+        assert_eq!(live_request.buckets_req.len(), 1);
+        assert_eq!(live_request.buckets_req[0].original_partition_name, None);
+        let mut names: Vec<_> = historical_request
+            .buckets_req
+            .iter()
+            .map(|b| b.original_partition_name.clone().expect("historical"))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["2026101510", "2026101611"]);
+
+        respond(&mut stream, *live_id, found(b"live row")).await;
+        let historical_response = LookupResponse {
+            buckets_resp: historical_request
+                .buckets_req
+                .iter()
+                .map(|b| PbLookupRespForBucket {
+                    bucket_id: 0,
+                    original_partition_name: b.original_partition_name.clone(),
+                    values: vec![PbValue {
+                        values: b.original_partition_name.clone().map(String::into_bytes),
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        respond(&mut stream, *historical_id, historical_response).await;
+
+        assert_eq!(live.await.unwrap().unwrap(), Some(b"live row".to_vec()));
+        assert_eq!(older.await.unwrap().unwrap(), Some(b"2026101510".to_vec()));
+        assert_eq!(newer.await.unwrap().unwrap(), Some(b"2026101611".to_vec()));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the sender stopped")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_throttled_historical_lookup_backs_off_like_the_java_client() {
+        for (retries, low, high) in [(0, 80, 120), (1, 160, 240), (3, 640, 960), (10, 5000, 5000)] {
+            let delay = historical_throttle_backoff(retries).as_millis() as u64;
+            assert!((low..=high).contains(&delay), "retry {retries}: {delay} ms");
+        }
+    }
+
+    /// Like the Java client: a lookup that arrives while a round awaits its response goes out in a
+    /// round of its own rather than waiting for the first one to be answered.
+    #[tokio::test]
+    async fn a_round_is_sent_while_the_previous_one_awaits_its_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let cluster = build_cluster_arc_with_port(&table_path(), TABLE_ID, 1, port as u32);
+        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let (queue, lookup_tx, re_enqueue_tx) =
+            LookupQueue::new(8, 8, 0, metadata.subscribe_cluster_changes());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut sender = LookupSender::new(metadata, queue, re_enqueue_tx, 2, 3, shutdown_rx);
+        let running = tokio::spawn(async move { sender.run().await });
+
+        let first = submit(&lookup_tx);
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let first_request = read_lookup_request(&mut stream).await;
+        let second = submit(&lookup_tx);
+        let second_request =
+            tokio::time::timeout(Duration::from_secs(10), read_lookup_request(&mut stream))
+                .await
+                .expect("the second round waited for the first one's response");
+
+        respond(&mut stream, second_request, found(b"second")).await;
+        respond(&mut stream, first_request, found(b"first")).await;
+        assert_eq!(second.await.unwrap().unwrap(), Some(b"second".to_vec()));
+        assert_eq!(first.await.unwrap().unwrap(), Some(b"first".to_vec()));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the sender stopped")
+            .unwrap();
     }
 }

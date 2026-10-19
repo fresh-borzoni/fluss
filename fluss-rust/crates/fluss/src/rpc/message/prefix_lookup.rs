@@ -35,13 +35,11 @@ impl PrefixLookupRequest {
     pub fn new_batched(table_id: TableId, buckets: Vec<BucketLookupKeys>) -> Self {
         let buckets_req: Vec<proto::PbPrefixLookupReqForBucket> = buckets
             .into_iter()
-            .map(|(bucket_id, partition_id, routing_bucket_count, keys)| {
-                proto::PbPrefixLookupReqForBucket {
-                    partition_id,
-                    bucket_id,
-                    keys,
-                    routing_bucket_count,
-                }
+            .map(|bucket| proto::PbPrefixLookupReqForBucket {
+                partition_id: bucket.partition_id,
+                bucket_id: bucket.bucket_id,
+                keys: bucket.keys,
+                routing_bucket_count: bucket.routing_bucket_count,
             })
             .collect();
 

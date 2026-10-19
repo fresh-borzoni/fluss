@@ -18,10 +18,147 @@
 /// Utils for partition.
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
-use crate::metadata::DataType;
+use crate::metadata::{AutoPartitionStrategy, DataType};
 use crate::row::{Date, Datum, Time, TimestampLtz, TimestampNtz};
 use jiff::ToSpan;
 use std::fmt::Write;
+
+/// The partition value of the system partition that answers lookups of expired partitions from
+/// the lake.
+pub const HISTORICAL_PARTITION_VALUE: &str = "__historical__";
+
+/// A field of an auto-partition time pattern.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TimeField {
+    Year,
+    Quarter,
+    Month,
+    Day,
+    Hour,
+    Literal(char),
+}
+
+impl TimeField {
+    /// The digits of a numeric field and the values they may take.
+    fn digits(self) -> Option<(usize, u32, u32)> {
+        match self {
+            TimeField::Year => Some((4, 0, 9999)),
+            TimeField::Quarter => Some((1, 1, 4)),
+            TimeField::Month => Some((2, 1, 12)),
+            TimeField::Day => Some((2, 1, 31)),
+            TimeField::Hour => Some((2, 0, 23)),
+            TimeField::Literal(_) => None,
+        }
+    }
+}
+
+/// Parses the `DateTimeFormatter` patterns auto-partitioning uses: the fixed-width fields `yyyy`,
+/// `Q`, `MM`, `dd` and `HH`, and separators that are not letters. Returns `None` for anything
+/// else, so such a table never treats a partition as past.
+fn parse_time_pattern(pattern: &str) -> Option<Vec<TimeField>> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let run = chars[i..].iter().take_while(|&&d| d == c).count();
+        match (c, run) {
+            ('y', 4) => fields.push(TimeField::Year),
+            ('Q', 1) => fields.push(TimeField::Quarter),
+            ('M', 2) => fields.push(TimeField::Month),
+            ('d', 2) => fields.push(TimeField::Day),
+            ('H', 2) => fields.push(TimeField::Hour),
+            (c, _) if c.is_ascii_alphabetic() || c == '\'' => return None,
+            (c, run) => fields.extend(std::iter::repeat_n(TimeField::Literal(c), run)),
+        }
+        i += run;
+    }
+    Some(fields)
+}
+
+fn matches_time_pattern(value: &str, fields: &[TimeField]) -> bool {
+    let mut rest = value;
+    for field in fields {
+        match (field, field.digits()) {
+            (TimeField::Literal(c), _) => match rest.strip_prefix(*c) {
+                Some(after) => rest = after,
+                None => return false,
+            },
+            (_, Some((width, min, max))) => {
+                let Some(digits) = rest.get(..width) else {
+                    return false;
+                };
+                if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return false;
+                }
+                let n: u32 = digits.parse().unwrap_or(u32::MAX);
+                if n < min || n > max {
+                    return false;
+                }
+                rest = &rest[width..];
+            }
+            (_, None) => return false,
+        }
+    }
+    rest.is_empty()
+}
+
+fn format_time(time: &jiff::Zoned, fields: &[TimeField]) -> String {
+    let mut out = String::new();
+    for field in fields {
+        let _ = match field {
+            TimeField::Year => write!(out, "{:04}", time.year()),
+            TimeField::Quarter => write!(out, "{}", (time.month() - 1) / 3 + 1),
+            TimeField::Month => write!(out, "{:02}", time.month()),
+            TimeField::Day => write!(out, "{:02}", time.day()),
+            TimeField::Hour => write!(out, "{:02}", time.hour()),
+            TimeField::Literal(c) => write!(out, "{c}"),
+        };
+    }
+    out
+}
+
+fn auto_partition_time_zone(name: &str) -> Option<jiff::tz::TimeZone> {
+    if ["UTC", "Z", "GMT"]
+        .iter()
+        .any(|utc| name.eq_ignore_ascii_case(utc))
+    {
+        return Some(jiff::tz::TimeZone::UTC);
+    }
+    jiff::tz::TimeZone::get(name).ok()
+}
+
+/// Whether `partition_time` is a valid auto-partition value earlier than the partition holding
+/// `now`, as Java's `PartitionUtils.isPastAutoPartition` decides it: the current partition and
+/// later ones may still be created, so only an earlier one is known to have expired.
+pub fn is_past_auto_partition(
+    partition_time: &str,
+    strategy: &AutoPartitionStrategy,
+    now: jiff::Timestamp,
+) -> bool {
+    let pattern = match strategy.time_format() {
+        Some(format) => format,
+        None => match strategy.time_unit().to_ascii_uppercase().as_str() {
+            "YEAR" => "yyyy",
+            "QUARTER" => "yyyyQ",
+            "MONTH" => "yyyyMM",
+            "DAY" => "yyyyMMdd",
+            "HOUR" => "yyyyMMddHH",
+            _ => return false,
+        },
+    };
+    let Some(fields) = parse_time_pattern(pattern) else {
+        return false;
+    };
+    if !matches_time_pattern(partition_time, &fields) {
+        return false;
+    }
+    let Some(time_zone) = auto_partition_time_zone(strategy.timezone()) else {
+        return false;
+    };
+    let current = format_time(&now.to_zoned(time_zone), &fields);
+    partition_time < current.as_str()
+}
 
 fn hex_string(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
@@ -191,6 +328,77 @@ pub fn convert_value_of_type(value: &Datum, data_type: &DataType) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    fn strategy(properties: &[(&str, &str)]) -> AutoPartitionStrategy {
+        let mut map: HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        map.entry("table.auto-partition.time-zone".to_string())
+            .or_insert_with(|| "UTC".to_string());
+        AutoPartitionStrategy::from(&map)
+    }
+
+    fn at(time: &str) -> jiff::Timestamp {
+        time.parse().unwrap()
+    }
+
+    #[test]
+    fn only_a_partition_before_the_current_one_is_past() {
+        let hourly = strategy(&[("table.auto-partition.time-unit", "HOUR")]);
+        let now = at("2026-10-17T12:30:00Z");
+        assert!(is_past_auto_partition("2026101711", &hourly, now));
+        assert!(is_past_auto_partition("2025010100", &hourly, now));
+        assert!(!is_past_auto_partition("2026101712", &hourly, now));
+        assert!(!is_past_auto_partition("2026101713", &hourly, now));
+    }
+
+    #[test]
+    fn a_value_the_pattern_does_not_parse_is_never_past() {
+        let daily = strategy(&[]);
+        let now = at("2026-10-17T12:30:00Z");
+        assert!(is_past_auto_partition("20261016", &daily, now));
+        assert!(!is_past_auto_partition("2026-10-16", &daily, now));
+        assert!(!is_past_auto_partition("20261316", &daily, now));
+        assert!(!is_past_auto_partition("2026101", &daily, now));
+        assert!(!is_past_auto_partition("__historical__", &daily, now));
+    }
+
+    #[test]
+    fn the_current_partition_is_taken_in_the_table_time_zone() {
+        let daily = strategy(&[("table.auto-partition.time-zone", "Asia/Shanghai")]);
+        // 17 Oct 20:00 UTC is already 18 Oct in Shanghai.
+        let now = at("2026-10-17T20:00:00Z");
+        assert!(is_past_auto_partition("20261017", &daily, now));
+        assert!(!is_past_auto_partition("20261018", &daily, now));
+    }
+
+    #[test]
+    fn a_custom_time_format_and_quarters() {
+        let custom = strategy(&[
+            ("table.auto-partition.time-unit", "DAY"),
+            ("table.auto-partition.time-format", "yyyy-MM-dd"),
+        ]);
+        let quarterly = strategy(&[("table.auto-partition.time-unit", "QUARTER")]);
+        let now = at("2026-10-17T12:30:00Z");
+        assert!(is_past_auto_partition("2026-10-16", &custom, now));
+        assert!(!is_past_auto_partition("2026-10-17", &custom, now));
+        assert!(!is_past_auto_partition("20261016", &custom, now));
+        assert!(is_past_auto_partition("20263", &quarterly, now));
+        assert!(!is_past_auto_partition("20264", &quarterly, now));
+    }
+
+    #[test]
+    fn an_unsupported_pattern_never_falls_back() {
+        let named_month = strategy(&[("table.auto-partition.time-format", "yyyy-MMM")]);
+        assert!(!is_past_auto_partition(
+            "2020-Jan",
+            &named_month,
+            at("2026-10-17T12:30:00Z")
+        ));
+    }
+
     use super::*;
     use crate::metadata::{
         BigIntType, BinaryType, BooleanType, BytesType, CharType, DateType, DoubleType, FloatType,

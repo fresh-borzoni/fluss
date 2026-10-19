@@ -67,6 +67,10 @@ impl AsyncWrite for Transport {
 impl Transport {
     pub async fn connect(server: &str, timeout: Option<Duration>) -> Result<Self, RpcError> {
         let tcp_stream = Self::connect_timeout(server, timeout).await?;
+        // Like the Java client: every request is flushed as one write, so Nagle's algorithm only
+        // holds a request back until the server acknowledges the previous one, which it may delay
+        // until that request's response is sent.
+        tcp_stream.set_nodelay(true)?;
         Ok(Transport::Plain { inner: tcp_stream })
     }
 
@@ -79,5 +83,17 @@ impl Transport {
                 })??),
             None => Ok(TcpStream::connect(host).await?),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn connect_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let super::Transport::Plain { inner } =
+            super::Transport::connect(&address, None).await.unwrap();
+        assert!(inner.nodelay().unwrap());
     }
 }

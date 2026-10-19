@@ -21,20 +21,22 @@ use crate::client::ClientSchemaGetter;
 use crate::client::lookup::LookupClient;
 use crate::client::metadata::Metadata;
 use crate::client::table::partition_getter::PartitionGetter;
-use crate::error::{Error, Result};
+use crate::error::{Error, FlussError, Result};
 use crate::metadata::{
-    KvFormat, PhysicalTablePath, RowType, Schema, TableBucket, TableInfo, TableOrPartition,
-    TablePath,
+    AutoPartitionStrategy, KvFormat, PhysicalTablePath, RowType, Schema, TableBucket, TableInfo,
+    TableOrPartition, TablePath,
 };
 use crate::record::RowAppendRecordBatchBuilder;
 use crate::record::kv::SCHEMA_ID_LENGTH;
 use crate::row::encode::{KeyEncoder, KeyEncoderFactory};
 use crate::row::{FixedSchemaDecoder, InternalRow, LookupRow};
+use crate::util::partition::{HISTORICAL_PARTITION_VALUE, is_past_auto_partition};
 use arrow::array::RecordBatch;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Bytes;
 use futures::future::try_join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Per-Lookuper decoder cache. The target-schema decoder is held
@@ -333,6 +335,14 @@ impl TableLookup {
             None
         };
 
+        let table_config = self.table_info.get_table_config();
+        let historical = (self.table_info.is_partitioned()
+            && table_config.is_historical_partition_enabled())
+        .then(|| HistoricalPartitions {
+            auto_partition: table_config.get_auto_partition_strategy(),
+            confirmed: Mutex::new(HashSet::new()),
+        });
+
         let schema_ctx = LookupSchemaCtx::new(&self.table_info, self.schema_getter)?;
 
         Ok(Lookuper {
@@ -344,6 +354,7 @@ impl TableLookup {
             primary_key_encoder: Mutex::new(primary_key_encoder),
             bucket_key_encoder: bucket_key_encoder.map(Mutex::new),
             partition_getter,
+            historical,
             schema_ctx,
         })
     }
@@ -369,7 +380,18 @@ pub struct Lookuper {
     primary_key_encoder: Mutex<Box<dyn KeyEncoder>>,
     bucket_key_encoder: Option<Mutex<Box<dyn KeyEncoder>>>,
     partition_getter: Option<PartitionGetter>,
+    /// Set when the table answers lookups of expired partitions from the lake
+    /// (`table.datalake.historical-partition.enabled`).
+    historical: Option<HistoricalPartitions>,
     schema_ctx: LookupSchemaCtx,
+}
+
+struct HistoricalPartitions {
+    auto_partition: AutoPartitionStrategy,
+    /// Missing past partitions already routed to the historical system partition, so later
+    /// lookups of them skip the metadata request. Like the Java lookuper, the option is read once:
+    /// a lookuper created before it was enabled keeps returning nothing for expired partitions.
+    confirmed: Mutex<HashSet<String>>,
 }
 
 impl Lookuper {
@@ -392,32 +414,39 @@ impl Lookuper {
             None => pk_bytes.clone(),
         };
 
-        let (partition_id, bucket_count) = if let Some(ref partition_getter) = self.partition_getter
-        {
-            let partition_name = partition_getter.get_partition(row)?;
-            let physical_table_path = PhysicalTablePath::of_partitioned(
-                Arc::clone(&self.table_path),
-                Some(partition_name),
-            );
-            let Some(partition_id) = self
-                .metadata
-                .check_and_update_partition_metadata(&physical_table_path)
-                .await?
-            else {
-                return Ok(self.schema_ctx.empty_result());
+        let (partition_id, bucket_count, partition_name) =
+            if let Some(ref partition_getter) = self.partition_getter {
+                let partition_name = partition_getter.get_partition(row)?;
+                if self.is_confirmed_historical(&partition_name) {
+                    return self
+                        .historical_lookup(&bk_bytes, pk_bytes, partition_name)
+                        .await;
+                }
+                let physical_table_path = PhysicalTablePath::of_partitioned(
+                    Arc::clone(&self.table_path),
+                    Some(partition_name.clone()),
+                );
+                let Some(partition_id) = self
+                    .metadata
+                    .check_and_update_partition_metadata(&physical_table_path)
+                    .await?
+                else {
+                    return self
+                        .may_fall_back_to_historical_lookup(&bk_bytes, pk_bytes, partition_name)
+                        .await;
+                };
+                let bucket_count = partition_bucket_count(
+                    &self.metadata,
+                    &self.table_info,
+                    physical_table_path,
+                    partition_id,
+                )
+                .await?;
+                (Some(partition_id), bucket_count, Some(partition_name))
+            } else {
+                // A non-partitioned table never changes `bucket.num`.
+                (None, self.table_info.num_buckets, None)
             };
-            let bucket_count = partition_bucket_count(
-                &self.metadata,
-                &self.table_info,
-                physical_table_path,
-                partition_id,
-            )
-            .await?;
-            (Some(partition_id), bucket_count)
-        } else {
-            // A non-partitioned table never changes `bucket.num`.
-            (None, self.table_info.num_buckets)
-        };
         let bucket_id = self.bucketing_function.bucketing(&bk_bytes, bucket_count)?;
 
         let table_id = self.table_info.get_table_id();
@@ -430,15 +459,119 @@ impl Lookuper {
                 self.table_path.as_ref().clone(),
                 table_bucket,
                 bucket_count,
+                pk_bytes.clone(),
+            )
+            .await;
+        let result = match (result, partition_name) {
+            // The partition expired after its route was cached.
+            (Err(e), Some(partition_name))
+                if e.api_error() == Some(FlussError::PartitionNotExists) =>
+            {
+                return self
+                    .may_fall_back_to_historical_lookup(&bk_bytes, pk_bytes, partition_name)
+                    .await;
+            }
+            (result, _) => result?,
+        };
+
+        self.schema_ctx
+            .build_result(result.into_iter().collect())
+            .await
+    }
+
+    fn is_confirmed_historical(&self, partition_name: &str) -> bool {
+        self.historical
+            .as_ref()
+            .is_some_and(|h| h.confirmed.lock().contains(partition_name))
+    }
+
+    /// Looks a key of a missing partition up in the lake when the table allows it and the
+    /// partition is past, as the Java lookuper does; otherwise the key has no row.
+    async fn may_fall_back_to_historical_lookup(
+        &self,
+        bk_bytes: &[u8],
+        pk_bytes: Bytes,
+        partition_name: String,
+    ) -> Result<LookupResult> {
+        // Drop a stale route first, so a partition created later is found by the next lookup.
+        let physical_table_path = PhysicalTablePath::of_partitioned(
+            Arc::clone(&self.table_path),
+            Some(partition_name.clone()),
+        );
+        if self
+            .metadata
+            .get_cluster()
+            .get_partition_id(&physical_table_path)
+            .is_some()
+        {
+            self.metadata
+                .invalidate_physical_table_meta(&HashSet::from([physical_table_path]));
+        }
+        let Some(historical) = &self.historical else {
+            return Ok(self.schema_ctx.empty_result());
+        };
+        // A missing current or future partition may still be created by auto-partitioning, so it
+        // is not cached as historical.
+        if !is_past_auto_partition(
+            &partition_name,
+            &historical.auto_partition,
+            jiff::Timestamp::now(),
+        ) {
+            return Ok(self.schema_ctx.empty_result());
+        }
+        historical.confirmed.lock().insert(partition_name.clone());
+        self.historical_lookup(bk_bytes, pk_bytes, partition_name)
+            .await
+    }
+
+    async fn historical_lookup(
+        &self,
+        bk_bytes: &[u8],
+        pk_bytes: Bytes,
+        partition_name: String,
+    ) -> Result<LookupResult> {
+        let physical_table_path = PhysicalTablePath::of_partitioned(
+            Arc::clone(&self.table_path),
+            Some(HISTORICAL_PARTITION_VALUE.to_string()),
+        );
+        let Some(partition_id) = self
+            .metadata
+            .check_and_update_partition_metadata(&physical_table_path)
+            .await?
+        else {
+            return Err(Error::partition_not_exist(format!(
+                "Table {} has no historical partition to look up expired partition {partition_name} in",
+                self.table_path
+            )));
+        };
+        // Route by the historical partition's own bucket count, which an ALTER of `bucket.num`
+        // does not change; the server resolves the lake bucket the row lives in.
+        let bucket_count = partition_bucket_count(
+            &self.metadata,
+            &self.table_info,
+            physical_table_path,
+            partition_id,
+        )
+        .await?;
+        let bucket_id = self.bucketing_function.bucketing(bk_bytes, bucket_count)?;
+        let table_bucket = TableBucket::new_with_partition(
+            self.table_info.get_table_id(),
+            Some(partition_id),
+            bucket_id,
+        );
+        let result = self
+            .lookup_client
+            .historical_lookup(
+                self.table_path.as_ref().clone(),
+                table_bucket,
+                bucket_count,
+                partition_name,
                 pk_bytes,
             )
             .await?;
-
-        let rows = match result {
-            Some(value_bytes) => vec![value_bytes],
-            None => Vec::new(),
-        };
-        self.schema_ctx.build_result(rows).await
+        self.schema_ctx
+            .build_result(result.into_iter().collect())
+            .await
     }
 
     /// Returns a reference to the table info.

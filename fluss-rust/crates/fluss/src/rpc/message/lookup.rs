@@ -27,8 +27,17 @@ use prost::Message;
 
 use bytes::{Buf, BufMut};
 
-/// A bucket's id, partition id and routing bucket count, and the keys to look up in it.
-pub type BucketLookupKeys = (BucketId, Option<PartitionId>, Option<i32>, Vec<Bytes>);
+/// The keys to look up in one bucket, with what the server needs to route them.
+pub struct BucketLookupKeys {
+    pub bucket_id: BucketId,
+    pub partition_id: Option<PartitionId>,
+    /// The bucket count `bucket_id` was computed with.
+    pub routing_bucket_count: Option<i32>,
+    /// Set for a historical lookup: the expired partition asked for. `partition_id` is then the
+    /// historical system partition. Prefix lookups do not support it.
+    pub original_partition_name: Option<String>,
+    pub keys: Vec<Bytes>,
+}
 
 pub struct LookupRequest {
     pub(crate) inner_request: proto::LookupRequest,
@@ -38,14 +47,12 @@ impl LookupRequest {
     pub fn new_batched(table_id: TableId, buckets: Vec<BucketLookupKeys>) -> Self {
         let buckets_req: Vec<proto::PbLookupReqForBucket> = buckets
             .into_iter()
-            .map(|(bucket_id, partition_id, routing_bucket_count, keys)| {
-                proto::PbLookupReqForBucket {
-                    partition_id,
-                    bucket_id,
-                    keys,
-                    original_partition_name: None,
-                    routing_bucket_count,
-                }
+            .map(|bucket| proto::PbLookupReqForBucket {
+                partition_id: bucket.partition_id,
+                bucket_id: bucket.bucket_id,
+                keys: bucket.keys,
+                original_partition_name: bucket.original_partition_name,
+                routing_bucket_count: bucket.routing_bucket_count,
             })
             .collect();
 

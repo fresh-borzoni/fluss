@@ -24,6 +24,9 @@ pub struct LookupQuery<T> {
     table_path: TablePath,
     table_bucket: TableBucket,
     routing_bucket_count: i32,
+    // Set for a historical lookup: the expired partition asked for, while `table_bucket` is a
+    // bucket of the historical system partition that answers it from the lake.
+    original_partition_name: Option<String>,
     key: Bytes,
     retries: i32,
     result_tx: Option<oneshot::Sender<Result<T>>>,
@@ -41,10 +44,17 @@ impl<T> LookupQuery<T> {
             table_path,
             table_bucket,
             routing_bucket_count,
+            original_partition_name: None,
             key,
             retries: 0,
             result_tx: Some(result_tx),
         }
+    }
+
+    /// Makes this a historical lookup of `original_partition_name`.
+    pub fn with_original_partition_name(mut self, original_partition_name: Option<String>) -> Self {
+        self.original_partition_name = original_partition_name;
+        self
     }
 
     pub fn table_path(&self) -> &TablePath {
@@ -57,6 +67,10 @@ impl<T> LookupQuery<T> {
 
     pub fn routing_bucket_count(&self) -> i32 {
         self.routing_bucket_count
+    }
+
+    pub fn original_partition_name(&self) -> Option<&String> {
+        self.original_partition_name.as_ref()
     }
 
     pub fn key(&self) -> &Bytes {
@@ -107,6 +121,13 @@ impl QueuedLookup {
         match self {
             Self::Primary(q) => q.table_bucket(),
             Self::Prefix(q) => q.table_bucket(),
+        }
+    }
+
+    pub fn original_partition_name(&self) -> Option<&String> {
+        match self {
+            Self::Primary(q) => q.original_partition_name(),
+            Self::Prefix(q) => q.original_partition_name(),
         }
     }
 

@@ -124,6 +124,47 @@ impl LookupClient {
         routing_bucket_count: i32,
         key_bytes: Bytes,
     ) -> Result<Option<Vec<u8>>> {
+        self.primary_lookup(
+            table_path,
+            table_bucket,
+            routing_bucket_count,
+            None,
+            key_bytes,
+        )
+        .await
+    }
+
+    /// Looks up a key of an expired partition, which the server answers from the lake.
+    ///
+    /// `table_bucket` is a bucket of the table's historical system partition, computed with
+    /// that partition's `routing_bucket_count`; `original_partition_name` is the expired
+    /// partition the key belongs to.
+    pub async fn historical_lookup(
+        &self,
+        table_path: TablePath,
+        table_bucket: TableBucket,
+        routing_bucket_count: i32,
+        original_partition_name: String,
+        key_bytes: Bytes,
+    ) -> Result<Option<Vec<u8>>> {
+        self.primary_lookup(
+            table_path,
+            table_bucket,
+            routing_bucket_count,
+            Some(original_partition_name),
+            key_bytes,
+        )
+        .await
+    }
+
+    async fn primary_lookup(
+        &self,
+        table_path: TablePath,
+        table_bucket: TableBucket,
+        routing_bucket_count: i32,
+        original_partition_name: Option<String>,
+        key_bytes: Bytes,
+    ) -> Result<Option<Vec<u8>>> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::UnexpectedError {
                 message: "Lookup client is closed".to_string(),
@@ -132,13 +173,16 @@ impl LookupClient {
         }
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let query = QueuedLookup::Primary(PrimaryLookupQuery::new(
-            table_path,
-            table_bucket,
-            routing_bucket_count,
-            key_bytes,
-            result_tx,
-        ));
+        let query = QueuedLookup::Primary(
+            PrimaryLookupQuery::new(
+                table_path,
+                table_bucket,
+                routing_bucket_count,
+                key_bytes,
+                result_tx,
+            )
+            .with_original_partition_name(original_partition_name),
+        );
 
         self.enqueue(query).await?;
 

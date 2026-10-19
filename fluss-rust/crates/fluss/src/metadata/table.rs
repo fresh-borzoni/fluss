@@ -1193,6 +1193,8 @@ pub struct AutoPartitionStrategy {
     auto_partition_num_precreate: i32,
     auto_partition_num_retention: i32,
     auto_partition_timezone: String,
+    #[serde(default)]
+    auto_partition_time_format: Option<String>,
 }
 
 impl AutoPartitionStrategy {
@@ -1226,6 +1228,9 @@ impl AutoPartitionStrategy {
                         .unwrap_or("UTC")
                         .to_string()
                 }),
+            auto_partition_time_format: properties
+                .get("table.auto-partition.time-format")
+                .map(|s| s.to_string()),
         }
     }
 
@@ -1251,6 +1256,12 @@ impl AutoPartitionStrategy {
 
     pub fn timezone(&self) -> &str {
         &self.auto_partition_timezone
+    }
+
+    /// The `DateTimeFormatter` pattern of partition values, when `table.auto-partition.time-format`
+    /// sets one; otherwise the time unit decides it.
+    pub fn time_format(&self) -> Option<&str> {
+        self.auto_partition_time_format.as_deref()
     }
 }
 
@@ -1313,6 +1324,14 @@ impl TableConfig {
 
     pub fn get_auto_partition_strategy(&self) -> AutoPartitionStrategy {
         AutoPartitionStrategy::from(&self.properties)
+    }
+
+    /// Whether lookups and writes of expired partitions go to the lake through the historical
+    /// system partition (`table.datalake.historical-partition.enabled`).
+    pub fn is_historical_partition_enabled(&self) -> bool {
+        self.properties
+            .get("table.datalake.historical-partition.enabled")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     /// Reads `table.statistics.columns`, which decides whether written batches

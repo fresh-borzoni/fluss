@@ -70,14 +70,32 @@ impl LookupQueue {
     }
 
     /// Drains a batch of lookup queries from the queue.
+    ///
+    /// A batch fills for up to `batch_timeout` from the start of the drain. When that window
+    /// closes empty, the drain sleeps until a lookup arrives instead of returning an empty batch,
+    /// so an idle client does not wake every `batch_timeout`; the batch then fills until the end
+    /// of the window the lookup arrived in, as if the windows had kept running.
     pub async fn drain(&mut self) -> Vec<QueuedLookup> {
         let mut lookups = Vec::with_capacity(self.max_batch_size);
-        let deadline = tokio::time::Instant::now() + self.batch_timeout;
+        let start = tokio::time::Instant::now();
+        let mut deadline = start + self.batch_timeout;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                break;
+                if !lookups.is_empty() {
+                    break;
+                }
+                match self.wait_for_lookup().await {
+                    Some(lookup) => lookups.push(lookup),
+                    None => break,
+                }
+                self.take_queued(&mut lookups);
+                deadline = Self::window_end(start, self.batch_timeout, tokio::time::Instant::now());
+                if lookups.len() >= self.max_batch_size {
+                    break;
+                }
+                continue;
             }
 
             // Re-enqueued lookups go first. A batch they fill still takes one new lookup, so
@@ -111,7 +129,8 @@ impl LookupQueue {
                         break;
                     }
                 }
-                _ = sleep => break,
+                // The window closed: send what it collected, or wait for a lookup (see above).
+                _ = sleep => {}
             }
 
             if lookups.len() >= self.max_batch_size {
@@ -120,6 +139,52 @@ impl LookupQueue {
         }
 
         lookups
+    }
+
+    /// Waits, without a timer, for the next lookup, re-enqueued ones first. `None` once every
+    /// handle that submits lookups is gone.
+    async fn wait_for_lookup(&mut self) -> Option<QueuedLookup> {
+        tokio::select! {
+            biased;
+            Some(lookup) = self.re_enqueue_rx.recv() => Some(lookup),
+            lookup = self.lookup_rx.recv() => lookup,
+        }
+    }
+
+    /// Moves lookups that are already queued into `lookups`, re-enqueued ones first, up to a
+    /// full batch; like `drain`, a batch the re-enqueued ones fill still takes one new lookup.
+    fn take_queued(&mut self, lookups: &mut Vec<QueuedLookup>) {
+        while lookups.len() < self.max_batch_size {
+            match self.re_enqueue_rx.try_recv() {
+                Ok(lookup) => lookups.push(lookup),
+                Err(_) => break,
+            }
+        }
+        let limit = self.max_batch_size.max(lookups.len() + 1);
+        while lookups.len() < limit {
+            match self.lookup_rx.try_recv() {
+                Ok(lookup) => lookups.push(lookup),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// The end of the `batch_timeout` window, counted in whole windows from `start`, that `now`
+    /// falls in: now itself for a zero timeout.
+    fn window_end(
+        start: tokio::time::Instant,
+        batch_timeout: Duration,
+        now: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        let window = batch_timeout.as_nanos();
+        if window == 0 {
+            return now;
+        }
+        let windows = now
+            .saturating_duration_since(start)
+            .as_nanos()
+            .div_ceil(window);
+        start + Duration::from_nanos(u64::try_from(windows * window).unwrap_or(u64::MAX))
     }
 
     /// Drains all remaining lookups from the queue.
@@ -146,37 +211,4 @@ impl LookupQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::lookup::PrimaryLookupQuery;
-    use crate::metadata::{TableBucket, TablePath};
-    use bytes::Bytes;
-    use tokio::sync::oneshot;
-
-    fn lookup(key: &'static [u8]) -> QueuedLookup {
-        let (result_tx, _result_rx) = oneshot::channel();
-        QueuedLookup::Primary(PrimaryLookupQuery::new(
-            TablePath::new("db", "tbl"),
-            TableBucket::new(1, 0),
-            1,
-            Bytes::from_static(key),
-            result_tx,
-        ))
-    }
-
-    #[tokio::test]
-    async fn a_batch_full_of_retries_still_takes_a_new_lookup() {
-        let (_cluster_tx, cluster_rx) = watch::channel(0);
-        let (mut queue, lookup_tx, re_enqueue_tx) = LookupQueue::new(8, 2, 60_000, cluster_rx);
-        re_enqueue_tx.send(lookup(b"retry")).unwrap();
-        re_enqueue_tx.send(lookup(b"retry")).unwrap();
-        lookup_tx.send(lookup(b"new")).await.unwrap();
-
-        let lookups = tokio::time::timeout(Duration::from_secs(10), queue.drain())
-            .await
-            .expect("a full batch does not wait for the batch timeout");
-
-        let keys: Vec<&[u8]> = lookups.iter().map(|lookup| lookup.key().as_ref()).collect();
-        assert_eq!(keys, [b"retry".as_slice(), b"retry", b"new"]);
-    }
-}
+mod tests;
