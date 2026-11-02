@@ -42,7 +42,7 @@ on:
         default: false
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +52,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+      # Trial on GitHub-hosted runners: free the disk space a self-hosted runner doesn't need.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       # Maven toolchain for fluss-lake-iceberg-1.12. The next step sets the JDK that runs Maven
       # and every other module.
       - name: Set up JDK 17 toolchain
@@ -83,7 +86,7 @@ jobs:
         run: |
           mvn -T 1C -B clean install -DskipTests $MAVEN_TOOLCHAIN_ARGS ${{ matrix.module == 'spark3-scala213' && '-Pscala-2.13' || '' }} ${{ inputs.maven-parameters }}
       - name: Test
-        timeout-minutes: 60
+        timeout-minutes: 180
         run: |
           TEST_MODULES=$(./.github/workflows/stage.sh ${{ matrix.module }})
           echo "github ref: ${{ github.ref }}"
