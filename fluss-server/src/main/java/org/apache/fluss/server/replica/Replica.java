@@ -832,6 +832,7 @@ public final class Replica {
                                         tableInfo,
                                         tableBucket,
                                         logTablet,
+                                        remoteLogManager,
                                         snapshotContext.getZooKeeperClient(),
                                         schemaGetter,
                                         new File(logTablet.getLogDir(), "derived-dv-recovery")));

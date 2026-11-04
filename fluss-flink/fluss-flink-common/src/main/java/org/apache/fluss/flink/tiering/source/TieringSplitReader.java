@@ -804,7 +804,21 @@ public class TieringSplitReader<WriteResult>
                 while (iter.hasNext()) {
                     RowWithPosResult rwp = iter.next();
                     byte[] key = keyEncoder.encodeKey(rwp.getRow());
-                    entries.put(Arrays.copyOf(key, key.length), new FilePos(fileId, rwp.getPos()));
+                    FilePos pos = new FilePos(fileId, rwp.getPos());
+                    FilePos other = entries.put(Arrays.copyOf(key, key.length), pos);
+                    if (other != null) {
+                        // one live row per key is expected, picking one leaves the other unmasked
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Derived DV re-index of %s bucket %s: two live rows of one"
+                                                + " key, in %s at %d and in %s at %d.",
+                                        rowPosSplit.getTablePath(),
+                                        rowPosSplit.getTableBucket(),
+                                        newFileDictEntries.get(other.fileId()),
+                                        other.rowPosition(),
+                                        lakeSplit.fileName(),
+                                        rwp.getPos()));
+                    }
                 }
             }
         }

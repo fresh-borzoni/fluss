@@ -273,6 +273,27 @@ class DerivedDvManagerTest {
     }
 
     @Test
+    void testFailedTailReplayFailsUnionReadsUntilReplaySucceeds() throws Exception {
+        src.replayFailure = new IllegalStateException("log gone");
+        recoverAtSnapshot100();
+
+        // the index is in place, so lookups still work
+        assertThat(asStrings(manager.lookup(100, Collections.singletonList(key("k1")))))
+                .containsExactly("k1@" + F1 + "#0");
+        // masks without the tail would miss k1 and k2
+        assertThatThrownBy(() -> manager.getDvForUnionRead(100, 0))
+                .isInstanceOf(IOException.class)
+                .hasRootCauseMessage("log gone");
+        assertThatThrownBy(() -> manager.getDvForUnionRead(100, 0)).isInstanceOf(IOException.class);
+
+        src.replayFailure = null;
+        DvSnapshot snapshot = manager.getDvForUnionRead(100, 0);
+        assertThat(lakeMasks(snapshot)).containsOnly(entry(F1, set(0L, 1L)));
+        assertThat(offsets(snapshot.getLogDvBitmap())).containsExactly(10L);
+        assertThat(snapshot.getSnapshotStartOffset()).isEqualTo(10L);
+    }
+
+    @Test
     void testLookupReturnsPositionsInCoveredSnapshot() throws Exception {
         recoverAtSnapshot100();
 
@@ -821,6 +842,7 @@ class DerivedDvManagerTest {
         final List<Long> replayedFrom = new CopyOnWriteArrayList<>();
         final List<Long> downloadedIndexIds = new CopyOnWriteArrayList<>();
 
+        volatile Exception replayFailure;
         volatile CountDownLatch chainGate;
         // when set, chain() and readChange() read a real index store (for one bucket)
         volatile PositionIndexStore store;
@@ -918,8 +940,13 @@ class DerivedDvManagerTest {
         }
 
         @Override
-        public void replayLog(long fromOffset, DerivedDvManager.ChangeConsumer consumer) {
+        public void replayLog(long fromOffset, DerivedDvManager.ChangeConsumer consumer)
+                throws Exception {
             replayedFrom.add(fromOffset);
+            Exception failure = replayFailure;
+            if (failure != null) {
+                throw failure;
+            }
             for (Change c : log) {
                 if (c.recordOffset >= fromOffset) {
                     consumer.accept(c.key.clone(), c.recordOffset, c.versionOffset);

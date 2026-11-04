@@ -28,8 +28,10 @@ import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.log.FetchIsolation;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.CloseableIterator;
@@ -45,7 +47,7 @@ import java.util.Optional;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
-/** A {@link DerivedDvManager.RecoverySource} over ZooKeeper, the index store and the local log. */
+/** A {@link DerivedDvManager.RecoverySource} over ZooKeeper, the index store and the log. */
 public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource {
 
     private static final int FETCH_BYTES = 8 * 1024 * 1024;
@@ -53,6 +55,7 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
     private final TableInfo tableInfo;
     private final TableBucket tableBucket;
     private final LogTablet logTablet;
+    private final RemoteLogManager remoteLogManager;
     private final ZooKeeperClient zkClient;
     private final SchemaGetter schemaGetter;
     private final PositionIndexStore store;
@@ -63,12 +66,14 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
             TableInfo tableInfo,
             TableBucket tableBucket,
             LogTablet logTablet,
+            RemoteLogManager remoteLogManager,
             ZooKeeperClient zkClient,
             SchemaGetter schemaGetter,
             File localTmp) {
         this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
+        this.remoteLogManager = remoteLogManager;
         this.zkClient = zkClient;
         this.schemaGetter = schemaGetter;
         this.store =
@@ -154,33 +159,52 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
                         tableInfo.getPhysicalPrimaryKeys(),
                         tableInfo.getTableConfig(),
                         tableInfo.isDefaultBucketKey());
-        long localStart = logTablet.localLogStartOffset();
-        if (fromOffset < localStart) {
-            // Skipping a prefix would let superseded versions through, so fail instead.
-            throw new IllegalStateException(
-                    String.format(
-                            "Derived DV: cannot rebuild %s from offset %d, the local log starts at"
-                                    + " %d.",
-                            tableBucket, fromOffset, localStart));
-        }
         long next = fromOffset;
+        RemoteLogFetcher remote = null;
         try (LogRecordReadContext readContext =
                 LogRecordReadContext.createReadContext(tableInfo, false, null, schemaGetter)) {
             while (true) {
-                LogRecords records =
-                        logTablet
-                                .read(next, FETCH_BYTES, FetchIsolation.LOG_END, true, null, null)
-                                .getRecords();
-                if (records == MemoryLogRecords.EMPTY) {
-                    break;
+                long localStart = logTablet.localLogStartOffset();
+                Iterable<LogRecordBatch> batches;
+                if (next < localStart) {
+                    // already moved to remote storage, read from there as KV recovery does
+                    if (remote == null) {
+                        remote = new RemoteLogFetcher(remoteLogManager, tableBucket, localTmp);
+                    }
+                    batches = remote.fetch(next, localStart);
+                } else {
+                    LogRecords records =
+                            logTablet
+                                    .read(
+                                            next,
+                                            FETCH_BYTES,
+                                            FetchIsolation.LOG_END,
+                                            true,
+                                            null,
+                                            null)
+                                    .getRecords();
+                    if (records == MemoryLogRecords.EMPTY) {
+                        break;
+                    }
+                    batches = records.batches();
                 }
-                boolean any = false;
-                for (LogRecordBatch batch : records.batches()) {
-                    any = true;
+                long before = next;
+                for (LogRecordBatch batch : batches) {
+                    if (batch.nextLogOffset() <= next) {
+                        continue;
+                    }
+                    if (batch.baseLogOffset() > next) {
+                        // a gap would let superseded versions through, so fail instead
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Derived DV: cannot rebuild %s, the log has no offsets"
+                                                + " %d to %d.",
+                                        tableBucket, next, batch.baseLogOffset() - 1));
+                    }
                     try (CloseableIterator<LogRecord> it = batch.records(readContext)) {
                         while (it.hasNext()) {
                             LogRecord r = it.next();
-                            if (r.logOffset() < fromOffset
+                            if (r.logOffset() < next
                                     || r.getChangeType() == ChangeType.UPDATE_BEFORE) {
                                 continue;
                             }
@@ -191,9 +215,20 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
                     }
                     next = batch.nextLogOffset();
                 }
-                if (!any) {
+                if (next == before) {
+                    if (before < localStart) {
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Derived DV: cannot rebuild %s, the remote log has no"
+                                                + " offset %d.",
+                                        tableBucket, before));
+                    }
                     break;
                 }
+            }
+        } finally {
+            if (remote != null) {
+                remote.close();
             }
         }
     }

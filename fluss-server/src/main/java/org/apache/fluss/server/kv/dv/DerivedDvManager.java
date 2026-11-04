@@ -66,6 +66,9 @@ public class DerivedDvManager extends DvManager {
     // The empty lake's tail is built on the first union read that needs it, so an initial load
     // before the first snapshot does not grow memory.
     private boolean emptyLakeTracked = false;
+    // the index of the covered snapshot is in place but its log tail is not, masks without the
+    // tail would let old versions through, so union reads fail until a replay succeeds
+    @Nullable private Exception tailFailure;
     /** Default of {@code kv.deletion-vectors.checkpoint-interval}. */
     public static final int DEFAULT_CHECKPOINT_INTERVAL = 50;
 
@@ -270,7 +273,7 @@ public class DerivedDvManager extends DvManager {
         PositionIndexStore.BucketData readChange(PositionIndexStore.ChainEntry entry)
                 throws Exception;
 
-        /** Replays the local log from {@code fromOffset}: (key, record offset, version or -1). */
+        /** Replays the log from {@code fromOffset}: (key, record offset, version or -1). */
         void replayLog(long fromOffset, ChangeConsumer consumer) throws Exception;
 
         /** Whether old chain entries were trimmed (a rebuild must then start at a checkpoint). */
@@ -304,7 +307,7 @@ public class DerivedDvManager extends DvManager {
 
     /**
      * Rebuilds the derived state on a new leader by replaying the published index chain up to the
-     * readable snapshot and the local log from its tiered offset.
+     * readable snapshot and the log from its tiered offset.
      */
     public synchronized void recover(RecoverySource src) throws Exception {
         this.recoverySource = src;
@@ -315,6 +318,7 @@ public class DerivedDvManager extends DvManager {
             coveredSnapshotId = -1;
             snapshotStartOffset = 0;
             emptyLakeTracked = false;
+            tailFailure = null;
             queue.clear();
             tail.clear();
             logDv.clear();
@@ -395,15 +399,29 @@ public class DerivedDvManager extends DvManager {
         logDv.clear();
         lakeDv.clear();
         unresolved.clear();
+        entriesApplied = upTo + 1;
+        entriesAtCheckpoint = checkpoint == null ? 0 : checkpoint.chainIndex + 1;
         // Replay into the queue: the local log can run past the high watermark, and a change above
         // it must not mask a version below it.
-        src.replayLog(startOffset, this::enqueueReplayed);
+        try {
+            src.replayLog(startOffset, this::enqueueReplayed);
+        } catch (Exception e) {
+            // the index stays, union reads retry the replay and fail until it succeeds
+            queue.clear();
+            tailFailure = e;
+            LOG.warn(
+                    "Derived DV recovery: covers snapshot {} but cannot replay the log from offset"
+                            + " {}; union reads fail until a replay succeeds.",
+                    snapshotId,
+                    startOffset,
+                    e);
+            return;
+        }
+        tailFailure = null;
         applyUpTo(highWatermark.getAsLong());
         unresolved.clear();
         unresolved.addAll(tail.keySet());
         scheduleResolve();
-        entriesApplied = upTo + 1;
-        entriesAtCheckpoint = checkpoint == null ? 0 : checkpoint.chainIndex + 1;
         maybeCheckpoint();
         metrics.rebuilt(System.currentTimeMillis() - t0);
         LOG.info(
@@ -551,6 +569,37 @@ public class DerivedDvManager extends DvManager {
         LOG.info(
                 "Derived DV: no lake snapshot yet; replayed the log from offset 0 for a union read"
                         + " ({} changes) in {} ms.",
+                queue.size(),
+                System.currentTimeMillis() - t0);
+    }
+
+    /** Replays the log tail again after a failed replay, the index is already in place. */
+    private void retryTail() throws IOException {
+        long t0 = System.currentTimeMillis();
+        generation++;
+        queue.clear();
+        tail.clear();
+        logDv.clear();
+        lakeDv.clear();
+        unresolved.clear();
+        try {
+            recoverySource.replayLog(snapshotStartOffset, this::enqueueReplayed);
+        } catch (Exception e) {
+            queue.clear();
+            tailFailure = e;
+            throw new IOException(
+                    String.format(
+                            "Derived DV: cannot replay the log of snapshot %d from offset %d, so"
+                                    + " no masks are served",
+                            coveredSnapshotId, snapshotStartOffset),
+                    e);
+        }
+        tailFailure = null;
+        LOG.info(
+                "Derived DV: replayed the log of snapshot {} from offset {} after a failed replay"
+                        + " ({} changes) in {} ms.",
+                coveredSnapshotId,
+                snapshotStartOffset,
                 queue.size(),
                 System.currentTimeMillis() - t0);
     }
@@ -766,6 +815,9 @@ public class DerivedDvManager extends DvManager {
         }
         if (coveredSnapshotId != requestedSnapshotId) {
             throw stale(requestedSnapshotId);
+        }
+        if (tailFailure != null) {
+            retryTail();
         }
         if (coveredSnapshotId < 0 && recoverySource != null && !emptyLakeTracked) {
             trackEmptyLake();
