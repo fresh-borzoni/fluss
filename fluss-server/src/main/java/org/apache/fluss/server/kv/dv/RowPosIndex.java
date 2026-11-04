@@ -29,8 +29,10 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.function.IntPredicate;
 
 /**
  * Operations wrapper for the RowPosIndex Column Family.
@@ -59,6 +61,44 @@ public class RowPosIndex {
             return value == null ? null : FilePos.decode(value);
         } catch (RocksDBException e) {
             throw new IOException("Failed to get RowPosIndex entry for rowId " + rowId, e);
+        }
+    }
+
+    /** Looks up by encoded primary key, which keys the index in derived mode. */
+    @Nullable
+    public FilePos getByKey(byte[] key) throws IOException {
+        try {
+            byte[] value = db.get(cfHandle, key);
+            return value == null ? null : FilePos.decode(value);
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to get position index entry", e);
+        }
+    }
+
+    /** Batched {@link #get(long)}. */
+    public List<FilePos> multiGet(List<Long> rowIds) throws IOException {
+        List<byte[]> keys = new ArrayList<>(rowIds.size());
+        for (long id : rowIds) {
+            keys.add(encodeRowId(id));
+        }
+        return multiGetByKeys(keys);
+    }
+
+    /** Batched {@link #getByKey}; an entry is null when the key is not in the index. */
+    public List<FilePos> multiGetByKeys(List<byte[]> keys) throws IOException {
+        List<FilePos> out = new ArrayList<>(keys.size());
+        if (keys.isEmpty()) {
+            return out;
+        }
+        try {
+            List<byte[]> values =
+                    db.multiGetAsList(Collections.nCopies(keys.size(), cfHandle), keys);
+            for (byte[] v : values) {
+                out.add(v == null ? null : FilePos.decode(v));
+            }
+            return out;
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to multi-get position index entries", e);
         }
     }
 
@@ -126,6 +166,53 @@ public class RowPosIndex {
         } catch (RocksDBException e) {
             throw new IOException("Failed to prune RowPosIndex entries for removed files", e);
         }
+    }
+
+    /**
+     * Writes the index as of {@code snapshot} into one SST at {@code sstPath} and returns the entry
+     * count. An empty index writes no file.
+     */
+    public long exportTo(String sstPath, @Nullable org.rocksdb.Snapshot snapshot)
+            throws IOException {
+        return exportTo(sstPath, snapshot, null);
+    }
+
+    /** Like {@link #exportTo(String, org.rocksdb.Snapshot)}, filtered by file id. */
+    public long exportTo(
+            String sstPath,
+            @Nullable org.rocksdb.Snapshot snapshot,
+            @Nullable IntPredicate keepFileId)
+            throws IOException {
+        long n = 0;
+        try (org.rocksdb.EnvOptions env = new org.rocksdb.EnvOptions();
+                org.rocksdb.Options options = new org.rocksdb.Options();
+                org.rocksdb.SstFileWriter writer = new org.rocksdb.SstFileWriter(env, options);
+                org.rocksdb.ReadOptions readOptions = new org.rocksdb.ReadOptions()) {
+            if (snapshot != null) {
+                readOptions.setSnapshot(snapshot);
+            }
+            boolean opened = false;
+            try (RocksIterator it = db.newIterator(cfHandle, readOptions)) {
+                for (it.seekToFirst(); it.isValid(); it.next()) {
+                    if (keepFileId != null
+                            && !keepFileId.test(FilePos.decode(it.value()).fileId())) {
+                        continue;
+                    }
+                    if (!opened) {
+                        writer.open(sstPath);
+                        opened = true;
+                    }
+                    writer.put(it.key(), it.value());
+                    n++;
+                }
+            }
+            if (opened) {
+                writer.finish();
+            }
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to export RowPosIndex to " + sstPath, e);
+        }
+        return n;
     }
 
     /** Ingests external SST files into the RowPosIndex column family. */

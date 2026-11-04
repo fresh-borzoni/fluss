@@ -61,6 +61,8 @@ import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
@@ -821,6 +823,19 @@ public final class Replica {
 
             logTablet.updateMinRetainOffset(restoreStartOffset);
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
+            // Rebuild the position index and the log tail before the replica serves.
+            if (kvTablet.getDvManager() instanceof DerivedDvManager) {
+                ((DerivedDvManager) kvTablet.getDvManager())
+                        .recover(
+                                new DerivedDvRecoverySource(
+                                        snapshotContext.getRemoteDataDir(),
+                                        tableInfo,
+                                        tableBucket,
+                                        logTablet,
+                                        snapshotContext.getZooKeeperClient(),
+                                        schemaGetter,
+                                        new File(logTablet.getLogDir(), "derived-dv-recovery")));
+            }
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(

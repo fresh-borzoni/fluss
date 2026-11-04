@@ -67,6 +67,15 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     // aggregated kv metrics
     private final Counter kvFlushCount;
     private final Histogram kvFlushLatencyHistogram;
+
+    // derived deletion vectors
+    private final Counter dvCatchUpCount;
+    private final Histogram dvCatchUpLatencyHistogram;
+    private final Counter dvRebuildCount;
+    private final Histogram dvRebuildLatencyHistogram;
+    private final Counter dvCheckpointCount;
+    private final Histogram dvCheckpointLatencyHistogram;
+    private final Counter dvStaleSnapshotCount;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
 
@@ -117,6 +126,22 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.KV_FLUSH_RATE, new MeterView(kvFlushCount));
         kvFlushLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
         histogram(MetricNames.KV_FLUSH_LATENCY_MS, kvFlushLatencyHistogram);
+
+        // about derived deletion vectors
+        dvCatchUpCount = new SimpleCounter();
+        meter(MetricNames.DV_CATCH_UP_RATE, new MeterView(dvCatchUpCount));
+        dvCatchUpLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_CATCH_UP_LATENCY_MS, dvCatchUpLatencyHistogram);
+        dvRebuildCount = new SimpleCounter();
+        meter(MetricNames.DV_REBUILD_RATE, new MeterView(dvRebuildCount));
+        dvRebuildLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_REBUILD_LATENCY_MS, dvRebuildLatencyHistogram);
+        dvCheckpointCount = new SimpleCounter();
+        meter(MetricNames.DV_CHECKPOINT_RATE, new MeterView(dvCheckpointCount));
+        dvCheckpointLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_CHECKPOINT_LATENCY_MS, dvCheckpointLatencyHistogram);
+        dvStaleSnapshotCount = new SimpleCounter();
+        meter(MetricNames.DV_STALE_SNAPSHOT_RATE, new MeterView(dvStaleSnapshotCount));
         kvTruncateAsDuplicatedCount = new SimpleCounter();
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
@@ -217,6 +242,34 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Histogram kvFlushLatencyHistogram() {
         return kvFlushLatencyHistogram;
+    }
+
+    public Counter dvCatchUpCount() {
+        return dvCatchUpCount;
+    }
+
+    public Histogram dvCatchUpLatencyHistogram() {
+        return dvCatchUpLatencyHistogram;
+    }
+
+    public Counter dvRebuildCount() {
+        return dvRebuildCount;
+    }
+
+    public Histogram dvRebuildLatencyHistogram() {
+        return dvRebuildLatencyHistogram;
+    }
+
+    public Counter dvCheckpointCount() {
+        return dvCheckpointCount;
+    }
+
+    public Histogram dvCheckpointLatencyHistogram() {
+        return dvCheckpointLatencyHistogram;
+    }
+
+    public Counter dvStaleSnapshotCount() {
+        return dvStaleSnapshotCount;
     }
 
     public Counter kvTruncateAsDuplicatedCount() {

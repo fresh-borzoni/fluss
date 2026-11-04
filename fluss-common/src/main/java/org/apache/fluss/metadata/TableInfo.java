@@ -248,6 +248,19 @@ public final class TableInfo {
         return properties.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
     }
 
+    /** Whether KV values and changelog records carry a RowId, which the derived mode omits. */
+    public boolean isRowIdEncoded() {
+        return isDeletionVectorsEnabled() && !isDeletionVectorsDerived();
+    }
+
+    /** Whether deletion vectors are enabled in the 'derived' mode. */
+    public boolean isDeletionVectorsDerived() {
+        return isDeletionVectorsEnabled()
+                && "derived"
+                        .equalsIgnoreCase(
+                                properties.get(ConfigOptions.TABLE_DELETION_VECTORS_MODE));
+    }
+
     /**
      * Returns the column index mapping for statistics collection.
      *

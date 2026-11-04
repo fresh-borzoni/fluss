@@ -2128,6 +2128,14 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     commitLakeTableSnapshotsData.getCommitLakeTableSnapshotByTableId().entrySet()) {
                 long tableId = entry.getKey();
                 CommitLakeTableSnapshotsData.CommitLakeTableSnapshot snapshot = entry.getValue();
+                TableInfo dvTableInfo = coordinatorContext.getTableInfoById(tableId);
+                if (snapshot.getDvPositionReport() != null
+                        && dvTableInfo != null
+                        && dvTableInfo.isDeletionVectorsDerived()) {
+                    // No prepare/switch round: the index change is published before the lake
+                    // commit, so the snapshot is readable as soon as it is registered.
+                    continue;
+                }
                 if (snapshot.getDvPositionReport() != null) {
                     if (pendingDvTables.contains(tableId)) {
                         // Fail immediately in the event loop thread — no need to go to
@@ -2293,7 +2301,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                     throw new FlussRuntimeException(
                                             "Lake snapshot metadata is null for table " + tableId);
                                 }
-                                if (snapshot.getDvPositionReport() != null) {
+                                if (snapshot.getDvPositionReport() != null
+                                        && dvPrepareEvents.containsKey(tableId)) {
                                     // DV table: register snapshot as non-readable. Data is
                                     // committed (tiered) but not readable until tablet
                                     // servers complete the DV Prepare phase.
@@ -2309,10 +2318,18 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                             nonReadableMetadata,
                                             snapshot.getEarliestSnapshotIDToKeep());
                                 } else {
-                                    // Non-DV table: register ZK snapshot immediately.
+                                    // Non-DV or derived DV table: readable now, with the
+                                    // tiered offsets as readable offsets when none are set.
+                                    LakeTable.LakeSnapshotMetadata m =
+                                            snapshot.getLakeSnapshotMetadata();
                                     lakeTableHelper.registerLakeTableSnapshotV2(
                                             tableId,
-                                            snapshot.getLakeSnapshotMetadata(),
+                                            m.getReadableOffsetsFilePath() != null
+                                                    ? m
+                                                    : new LakeTable.LakeSnapshotMetadata(
+                                                            m.getSnapshotId(),
+                                                            m.getTieredOffsetsFilePath(),
+                                                            m.getTieredOffsetsFilePath()),
                                             snapshot.getEarliestSnapshotIDToKeep());
                                 }
                             } catch (Exception e) {

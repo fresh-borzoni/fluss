@@ -20,11 +20,19 @@ package org.apache.fluss.server.kv.dv;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
+import org.rocksdb.Options;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.Snapshot;
+import org.rocksdb.SstFileReader;
+import org.rocksdb.SstFileReaderIterator;
 import org.rocksdb.WriteBatch;
 
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Test for {@link DvRocksDB}. */
 class DvRocksDBTest {
@@ -108,5 +116,59 @@ class DvRocksDBTest {
             assertThat(dvRocksDB.rowPosIndex().get(2L)).isEqualTo(new FilePos(20, 200L));
             assertThat(dvRocksDB.fileDict().getFilePath(10)).isEqualTo("/data/file10.parquet");
         }
+    }
+
+    @Test
+    void testSnapshotIsPointInTimeView() throws Exception {
+        try (DvRocksDB dvRocksDB = DvRocksDB.open(tempDir.resolve("db").toString())) {
+            dvRocksDB.rowPosIndex().put(1L, new FilePos(10, 100L));
+            dvRocksDB.rowPosIndex().put(3L, new FilePos(10, 300L));
+            dvRocksDB.fileDict().put(10, "/data/file10.parquet");
+
+            Snapshot snapshot = dvRocksDB.snapshot();
+            try {
+                // writes after the snapshot: an insert, an overwrite, a delete, a new file
+                dvRocksDB.rowPosIndex().put(2L, new FilePos(20, 200L));
+                dvRocksDB.rowPosIndex().put(1L, new FilePos(20, 111L));
+                dvRocksDB.rowPosIndex().delete(3L);
+                dvRocksDB.fileDict().put(20, "/data/file20.parquet");
+
+                String atSnapshot = tempDir.resolve("at-snapshot.sst").toString();
+                assertThat(dvRocksDB.rowPosIndex().exportTo(atSnapshot, snapshot)).isEqualTo(2L);
+                assertThat(readSst(atSnapshot))
+                        .containsExactly(
+                                entry(1L, new FilePos(10, 100L)), entry(3L, new FilePos(10, 300L)));
+                assertThat(dvRocksDB.fileDict().idToPathEntries(snapshot))
+                        .containsOnly(entry(10, "/data/file10.parquet"));
+
+                // without a snapshot the latest state is visible
+                String latest = tempDir.resolve("latest.sst").toString();
+                assertThat(dvRocksDB.rowPosIndex().exportTo(latest, null)).isEqualTo(2L);
+                assertThat(readSst(latest))
+                        .containsExactly(
+                                entry(1L, new FilePos(20, 111L)), entry(2L, new FilePos(20, 200L)));
+                assertThat(dvRocksDB.fileDict().idToPathEntries(null))
+                        .containsOnly(
+                                entry(10, "/data/file10.parquet"),
+                                entry(20, "/data/file20.parquet"));
+            } finally {
+                dvRocksDB.releaseSnapshot(snapshot);
+            }
+        }
+    }
+
+    private static Map<Long, FilePos> readSst(String path) throws Exception {
+        Map<Long, FilePos> out = new LinkedHashMap<>();
+        try (Options options = new Options();
+                SstFileReader reader = new SstFileReader(options);
+                ReadOptions readOptions = new ReadOptions()) {
+            reader.open(path);
+            try (SstFileReaderIterator it = reader.newIterator(readOptions)) {
+                for (it.seekToFirst(); it.isValid(); it.next()) {
+                    out.put(RowPosIndex.decodeRowId(it.key()), FilePos.decode(it.value()));
+                }
+            }
+        }
+        return out;
     }
 }

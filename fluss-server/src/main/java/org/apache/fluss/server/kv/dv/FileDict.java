@@ -27,6 +27,7 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -86,6 +87,32 @@ public class FileDict {
         } catch (RocksDBException e) {
             throw new IOException("Failed to get FileDict filePath for fileId " + fileId, e);
         }
+    }
+
+    /** Returns all fileId to path entries as of {@code snapshot}, or the latest if null. */
+    public Map<Integer, String> idToPathEntries(@Nullable org.rocksdb.Snapshot snapshot)
+            throws IOException {
+        Map<Integer, String> out = new HashMap<>();
+        try (org.rocksdb.ReadOptions readOptions = new org.rocksdb.ReadOptions()) {
+            if (snapshot != null) {
+                readOptions.setSnapshot(snapshot);
+            }
+            try (org.rocksdb.RocksIterator it = db.newIterator(cfHandle, readOptions)) {
+                for (it.seek(new byte[] {PREFIX_ID_TO_PATH}); it.isValid(); it.next()) {
+                    byte[] k = it.key();
+                    if (k.length != 5 || k[0] != PREFIX_ID_TO_PATH) {
+                        break;
+                    }
+                    int id =
+                            ((k[1] & 0xFF) << 24)
+                                    | ((k[2] & 0xFF) << 16)
+                                    | ((k[3] & 0xFF) << 8)
+                                    | (k[4] & 0xFF);
+                    out.put(id, new String(it.value(), StandardCharsets.UTF_8));
+                }
+            }
+        }
+        return out;
     }
 
     /** Writes a bidirectional mapping atomically using a WriteBatch. */

@@ -1429,6 +1429,9 @@ message GetDvSnapshotRequest {
   // along with logEndOffset. Used by tiering to get both stoppingOffset
   // and logDvBitmap in a single RPC.
   optional int64 log_dv_from_offset = 5;
+  // Derived DV mode: primary keys whose live position in readable_snapshot_id is requested
+  // (tiering resolves the superseded rows of its base snapshot through these).
+  repeated bytes lookup_keys = 6;
 }
 
 message GetDvSnapshotResponse {
@@ -1440,4 +1443,12 @@ message GetDvSnapshotResponse {
   required int64 log_end_offset = 3;
   // The log start offset for this snapshot (snapshotStartLogOffset)
   required int64 snapshot_start_offset = 4;
+  // Derived DV mode: positions of the requested lookup_keys found in the snapshot
+  repeated PbDvKeyPosition key_positions = 5;
+}
+
+message PbDvKeyPosition {
+  optional bytes key = 1;
+  optional string file_path = 2;
+  optional int64 pos = 3;
 }

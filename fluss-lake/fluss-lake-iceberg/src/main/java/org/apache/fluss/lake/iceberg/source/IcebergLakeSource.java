@@ -52,10 +52,12 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
@@ -198,6 +200,68 @@ public class IcebergLakeSource implements LakeSource<IcebergSplit> {
             // Appends carry no removed files, so no oldFiles cleanup here (compaction, handled
             // above, is the only source of removed files).
             return new DataDeltaPlan<>(toSnapshotId, newSplits, Collections.emptyMap());
+        } finally {
+            closeCatalogQuietly(catalog);
+        }
+    }
+
+    @Override
+    @Nullable
+    public DataDeltaPlan<IcebergSplit> planRewrite(long baseSnapshotId) {
+        Catalog catalog = IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
+        try {
+            Table table = catalog.loadTable(toIceberg(tablePath));
+            Snapshot current = table.currentSnapshot();
+            if (baseSnapshotId <= 0 || current == null || current.snapshotId() == baseSnapshotId) {
+                return null;
+            }
+            Function<FileScanTask, Integer> bucketOf =
+                    IcebergSplitPlanner.createBucketExtractor(table);
+            Function<FileScanTask, List<String>> partitionOf =
+                    IcebergSplitPlanner.createPartitionExtractor(table);
+            boolean baseLost = table.snapshot(baseSnapshotId) == null;
+            Map<String, FileScanTask> baseFiles = new LinkedHashMap<>();
+            if (!baseLost) {
+                try (CloseableIterable<FileScanTask> tasks =
+                        table.newScan().useSnapshot(baseSnapshotId).planFiles()) {
+                    for (FileScanTask task : tasks) {
+                        baseFiles.put(task.file().location(), task);
+                    }
+                }
+            }
+            List<IcebergSplit> added = new ArrayList<>();
+            Set<String> currentFiles = new HashSet<>();
+            try (CloseableIterable<FileScanTask> tasks =
+                    table.newScan().useSnapshot(current.snapshotId()).planFiles()) {
+                for (FileScanTask task : tasks) {
+                    currentFiles.add(task.file().location());
+                    if (!baseFiles.containsKey(task.file().location())) {
+                        added.add(
+                                new IcebergSplit(
+                                        task, bucketOf.apply(task), partitionOf.apply(task)));
+                    }
+                }
+            }
+            Map<String, Map<Integer, List<String>>> removed = new HashMap<>();
+            for (Map.Entry<String, FileScanTask> e : baseFiles.entrySet()) {
+                if (!currentFiles.contains(e.getKey())) {
+                    List<String> part = partitionOf.apply(e.getValue());
+                    String partitionName =
+                            part == null || part.isEmpty()
+                                    ? null
+                                    : String.join(
+                                            ResolvedPartitionSpec.PARTITION_SPEC_SEPARATOR, part);
+                    removed.computeIfAbsent(partitionName, k -> new HashMap<>())
+                            .computeIfAbsent(bucketOf.apply(e.getValue()), k -> new ArrayList<>())
+                            .add(IcebergSplit.fileNameOf(e.getValue()));
+                }
+            }
+            if (!baseLost && removed.isEmpty()) {
+                return null; // only appends or metadata changes since the base
+            }
+            return new DataDeltaPlan<>(current.snapshotId(), added, removed);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to plan the re-index of rewritten files.", e);
         } finally {
             closeCatalogQuietly(catalog);
         }

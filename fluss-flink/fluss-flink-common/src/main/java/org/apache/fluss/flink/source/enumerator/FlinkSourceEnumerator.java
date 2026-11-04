@@ -477,6 +477,17 @@ public class FlinkSourceEnumerator
             context.callAsync(
                     () -> {
                         List<SourceSplitBase> splits = generateHybridLakeFlussSplits();
+                        if (splits == null
+                                && tableInfo != null
+                                && tableInfo.hasPrimaryKey()
+                                && tableInfo.isDeletionVectorsEnabled()) {
+                            // The Fluss-only fallback is unbounded, so a batch read never ends.
+                            throw new IllegalStateException(
+                                    "Table "
+                                            + tablePath
+                                            + " has no readable lake snapshot yet; a batch union read "
+                                            + "is possible after its first tiering round.");
+                        }
                         // No lake snapshot exists, fall back to Fluss-only splits
                         if (splits == null) {
                             LOG.info(
@@ -991,6 +1002,56 @@ public class FlinkSourceEnumerator
         }
     }
 
+    // Flink silently drops an assignment RPC over the frame size (10 MB by default), and splits
+    // carry deletion bitmaps, so assignments are bounded by payload.
+    private static final long MAX_ASSIGNMENT_PAYLOAD_BYTES = 4L << 20;
+    private static final long MAX_SPLIT_PAYLOAD_BYTES = 8L << 20;
+    private static final long SPLIT_BASE_BYTES = 16L << 10; // file scan task, paths, schema
+
+    private static long estimatedPayloadBytes(SourceSplitBase split) {
+        long bytes = SPLIT_BASE_BYTES;
+        if (split instanceof LakeSnapshotSplit) {
+            Map<String, byte[]> dv = ((LakeSnapshotSplit) split).getLakeDvMap();
+            if (dv != null) {
+                for (Map.Entry<String, byte[]> e : dv.entrySet()) {
+                    bytes += e.getKey().length() + (e.getValue() == null ? 0 : e.getValue().length);
+                }
+            }
+        } else if (split instanceof LogSplit) {
+            byte[] logDv = ((LogSplit) split).getLogDvBitmap();
+            bytes += logDv == null ? 0 : logDv.length;
+        }
+        return bytes;
+    }
+
+    private List<List<SourceSplitBase>> boundedByPayload(List<SourceSplitBase> splits) {
+        List<List<SourceSplitBase>> rpcs = new ArrayList<>();
+        List<SourceSplitBase> current = new ArrayList<>();
+        long currentBytes = 0;
+        for (SourceSplitBase split : splits) {
+            long bytes = estimatedPayloadBytes(split);
+            if (bytes > MAX_SPLIT_PAYLOAD_BYTES) {
+                throw new FlinkRuntimeException(
+                        String.format(
+                                "Split %s of %s carries ~%d bytes of deletion vectors, more than one"
+                                        + " assignment RPC can carry; refusing to read instead of"
+                                        + " returning an incomplete result.",
+                                split.splitId(), tablePath, bytes));
+            }
+            if (!current.isEmpty() && currentBytes + bytes > MAX_ASSIGNMENT_PAYLOAD_BYTES) {
+                rpcs.add(current);
+                current = new ArrayList<>();
+                currentBytes = 0;
+            }
+            current.add(split);
+            currentBytes += bytes;
+        }
+        if (!current.isEmpty()) {
+            rpcs.add(current);
+        }
+        return rpcs;
+    }
+
     private void assignPendingSplits(Set<Integer> pendingReaders) {
         Map<Integer, List<SourceSplitBase>> incrementalAssignment = new HashMap<>();
 
@@ -1049,10 +1110,12 @@ public class FlinkSourceEnumerator
                                     Collectors.toMap(
                                             Map.Entry::getKey,
                                             entry ->
-                                                    (entry.getValue().size()
-                                                                    + splitPerAssignmentBatchSize
-                                                                    - 1)
-                                                            / splitPerAssignmentBatchSize));
+                                                    (int)
+                                                            ((entry.getValue().size()
+                                                                            + (long)
+                                                                                    splitPerAssignmentBatchSize
+                                                                            - 1)
+                                                                    / splitPerAssignmentBatchSize)));
             LOG.info(
                     "Assigning splits to {} readers: totalSplits={}, batchesPerReader={}",
                     incrementalAssignment.size(),
@@ -1065,14 +1128,13 @@ public class FlinkSourceEnumerator
                     incrementalAssignment.entrySet()) {
                 int readerId = entry.getKey();
                 List<SourceSplitBase> splits = entry.getValue();
-                Lists.partition(splits, splitPerAssignmentBatchSize).stream()
-                        .forEach(
-                                batchSplits -> {
-                                    context.assignSplits(
-                                            new SplitsAssignment<>(
-                                                    Collections.singletonMap(
-                                                            readerId, batchSplits)));
-                                });
+                for (List<SourceSplitBase> batchSplits :
+                        Lists.partition(splits, splitPerAssignmentBatchSize)) {
+                    for (List<SourceSplitBase> rpc : boundedByPayload(batchSplits)) {
+                        context.assignSplits(
+                                new SplitsAssignment<>(Collections.singletonMap(readerId, rpc)));
+                    }
+                }
             }
         }
 

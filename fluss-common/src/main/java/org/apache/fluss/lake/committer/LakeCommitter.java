@@ -89,6 +89,30 @@ public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable 
             throws IOException;
 
     /**
+     * Commits {@code committable} together with deletion vectors for the given row positions per
+     * data-file basename, atomically on top of {@code baseSnapshotId}. Fails if a referenced file
+     * is gone or a conflicting commit happened since the base.
+     */
+    default LakeCommitResult commitWithDeletes(
+            CommittableT committable,
+            Map<String, String> snapshotProperties,
+            Map<String, long[]> deletedPositionsByFile,
+            long baseSnapshotId)
+            throws IOException {
+        throw new UnsupportedOperationException("commitWithDeletes is not supported");
+    }
+
+    /**
+     * Commits this round's compaction rewrite, if any, before the round's deletes so that it
+     * validates against the files it read. Returns its snapshot id, or null if there is none or it
+     * was rejected because the replaced files changed; a rejected rewrite is safe to skip.
+     */
+    @Nullable
+    default Long commitPendingRewrite(CommittableT committable) throws IOException {
+        return null;
+    }
+
+    /**
      * Materializes logical deletion vectors into physical delete files on top of {@code
      * baseSnapshotId}. The map is keyed by lake data-file path; each value is a serialized
      * RoaringBitmap of deleted row positions in that file. No-op by default; lakes that support

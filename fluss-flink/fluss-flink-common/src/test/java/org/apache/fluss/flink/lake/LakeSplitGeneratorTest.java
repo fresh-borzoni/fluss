@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.lake;
 
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.config.ConfigOptions;
@@ -107,7 +108,7 @@ class LakeSplitGeneratorTest {
 
     @Test
     void testDvEnabledNoDataGap() throws Exception {
-        // Lake snapshot offsets equal stopping offsets → no DV needed
+        // No log beyond the tiered offsets, but the lake rows still need their LakeDv masks.
         Map<TableBucket, Long> lakeOffsets = new HashMap<>();
         lakeOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
         lakeOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
@@ -119,26 +120,35 @@ class LakeSplitGeneratorTest {
         stoppingOffsets.put(2, 300L);
 
         TestAdmin admin = new TestAdmin(lakeOffsets, stoppingOffsets);
+        for (int b = 0; b < BUCKET_COUNT; b++) {
+            admin.addDvResponse(
+                    new TableBucket(TABLE_ID, b),
+                    createDvResponse("file" + b + ".parquet", new byte[] {(byte) b}));
+        }
 
         LakeSplitGenerator generator = createGenerator(true, false, admin, stoppingOffsets);
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
+        // DV tables never sort-merge: one masked LakeSnapshotSplit per bucket and no LogSplit.
         assertThat(splits).hasSize(BUCKET_COUNT);
-        for (SourceSplitBase split : splits) {
-            LakeSnapshotAndFlussLogSplit hybridSplit = (LakeSnapshotAndFlussLogSplit) split;
-            // No DV should be attached since there's no data gap
-            assertThat(hybridSplit.getDvSnapshot()).isNull();
+        assertThat(splits).allMatch(split -> split instanceof LakeSnapshotSplit);
+        for (int b = 0; b < BUCKET_COUNT; b++) {
+            LakeSnapshotSplit lakeSplit = findLakeSnapshotSplitForBucket(splits, b);
+            assertThat(lakeSplit.getLakeDvMap()).containsOnlyKeys("file" + b + ".parquet");
         }
 
-        // Verify no DV fetch was made
-        assertThat(admin.dvFetchedBuckets).isEmpty();
+        assertThat(admin.dvFetchedBuckets)
+                .containsExactlyInAnyOrder(
+                        new TableBucket(TABLE_ID, 0),
+                        new TableBucket(TABLE_ID, 1),
+                        new TableBucket(TABLE_ID, 2));
     }
 
     @Test
     void testDvEnabledMixedGap() throws Exception {
-        // Bucket 0: gap (100 vs 150) → DV needed
-        // Bucket 1: no gap (200 vs 200) → DV not needed
-        // Bucket 2: gap (300 vs 400) → DV needed
+        // Bucket 0: gap (100 vs 150)
+        // Bucket 1: no gap (200 vs 200)
+        // Bucket 2: gap (300 vs 400)
         Map<TableBucket, Long> lakeOffsets = new HashMap<>();
         lakeOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
         lakeOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
@@ -153,38 +163,60 @@ class LakeSplitGeneratorTest {
         admin.addDvResponse(
                 new TableBucket(TABLE_ID, 0), createDvResponse("file0.parquet", new byte[] {1}));
         admin.addDvResponse(
+                new TableBucket(TABLE_ID, 1), createDvResponse("file1.parquet", new byte[] {3}));
+        admin.addDvResponse(
                 new TableBucket(TABLE_ID, 2), createDvResponse("file2.parquet", new byte[] {2}));
 
         LakeSplitGenerator generator = createGenerator(true, false, admin, stoppingOffsets);
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
-        // Bucket 0: DV → LakeSnapshotSplit + LogSplit (2 splits)
-        // Bucket 1: no DV (no gap) → LakeSnapshotAndFlussLogSplit (1 split)
-        // Bucket 2: DV → LakeSnapshotSplit + LogSplit (2 splits)
+        // A lake split per bucket, plus log splits for buckets 0 and 2.
         assertThat(splits).hasSize(5);
+        assertThat(splits).noneMatch(split -> split instanceof LakeSnapshotAndFlussLogSplit);
 
-        // Bucket 0: has DV - split into separate lake + log
         LakeSnapshotSplit lakeSplit0 = findLakeSnapshotSplitForBucket(splits, 0);
-        assertThat(lakeSplit0.getLakeDvMap()).isNotNull();
-        assertThat(lakeSplit0.getLakeDvMap()).containsKey("file0.parquet");
+        assertThat(lakeSplit0.getLakeDvMap()).containsOnlyKeys("file0.parquet");
         LogSplit logSplit0 = findLogSplitForBucket(splits, 0);
-        assertThat(logSplit0).isNotNull();
+        assertThat(logSplit0.getStartingOffset()).isEqualTo(100L);
+        assertThat(logSplit0.getStoppingOffset()).contains(150L);
+        // An empty LogDv still makes it a DV batch read, which drops -U/-D.
+        assertThat(logSplit0.isDvBatchRead()).isTrue();
 
-        // Bucket 1: no DV (no gap) - still LakeSnapshotAndFlussLogSplit
-        LakeSnapshotAndFlussLogSplit split1 = findHybridSplitForBucket(splits, 1);
-        assertThat(split1.getDvSnapshot()).isNull();
+        LakeSnapshotSplit lakeSplit1 = findLakeSnapshotSplitForBucket(splits, 1);
+        assertThat(lakeSplit1.getLakeDvMap()).containsOnlyKeys("file1.parquet");
+        assertThat(splits).filteredOn(split -> split.getTableBucket().getBucket() == 1).hasSize(1);
 
-        // Bucket 2: has DV - split into separate lake + log
         LakeSnapshotSplit lakeSplit2 = findLakeSnapshotSplitForBucket(splits, 2);
-        assertThat(lakeSplit2.getLakeDvMap()).isNotNull();
-        assertThat(lakeSplit2.getLakeDvMap()).containsKey("file2.parquet");
+        assertThat(lakeSplit2.getLakeDvMap()).containsOnlyKeys("file2.parquet");
         LogSplit logSplit2 = findLogSplitForBucket(splits, 2);
-        assertThat(logSplit2).isNotNull();
+        assertThat(logSplit2.getStartingOffset()).isEqualTo(300L);
+        assertThat(logSplit2.getStoppingOffset()).contains(400L);
 
-        // Verify only buckets 0 and 2 were fetched
+        // Every bucket with tiered data needs its LakeDv, gap or not.
         assertThat(admin.dvFetchedBuckets)
                 .containsExactlyInAnyOrder(
-                        new TableBucket(TABLE_ID, 0), new TableBucket(TABLE_ID, 2));
+                        new TableBucket(TABLE_ID, 0),
+                        new TableBucket(TABLE_ID, 1),
+                        new TableBucket(TABLE_ID, 2));
+    }
+
+    @Test
+    void testStreamingReadOfDvTableFallsBackToFlussSplits() throws Exception {
+        Map<TableBucket, Long> lakeOffsets = new HashMap<>();
+        lakeOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
+        TestAdmin admin = new TestAdmin(lakeOffsets, Collections.emptyMap());
+
+        LakeSplitGenerator generator =
+                createGenerator(true, admin, new NoStoppingOffsetsInitializer());
+
+        // Masks serve bounded reads only; a streaming read uses the KV snapshot and changelog.
+        assertThat(generator.generateHybridLakeFlussSplits()).isNull();
+        assertThat(admin.lakeSnapshotRequests).isZero();
+        assertThat(admin.dvFetchedBuckets).isEmpty();
+
+        // Without deletion vectors a streaming read still gets hybrid lake and log splits.
+        LakeSplitGenerator noDv = createGenerator(false, admin, new NoStoppingOffsetsInitializer());
+        assertThat(noDv.generateHybridLakeFlussSplits()).isNotNull();
     }
 
     @Test
@@ -277,24 +309,72 @@ class LakeSplitGeneratorTest {
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
         assertThat(splits).isNotNull();
+        assertThat(splits).noneMatch(split -> split instanceof LakeSnapshotAndFlussLogSplit);
 
-        // Verify DV was only fetched for buckets with gaps
-        // partition1/bucket0: gap (100 vs 150) → fetched
-        // partition1/bucket1: no gap (200 vs 200) → not fetched
-        // partition2/bucket0: gap (50 vs 100) → fetched
-        // partition2/bucket1: no gap (60 vs 60) → not fetched
+        // Every bucket with tiered data fetches its DV; bucket 2 of each partition has none tiered.
         assertThat(admin.dvFetchedBuckets)
                 .containsExactlyInAnyOrder(
                         new TableBucket(TABLE_ID, partition1Id, 0),
-                        new TableBucket(TABLE_ID, partition2Id, 0));
+                        new TableBucket(TABLE_ID, partition1Id, 1),
+                        new TableBucket(TABLE_ID, partition2Id, 0),
+                        new TableBucket(TABLE_ID, partition2Id, 1));
 
-        // Verify DV data passed correct partition IDs
-        for (TableBucket fetchedBucket : admin.dvFetchedBuckets) {
-            assertThat(fetchedBucket.getPartitionId()).isNotNull();
-        }
+        assertThat(splitsOf(splits, partition1Id, 0))
+                .hasSize(2)
+                .anyMatch(split -> split instanceof LakeSnapshotSplit);
+        LogSplit p1Log = (LogSplit) only(splitsOf(splits, partition1Id, 0), LogSplit.class);
+        assertThat(p1Log.getStartingOffset()).isEqualTo(100L);
+        assertThat(p1Log.getStoppingOffset()).contains(150L);
+        assertThat(splitsOf(splits, partition1Id, 1))
+                .singleElement()
+                .isInstanceOf(LakeSnapshotSplit.class);
+        LogSplit p2Log = (LogSplit) only(splitsOf(splits, partition2Id, 0), LogSplit.class);
+        assertThat(p2Log.getStartingOffset()).isEqualTo(50L);
+        assertThat(p2Log.getStoppingOffset()).contains(100L);
+        assertThat(splitsOf(splits, partition2Id, 1))
+                .singleElement()
+                .isInstanceOf(LakeSnapshotSplit.class);
+        assertThat(splitsOf(splits, partition1Id, 2))
+                .noneMatch(split -> split instanceof LakeSnapshotSplit);
+        assertThat(splitsOf(splits, partition2Id, 2))
+                .noneMatch(split -> split instanceof LakeSnapshotSplit);
+
+        LakeSnapshotSplit p1Lake =
+                (LakeSnapshotSplit)
+                        only(splitsOf(splits, partition1Id, 0), LakeSnapshotSplit.class);
+        assertThat(p1Lake.getLakeDvMap()).containsOnlyKeys("p1-file0.parquet");
+        LakeSnapshotSplit p2Lake =
+                (LakeSnapshotSplit)
+                        only(splitsOf(splits, partition2Id, 0), LakeSnapshotSplit.class);
+        assertThat(p2Lake.getLakeDvMap()).containsOnlyKeys("p2-file0.parquet");
     }
 
     // ---- Helper methods ----
+
+    private static List<SourceSplitBase> splitsOf(
+            List<SourceSplitBase> splits, long partitionId, int bucketId) {
+        List<SourceSplitBase> out = new ArrayList<>();
+        for (SourceSplitBase split : splits) {
+            TableBucket tb = split.getTableBucket();
+            if (tb.getBucket() == bucketId
+                    && tb.getPartitionId() != null
+                    && tb.getPartitionId() == partitionId) {
+                out.add(split);
+            }
+        }
+        return out;
+    }
+
+    private static SourceSplitBase only(List<SourceSplitBase> splits, Class<?> type) {
+        List<SourceSplitBase> matching = new ArrayList<>();
+        for (SourceSplitBase split : splits) {
+            if (type.isInstance(split)) {
+                matching.add(split);
+            }
+        }
+        assertThat(matching).hasSize(1);
+        return matching.get(0);
+    }
 
     private LakeSnapshotAndFlussLogSplit findHybridSplitForBucket(
             List<SourceSplitBase> splits, int bucketId) {
@@ -332,6 +412,26 @@ class LakeSplitGeneratorTest {
             boolean isPartitioned,
             TestAdmin admin,
             Map<Integer, Long> stoppingOffsets) {
+        return createGenerator(
+                dvEnabled,
+                isPartitioned,
+                admin,
+                stoppingOffsets,
+                (partitionName, buckets, retriever) -> stoppingOffsets);
+    }
+
+    private LakeSplitGenerator createGenerator(
+            boolean dvEnabled, TestAdmin admin, OffsetsInitializer stoppingInitializer) {
+        return createGenerator(
+                dvEnabled, false, admin, Collections.emptyMap(), stoppingInitializer);
+    }
+
+    private LakeSplitGenerator createGenerator(
+            boolean dvEnabled,
+            boolean isPartitioned,
+            TestAdmin admin,
+            Map<Integer, Long> stoppingOffsets,
+            OffsetsInitializer stoppingInitializer) {
         TableInfo tableInfo = createTableInfo(dvEnabled, isPartitioned);
         TestingLakeSource lakeSource =
                 new TestingLakeSource(
@@ -342,9 +442,6 @@ class LakeSplitGeneratorTest {
                                         new ResolvedPartitionSpec(
                                                 Collections.emptyList(), Collections.emptyList()),
                                         null)));
-
-        OffsetsInitializer stoppingInitializer =
-                (partitionName, buckets, retriever) -> stoppingOffsets;
 
         OffsetsInitializer.BucketOffsetsRetriever retriever =
                 new OffsetsInitializer.BucketOffsetsRetriever() {
@@ -465,6 +562,7 @@ class LakeSplitGeneratorTest {
         @Nullable private final Map<Integer, Long> defaultStoppingOffsets;
         private final Map<TableBucket, GetDvSnapshotResponse> dvResponses = new HashMap<>();
         final Set<TableBucket> dvFetchedBuckets = new HashSet<>();
+        int lakeSnapshotRequests;
 
         TestAdmin(
                 Map<TableBucket, Long> lakeOffsets,
@@ -483,6 +581,7 @@ class LakeSplitGeneratorTest {
 
         @Override
         public CompletableFuture<LakeSnapshot> getReadableLakeSnapshot(TablePath tablePath) {
+            lakeSnapshotRequests++;
             return CompletableFuture.completedFuture(new LakeSnapshot(1L, lakeOffsets));
         }
 

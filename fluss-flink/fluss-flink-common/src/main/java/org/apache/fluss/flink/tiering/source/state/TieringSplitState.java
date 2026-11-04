@@ -58,7 +58,8 @@ public class TieringSplitState {
                     split.getTotalExpectedResults(),
                     split.getCompactSnapshotId(),
                     split.getRemoteUploadBasePath(),
-                    split.getFlussColumnCount());
+                    split.getFlussColumnCount(),
+                    split.isByPrimaryKey());
         } else {
             final TieringLogSplit split = (TieringLogSplit) tieringSplit;
             return new TieringLogSplit(

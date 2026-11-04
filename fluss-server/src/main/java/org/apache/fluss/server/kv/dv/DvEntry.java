@@ -34,8 +34,37 @@ public class DvEntry {
 
     private final long oldRowId;
 
+    // Set only by derived(); recordOffset is the last log record the change produced.
+    private final byte[] key;
+    private final long recordOffset;
+    private final long versionOffset;
+
     public DvEntry(long oldRowId) {
+        this(oldRowId, null, -1, -1);
+    }
+
+    private DvEntry(long oldRowId, byte[] key, long recordOffset, long versionOffset) {
         this.oldRowId = oldRowId;
+        this.key = key;
+        this.recordOffset = recordOffset;
+        this.versionOffset = versionOffset;
+    }
+
+    /** A derived-mode change of {@code key}; {@code versionOffset} is -1 for a delete. */
+    public static DvEntry derived(byte[] key, long recordOffset, long versionOffset) {
+        return new DvEntry(-1, key, recordOffset, versionOffset);
+    }
+
+    public byte[] getKey() {
+        return key;
+    }
+
+    public long getRecordOffset() {
+        return recordOffset;
+    }
+
+    public long getVersionOffset() {
+        return versionOffset;
     }
 
     /** Returns the RowId (changelog offset) of the superseded +I/+U record. */

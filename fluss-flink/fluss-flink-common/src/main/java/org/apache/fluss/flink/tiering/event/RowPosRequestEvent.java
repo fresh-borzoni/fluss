@@ -61,6 +61,9 @@ public class RowPosRequestEvent implements SourceEvent {
     /** The number of user-defined columns in the Fluss schema (excludes system columns). */
     private final int flussColumnCount;
 
+    /** Whether rows are indexed by primary key (derived deletion vectors), not by __rowid. */
+    private final boolean byPrimaryKey;
+
     public RowPosRequestEvent(
             long tableId,
             TablePath tablePath,
@@ -68,7 +71,9 @@ public class RowPosRequestEvent implements SourceEvent {
             Map<String, Map<Integer, List<byte[]>>> serializedSplitsByPartitionAndBucket,
             long compactSnapshotId,
             String remoteUploadBasePath,
-            int flussColumnCount) {
+            int flussColumnCount,
+            boolean byPrimaryKey) {
+        this.byPrimaryKey = byPrimaryKey;
         this.tableId = tableId;
         this.tablePath = tablePath;
         this.nextFileId = nextFileId;
@@ -104,5 +109,9 @@ public class RowPosRequestEvent implements SourceEvent {
 
     public int getFlussColumnCount() {
         return flussColumnCount;
+    }
+
+    public boolean isByPrimaryKey() {
+        return byPrimaryKey;
     }
 }

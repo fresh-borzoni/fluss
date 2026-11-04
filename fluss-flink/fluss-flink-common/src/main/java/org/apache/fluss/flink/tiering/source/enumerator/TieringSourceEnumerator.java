@@ -389,7 +389,8 @@ public class TieringSourceEnumerator
                                 totalBatchCount,
                                 compactSnapshotId,
                                 remoteUploadBasePath,
-                                flussColumnCount);
+                                flussColumnCount,
+                                event.isByPrimaryKey());
                 rowPosSplits.add(rowPosSplit);
             }
         }

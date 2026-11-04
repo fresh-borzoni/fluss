@@ -22,6 +22,8 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
 
+import javax.annotation.Nullable;
+
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -56,6 +58,12 @@ public interface SnapshotContext {
 
     /** Get the remote root path to store kv snapshot files. */
     FsPath getRemoteKvDir();
+
+    /** Returns the default remote data directory, which holds the DV position index. */
+    @Nullable
+    default String getRemoteDataDir() {
+        return null;
+    }
 
     /**
      * Get the provider of latest CompletedSnapshot for a table bucket. When no completed snapshot

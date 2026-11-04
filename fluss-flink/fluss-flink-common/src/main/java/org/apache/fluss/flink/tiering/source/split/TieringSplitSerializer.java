@@ -40,6 +40,8 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
     public static final TieringSplitSerializer INSTANCE = new TieringSplitSerializer();
 
     private static final int VERSION_0 = 0;
+    /** Adds the row-pos split's byPrimaryKey flag. */
+    private static final int VERSION_1 = 1;
 
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
@@ -48,7 +50,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
     private static final byte TIERING_LOG_SPLIT_FLAG = 2;
     private static final byte TIERING_ROW_POS_SPLIT_FLAG = 3;
 
-    private static final int CURRENT_VERSION = VERSION_0;
+    private static final int CURRENT_VERSION = VERSION_1;
 
     @Override
     public int getVersion() {
@@ -109,6 +111,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
             out.writeLong(rowPosSplit.getCompactSnapshotId());
             out.writeUTF(rowPosSplit.getRemoteUploadBasePath());
             out.writeInt(rowPosSplit.getFlussColumnCount());
+            out.writeBoolean(rowPosSplit.isByPrimaryKey());
         } else {
             // Log split
             TieringLogSplit tieringLogSplit = split.asTieringLogSplit();
@@ -134,7 +137,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
 
     @Override
     public TieringSplit deserialize(int version, byte[] serialized) throws IOException {
-        if (version != VERSION_0) {
+        if (version != VERSION_0 && version != VERSION_1) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -192,6 +195,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
             long compactSnapshotId = in.readLong();
             String remoteUploadBasePath = in.readUTF();
             int flussColumnCount = in.readInt();
+            boolean byPrimaryKey = version >= VERSION_1 && in.readBoolean();
             return new TieringRowPosSplit(
                     tablePath,
                     tableBucket,
@@ -201,7 +205,8 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<Tiering
                     totalExpectedResults,
                     compactSnapshotId,
                     remoteUploadBasePath,
-                    flussColumnCount);
+                    flussColumnCount,
+                    byPrimaryKey);
         } else {
             // deserialize starting offset
             long startingOffset = in.readLong();

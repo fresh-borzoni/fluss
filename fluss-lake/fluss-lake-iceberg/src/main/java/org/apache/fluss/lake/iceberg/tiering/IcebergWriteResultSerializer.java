@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.PositionIndexDelta;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.utils.InstantiationUtils;
@@ -33,7 +34,7 @@ import java.io.IOException;
 /** Serializer for {@link IcebergWriteResult}. */
 public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<IcebergWriteResult> {
 
-    private static final int CURRENT_VERSION = 1;
+    private static final int CURRENT_VERSION = 2;
 
     @Override
     public int getVersion() {
@@ -64,6 +65,14 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
                 dos.writeInt(rewriteResultBytes.length);
                 dos.write(rewriteResultBytes);
             }
+            // Since version 2: the optional position index delta.
+            PositionIndexDelta delta = icebergWriteResult.positionIndexDelta();
+            dos.writeBoolean(delta != null);
+            if (delta != null) {
+                byte[] deltaBytes = InstantiationUtils.serializeObject(delta);
+                dos.writeInt(deltaBytes.length);
+                dos.write(deltaBytes);
+            }
             return baos.toByteArray();
         }
     }
@@ -72,6 +81,7 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
     public IcebergWriteResult deserialize(int version, byte[] serialized) throws IOException {
         WriteResult writeResult;
         RewriteDataFileResult rewriteDataFileResult;
+        PositionIndexDelta delta = null;
         try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(serialized))) {
             int wrLen = dis.readInt();
             if (wrLen < 0 || wrLen > serialized.length) {
@@ -97,9 +107,15 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
             } else {
                 rewriteDataFileResult = null;
             }
+            if (version >= 2 && dis.readBoolean()) {
+                int dLen = dis.readInt();
+                byte[] dBytes = new byte[dLen];
+                dis.readFully(dBytes);
+                delta = InstantiationUtils.deserializeObject(dBytes, getClass().getClassLoader());
+            }
         } catch (ClassNotFoundException e) {
             throw new IOException(e);
         }
-        return new IcebergWriteResult(writeResult, rewriteDataFileResult);
+        return new IcebergWriteResult(writeResult, rewriteDataFileResult, delta);
     }
 }

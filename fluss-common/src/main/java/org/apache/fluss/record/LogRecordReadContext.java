@@ -96,7 +96,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
             AllocationManager.Factory allocationManagerFactory) {
         RowType rowType = tableInfo.getRowType();
         LogFormat logFormat = tableInfo.getTableConfig().getLogFormat();
-        boolean dvEnabled = tableInfo.isDeletionVectorsEnabled();
+        boolean dvEnabled = tableInfo.isRowIdEncoded();
         // only for arrow log format, the projection can be push downed to the server side
         boolean projectionPushDowned = projection != null && logFormat == LogFormat.ARROW;
         int schemaId = tableInfo.getSchemaId();

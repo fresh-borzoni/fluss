@@ -23,13 +23,22 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.EnvOptions;
 import org.rocksdb.Options;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.SstFileReader;
+import org.rocksdb.SstFileReaderIterator;
 import org.rocksdb.SstFileWriter;
 import org.rocksdb.WriteBatch;
 
+import java.io.File;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Test for {@link RowPosIndex}. */
 class RowPosIndexTest {
@@ -144,5 +153,70 @@ class RowPosIndexTest {
         assertThat(RowPosIndex.decodeRowId(RowPosIndex.encodeRowId(Long.MAX_VALUE)))
                 .isEqualTo(Long.MAX_VALUE);
         assertThat(RowPosIndex.decodeRowId(RowPosIndex.encodeRowId(-1L))).isEqualTo(-1L);
+    }
+
+    @Test
+    void testExportToAndIngestRoundTrip() throws Exception {
+        RowPosIndex index = dvRocksDB.rowPosIndex();
+        index.put(1L, new FilePos(10, 100L));
+        index.put(2L, new FilePos(10, 200L));
+        index.put(3L, new FilePos(20, 300L));
+        index.put(1L << 40, new FilePos(Integer.MAX_VALUE, Long.MAX_VALUE));
+        index.delete(2L); // deleted entries are not exported
+        String sst = tempDir.resolve("export.sst").toString();
+
+        assertThat(index.exportTo(sst, null)).isEqualTo(3L);
+
+        Map<Long, FilePos> exported = readSst(sst);
+        assertThat(exported)
+                .containsExactly(
+                        entry(1L, new FilePos(10, 100L)),
+                        entry(3L, new FilePos(20, 300L)),
+                        entry(1L << 40, new FilePos(Integer.MAX_VALUE, Long.MAX_VALUE)));
+
+        try (DvRocksDB other = DvRocksDB.open(tempDir.resolve("other").toString())) {
+            other.rowPosIndex().ingestExternalFile(Collections.singletonList(sst));
+            for (Map.Entry<Long, FilePos> e : exported.entrySet()) {
+                assertThat(other.rowPosIndex().get(e.getKey())).isEqualTo(e.getValue());
+            }
+            assertThat(other.rowPosIndex().get(2L)).isNull();
+            assertThat(other.rowPosIndex().multiGet(Arrays.asList(1L, 2L, 3L, 1L << 40)))
+                    .isEqualTo(index.multiGet(Arrays.asList(1L, 2L, 3L, 1L << 40)));
+
+            // re-exporting the ingested copy yields the same entries
+            String again = tempDir.resolve("again.sst").toString();
+            assertThat(other.rowPosIndex().exportTo(again, null)).isEqualTo(3L);
+            assertThat(readSst(again)).isEqualTo(exported);
+        }
+    }
+
+    @Test
+    void testExportToEmptyIndexWritesNoFile() throws Exception {
+        RowPosIndex index = dvRocksDB.rowPosIndex();
+        File sst = tempDir.resolve("empty.sst").toFile();
+
+        assertThat(index.exportTo(sst.getPath(), null)).isZero();
+        assertThat(sst).doesNotExist();
+
+        // an index whose entries were all deleted is empty as well
+        index.put(1L, new FilePos(10, 100L));
+        index.delete(1L);
+        assertThat(index.exportTo(sst.getPath(), null)).isZero();
+        assertThat(sst).doesNotExist();
+    }
+
+    private static Map<Long, FilePos> readSst(String path) throws RocksDBException {
+        Map<Long, FilePos> out = new LinkedHashMap<>();
+        try (Options options = new Options();
+                SstFileReader reader = new SstFileReader(options);
+                ReadOptions readOptions = new ReadOptions()) {
+            reader.open(path);
+            try (SstFileReaderIterator it = reader.newIterator(readOptions)) {
+                for (it.seekToFirst(); it.isValid(); it.next()) {
+                    out.put(RowPosIndex.decodeRowId(it.key()), FilePos.decode(it.value()));
+                }
+            }
+        }
+        return out;
     }
 }

@@ -101,6 +101,18 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
     }
 
     /**
+     * Plans the re-index of data files rewritten since {@code baseSnapshotId} by any engine,
+     * comparing the base's data files with the current snapshot's so expired snapshots in between
+     * cannot hide a rewrite. Returns null if no data file was removed; otherwise one split per new
+     * file (read with {@link RecordReader#readWithPos()}) and the removed files, or every current
+     * file if the base no longer exists.
+     */
+    @Nullable
+    default DataDeltaPlan<Split> planRewrite(long baseSnapshotId) {
+        return null;
+    }
+
+    /**
      * Context interface for planners, providing the snapshot id of the table in data-lake to plan
      * splits.
      */

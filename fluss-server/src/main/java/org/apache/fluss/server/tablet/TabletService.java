@@ -102,6 +102,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -464,7 +465,20 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         CompletableFuture<GetDvSnapshotResponse> response = new CompletableFuture<>();
         try {
             Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
-            if (request.hasLogDvFromOffset()) {
+            if (request.getLookupKeysCount() > 0) {
+                // Tiering resolves the positions of its base snapshot by key.
+                List<byte[]> keys = new ArrayList<>(request.getLookupKeysCount());
+                for (int i = 0; i < request.getLookupKeysCount(); i++) {
+                    keys.add(request.getLookupKeyAt(i));
+                }
+                response.complete(
+                        replicaManager.lookupDvPositions(
+                                request.getTableId(),
+                                partitionId,
+                                request.getBucketId(),
+                                request.getReadableSnapshotId(),
+                                keys));
+            } else if (request.hasLogDvFromOffset()) {
                 // LogDv-only mode for tiering: returns logEndOffset + logDvBitmap
                 response.complete(
                         replicaManager.getLogDvSnapshot(

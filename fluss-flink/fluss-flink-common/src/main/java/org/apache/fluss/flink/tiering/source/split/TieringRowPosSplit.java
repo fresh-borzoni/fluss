@@ -57,6 +57,9 @@ public class TieringRowPosSplit extends TieringSplit {
     /** The number of user-defined columns in the Fluss schema (excludes system columns). */
     private final int flussColumnCount;
 
+    /** Whether rows are indexed by primary key (derived deletion vectors), not by __rowid. */
+    private final boolean byPrimaryKey;
+
     public TieringRowPosSplit(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -67,7 +70,32 @@ public class TieringRowPosSplit extends TieringSplit {
             long compactSnapshotId,
             String remoteUploadBasePath,
             int flussColumnCount) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                fileIds,
+                serializedLakeSplits,
+                totalExpectedResults,
+                compactSnapshotId,
+                remoteUploadBasePath,
+                flussColumnCount,
+                false);
+    }
+
+    public TieringRowPosSplit(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            int[] fileIds,
+            byte[][] serializedLakeSplits,
+            int totalExpectedResults,
+            long compactSnapshotId,
+            String remoteUploadBasePath,
+            int flussColumnCount,
+            boolean byPrimaryKey) {
         super(tablePath, tableBucket, partitionName, totalExpectedResults, false);
+        this.byPrimaryKey = byPrimaryKey;
         this.fileIds = fileIds;
         this.serializedLakeSplits = serializedLakeSplits;
         this.totalExpectedResults = totalExpectedResults;
@@ -105,6 +133,10 @@ public class TieringRowPosSplit extends TieringSplit {
         return flussColumnCount;
     }
 
+    public boolean isByPrimaryKey() {
+        return byPrimaryKey;
+    }
+
     @Override
     public TieringRowPosSplit copy(int numberOfSplits) {
         return new TieringRowPosSplit(
@@ -116,7 +148,8 @@ public class TieringRowPosSplit extends TieringSplit {
                 numberOfSplits,
                 compactSnapshotId,
                 remoteUploadBasePath,
-                flussColumnCount);
+                flussColumnCount,
+                byPrimaryKey);
     }
 
     @Override
@@ -142,6 +175,8 @@ public class TieringRowPosSplit extends TieringSplit {
                 + '\''
                 + ", flussColumnCount="
                 + flussColumnCount
+                + ", byPrimaryKey="
+                + byPrimaryKey
                 + '}';
     }
 
@@ -157,6 +192,7 @@ public class TieringRowPosSplit extends TieringSplit {
         return totalExpectedResults == that.totalExpectedResults
                 && compactSnapshotId == that.compactSnapshotId
                 && flussColumnCount == that.flussColumnCount
+                && byPrimaryKey == that.byPrimaryKey
                 && Arrays.equals(fileIds, that.fileIds)
                 && Arrays.deepEquals(serializedLakeSplits, that.serializedLakeSplits)
                 && Objects.equals(remoteUploadBasePath, that.remoteUploadBasePath);
@@ -170,7 +206,8 @@ public class TieringRowPosSplit extends TieringSplit {
                         totalExpectedResults,
                         compactSnapshotId,
                         remoteUploadBasePath,
-                        flussColumnCount);
+                        flussColumnCount,
+                        byPrimaryKey);
         result = 31 * result + Arrays.hashCode(fileIds);
         result = 31 * result + Arrays.deepHashCode(serializedLakeSplits);
         return result;

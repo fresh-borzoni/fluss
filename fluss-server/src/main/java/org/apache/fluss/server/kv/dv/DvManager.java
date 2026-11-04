@@ -93,6 +93,43 @@ public class DvManager implements Closeable {
         this.dvRWLock = dvRWLock;
     }
 
+    // "fip31-batched": per KV batch, one lookup and one read-modify-write per touched bitmap, with
+    // all point updates in one WriteBatch.
+    private boolean batched = false;
+
+    public void setBatched(boolean batched) {
+        this.batched = batched;
+    }
+
+    private void handleChangelogSyncedBatched(List<DvEntry> entries) throws IOException {
+        List<Long> rowIds = new ArrayList<>(entries.size());
+        for (DvEntry e : entries) {
+            rowIds.add(e.getOldRowId());
+        }
+        dvRocksDB.logDv().markDeletedAll(rowIds);
+        List<FilePos> hits = dvRocksDB.rowPosIndex().multiGet(rowIds);
+        Map<Integer, List<Long>> lakeByFile = new HashMap<>();
+        try (org.rocksdb.WriteBatch batch = new org.rocksdb.WriteBatch()) {
+            for (int i = 0; i < rowIds.size(); i++) {
+                long rowId = rowIds.get(i);
+                FilePos fp = hits.get(i);
+                if (fp != null) {
+                    lakeByFile
+                            .computeIfAbsent(fp.fileId(), k -> new ArrayList<>())
+                            .add(fp.rowPosition());
+                    dvRocksDB.rowPosIndex().delete(batch, rowId);
+                    dvRocksDB.pendingDeletes().put(batch, rowId, fp);
+                } else {
+                    dvRocksDB.pendingDeletes().putPending(batch, rowId);
+                }
+            }
+            dvRocksDB.lakeDv().markDeletedAll(lakeByFile);
+            dvRocksDB.getDb().write(dvRocksDB.getWriteOptions(), batch);
+        } catch (org.rocksdb.RocksDBException e) {
+            throw new IOException("Failed to apply batched DV updates", e);
+        }
+    }
+
     /**
      * Processes collected -U/-D entries after changelog append succeeds. This is the main entry
      * point called from KvTablet's putAsLeader after the WAL batch is synced.
@@ -100,6 +137,15 @@ public class DvManager implements Closeable {
      * @param entries the DV entries to process, each representing a superseded +I/+U record
      */
     public void handleChangelogSynced(List<DvEntry> entries) throws IOException {
+        if (batched) {
+            dvRWLock.writeLock();
+            try {
+                handleChangelogSyncedBatched(entries);
+            } finally {
+                dvRWLock.writeUnlock();
+            }
+            return;
+        }
         dvRWLock.writeLock();
         try {
             for (DvEntry entry : entries) {
@@ -409,7 +455,7 @@ public class DvManager implements Closeable {
      * @param toOffset the end offset (exclusive)
      * @return the serialized LogDv bitmap bytes, or null if no deleted offsets in range
      */
-    @javax.annotation.Nullable
+    @Nullable
     public byte[] getLogDvSnapshot(long fromOffset, long toOffset) throws IOException {
         Roaring64Bitmap bitmap = dvRocksDB.logDv().snapshot(fromOffset, toOffset);
         if (bitmap.isEmpty()) {

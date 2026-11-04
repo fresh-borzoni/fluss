@@ -154,7 +154,7 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         return result;
     }
 
-    static Function<FileScanTask, Integer> createBucketExtractor(Table table) {
+    public static Function<FileScanTask, Integer> createBucketExtractor(Table table) {
         Function<StructLike, Integer> fromPartition = createBucketExtractorFromPartition(table);
         return task -> fromPartition.apply(task.file().partition());
     }
@@ -198,7 +198,7 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
                         .collect(Collectors.toList());
     }
 
-    static Function<FileScanTask, List<String>> createPartitionExtractor(Table table) {
+    public static Function<FileScanTask, List<String>> createPartitionExtractor(Table table) {
         PartitionSpec partitionSpec = table.spec();
         List<PartitionField> partitionFields = partitionSpec.fields();
 

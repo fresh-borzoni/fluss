@@ -22,6 +22,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
+import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.FlussRuntimeException;
@@ -86,6 +87,7 @@ import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DvManager;
 import org.apache.fluss.server.kv.dv.DvSnapshot;
 import org.apache.fluss.server.kv.dv.RowPosSstDownloader;
@@ -1093,8 +1095,17 @@ public class ReplicaManager implements ServerReconfigurable {
                             lakeBucketOffsets.entrySet()) {
                         TableBucket tb = lakeBucketOffsetEntry.getKey();
                         LakeBucketOffset lakeBucketOffset = lakeBucketOffsetEntry.getValue();
-                        LogTablet logTablet = getReplicaOrException(tb).getLogTablet();
+                        Replica notified = getReplicaOrException(tb);
+                        LogTablet logTablet = notified.getLogTablet();
                         logTablet.updateLakeTableSnapshotId(lakeBucketOffset.getSnapshotId());
+                        // Catch up in the background; only the leader holds DV state.
+                        KvTablet notifiedKv = notified.isLeader() ? notified.getKvTablet() : null;
+                        if (notifiedKv != null
+                                && notifiedKv.isDvEnabled()
+                                && notifiedKv.getDvManager() instanceof DerivedDvManager) {
+                            ((DerivedDvManager) notifiedKv.getDvManager())
+                                    .advanceAsync(lakeBucketOffset.getSnapshotId());
+                        }
 
                         lakeBucketOffset
                                 .getLogStartOffset()
@@ -1141,7 +1152,11 @@ public class ReplicaManager implements ServerReconfigurable {
             try {
                 Replica replica = getReplicaOrException(tb);
                 KvTablet kvTablet = replica.getKvTablet();
-                checkNotNull(kvTablet, "KvTablet not available for %s", tb);
+                if (!replica.isLeader() || kvTablet == null) {
+                    // Only the leader holds DV state; a new leader rebuilds it.
+                    LOG.debug("Skip DV Prepare for non-leader replica {}", tb);
+                    continue;
+                }
                 checkState(kvTablet.isDvEnabled(), "DV not enabled for %s", tb);
                 DvManager dvManager = kvTablet.getDvManager();
 
@@ -1163,6 +1178,9 @@ public class ReplicaManager implements ServerReconfigurable {
                         downloader,
                         indexSnapshotId,
                         localTempDir);
+                if (dvManager instanceof DerivedDvManager) {
+                    ((DerivedDvManager) dvManager).setPreparedReadable(snapshotId);
+                }
 
                 LOG.info("DV Prepare completed for {} snapshot {}", tb, snapshotId);
             } catch (Exception e) {
@@ -1180,7 +1198,10 @@ public class ReplicaManager implements ServerReconfigurable {
             try {
                 Replica replica = getReplicaOrException(tb);
                 KvTablet kvTablet = replica.getKvTablet();
-                checkNotNull(kvTablet, "KvTablet not available for %s", tb);
+                if (!replica.isLeader() || kvTablet == null) {
+                    LOG.debug("Skip DV ReadableSwitch for non-leader replica {}", tb);
+                    continue;
+                }
                 checkState(kvTablet.isDvEnabled(), "DV not enabled for %s", tb);
                 DvManager dvManager = kvTablet.getDvManager();
 
@@ -1244,13 +1265,11 @@ public class ReplicaManager implements ServerReconfigurable {
             long tableId, @Nullable Long partitionId, int bucketId, long readableSnapshotId) {
         TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
         try {
-            Replica replica = getReplicaOrException(tb);
-            KvTablet kvTablet = replica.getKvTablet();
-            checkNotNull(kvTablet, "KvTablet not available for %s", tb);
+            KvTablet kvTablet = dvLeaderKvTablet(tb);
             checkState(kvTablet.isDvEnabled(), "DV not enabled for %s", tb);
             DvManager dvManager = kvTablet.getDvManager();
 
-            long logEndOffset = replica.getLocalLogEndOffset();
+            long logEndOffset = getReplicaOrException(tb).getLocalLogEndOffset();
 
             dvManager.getDvRWLock().readLock();
             try {
@@ -1259,9 +1278,60 @@ public class ReplicaManager implements ServerReconfigurable {
             } finally {
                 dvManager.getDvRWLock().readUnlock();
             }
+        } catch (ApiException e) {
+            throw e;
         } catch (Exception e) {
             throw new FlussRuntimeException(
                     "Failed to get DV snapshot for " + tb + " snapshot " + readableSnapshotId, e);
+        }
+    }
+
+    /**
+     * Returns the leader's KvTablet, or throws NotLeaderOrFollower so the client refreshes its
+     * cached leader instead of retrying this server.
+     */
+    private KvTablet dvLeaderKvTablet(TableBucket tb) {
+        Replica replica = getReplicaOrException(tb);
+        KvTablet kvTablet = replica.getKvTablet();
+        if (!replica.isLeader() || kvTablet == null) {
+            throw new NotLeaderOrFollowerException(
+                    String.format(
+                            "Server %s is not the leader of %s for a deletion-vector request.",
+                            serverId, tb));
+        }
+        return kvTablet;
+    }
+
+    /** Returns the positions of the given primary keys in snapshot {@code snapshotId}. */
+    public GetDvSnapshotResponse lookupDvPositions(
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long snapshotId,
+            List<byte[]> keys) {
+        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+        try {
+            KvTablet kvTablet = dvLeaderKvTablet(tb);
+            DvManager dvManager = kvTablet.getDvManager();
+            checkState(
+                    dvManager instanceof DerivedDvManager,
+                    "Derived DV mode not enabled for %s",
+                    tb);
+            List<Object[]> found = ((DerivedDvManager) dvManager).lookup(snapshotId, keys);
+            GetDvSnapshotResponse resp =
+                    new GetDvSnapshotResponse().setLogEndOffset(-1).setSnapshotStartOffset(-1);
+            for (Object[] f : found) {
+                resp.addKeyPosition()
+                        .setKey((byte[]) f[0])
+                        .setFilePath((String) f[1])
+                        .setPos((Long) f[2]);
+            }
+            return resp;
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to get DV snapshot for " + tb + " snapshot " + snapshotId, e);
         }
     }
 
@@ -1280,13 +1350,11 @@ public class ReplicaManager implements ServerReconfigurable {
             long tableId, @Nullable Long partitionId, int bucketId, long logDvFromOffset) {
         TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
         try {
-            Replica replica = getReplicaOrException(tb);
-            KvTablet kvTablet = replica.getKvTablet();
-            checkNotNull(kvTablet, "KvTablet not available for %s", tb);
+            KvTablet kvTablet = dvLeaderKvTablet(tb);
             checkState(kvTablet.isDvEnabled(), "DV not enabled for %s", tb);
             DvManager dvManager = kvTablet.getDvManager();
 
-            long logEndOffset = replica.getLocalLogEndOffset();
+            long logEndOffset = getReplicaOrException(tb).getLocalLogEndOffset();
 
             dvManager.getDvRWLock().readLock();
             try {
@@ -1302,6 +1370,8 @@ public class ReplicaManager implements ServerReconfigurable {
             } finally {
                 dvManager.getDvRWLock().readUnlock();
             }
+        } catch (ApiException e) {
+            throw e;
         } catch (Exception e) {
             throw new FlussRuntimeException("Failed to get LogDv snapshot for " + tb, e);
         }

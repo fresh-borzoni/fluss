@@ -153,6 +153,15 @@ public class DvRocksDB implements Closeable {
         }
     }
 
+    /** Returns a point-in-time view for reads outside the manager lock; callers must release it. */
+    public org.rocksdb.Snapshot snapshot() {
+        return db.getSnapshot();
+    }
+
+    public void releaseSnapshot(org.rocksdb.Snapshot snapshot) {
+        db.releaseSnapshot(snapshot);
+    }
+
     public RowPosIndex rowPosIndex() {
         return rowPosIndex;
     }
@@ -171,6 +180,10 @@ public class DvRocksDB implements Closeable {
 
     public PendingDeletes pendingDeletes() {
         return pendingDeletes;
+    }
+
+    WriteOptions getWriteOptions() {
+        return writeOptions;
     }
 
     /** Returns the underlying RocksDB instance. Intended for advanced operations. */

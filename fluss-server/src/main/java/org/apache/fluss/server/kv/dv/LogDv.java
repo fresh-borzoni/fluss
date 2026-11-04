@@ -29,6 +29,11 @@ import org.rocksdb.RocksIterator;
 import org.rocksdb.WriteOptions;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Operations wrapper for the LogDv Column Family.
@@ -66,6 +71,27 @@ public class LogDv {
         }
         bitmap.add(offsetInRange);
         putBitmap(key, bitmap);
+    }
+
+    /** Batched variant of {@link #markDeleted}: one read-modify-write per touched range. */
+    public void markDeletedAll(Collection<Long> offsets) throws IOException {
+        Map<Long, List<Integer>> byRange = new HashMap<>();
+        for (long offset : offsets) {
+            long rangeStart = (offset / RANGE_SIZE) * RANGE_SIZE;
+            byRange.computeIfAbsent(rangeStart, k -> new ArrayList<>())
+                    .add((int) (offset - rangeStart));
+        }
+        for (Map.Entry<Long, List<Integer>> e : byRange.entrySet()) {
+            byte[] key = encodeRangeStart(e.getKey());
+            RoaringBitmap bitmap = getBitmap(key);
+            if (bitmap == null) {
+                bitmap = new RoaringBitmap();
+            }
+            for (int o : e.getValue()) {
+                bitmap.add(o);
+            }
+            putBitmap(key, bitmap);
+        }
     }
 
     /** Checks whether the specified log offset has been marked as deleted. */

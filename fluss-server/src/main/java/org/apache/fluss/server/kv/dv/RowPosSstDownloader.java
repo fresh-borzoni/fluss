@@ -95,7 +95,12 @@ public class RowPosSstDownloader {
     public RowPosSstIndex readIndex(long snapshotId, @Nullable Long partitionId)
             throws IOException {
         FsPath baseDir = buildBaseDir(snapshotId, partitionId);
-        FsPath indexPath = new FsPath(baseDir, INDEX_FILE);
+        // A version-2 rowpos.manifest, when present, supersedes the version-1 index.json.
+        FsPath manifestPath = new FsPath(baseDir, RowPosSstIndex.MANIFEST_FILE);
+        FsPath indexPath =
+                manifestPath.getFileSystem().exists(manifestPath)
+                        ? manifestPath
+                        : new FsPath(baseDir, INDEX_FILE);
         FileSystem fs = indexPath.getFileSystem();
 
         FSDataInputStream in = null;

@@ -17,6 +17,8 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.PositionIndexDelta;
+import org.apache.fluss.lake.dv.index.PositionIndexDeltaProvider;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 
 import org.apache.iceberg.io.WriteResult;
@@ -26,7 +28,7 @@ import javax.annotation.Nullable;
 import java.io.Serializable;
 
 /** The write result of Iceberg lake writer to pass to committer to commit. */
-public class IcebergWriteResult implements Serializable {
+public class IcebergWriteResult implements Serializable, PositionIndexDeltaProvider {
 
     private static final long serialVersionUID = 1L;
 
@@ -36,10 +38,27 @@ public class IcebergWriteResult implements Serializable {
     // the rewrite result
     @Nullable private final RewriteDataFileResult rewriteDataFileResult;
 
+    // the bucket's position-index change, only set when deletion vectors are derived
+    @Nullable private final PositionIndexDelta positionIndexDelta;
+
     public IcebergWriteResult(
             WriteResult writeResult, @Nullable RewriteDataFileResult rewriteDataFileResult) {
+        this(writeResult, rewriteDataFileResult, null);
+    }
+
+    public IcebergWriteResult(
+            WriteResult writeResult,
+            @Nullable RewriteDataFileResult rewriteDataFileResult,
+            @Nullable PositionIndexDelta positionIndexDelta) {
         this.writeResult = writeResult;
         this.rewriteDataFileResult = rewriteDataFileResult;
+        this.positionIndexDelta = positionIndexDelta;
+    }
+
+    @Override
+    @Nullable
+    public PositionIndexDelta positionIndexDelta() {
+        return positionIndexDelta;
     }
 
     public WriteResult getWriteResult() {

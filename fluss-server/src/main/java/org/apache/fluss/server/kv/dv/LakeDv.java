@@ -32,6 +32,7 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -94,6 +95,20 @@ public class LakeDv {
         }
         bitmap.add(rowPosition);
         put(fileId, bitmap);
+    }
+
+    /** Batched variant of {@link #markDeleted}: one read-modify-write per touched file. */
+    public void markDeletedAll(Map<Integer, List<Long>> positionsByFile) throws IOException {
+        for (Map.Entry<Integer, List<Long>> e : positionsByFile.entrySet()) {
+            Roaring64Bitmap bitmap = get(e.getKey());
+            if (bitmap == null) {
+                bitmap = new Roaring64Bitmap();
+            }
+            for (long pos : e.getValue()) {
+                bitmap.addLong(pos);
+            }
+            put(e.getKey(), bitmap);
+        }
     }
 
     /** Deletes the entire LakeDv entry for the specified file. */

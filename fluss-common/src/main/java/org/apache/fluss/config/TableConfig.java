@@ -148,6 +148,23 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
     }
 
+    /** Returns the deletion vector mode: "fip31" (default), "fip31-batched" or "derived". */
+    public String getDeletionVectorsMode() {
+        return config.get(ConfigOptions.TABLE_DELETION_VECTORS_MODE);
+    }
+
+    /** Whether KV values and changelog records carry a RowId, which the derived mode omits. */
+    public boolean isRowIdEncoded() {
+        return isDeletionVectorsEnabled() && !isDeletionVectorsDerived();
+    }
+
+    /** Whether deletion vectors are enabled in the 'derived' mode. */
+    public boolean isDeletionVectorsDerived() {
+        return isDeletionVectorsEnabled()
+                && "derived"
+                        .equalsIgnoreCase(config.get(ConfigOptions.TABLE_DELETION_VECTORS_MODE));
+    }
+
     /** Gets the Arrow compression type and compression level of the table. */
     public ArrowCompressionInfo getArrowCompressionInfo() {
         return ArrowCompressionInfo.fromConf(config);

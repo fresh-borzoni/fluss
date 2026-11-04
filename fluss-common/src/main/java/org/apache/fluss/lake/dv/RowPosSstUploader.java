@@ -165,6 +165,21 @@ public class RowPosSstUploader {
         }
     }
 
+    /**
+     * Writes the version-2 {@code rowpos.manifest} of one snapshot and partition; call it only
+     * after all of its buckets' SSTs are uploaded.
+     */
+    public void writeManifest(long snapshotId, @Nullable Long partitionId, RowPosSstIndex manifest)
+            throws IOException {
+        FsPath baseDir = buildBaseDir(snapshotId, partitionId);
+        FsPath path = new FsPath(baseDir, RowPosSstIndex.MANIFEST_FILE);
+        FileSystem fs = path.getFileSystem();
+        fs.mkdirs(baseDir);
+        try (FSDataOutputStream out = fs.create(path, FileSystem.WriteMode.OVERWRITE)) {
+            out.write(manifest.toJsonBytes());
+        }
+    }
+
     /** Whether a RowPos scan was already uploaded for this snapshot (any partition). */
     public boolean isIndexed(long snapshotId) throws IOException {
         FsPath dir = buildBaseDir(snapshotId, null);

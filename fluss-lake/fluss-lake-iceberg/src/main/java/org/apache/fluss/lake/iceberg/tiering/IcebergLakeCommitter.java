@@ -23,6 +23,7 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.iceberg.IcebergLakeCatalog;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.IcebergDvFileWriter;
+import org.apache.fluss.lake.iceberg.tiering.writer.IcebergPositionDeleteFileWriter;
 import org.apache.fluss.metadata.TablePath;
 
 import org.apache.iceberg.AppendFiles;
@@ -36,6 +37,7 @@ import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.BaseDeleteLoader;
@@ -44,6 +46,7 @@ import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.events.CreateSnapshotEvent;
 import org.apache.iceberg.events.Listener;
 import org.apache.iceberg.events.Listeners;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.WriteResult;
@@ -187,6 +190,228 @@ public class IcebergLakeCommitter implements LakeCommitter<IcebergWriteResult, I
         } catch (Exception e) {
             throw new IOException("Failed to commit to Iceberg table.", e);
         }
+    }
+
+    @Override
+    @Nullable
+    public Long commitPendingRewrite(IcebergCommittable committable) {
+        if (committable.rewriteDataFileResults().isEmpty()) {
+            return null;
+        }
+        // Runs before this round's deletes; it only fails, and is then safely dropped, if another
+        // commit changed the files it rewrites.
+        Long id = commitRewrite(committable.rewriteDataFileResults(), new HashMap<>());
+        LOG.info("Derived DV: Fluss compaction rewrite committed as snapshot {}.", id);
+        return id;
+    }
+
+    /**
+     * Commits this round's data files together with the deletes of the base rows they supersede, so
+     * every snapshot is consistent at its tiered offsets.
+     */
+    @Override
+    public LakeCommitResult commitWithDeletes(
+            IcebergCommittable committable,
+            Map<String, String> snapshotProperties,
+            Map<String, long[]> deletedPositionsByFile,
+            long baseSnapshotId)
+            throws IOException {
+        try {
+            icebergTable.refresh();
+            RowDelta rowDelta = icebergTable.newRowDelta();
+            committable.getDataFiles().forEach(rowDelta::addRows);
+            List<DeleteFile> superseded = new ArrayList<>();
+            List<DeleteFile> newDvs = new ArrayList<>();
+            List<CharSequence> referenced = new ArrayList<>();
+            if (!deletedPositionsByFile.isEmpty()) {
+                if (baseSnapshotId <= 0 || icebergTable.snapshot(baseSnapshotId) == null) {
+                    throw new IOException(
+                            "Derived DV commit: base snapshot "
+                                    + baseSnapshotId
+                                    + " not found while deletes are pending");
+                }
+                Map<String, DataFile> fileByBase = new HashMap<>();
+                Map<String, List<DeleteFile>> existingDvs = new HashMap<>();
+                try (CloseableIterable<FileScanTask> tasks =
+                        icebergTable.newScan().useSnapshot(baseSnapshotId).planFiles()) {
+                    for (FileScanTask task : tasks) {
+                        String loc = task.file().location();
+                        String base = loc.substring(loc.lastIndexOf('/') + 1);
+                        if (deletedPositionsByFile.containsKey(base)) {
+                            fileByBase.put(base, task.file());
+                            existingDvs.put(loc, new ArrayList<>(task.deletes()));
+                        }
+                    }
+                }
+                DeleteLoader deleteLoader =
+                        new BaseDeleteLoader(df -> icebergTable.io().newInputFile(df.location()));
+                Function<String, PositionDeleteIndex> loadPrevious =
+                        path -> {
+                            List<DeleteFile> prev = positionDeletesOf(existingDvs.get(path));
+                            return prev.isEmpty()
+                                    ? null
+                                    : deleteLoader.loadPositionDeletes(prev, path);
+                        };
+                // v3 tables get deletion vectors, v2 tables file-scoped position-delete files;
+                // either replaces the data file's previous one, so deletes never pile up.
+                boolean deletionVectors = TableUtil.formatVersion(icebergTable) >= 3;
+                DeleteWriteResult dvResult;
+                if (deletionVectors) {
+                    try (IcebergDvFileWriter dvWriter =
+                            new IcebergDvFileWriter(icebergTable, 0, loadPrevious)) {
+                        for (Map.Entry<String, long[]> e : deletedPositionsByFile.entrySet()) {
+                            DataFile df = dataFileOf(fileByBase, e.getKey(), baseSnapshotId);
+                            if (df != null) {
+                                dvWriter.delete(df, e.getValue());
+                                referenced.add(df.location());
+                            }
+                        }
+                        dvResult = dvWriter.complete();
+                    }
+                } else {
+                    try (IcebergPositionDeleteFileWriter posWriter =
+                            new IcebergPositionDeleteFileWriter(
+                                    icebergTable,
+                                    0,
+                                    loadPrevious,
+                                    path -> positionDeletesOf(existingDvs.get(path)))) {
+                        for (Map.Entry<String, long[]> e : deletedPositionsByFile.entrySet()) {
+                            DataFile df = dataFileOf(fileByBase, e.getKey(), baseSnapshotId);
+                            if (df != null) {
+                                posWriter.delete(df, e.getValue());
+                                referenced.add(df.location());
+                            }
+                        }
+                        dvResult = posWriter.complete();
+                    }
+                }
+                newDvs.addAll(dvResult.deleteFiles());
+                superseded.addAll(dvResult.rewrittenDeleteFiles());
+            }
+            newDvs.forEach(rowDelta::addDeletes);
+            superseded.forEach(rowDelta::removeDeletes);
+            if (baseSnapshotId > 0 && icebergTable.snapshot(baseSnapshotId) != null) {
+                // No data files may be added after the base; the index would not know their rows.
+                rowDelta.validateFromSnapshot(baseSnapshotId)
+                        .conflictDetectionFilter(Expressions.alwaysTrue())
+                        .validateNoConflictingDataFiles();
+            }
+            if (!referenced.isEmpty()) {
+                rowDelta.validateDataFilesExist(referenced);
+            }
+            long snapshotId = commit(rowDelta, snapshotProperties);
+            LOG.info(
+                    "Derived DV commit: snapshot {} on base {} added {} data files, {} DVs ({} superseded).",
+                    snapshotId,
+                    baseSnapshotId,
+                    committable.getDataFiles().size(),
+                    newDvs.size(),
+                    superseded.size());
+            protectReadable(snapshotId);
+            return LakeCommitResult.unknownReadableSnapshot(snapshotId);
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Derived DV commit to Iceberg failed.", e);
+        }
+    }
+
+    /**
+     * Returns the base snapshot's data file, or null if the file is gone from the base, in which
+     * case its rows are gone too and there is nothing to delete.
+     */
+    @Nullable
+    private static DataFile dataFileOf(
+            Map<String, DataFile> fileByBase, String baseName, long baseSnapshotId) {
+        DataFile df = fileByBase.get(baseName);
+        if (df == null) {
+            LOG.warn(
+                    "Derived DV commit: data file {} is not in base snapshot {}; its rows are gone,"
+                            + " nothing to delete.",
+                    baseName,
+                    baseSnapshotId);
+        }
+        return df;
+    }
+
+    /** Returns the position deletes (v2 files or v3 DVs) among a data file's delete files. */
+    private static List<DeleteFile> positionDeletesOf(List<DeleteFile> deletes) {
+        List<DeleteFile> out = new ArrayList<>();
+        if (deletes != null) {
+            for (DeleteFile d : deletes) {
+                if (d.content() == org.apache.iceberg.FileContent.POSITION_DELETES) {
+                    out.add(d);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Tag prefix of the snapshots Fluss made readable; tagged snapshots survive expiration. */
+    public static final String READABLE_TAG_PREFIX = "fluss-readable-";
+    /** Iceberg table property: how many recent readable snapshots stay tagged (default 10). */
+    public static final String PROTECTED_SNAPSHOTS_PROPERTY = "fluss.protected-snapshots";
+
+    private static final int DEFAULT_PROTECTED_SNAPSHOTS = 10;
+
+    /**
+     * Tags the readable snapshot and untags all but the most recent ones, so expiration keeps the
+     * files an in-flight union read needs. Best effort: a failure never fails the data commit.
+     */
+    private void protectReadable(long snapshotId) {
+        try {
+            icebergTable.refresh();
+            int keep = DEFAULT_PROTECTED_SNAPSHOTS;
+            String configured = icebergTable.properties().get(PROTECTED_SNAPSHOTS_PROPERTY);
+            if (configured != null) {
+                keep = Math.max(1, Integer.parseInt(configured.trim()));
+            }
+            List<Map.Entry<String, org.apache.iceberg.SnapshotRef>> tags = new ArrayList<>();
+            for (Map.Entry<String, org.apache.iceberg.SnapshotRef> e :
+                    icebergTable.refs().entrySet()) {
+                if (e.getKey().startsWith(READABLE_TAG_PREFIX) && e.getValue().isTag()) {
+                    tags.add(e);
+                }
+            }
+            // Newest first.
+            tags.sort(
+                    (a, b) ->
+                            Long.compare(
+                                    sequenceOf(b.getValue().snapshotId()),
+                                    sequenceOf(a.getValue().snapshotId())));
+            org.apache.iceberg.ManageSnapshots ms = icebergTable.manageSnapshots();
+            String tag = READABLE_TAG_PREFIX + snapshotId;
+            boolean exists = icebergTable.refs().containsKey(tag);
+            if (!exists) {
+                ms.createTag(tag, snapshotId);
+            }
+            int kept = 1; // the new tag
+            int removed = 0;
+            for (Map.Entry<String, org.apache.iceberg.SnapshotRef> e : tags) {
+                if (e.getKey().equals(tag)) {
+                    continue;
+                }
+                if (kept < keep) {
+                    kept++;
+                } else {
+                    ms.removeTag(e.getKey());
+                    removed++;
+                }
+            }
+            if (!exists || removed > 0) {
+                ms.commit();
+            }
+        } catch (Exception e) {
+            LOG.warn(
+                    "Derived DV: could not tag readable snapshot {} (retried next round).",
+                    snapshotId,
+                    e);
+        }
+    }
+
+    private long sequenceOf(long snapshotId) {
+        Snapshot s = icebergTable.snapshot(snapshotId);
+        return s == null ? -1 : s.sequenceNumber();
     }
 
     /**

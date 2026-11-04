@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.fs.FsPath;
@@ -58,6 +59,7 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
     private final int maxFetchLogSizeInRecoverKv;
 
     private final FsPath remoteKvDir;
+    private final String remoteDataDir;
 
     private DefaultSnapshotContext(
             ZooKeeperClient zooKeeperClient,
@@ -69,8 +71,10 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             long kvSnapshotIntervalMs,
             int writeBufferSizeInBytes,
             FsPath remoteKvDir,
+            String remoteDataDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
             int maxFetchLogSizeInRecoverKv) {
+        this.remoteDataDir = remoteDataDir;
         this.zooKeeperClient = zooKeeperClient;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.snapshotScheduler = snapshotScheduler;
@@ -100,8 +104,14 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 conf.get(ConfigOptions.KV_SNAPSHOT_INTERVAL).toMillis(),
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
                 FlussPaths.remoteKvDir(conf),
+                FlussConfigUtils.getDefaultRemoteDataDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes());
+    }
+
+    @Override
+    public String getRemoteDataDir() {
+        return remoteDataDir;
     }
 
     public ZooKeeperClient getZooKeeperClient() {

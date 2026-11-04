@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Test for {@link FileDict}. */
 class FileDictTest {
@@ -126,5 +127,29 @@ class FileDictTest {
 
         assertThat(fileDict.getFileId("/data/日本語/ファイル.parquet")).isEqualTo(1);
         assertThat(fileDict.getFilePath(1)).isEqualTo("/data/日本語/ファイル.parquet");
+    }
+
+    @Test
+    void testIdToPathEntriesReturnsOnlyIdToPathMappings() throws Exception {
+        FileDict fileDict = dvRocksDB.fileDict();
+        assertThat(fileDict.idToPathEntries(null)).isEmpty();
+
+        fileDict.put(1, "/data/file1.parquet");
+        fileDict.put(2, "/data/file2.parquet");
+        fileDict.put(256, "x");
+        fileDict.put(Integer.MAX_VALUE, "/data/max.parquet");
+        // path bytes that look like an id->path key must not leak into the result
+        fileDict.put(3, "\u0001\u0000\u0000\u0000");
+
+        assertThat(fileDict.idToPathEntries(null))
+                .containsOnly(
+                        entry(1, "/data/file1.parquet"),
+                        entry(2, "/data/file2.parquet"),
+                        entry(3, "\u0001\u0000\u0000\u0000"),
+                        entry(256, "x"),
+                        entry(Integer.MAX_VALUE, "/data/max.parquet"));
+
+        fileDict.delete(2);
+        assertThat(fileDict.idToPathEntries(null)).containsOnlyKeys(1, 3, 256, Integer.MAX_VALUE);
     }
 }

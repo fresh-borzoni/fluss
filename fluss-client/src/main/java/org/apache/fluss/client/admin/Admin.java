@@ -791,6 +791,21 @@ public interface Admin extends AutoCloseable {
             long readableSnapshotId);
 
     /**
+     * Looks up the live data file and row position of each encoded primary key at readable snapshot
+     * {@code snapshotId}. Fails with a stale-snapshot error unless the leader's position index is
+     * at exactly that snapshot.
+     */
+    default CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
+            TablePath tablePath,
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long snapshotId,
+            List<byte[]> keys) {
+        throw new UnsupportedOperationException("lookupDvPositions");
+    }
+
+    /**
      * Gets LogDv bitmap and logEndOffset for a specific bucket. Used by tiering to get both the
      * stoppingOffset and LogDv bitmap in a single RPC. The server computes LogDv bitmap for
      * [fromOffset, logEndOffset) and returns both.

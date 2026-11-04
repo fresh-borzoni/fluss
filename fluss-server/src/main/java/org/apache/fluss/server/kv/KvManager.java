@@ -277,7 +277,13 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     tableConfig.getChangelogImage(),
                                     sharedRocksDBRateLimiter,
                                     autoIncrementManager,
-                                    tableConfig.isDeletionVectorsEnabled());
+                                    tableConfig.isRowIdEncoded(),
+                                    tableConfig.isDeletionVectorsDerived());
+                    if (tablet.getDvManager() != null
+                            && "fip31-batched"
+                                    .equalsIgnoreCase(tableConfig.getDeletionVectorsMode())) {
+                        tablet.getDvManager().setBatched(true);
+                    }
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -396,7 +402,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         tableConfig.getChangelogImage(),
                         sharedRocksDBRateLimiter,
                         autoIncrementManager,
-                        tableConfig.isDeletionVectorsEnabled());
+                        tableConfig.isRowIdEncoded(),
+                        tableConfig.isDeletionVectorsDerived());
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(
@@ -408,6 +415,10 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                             tableBucket,
                             tabletDir.getAbsolutePath(),
                             currentKvs.get(tableBucket).getKvTabletDir().getAbsolutePath()));
+        }
+        if (kvTablet.getDvManager() != null
+                && "fip31-batched".equalsIgnoreCase(tableConfig.getDeletionVectorsMode())) {
+            kvTablet.getDvManager().setBatched(true);
         }
         this.currentKvs.put(tableBucket, kvTablet);
 

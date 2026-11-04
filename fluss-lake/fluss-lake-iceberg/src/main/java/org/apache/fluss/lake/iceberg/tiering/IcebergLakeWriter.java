@@ -21,6 +21,7 @@ import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.AppendOnlyTaskWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.DeltaTaskWriter;
+import org.apache.fluss.lake.iceberg.tiering.writer.DerivedDvRecordWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.DvRecordWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
@@ -73,6 +74,7 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
         // Create a record writer
         this.recordWriter = createRecordWriter(writerInitContext);
 
+        // With derived DVs a rewrite commits as its own snapshot and the next round re-indexes it.
         if (writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction()) {
             this.compactionExecutor =
                     Executors.newSingleThreadExecutor(
@@ -94,7 +96,9 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
                         writerInitContext.partition(),
                         writerInitContext.tableBucket().getBucket(),
                         dvEnabled);
-        if (dvEnabled) {
+        if (dvEnabled && writerInitContext.tableInfo().isDeletionVectorsDerived()) {
+            return new DerivedDvRecordWriter(icebergTable, writerInitContext, taskWriter);
+        } else if (dvEnabled) {
             return new DvRecordWriter(icebergTable, writerInitContext, taskWriter);
         } else if (equalityFieldIds.isEmpty()) {
             return new AppendOnlyTaskWriter(icebergTable, writerInitContext, taskWriter);
@@ -120,6 +124,12 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
             RewriteDataFileResult rewriteDataFileResult = null;
             if (compactionFuture != null) {
                 rewriteDataFileResult = compactionFuture.get();
+            }
+            if (recordWriter instanceof DerivedDvRecordWriter) {
+                return new IcebergWriteResult(
+                        writeResult,
+                        rewriteDataFileResult,
+                        ((DerivedDvRecordWriter) recordWriter).positionIndexDelta());
             }
             return new IcebergWriteResult(writeResult, rewriteDataFileResult);
         } catch (Exception e) {

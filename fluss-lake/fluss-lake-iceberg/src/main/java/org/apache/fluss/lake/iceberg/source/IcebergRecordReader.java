@@ -84,14 +84,22 @@ public class IcebergRecordReader implements RecordReader {
         if (project != null) {
             tableScan = applyProject(tableScan, project);
         }
-        IcebergGenericReader reader = new IcebergGenericReader(tableScan, true);
         struct = tableScan.schema().asStruct();
-        this.iterator =
-                new IcebergRecordAsFlussRecordIterator(reader.open(fileScanTask), struct, catalog);
+        // The iterator opens lazily in read(): readWithPos() callers never close it, so an eager
+        // open would leak a connection per split.
+        this.readScan = tableScan;
     }
+
+    private final TableScan readScan;
 
     @Override
     public CloseableIterator<LogRecord> read() throws IOException {
+        if (iterator == null) {
+            IcebergGenericReader reader = new IcebergGenericReader(readScan, true);
+            iterator =
+                    new IcebergRecordAsFlussRecordIterator(
+                            reader.open(fileScanTask), struct, catalog);
+        }
         return iterator;
     }
 

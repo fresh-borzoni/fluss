@@ -146,6 +146,15 @@ public class MetricNames {
     // for kv tablet
     public static final String KV_FLUSH_RATE = "kvFlushPerSecond";
     public static final String KV_FLUSH_LATENCY_MS = "kvFlushLatencyMs";
+
+    // for derived deletion vectors on the tablet server
+    public static final String DV_CATCH_UP_RATE = "dvCatchUpPerSecond";
+    public static final String DV_CATCH_UP_LATENCY_MS = "dvCatchUpLatencyMs";
+    public static final String DV_REBUILD_RATE = "dvRebuildPerSecond";
+    public static final String DV_REBUILD_LATENCY_MS = "dvRebuildLatencyMs";
+    public static final String DV_CHECKPOINT_RATE = "dvCheckpointPerSecond";
+    public static final String DV_CHECKPOINT_LATENCY_MS = "dvCheckpointLatencyMs";
+    public static final String DV_STALE_SNAPSHOT_RATE = "dvStaleSnapshotPerSecond";
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE =
             "preWriteBufferTruncateAsDuplicatedPerSecond";
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE =
