@@ -147,15 +147,46 @@ public class FlinkIcebergTieringTestBase {
     }
 
     protected JobClient buildTieringJob(StreamExecutionEnvironment execEnv) throws Exception {
+        return buildTieringJob(execEnv, getIcebergCatalogConf());
+    }
+
+    /** Builds the tiering job on the Iceberg catalog of {@code icebergCatalogConf}. */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv, Map<String, String> icebergCatalogConf)
+            throws Exception {
+        return buildTieringJob(execEnv, icebergCatalogConf, new Configuration());
+    }
+
+    /**
+     * Builds the tiering job on the Iceberg catalog of {@code icebergCatalogConf}, with {@code
+     * flussOverrides} on top of the client configuration.
+     */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv,
+            Map<String, String> icebergCatalogConf,
+            Configuration flussOverrides)
+            throws Exception {
         Configuration flussConfig = new Configuration(clientConf);
         flussConfig.set(POLL_TIERING_TABLE_INTERVAL, Duration.ofMillis(500L));
+        flussConfig.addAll(flussOverrides);
         return LakeTieringJobBuilder.newBuilder(
                         execEnv,
                         flussConfig,
-                        Configuration.fromMap(getIcebergCatalogConf()),
+                        Configuration.fromMap(icebergCatalogConf),
                         new Configuration(),
                         DataLakeFormat.ICEBERG.toString())
                 .build();
+    }
+
+    /**
+     * The catalog configuration of a tiering job whose commits run the hooks of {@link
+     * CommitHookCatalog}, on the same warehouse.
+     */
+    protected static Map<String, String> getCommitHookCatalogConf() {
+        Map<String, String> icebergConf = new HashMap<>();
+        icebergConf.put("catalog-impl", CommitHookCatalog.class.getName());
+        icebergConf.put("warehouse", warehousePath);
+        return icebergConf;
     }
 
     protected static Map<String, String> getIcebergCatalogConf() {

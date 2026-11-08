@@ -32,6 +32,7 @@ import org.apache.fluss.config.KvBatchStrategy;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.lake.LakeSplitGenerator;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.FlinkSource;
@@ -43,6 +44,7 @@ import org.apache.fluss.flink.source.split.HybridSnapshotLogSplit;
 import org.apache.fluss.flink.source.split.KvBatchSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
+import org.apache.fluss.flink.source.split.SourceSplitSerializer;
 import org.apache.fluss.flink.source.state.SourceEnumeratorState;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
@@ -1288,6 +1290,8 @@ public class FlinkSourceEnumerator
                             stoppingOffsetsInitializer,
                             tableInfo.getNumBuckets(),
                             this::listPartitions);
+            lakeSplitGenerator.setFileGroupRows(
+                    flussConf.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS));
             List<SourceSplitBase> generatedSplits =
                     lakeSplitGenerator.generateHybridLakeFlussSplits();
             if (generatedSplits == null) {
@@ -1370,6 +1374,10 @@ public class FlinkSourceEnumerator
                 return false;
             }
         }
+        if (split instanceof DvBucketSplit && ((DvBucketSplit) split).lakeSplitCount() > 0) {
+            // its reader reads the lake files of a dropped partition only
+            return false;
+        }
 
         return removedPartitionsMap.containsKey(split.getTableBucket().getPartitionId());
     }
@@ -1430,6 +1438,58 @@ public class FlinkSourceEnumerator
             int task = getSplitOwner(sourceSplit);
             pendingSplitAssignment.computeIfAbsent(task, k -> new LinkedList<>()).add(sourceSplit);
         }
+    }
+
+    // Flink silently drops an assignment RPC over the frame size (10 MB by default). A split of a
+    // table with deletion vectors carries all lake files of its bucket, so assignments of such
+    // tables are bounded by the splits' serialized size.
+    private static final long MAX_ASSIGNMENT_PAYLOAD_BYTES = 4L << 20;
+    private static final long MAX_SPLIT_PAYLOAD_BYTES = 8L << 20;
+
+    @Nullable private SourceSplitSerializer payloadSerializer;
+
+    private long payloadBytes(SourceSplitBase split) {
+        if (payloadSerializer == null) {
+            payloadSerializer = new SourceSplitSerializer(lakeSource);
+        }
+        try {
+            return payloadSerializer.serialize(split).length;
+        } catch (IOException e) {
+            throw new FlinkRuntimeException("Failed to serialize split " + split.splitId(), e);
+        }
+    }
+
+    private List<List<SourceSplitBase>> boundedByPayload(List<SourceSplitBase> splits) {
+        List<List<SourceSplitBase>> rpcs = new ArrayList<>();
+        List<SourceSplitBase> current = new ArrayList<>();
+        long currentBytes = 0;
+        for (SourceSplitBase split : splits) {
+            long bytes = payloadBytes(split);
+            if (bytes > MAX_SPLIT_PAYLOAD_BYTES) {
+                int lakeSplits =
+                        split instanceof DvBucketSplit
+                                ? ((DvBucketSplit) split).lakeSplitCount()
+                                : 1;
+                throw new FlinkRuntimeException(
+                        String.format(
+                                "Split %s of %s is %d bytes (%d lake files), more than one"
+                                        + " assignment RPC can carry; refusing to read instead of"
+                                        + " returning an incomplete result. Compact the bucket's"
+                                        + " lake files.",
+                                split.splitId(), tablePath, bytes, lakeSplits));
+            }
+            if (!current.isEmpty() && currentBytes + bytes > MAX_ASSIGNMENT_PAYLOAD_BYTES) {
+                rpcs.add(current);
+                current = new ArrayList<>();
+                currentBytes = 0;
+            }
+            current.add(split);
+            currentBytes += bytes;
+        }
+        if (!current.isEmpty()) {
+            rpcs.add(current);
+        }
+        return rpcs;
     }
 
     private void assignPendingSplits(Set<Integer> pendingReaders) {
@@ -1496,14 +1556,18 @@ public class FlinkSourceEnumerator
                     incrementalAssignment.entrySet()) {
                 int readerId = entry.getKey();
                 List<SourceSplitBase> splits = entry.getValue();
-                Lists.partition(splits, splitPerAssignmentBatchSize).stream()
-                        .forEach(
-                                batchSplits -> {
-                                    context.assignSplits(
-                                            new SplitsAssignment<>(
-                                                    Collections.singletonMap(
-                                                            readerId, batchSplits)));
-                                });
+                for (List<SourceSplitBase> batchSplits :
+                        Lists.partition(splits, splitPerAssignmentBatchSize)) {
+                    // A split of a table with deletion vectors carries its bucket's lake files, so
+                    // their assignments are also bounded by payload.
+                    for (List<SourceSplitBase> rpc :
+                            isDvPrimaryKeyTable()
+                                    ? boundedByPayload(batchSplits)
+                                    : Collections.singletonList(batchSplits)) {
+                        context.assignSplits(
+                                new SplitsAssignment<>(Collections.singletonMap(readerId, rpc)));
+                    }
+                }
             }
         }
 
@@ -1513,6 +1577,18 @@ public class FlinkSourceEnumerator
                     pendingReaders);
             pendingReaders.forEach(context::signalNoMoreSplits);
         }
+    }
+
+    @VisibleForTesting
+    void setTableInfo(TableInfo tableInfo) {
+        this.tableInfo = tableInfo;
+    }
+
+    /** Whether the table is a primary key table with deletion vectors. */
+    private boolean isDvPrimaryKeyTable() {
+        return tableInfo != null
+                && tableInfo.hasPrimaryKey()
+                && tableInfo.isDeletionVectorsEnabled();
     }
 
     /**
@@ -1542,11 +1618,17 @@ public class FlinkSourceEnumerator
                         : ((tableBucket.getPartitionId().hashCode() * 31) & 0x7FFFFFFF)
                                 % context.currentParallelism();
 
-        // super hack logic, if the bucket is -1, it means the split is
-        // for bucket unaware, like paimon unaware bucket log table,
-        // we use hash split id to get the split owner
+        // Splits that are independent, bounded reads go to readers by split id, not by bucket,
+        // since any reader can own any of them. These are the LakeSnapshotSplits of a primary
+        // key table with deletion vectors (the lake files of a partition dropped from Fluss, or
+        // splits with masks restored from an older checkpoint) and the DvBucketSplits of a
+        // bucket that share a pinned cut. A bucket read by one DvBucketSplit is assigned by
+        // bucket. Bucket-unaware lake splits (bucket == -1, e.g. of a Paimon unaware-bucket log
+        // table) have no bucket to assign by either.
         // todo: refactor the split assign logic
-        if (split.isLakeSplit() && tableBucket.getBucket() == -1) {
+        if ((isDvPrimaryKeyTable() && split instanceof LakeSnapshotSplit)
+                || (split instanceof DvBucketSplit && ((DvBucketSplit) split).sharesBucket())
+                || (split.isLakeSplit() && tableBucket.getBucket() == -1)) {
             return (split.splitId().hashCode() & 0x7FFFFFFF) % context.currentParallelism();
         }
 

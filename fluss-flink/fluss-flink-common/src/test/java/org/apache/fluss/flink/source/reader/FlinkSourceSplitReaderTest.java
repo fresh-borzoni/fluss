@@ -32,15 +32,25 @@ import org.apache.fluss.flink.source.split.KvBatchSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.Planner;
+import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.SortedRecordReader;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.CloseableIterator;
 
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
@@ -57,6 +67,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -186,7 +197,11 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
                                                                     null,
                                                                     0)))))
                     .hasMessageContaining(
-                            "Table ID mismatch: expected 0, but split contains 1 for table 'test-flink-db.test-only-snapshot-table'. "
+                            "Table ID mismatch: expected "
+                                    + tableId
+                                    + ", but split contains "
+                                    + (tableId + 1)
+                                    + " for table 'test-flink-db.test-only-snapshot-table'. "
                                     + "This usually happens when a table with the same name was dropped and recreated between job runs, "
                                     + "causing metadata inconsistency. To resolve this, please restart the job **without** using "
                                     + "the previous savepoint or checkpoint.");
@@ -521,6 +536,191 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
             assertThat(records.finishedSplits())
                     .containsExactlyInAnyOrder(
                             split1.splitId(), split2.splitId(), split3.splitId());
+        }
+    }
+
+    /**
+     * A bounded log split whose partition is dropped while it is read ends with the rows read. The
+     * stopping offset lies beyond the log, as the rest of the log is gone once the partition is.
+     */
+    @Test
+    void testLogSplitOfDroppedPartitionFinishes() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test-dropped-partition-log");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("p", DataTypes.STRING())
+                        .build();
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder()
+                                .schema(schema)
+                                .partitionedBy("p")
+                                .distributedBy(1)
+                                .build());
+        TableBucket bucket = createPartitionWithRows(tablePath, tableId, false);
+        LogSplit split = new LogSplit(bucket, "p1", 0L, 1_000L);
+
+        try (FlinkSourceSplitReader reader = createSplitReader(tablePath, schema.getRowType())) {
+            assignSplits(reader, Collections.singletonList(split));
+            assertThat(fetchUntilFinished(reader, split.splitId(), 10, 0, tablePath)).isEqualTo(10);
+        }
+    }
+
+    /**
+     * A union read merging a lake snapshot with the log of a partition dropped meanwhile merges the
+     * log read so far.
+     */
+    @Test
+    void testMergedLakeSplitOfDroppedPartitionFinishes() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test-dropped-partition-merge");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("p", DataTypes.STRING())
+                        .primaryKey("id", "p")
+                        .build();
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder()
+                                .schema(schema)
+                                .partitionedBy("p")
+                                .distributedBy(1)
+                                .build());
+        TableBucket bucket = createPartitionWithRows(tablePath, tableId, true);
+        LakeSnapshotAndFlussLogSplit split =
+                new LakeSnapshotAndFlussLogSplit(bucket, "p1", null, 0L, 1_000L);
+
+        try (FlinkSourceSplitReader reader =
+                new FlinkSourceSplitReader(
+                        clientConf,
+                        tablePath,
+                        schema.getRowType(),
+                        null,
+                        null,
+                        new EmptySortedLakeSource(),
+                        createMockSourceReaderMetrics())) {
+            assignSplits(reader, Collections.singletonList(split));
+            // the drop may come before the log was read: the merge holds a prefix of it
+            assertThat(fetchUntilFinished(reader, split.splitId(), 0, 1, tablePath))
+                    .isBetween(0, 10);
+        }
+    }
+
+    /** Creates partition p1 with ten rows in bucket 0, and returns that bucket. */
+    private TableBucket createPartitionWithRows(
+            TablePath tablePath, long tableId, boolean primaryKey) throws Exception {
+        ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+        createPartitions(zkClient, tablePath, Collections.singletonList("p1"));
+        long partitionId = waitUntilPartitions(zkClient, tablePath, 1).keySet().iterator().next();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(tableId, partitionId);
+        try (Table table = conn.getTable(tablePath)) {
+            if (primaryKey) {
+                UpsertWriter writer = table.newUpsert().createWriter();
+                for (int i = 0; i < 10; i++) {
+                    writer.upsert(row(i, "v" + i, "p1"));
+                }
+                writer.flush();
+            } else {
+                AppendWriter writer = table.newAppend().createWriter();
+                for (int i = 0; i < 10; i++) {
+                    writer.append(row(i, "v" + i, "p1"));
+                }
+                writer.flush();
+            }
+        }
+        return new TableBucket(tableId, partitionId, 0);
+    }
+
+    /**
+     * Fetches until the split finishes, dropping partition p1 once {@code rowsBeforeDrop} rows and
+     * {@code fetchesBeforeDrop} fetches were made. Returns the number of rows read.
+     */
+    private int fetchUntilFinished(
+            FlinkSourceSplitReader reader,
+            String splitId,
+            int rowsBeforeDrop,
+            int fetchesBeforeDrop,
+            TablePath tablePath)
+            throws Exception {
+        int rows = 0;
+        int fetches = 0;
+        boolean dropped = false;
+        long deadline = System.currentTimeMillis() + Duration.ofMinutes(2).toMillis();
+        while (System.currentTimeMillis() < deadline) {
+            if (!dropped && rows >= rowsBeforeDrop && fetches >= fetchesBeforeDrop) {
+                ZooKeeperClient zkClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
+                dropPartitions(zkClient, tablePath, Collections.singleton("p1"));
+                waitUntilPartitions(zkClient, tablePath, 0);
+                dropped = true;
+            }
+            RecordsWithSplitIds<RecordAndPos> records = reader.fetch();
+            fetches++;
+            boolean finished = records.finishedSplits().contains(splitId);
+            String id;
+            while ((id = records.nextSplit()) != null) {
+                while (records.nextRecordFromSplit() != null) {
+                    if (id.equals(splitId)) {
+                        rows++;
+                    }
+                }
+            }
+            records.recycle();
+            if (finished) {
+                assertThat(dropped).isTrue();
+                return rows;
+            }
+        }
+        throw new AssertionError("split " + splitId + " never finished after its partition drop");
+    }
+
+    /** An empty lake source that reads in key order. */
+    private static class EmptySortedLakeSource implements LakeSource<LakeSplit> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public LakeSource<LakeSplit> copy() {
+            return this;
+        }
+
+        @Override
+        public void withProject(int[][] project) {}
+
+        @Override
+        public void withLimit(int limit) {}
+
+        @Override
+        public FilterPushDownResult withFilters(List<Predicate> predicates) {
+            return FilterPushDownResult.of(Collections.emptyList(), predicates);
+        }
+
+        @Override
+        public Planner<LakeSplit> createPlanner(PlannerContext context) {
+            return Collections::emptyList;
+        }
+
+        @Override
+        public RecordReader createRecordReader(ReaderContext<LakeSplit> context) {
+            return new SortedRecordReader() {
+                @Override
+                public Comparator<InternalRow> order() {
+                    return Comparator.comparingInt(row -> row.getInt(0));
+                }
+
+                @Override
+                public CloseableIterator<LogRecord> read() {
+                    return CloseableIterator.emptyIterator();
+                }
+            };
+        }
+
+        @Override
+        public SimpleVersionedSerializer<LakeSplit> getSplitSerializer() {
+            throw new UnsupportedOperationException();
         }
     }
 

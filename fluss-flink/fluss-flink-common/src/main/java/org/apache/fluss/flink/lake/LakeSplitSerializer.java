@@ -17,6 +17,9 @@
 
 package org.apache.fluss.flink.lake;
 
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketMaskState;
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
@@ -33,8 +36,11 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
+import static org.apache.fluss.flink.lake.split.DvBucketSplit.DV_BUCKET_SPLIT_KIND;
 import static org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit.LAKE_SNAPSHOT_FLUSS_LOG_SPLIT_KIND;
 import static org.apache.fluss.flink.lake.split.LakeSnapshotSplit.LAKE_SNAPSHOT_SPLIT_KIND;
 
@@ -87,6 +93,23 @@ public class LakeSplitSerializer {
             out.writeLong(lakeSnapshotAndFlussLogSplit.getRecordsToSkip());
             out.writeInt(lakeSnapshotAndFlussLogSplit.getCurrentLakeSplitIndex());
             out.writeBoolean(lakeSnapshotAndFlussLogSplit.isLakeSplitFinished());
+        } else if (split instanceof DvBucketSplit) {
+            // since VERSION_3 of the enclosing SourceSplitSerializer
+            DvBucketSplit dvSplit = (DvBucketSplit) split;
+            out.writeLong(dvSplit.getSnapshotId());
+            out.writeLong(dvSplit.getSnapshotLogOffset());
+            out.writeLong(dvSplit.getStoppingOffset());
+            writeLakeSplits(out, dvSplit.getLakeSplits());
+            out.writeByte(dvSplit.getReadMode().code());
+            out.writeLong(dvSplit.getMaskLogEndOffset());
+            out.writeInt(dvSplit.getCurrentLakeSplitIndex());
+            out.writeLong(dvSplit.getRecordsToSkip());
+            out.writeLong(dvSplit.getNextLogOffset());
+            writeMaskState(out, dvSplit.getMaskState());
+            out.writeBoolean(dvSplit.isPinned());
+            out.writeInt(dvSplit.getFileGroup());
+            out.writeBoolean(dvSplit.readsLog());
+            out.writeLong(dvSplit.getPinnedLogStartOffset());
         } else {
             throw new UnsupportedOperationException(
                     "Unsupported split type: " + split.getClass().getName());
@@ -145,8 +168,131 @@ public class LakeSplitSerializer {
                     recordsToSkip,
                     splitIndex,
                     isLakeSplitFinished);
+        } else if (splitKind == DV_BUCKET_SPLIT_KIND) {
+            long snapshotId = input.readLong();
+            long snapshotLogOffset = input.readLong();
+            long stoppingOffset = input.readLong();
+            List<LakeSplit> lakeSplits = readLakeSplits(input, version);
+            DvBucketPart.ReadMode readMode = DvBucketPart.ReadMode.of(input.readByte());
+            long maskLogEndOffset = input.readLong();
+            int currentLakeSplitIndex = input.readInt();
+            long recordsToSkip = input.readLong();
+            long nextLogOffset = input.readLong();
+            DvBucketMaskState maskState = readMaskState(input);
+            boolean pinned = input.readBoolean();
+            int fileGroup = input.readInt();
+            boolean readsLog = input.readBoolean();
+            long pinnedLogStartOffset = input.readLong();
+            return new DvBucketSplit(
+                    tableBucket,
+                    partition,
+                    snapshotId,
+                    snapshotLogOffset,
+                    stoppingOffset,
+                    lakeSplits,
+                    readMode,
+                    maskLogEndOffset,
+                    currentLakeSplitIndex,
+                    recordsToSkip,
+                    nextLogOffset,
+                    maskState,
+                    pinned,
+                    fileGroup,
+                    readsLog,
+                    pinnedLogStartOffset);
         } else {
             throw new UnsupportedOperationException("Unsupported split kind: " + splitKind);
         }
+    }
+
+    private void writeLakeSplits(DataOutputSerializer out, @Nullable List<LakeSplit> lakeSplits)
+            throws IOException {
+        if (lakeSplits == null) {
+            out.writeBoolean(false);
+            return;
+        }
+        out.writeBoolean(true);
+        out.writeInt(lakeSplits.size());
+        for (LakeSplit lakeSplit : lakeSplits) {
+            byte[] serializeBytes = sourceSplitSerializer.serialize(lakeSplit);
+            out.writeInt(serializeBytes.length);
+            out.write(serializeBytes);
+        }
+    }
+
+    @Nullable
+    private List<LakeSplit> readLakeSplits(DataInputDeserializer input, int version)
+            throws IOException {
+        if (!input.readBoolean()) {
+            return null;
+        }
+        int size = input.readInt();
+        List<LakeSplit> lakeSplits = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            byte[] serializeBytes = new byte[input.readInt()];
+            input.readFully(serializeBytes);
+            lakeSplits.add(sourceSplitSerializer.deserialize(version, serializeBytes));
+        }
+        return lakeSplits;
+    }
+
+    private static void writeMaskState(
+            DataOutputSerializer out, @Nullable DvBucketMaskState maskState) throws IOException {
+        if (maskState == null) {
+            out.writeBoolean(false);
+            return;
+        }
+        out.writeBoolean(true);
+        out.writeLong(maskState.getLogStartOffset());
+        out.writeLong(maskState.getLogEndOffset());
+        String identity = maskState.getLakeSnapshotIdentity();
+        out.writeBoolean(identity != null);
+        if (identity != null) {
+            out.writeUTF(identity);
+        }
+        writeBytes(out, maskState.getLogMask());
+        out.writeInt(maskState.getLakeMasks().size());
+        for (Map.Entry<String, byte[]> e : maskState.getLakeMasks().entrySet()) {
+            out.writeUTF(e.getKey());
+            writeBytes(out, e.getValue());
+        }
+    }
+
+    @Nullable
+    private static DvBucketMaskState readMaskState(DataInputDeserializer input) throws IOException {
+        if (!input.readBoolean()) {
+            return null;
+        }
+        long logStartOffset = input.readLong();
+        long logEndOffset = input.readLong();
+        String identity = input.readBoolean() ? input.readUTF() : null;
+        byte[] logMask = readBytes(input);
+        int size = input.readInt();
+        Map<String, byte[]> lakeMasks = new HashMap<>(size);
+        for (int i = 0; i < size; i++) {
+            lakeMasks.put(input.readUTF(), readBytes(input));
+        }
+        return new DvBucketMaskState(logStartOffset, logEndOffset, identity, lakeMasks, logMask);
+    }
+
+    private static void writeBytes(DataOutputSerializer out, @Nullable byte[] bytes)
+            throws IOException {
+        if (bytes == null) {
+            out.writeInt(-1);
+        } else {
+            out.writeInt(bytes.length);
+            out.write(bytes);
+        }
+    }
+
+    @Nullable
+    private static byte[] readBytes(DataInputDeserializer input) throws IOException {
+        int length = input.readInt();
+        if (length < 0) {
+            return null;
+        }
+        byte[] bytes = new byte[length];
+        input.readFully(bytes);
+        return bytes;
     }
 }

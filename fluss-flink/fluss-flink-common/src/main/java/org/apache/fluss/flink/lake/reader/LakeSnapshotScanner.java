@@ -39,9 +39,14 @@ public class LakeSnapshotScanner implements BatchScanner {
     private CloseableIterator<InternalRow> rowsIterator;
 
     public LakeSnapshotScanner(
-            LakeSource<LakeSplit> lakeSource, LakeSnapshotSplit lakeSnapshotSplit) {
+            LakeSource<LakeSplit> lakeSource,
+            LakeSnapshotSplit lakeSnapshotSplit,
+            @Nullable int[][] projection) {
         this.lakeSource = lakeSource;
         this.lakeSnapshotSplit = lakeSnapshotSplit;
+        if (projection != null) {
+            lakeSource.withProject(projection);
+        }
     }
 
     @Nullable

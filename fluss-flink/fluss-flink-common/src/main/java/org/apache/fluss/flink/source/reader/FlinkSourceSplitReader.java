@@ -20,7 +20,9 @@ package org.apache.fluss.flink.source.reader;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.scanner.DroppedPartitionDetector;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.scanner.batch.KvSnapshotAndLogBatchScanner;
@@ -121,6 +123,11 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     // Set to collect table buckets that are unsubscribed.
     private Set<TableBucket> unsubscribedTableBuckets = new HashSet<>();
 
+    // created on first use, for deletion vector masks and partition checks
+    @Nullable private Admin admin;
+    // bounded log reads whose bucket stops making progress ask whether its partition was dropped
+    private final DroppedPartitionDetector droppedPartitions;
+
     public FlinkSourceSplitReader(
             Configuration flussConf,
             TablePath tablePath,
@@ -135,6 +142,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
                         Collections.singleton(MetricNames.SCANNER_RECORDS_LAG));
         this.connection = ConnectionFactory.createConnection(flussConf, flinkMetricRegistry);
         this.table = connection.getTable(tablePath);
+        this.droppedPartitions = new DroppedPartitionDetector(this::admin, tablePath);
         this.tableId = table.getTableInfo().getTableId();
         this.sourceOutputType = sourceOutputType;
         this.boundedSplits = new ArrayDeque<>();
@@ -195,6 +203,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
                 ScanRecords scanRecords = logScanner.poll(POLL_TIMEOUT);
                 FlinkRecordsWithSplitIds records = forLogRecords(scanRecords);
                 removeFinishedSplits(records.finishedSplits());
+                finishSplitsOfDroppedPartitions(scanRecords);
                 return records;
             }
         }
@@ -263,9 +272,52 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     private LakeSplitReaderGenerator getLakeSplitReader() {
         if (lakeSplitReaderGenerator == null) {
             lakeSplitReaderGenerator =
-                    new LakeSplitReaderGenerator(table, projectedFields, checkNotNull(lakeSource));
+                    new LakeSplitReaderGenerator(
+                            table,
+                            projectedFields,
+                            checkNotNull(lakeSource),
+                            this::admin,
+                            droppedPartitions);
         }
         return lakeSplitReaderGenerator;
+    }
+
+    private synchronized Admin admin() {
+        if (admin == null) {
+            admin = connection.getAdmin();
+        }
+        return admin;
+    }
+
+    /**
+     * Finishes the bounded log splits whose partition was dropped from Fluss. A log scanner keeps
+     * polling the buckets of a dropped partition without an error, so such a split would never
+     * reach its stopping offset. A bucket that made no progress in a poll is checked. The split
+     * ends with the log read so far, as the splits of a partition dropped during a streaming read
+     * do.
+     */
+    private void finishSplitsOfDroppedPartitions(ScanRecords scanRecords) {
+        Iterator<Map.Entry<TableBucket, String>> iterator = subscribedBuckets.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<TableBucket, String> entry = iterator.next();
+            TableBucket tableBucket = entry.getKey();
+            Long partitionId = tableBucket.getPartitionId();
+            if (partitionId == null
+                    || !stoppingOffsets.containsKey(tableBucket)
+                    || !scanRecords.records(tableBucket).isEmpty()
+                    || scanRecords.consumedUpToOffset(tableBucket) != null
+                    || !droppedPartitions.isDropped(partitionId)) {
+                continue;
+            }
+            LOG.warn(
+                    "The partition of split {} was dropped while its log was read; the split ends"
+                            + " with the log read so far.",
+                    entry.getValue());
+            logScanner.unsubscribe(partitionId, tableBucket.getBucket());
+            stoppingOffsets.remove(tableBucket);
+            removedSplits.add(entry.getValue());
+            iterator.remove();
+        }
     }
 
     private void subscribeLog(SourceSplitBase split, long startingOffset) {
@@ -427,6 +479,7 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
             HybridSnapshotLogSplit hybridSnapshotLogSplit =
                     currentBoundedSplit.asHybridSnapshotLogSplit();
             if (hybridSnapshotLogSplit.isBatch()) {
+                Long partitionId = hybridSnapshotLogSplit.getTableBucket().getPartitionId();
                 BatchScanner batchScanner =
                         new KvSnapshotAndLogBatchScanner(
                                 table,
@@ -441,7 +494,10 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
                                                                 "Batch hybrid snapshot log split "
                                                                         + "must have a stopping "
                                                                         + "offset.")),
-                                projectedFields);
+                                projectedFields,
+                                partitionId == null
+                                        ? null
+                                        : () -> droppedPartitions.isDropped(partitionId));
                 currentBoundedSplitReader =
                         new BoundedSplitReader(
                                 batchScanner, hybridSnapshotLogSplit.recordsToSkip());
@@ -651,6 +707,9 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         }
         if (logScanner != null) {
             logScanner.close();
+        }
+        if (admin != null) {
+            admin.close();
         }
         table.close();
         connection.close();

@@ -17,17 +17,23 @@
 
 package org.apache.fluss.flink.source.split;
 
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
+import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.TestingLakeSource;
 import org.apache.fluss.lake.source.TestingLakeSplit;
 import org.apache.fluss.metadata.TableBucket;
 
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -210,8 +216,52 @@ class SourceSplitSerializerTest {
         assertLakeSnapshotSplit(deserializedSplit, split, 0L);
     }
 
+    @Test
+    void testDeserializeVersionTwoLogSplit() throws Exception {
+        // the layout of LogSplit in VERSION_2, unchanged in VERSION_3
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeByte(SourceSplitBase.LOG_SPLIT_FLAG);
+        out.writeLong(tableBucket.getTableId());
+        out.writeBoolean(false);
+        out.writeInt(tableBucket.getBucket());
+        out.writeLong(10L);
+        out.writeLong(20L);
+        byte[] logSplitV2 = out.getCopyOfBuffer();
+
+        SourceSplitBase deserializedSplit = serializer.deserialize(2, logSplitV2);
+
+        assertThat(deserializedSplit).isEqualTo(new LogSplit(tableBucket, null, 10L, 20L));
+        assertThat(serializer.serialize(deserializedSplit)).isEqualTo(logSplitV2);
+    }
+
+    @Test
+    void testDeserializeVersionTwoLakeSnapshotSplit() throws Exception {
+        TestingLakeSplit lakeSplit = new TestingLakeSplit(2, null);
+        LakeSnapshotSplit split = new LakeSnapshotSplit(tableBucket, null, lakeSplit, 5, 7L);
+        byte[] lakeSplitBytes = lakeSource.getSplitSerializer().serialize(lakeSplit);
+
+        // the layout of LakeSnapshotSplit in VERSION_2, unchanged in VERSION_3
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeByte(LakeSnapshotSplit.LAKE_SNAPSHOT_SPLIT_KIND);
+        out.writeLong(tableBucket.getTableId());
+        out.writeBoolean(false);
+        out.writeInt(tableBucket.getBucket());
+        out.writeInt(lakeSource.getSplitSerializer().getVersion());
+        out.writeInt(5);
+        out.writeInt(lakeSplitBytes.length);
+        out.write(lakeSplitBytes);
+        out.writeLong(7L);
+        byte[] lakeSnapshotSplitV2 = out.getCopyOfBuffer();
+
+        LakeSnapshotSplit deserializedSplit =
+                (LakeSnapshotSplit) lakeSerializer.deserialize(2, lakeSnapshotSplitV2);
+
+        assertLakeSnapshotSplit(deserializedSplit, split, 7L);
+        assertThat(lakeSerializer.serialize(deserializedSplit)).isEqualTo(lakeSnapshotSplitV2);
+    }
+
     @ParameterizedTest
-    @ValueSource(ints = {-1, 3})
+    @ValueSource(ints = {-1, 4})
     void testDeserializeUnknownVersion(int version) {
         assertThatThrownBy(
                         () ->
@@ -220,6 +270,45 @@ class SourceSplitSerializerTest {
                                         serializer.serialize(new LogSplit(tableBucket, null, 0))))
                 .isInstanceOf(IOException.class)
                 .hasMessage("Unknown version " + version);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testDvBucketSplitSerde(boolean isPartitioned) throws Exception {
+        TableBucket bucket = isPartitioned ? partitionedTableBucket : tableBucket;
+        String partitionName = isPartitioned ? "2024" : null;
+        List<LakeSplit> lakeSplits =
+                Arrays.asList(
+                        new TestingLakeSplit(bucket.getBucket(), Collections.emptyList()),
+                        new TestingLakeSplit(bucket.getBucket(), Collections.emptyList()));
+        DvBucketSplit planned =
+                new DvBucketSplit(bucket, partitionName, 42L, 100L, 150L, lakeSplits);
+        DvBucketSplit read =
+                planned.resolved(DvBucketPart.ReadMode.MASKED, 43L, 120L, lakeSplits, 160L)
+                        .atPosition(1, 7L, DvBucketSplit.LOG_NOT_STARTED);
+        DvBucketSplit logOnly = new DvBucketSplit(bucket, partitionName, -1L, -1L, 30L, null);
+
+        for (DvBucketSplit split : Arrays.asList(planned, read, logOnly)) {
+            DvBucketSplit deserialized =
+                    (DvBucketSplit)
+                            lakeSerializer.deserialize(
+                                    lakeSerializer.getVersion(), lakeSerializer.serialize(split));
+            assertThat(deserialized.getTableBucket()).isEqualTo(split.getTableBucket());
+            assertThat(deserialized.getPartitionName()).isEqualTo(split.getPartitionName());
+            assertThat(deserialized.getSnapshotId()).isEqualTo(split.getSnapshotId());
+            assertThat(deserialized.getSnapshotLogOffset()).isEqualTo(split.getSnapshotLogOffset());
+            assertThat(deserialized.getStoppingOffset()).isEqualTo(split.getStoppingOffset());
+            assertThat(deserialized.lakeSplitCount()).isEqualTo(split.lakeSplitCount());
+            assertThat(deserialized.getLakeSplits() == null)
+                    .isEqualTo(split.getLakeSplits() == null);
+            assertThat(deserialized.getReadMode()).isEqualTo(split.getReadMode());
+            assertThat(deserialized.getMaskLogEndOffset()).isEqualTo(split.getMaskLogEndOffset());
+            assertThat(deserialized.getCurrentLakeSplitIndex())
+                    .isEqualTo(split.getCurrentLakeSplitIndex());
+            assertThat(deserialized.getRecordsToSkip()).isEqualTo(split.getRecordsToSkip());
+            assertThat(deserialized.getNextLogOffset()).isEqualTo(split.getNextLogOffset());
+            assertThat(deserialized.splitId()).isEqualTo(split.splitId());
+        }
     }
 
     @ParameterizedTest

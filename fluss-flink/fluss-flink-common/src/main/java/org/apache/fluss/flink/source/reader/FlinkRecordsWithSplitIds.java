@@ -119,7 +119,8 @@ public class FlinkRecordsWithSplitIds implements RecordsWithSplitIds<RecordAndPo
                         + "iterate over the records split.");
         if (currentRecordIterator.hasNext()) {
             RecordAndPos recordAndPos = currentRecordIterator.next();
-            if (recordAndPos.isSnapshotPhaseFinished()) {
+            // a marker carries no record and is not bounded by the stopping offset
+            if (recordAndPos.isSnapshotPhaseFinished() || recordAndPos.record() == null) {
                 return recordAndPos;
             }
             long offset = recordAndPos.record().logOffset();
