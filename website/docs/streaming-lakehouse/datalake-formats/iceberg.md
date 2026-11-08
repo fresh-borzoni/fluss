@@ -574,8 +574,17 @@ The table option `table.datalake.auto-compaction` (disabled by default) provides
 When enabled for a specific table, compaction is automatically triggered during write operations to that table by the tiering service.
 
 :::note
-Tiering-managed auto compaction is currently only supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns). Newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
+Tiering-managed auto compaction is supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns) and for primary key tables with deletion vectors (`table.deletion-vectors.enabled`). Other newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
 :::
+
+#### Tables with deletion vectors
+
+For primary key tables with deletion vectors, the tiering service compacts each bucket with a tiered policy, so that frequent tiering rounds do not rewrite the same rows again and again:
+
+- **When**: a bucket is compacted at most once per `table.datalake.auto-compaction.interval` (default 10 minutes), once it has `table.datalake.auto-compaction.min-small-files` (default 3) small files, four medium or large files of the same size class, or a file whose deletion vector or position deletes hide more than a fifth of its rows.
+- **What**: files fall into size classes by the target file size `T` (`write.target-file-size-bytes`, at most `read.split.target-size`): small (below `T/16`), medium (below `T/4`), large (below `T`) and full. Small files are merged together; medium and large files four of a class at a time, so rows climb the classes instead of being merged into one growing file with every batch of new files. Full files are rewritten only to drop the rows their deletes hide. In a simulation of a bucket written every minute for 4 GB, compactions rewrite about 3x the tiered bytes at 1 MB per round and about 2x at 12 MB per round, against about 63x and 5x when every small file was merged into one growing file.
+- **Freshness**: a round waits at most 10 seconds for its bucket's compaction after writing its data. A slower compaction is stopped: the round commits the file groups it finished, and the rest is compacted later.
+- **Positions**: the compaction hands the new position of every row it rewrote to the deletion vector position index, so the rewrite is registered without reading its files again. Files rewritten by another engine are re-indexed by the tiering service.
 
 #### Configuration
 
