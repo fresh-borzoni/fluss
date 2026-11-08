@@ -339,6 +339,16 @@ CREATE TABLE user_profiles (
 ) PARTITIONED BY (bucket(user_id, 4));
 ```
 
+#### Primary Key Tables with Deletion Vectors
+
+A primary key table created with `'table.deletion-vectors.enabled' = 'true'` is tiered with positional deletes instead of equality deletes. Each tiering round looks up the previous row of every key it changed, and commits its new data files and the deletes of the superseded rows in one Iceberg commit. Every snapshot Fluss commits thus has at most one live row per key, and an engine that reads the table directly needs no merge by key.
+
+- **Format version**: Fluss creates the Iceberg table with format version 3 and file-scoped deletes (`write.delete.granularity` = `file`), so each data file has at most one deletion vector. To write format version 2 position delete files instead, one per data file, set `'iceberg.format-version' = '2'` when creating the table. Format version 1 has no position deletes and is refused for tables with deletion vectors.
+- **Engines**: reading a format version 3 table requires an engine and Iceberg library with format version 3 support. Some engines and engine versions cannot read format version 3 tables yet; check the Iceberg support of each engine that reads the table. For such engines, create the table with format version 2: any engine that reads Iceberg position deletes reads it.
+- **Layout**: deletion vectors require the current clean layout. A table with the legacy layout (the `__bucket`, `__offset` and `__timestamp` system columns) is refused, and the tiering service fails its rounds with an error.
+- **Other engines**: other engines may compact, rewrite or expire the Iceberg table, and the tiering service re-indexes the files they rewrote. They must not write rows to it, and the table must not be rolled back past the snapshot Fluss registered. See [Lakehouse Storage](../../maintenance/tiered-storage/lakehouse-storage.md#tiering-service-options).
+- **Snapshot expiry**: with `table.datalake.auto-expire-snapshot` or `lake.tiering.auto-expire-snapshot`, the tiering service expires old snapshots of these tables and keeps those Fluss still needs. It tags the readable snapshots it registers `fluss-readable-<snapshot id>`; the tags keep them from expiring, also by other engines' expiry. The tiering service does not expire snapshots of Iceberg tables without deletion vectors.
+
 ### Log Tables
 
 The table mapping for Fluss log tables varies depending on whether the bucket key is specified or not.
@@ -460,7 +470,7 @@ To read the full dataset, which includes both Fluss (fresh) and Iceberg (histori
 
 **Table type support:**
 - **Log tables**: Supported in both batch and streaming mode.
-- **Primary key tables**: Supported in both batch and streaming mode. Updates tiered to Iceberg are written as equality deletes.
+- **Primary key tables**: Supported in both batch and streaming mode. For tables without deletion vectors, updates tiered to Iceberg are written as equality deletes. For [tables with deletion vectors](#primary-key-tables-with-deletion-vectors), they are written as position deletes, and a batch union read hides the lake rows of keys changed in Fluss by position, without merging the lake and Fluss data by key; a streaming union read of such a table reads the Fluss KV snapshot and changelog instead of the Iceberg files.
 
 ```sql title="Batch mode"
 SET 'execution.runtime-mode' = 'batch';
@@ -574,14 +584,23 @@ The table option `table.datalake.auto-compaction` (disabled by default) provides
 When enabled for a specific table, compaction is automatically triggered during write operations to that table by the tiering service.
 
 :::note
-Tiering-managed auto compaction is currently only supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns). Newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
+Tiering-managed auto compaction is supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns) and for primary key tables with deletion vectors (`table.deletion-vectors.enabled`). Other newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
 :::
+
+#### Tables with deletion vectors
+
+For primary key tables with deletion vectors, the tiering service compacts each bucket with a tiered policy, so that frequent tiering rounds do not rewrite the same rows again and again:
+
+- **When**: a bucket is compacted at most once per `table.datalake.auto-compaction.interval` (default 10 minutes), once it has `table.datalake.auto-compaction.min-small-files` (default 3) small files, four medium or large files of the same size class, or a file whose deletion vector or position deletes hide more than a fifth of its rows.
+- **What**: files fall into size classes by the target file size `T` (`write.target-file-size-bytes`, at most `read.split.target-size`): small (below `T/16`), medium (below `T/4`), large (below `T`) and full. Small files are merged together; medium and large files four of a class at a time, so rows climb the classes instead of being merged into one growing file with every batch of new files. Full files are rewritten only to drop the rows their deletes hide. In a simulation of a bucket written every minute for 4 GB, compactions rewrite about 3x the tiered bytes at 1 MB per round and about 2x at 12 MB per round.
+- **Freshness**: a round waits at most 10 seconds for its bucket's compaction after writing its data. A slower compaction is stopped: the round commits the file groups it finished, and the rest is compacted later.
+- **Positions**: the compaction hands the new position of every row it rewrote to the deletion vector position index, so the rewrite is registered without reading its files again. Files rewritten by another engine are re-indexed by the tiering service.
 
 #### Configuration
 
-As noted above, `table.datalake.auto-compaction` only takes effect for legacy tables. The following shows the option syntax; it is a no-op on a newly created clean table.
+As noted above, `table.datalake.auto-compaction` takes effect for legacy tables and for primary key tables with deletion vectors; it is a no-op on other newly created clean tables. The following shows the option syntax.
 
-```sql title="Flink SQL (legacy tables only)"
+```sql title="Flink SQL"
 CREATE TABLE example_table (
     id BIGINT,
     data STRING,
@@ -604,6 +623,8 @@ Fluss adds specific metadata to Iceberg snapshots for traceability:
 
 - **commit-user**: Set to `__fluss_lake_tiering` to identify Fluss-generated snapshots
 - **fluss-offsets**: JSON string containing the Fluss bucket offset mapping to track the tiering progress
+
+The snapshots of [tables with deletion vectors](#primary-key-tables-with-deletion-vectors) also carry `fluss-dv-base` (the snapshot the round's deletes apply to), `fluss-dv-index-id` (the position index change of the round), `fluss-dv-offsets` (the tiered offset of every bucket) and `fluss-dv-format-version` (the format version of these properties). A compaction by the tiering service carries `fluss-compacted-buckets`, the buckets it rewrote. Fluss reads these properties, for example to finish a round whose tiering service failed after its lake commit.
 
 #### Non-Partitioned Tables
 
@@ -651,3 +672,4 @@ For partitioned tables, the metadata structure includes partition information:
 ## Current Limitations
 
 - **Multiple bucket keys**: Not supported until Iceberg implements multi-argument partition transforms
+- **Deletion vectors**: `table.deletion-vectors.enabled` can only be set when a table is created, not on an existing table, and only Fluss may write rows to the Iceberg table. See [Primary Key Tables with Deletion Vectors](#primary-key-tables-with-deletion-vectors).

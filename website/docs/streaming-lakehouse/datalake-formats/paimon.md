@@ -143,6 +143,19 @@ CREATE TABLE fluss_order_with_lake (
 
 For example, you can specify the Paimon property `file.format` to change the file format of the Paimon table, or set `deletion-vectors.enabled` to enable or disable deletion vectors for the Paimon table.
 
+### Primary Key Tables with Deletion Vectors
+
+A primary key table created with `'table.deletion-vectors.enabled' = 'true'` uses Paimon deletion vectors, and its batch union reads hide the Paimon rows of keys changed in Fluss by position instead of merging the Paimon and Fluss data by key. Paimon merges the rows by primary key and writes the deletion vectors itself during compactions, so Fluss writes no deletes to the Paimon table.
+
+- **Paimon options**: Fluss creates the Paimon table with `deletion-vectors.enabled` = `true`; setting `paimon.deletion-vectors.enabled` to `false` is refused. The Paimon merge engine must be `deduplicate`, the default, so that Paimon keeps the last row of each key as Fluss tiered it; another `merge-engine` and a `sequence.field` are refused. Options that make Paimon drop rows on its own are refused too: `ignore-delete` and its aliases `deduplicate.ignore-delete`, `first-row.ignore-delete` and `partial-update.ignore-delete`, and `record-level.expire-time`. These checks apply to the effective options of the Paimon table, including those it inherits from the Paimon catalog's `table-default.*` options, when the table is created and before the tiering service tiers it.
+- **Partition keys**: as for any Paimon table with deletion vectors, the partition keys must be of type `STRING`.
+- **Readable snapshot**: Paimon readers of a table with deletion vectors do not read level-0 files, so union reads use the latest compacted snapshot. New data becomes readable from Paimon once a compaction, by `table.datalake.auto-compaction` or a Paimon compaction job, moves it out of level 0. Until then, union reads read it from the Fluss log, which Fluss keeps for this (see [Data Retention](../../maintenance/tiered-storage/lakehouse-storage.md#data-retention)). The tiering service indexes the files of each newly readable snapshot when it commits the next round.
+- **Snapshot expiry**: Fluss keeps the readable snapshot it registered last and the one before from expiring with the Paimon consumers `fluss-readable` and `fluss-readable-previous`, which also hold off Paimon's own snapshot expiration.
+- **Other engines**: other engines may compact the Paimon table, and the tiering service re-indexes the files their compactions make readable. They must not write rows to it (an `APPEND` or `OVERWRITE` commit), and the table must not be rolled back past the snapshot Fluss registered; either stops tiering of the table with an error. See [Lakehouse Storage](../../maintenance/tiered-storage/lakehouse-storage.md#tiering-service-options).
+- **Streaming union reads** of such a table read the Fluss KV snapshot and changelog instead of the Paimon files.
+
+`table.deletion-vectors.enabled` can only be set when a table is created.
+
 ## Read Tables
 
 ### Reading with Apache Flink

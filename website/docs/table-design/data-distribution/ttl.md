@@ -122,6 +122,44 @@ Keep these effects and restrictions in mind:
 Existing remote snapshot files have separate retention, controlled by
 [`kv.snapshot.num-retained`](../../maintenance/tiered-storage/remote-storage.md#remote-snapshot-of-primary-key-table).
 
+### Row TTL with Deletion Vectors
+
+A lakehouse table with deletion vectors (`table.deletion-vectors.enabled`) can use row TTL by
+processing time or by event time (`table.kv.ttl.time-column`). Its KV values keep the log offset
+of their version and their TTL time in two fields of their own;
+Fluss picks this value layout when the table is created. Row TTL cleanup writes nothing to the
+changelog, while the lake can still hold a row of an expired key, so union reads behave as follows:
+
+- **An insert after expiry hides the old lake row.** A write that finds no value for its key may
+  follow an expired one, so its key is looked up in the lake. If the lake holds a row of the key,
+  union reads hide it and return the new row.
+- **A row expires from the KV only after it is tiered.** The leader of each bucket caps the time
+  the TTL filter compares rows with below the TTL of the oldest row written after the readable
+  lake snapshot, by processing or by event time. It reads that time from each row as the row is
+  written, so the cap needs no margin and no clock of its own. Once a lake snapshot holds a row,
+  the row expires at its TTL. While tiering stalls, rows written since the readable lake snapshot
+  stay in the KV past their TTL, and a primary key lookup can return them, as it can any expired
+  row compaction has not removed yet.
+- **A row whose TTL time is already old when it is written holds back expiry in its bucket**
+  until it is tiered: a late or backfilled row by event time, or an event time that defaults to 0.
+  A steady stream of such rows holds it back for good, so write null for an unknown event time,
+  which never expires. The metric `dvRowTtlCapLagMs`, and `dvRowTtlCapLagMsMax` per table, show
+  how far a bucket's expiry lags the clock, and the leader logs a warning when it lags by more
+  than the TTL.
+- **A new leader takes the cap over with the KV snapshot it restores.** The snapshot records the
+  readable offset the old leader capped its filter for and the oldest TTL times below the
+  snapshot's offset, so the restored KV holds every version after that offset and the new
+  leader's cap covers the rows it restores. A KV snapshot saved without them, for example by an
+  older version, was compacted by a filter the new leader did not cap: until the bucket covers a
+  lake snapshot readable from the KV snapshot's offset, the filter expires nothing, and union
+  reads read the bucket by key, as when it rebuilds: the lake files and the log after the readable
+  offset, folded to the last change of each key. That is exact but reads all lake keys of the
+  bucket, so it is slower, and the metric `dvRowTtlFoldPerSecond` counts it. The same holds while
+  a bucket covers an older lake snapshot than its filter was capped for.
+- **Deleting a key whose row has expired is a no-op**, as for any table with row TTL: nothing is
+  written to the changelog, so a row of the key that was tiered stays in the lake and visible in
+  union reads.
+
 ## Partition Retention
 
 Use [auto partitioning](partitioning.md#auto-partitioning) when data should expire in whole time
