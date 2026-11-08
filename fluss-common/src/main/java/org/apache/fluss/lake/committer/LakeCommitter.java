@@ -100,6 +100,11 @@ public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable 
     /**
      * Aborts the given committable object.
      *
+     * <p>Fluss aborts a committable whose commit did not land, or was never attempted, to delete
+     * the files written for it. It must delete only files the committable itself wrote, and never a
+     * file a lake snapshot references: a file the committable only references again, e.g. one a
+     * compaction moved to another level under the same name, stays.
+     *
      * @param committable the committable object
      * @throws IOException if an I/O error occurs
      */

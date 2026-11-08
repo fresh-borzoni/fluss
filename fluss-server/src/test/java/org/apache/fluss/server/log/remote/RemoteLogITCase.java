@@ -20,9 +20,12 @@ package org.apache.fluss.server.log.remote;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
+import org.apache.fluss.exception.DeletionVectorsNotReadyException;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.dv.FilePos;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -37,6 +40,11 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
+import org.apache.fluss.rpc.messages.PbCommitLakeTableSnapshotRespForTable;
+import org.apache.fluss.rpc.messages.PbLakeTableSnapshotMetadata;
 import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.server.entity.FetchReqInfo;
@@ -50,19 +58,28 @@ import org.apache.fluss.server.testutils.RpcMessageTestUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.ManualClock;
+import org.apache.fluss.utils.json.TableBucketOffsets;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import javax.annotation.Nullable;
+
+import java.io.File;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.Duration;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -73,6 +90,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1;
@@ -81,6 +99,8 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
+import static org.apache.fluss.server.testutils.LakeTieringTestUtils.renewTiering;
+import static org.apache.fluss.server.testutils.LakeTieringTestUtils.takeTableToTier;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.assertProduceLogResponse;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createPartition;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
@@ -93,6 +113,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** ITCase for remote log. */
@@ -112,6 +133,8 @@ public class RemoteLogITCase {
                     .build();
 
     private ZooKeeperClient zkClient;
+
+    @TempDir private File tempDir;
 
     @BeforeEach
     void setup() {
@@ -924,6 +947,264 @@ public class RemoteLogITCase {
             // Restart the stopped server so other tests are not affected.
             FLUSS_CLUSTER_EXTENSION.startTabletServer(leaderId);
         }
+    }
+
+    /**
+     * The deletion vectors of a Paimon table need its log from the readable offset, the first
+     * offset still in level 0, which lags the tiered offset. Expired remote segments stay from
+     * there although they are tiered, until a compaction moves the readable offset, and a new
+     * leader rebuilds the masks from them after the followers dropped their local copies.
+     */
+    @Test
+    void testRemoteLogTTLKeepsTheLogDeletionVectorsNeed() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_remote_log_ttl_dv");
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(1)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_LOG_TTL, Duration.ofHours(1))
+                        .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(100))
+                        .build();
+        long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
+        // the coordinator registers lake snapshots of a table with deletion vectors only under
+        // the tiering epoch of the round that commits them
+        long tieringEpoch =
+                takeTableToTier(FLUSS_CLUSTER_EXTENSION.newCoordinatorClient(), tableId);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leaderId = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leaderId);
+        for (int round = 0; round < 30; round++) {
+            putKv(leaderGateway, tableId, round);
+        }
+        Replica leaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tb);
+        LogTablet logTablet = leaderReplica.getLogTablet();
+        long logEnd = logTablet.localLogEndOffset();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(logTablet.getHighWatermark()).isEqualTo(logEnd));
+        TabletServer leaderServer = FLUSS_CLUSTER_EXTENSION.getTabletServerById(leaderId);
+        RemoteLogTablet remoteLog =
+                leaderServer.getReplicaManager().getRemoteLogManager().remoteLogTablet(tb);
+
+        // Tiered into level 0 up to the log end, but not compacted, so no snapshot is readable.
+        commitLakeSnapshot(tableId, tieringEpoch, tb, 1, logEnd, null);
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(logTablet.getLakeLogEndOffset()).isEqualTo(logEnd));
+        // Every uploaded segment expires and is tiered, but a rebuild replays the log from offset
+        // 0, so all of it stays.
+        long activeSegmentBase = logTablet.activeLogSegment().getBaseOffset();
+        MANUAL_CLOCK.advanceTime(Duration.ofHours(1).plusMinutes(30));
+        retry(
+                Duration.ofMinutes(2),
+                () -> {
+                    assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(activeSegmentBase);
+                    assertThat(remoteLog.getDvRetainedSegments())
+                            .isEqualTo(remoteLog.allRemoteLogSegments().size());
+                });
+        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
+        List<RemoteLogSegment> segments =
+                remoteLog.allRemoteLogSegments().stream()
+                        .sorted(Comparator.comparingLong(RemoteLogSegment::remoteLogStartOffset))
+                        .collect(Collectors.toList());
+        assertThat(segments.size()).isGreaterThanOrEqualTo(5);
+
+        // A compaction makes snapshot 2 readable from the start of a middle segment.
+        int mid = segments.size() / 2;
+        long readable = segments.get(mid).remoteLogStartOffset();
+        writeIndexChange(leaderServer, tablePath, tb, 2L);
+        commitLakeSnapshot(tableId, tieringEpoch, tb, 2, logEnd, readable);
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(leaderReplica.getDvLogRetainOffset()).isEqualTo(readable));
+        // the segments before it go, those from it on stay
+        retry(
+                Duration.ofMinutes(2),
+                () -> {
+                    assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(readable);
+                    assertThat(remoteLog.allRemoteLogSegments())
+                            .containsExactlyInAnyOrderElementsOf(
+                                    segments.subList(mid, segments.size()));
+                    assertThat(remoteLog.getDvRetainedSegments()).isEqualTo(segments.size() - mid);
+                });
+
+        // The followers drop their local copies of what is in remote storage once a KV snapshot
+        // lets them, so a new leader reads the log from the readable offset there.
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+        for (int followerId = 0; followerId < 3; followerId++) {
+            if (followerId == leaderId) {
+                continue;
+            }
+            LogTablet followerLog =
+                    FLUSS_CLUSTER_EXTENSION
+                            .waitAndGetFollowerReplica(tb, followerId)
+                            .getLogTablet();
+            retry(
+                    Duration.ofMinutes(2),
+                    () -> assertThat(followerLog.localLogStartOffset()).isGreaterThan(readable));
+        }
+        FLUSS_CLUSTER_EXTENSION.stopTabletServer(leaderId);
+        try {
+            int newLeaderId =
+                    waitValue(
+                            () -> {
+                                int id = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+                                return id == leaderId ? Optional.empty() : Optional.of(id);
+                            },
+                            Duration.ofMinutes(1),
+                            "no new leader for " + tb);
+            // The new leader rebuilds the masks of snapshot 2 from the remote log.
+            GetDvSnapshotResponse masks =
+                    getDvSnapshot(
+                            FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(newLeaderId),
+                            tableId,
+                            2L);
+            assertThat(masks.getLogEndOffset()).isEqualTo(logEnd);
+            TabletServer newLeaderServer = FLUSS_CLUSTER_EXTENSION.getTabletServerById(newLeaderId);
+            Replica newLeaderReplica =
+                    newLeaderServer.getReplicaManager().getReplicaOrException(tb);
+            assertThat(newLeaderReplica.getLogTablet().localLogStartOffset())
+                    .isGreaterThan(readable);
+            assertThat(newLeaderReplica.getDvLogRetainOffset()).isEqualTo(readable);
+            RemoteLogTablet newRemoteLog =
+                    newLeaderServer.getReplicaManager().getRemoteLogManager().remoteLogTablet(tb);
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(newRemoteLog.getDvRetainedSegments()).isPositive());
+            assertThat(newRemoteLog.getRemoteLogStartOffset()).isEqualTo(readable);
+        } finally {
+            // Restart the stopped server so other tests are not affected.
+            FLUSS_CLUSTER_EXTENSION.startTabletServer(leaderId);
+            FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        }
+    }
+
+    private static void putKv(TabletServerGateway gateway, long tableId, int round)
+            throws Exception {
+        Object[][] rows =
+                DATA1.stream()
+                        .map(row -> new Object[] {row[0], row[1] + "-" + round})
+                        .toArray(Object[][]::new);
+        PutKvResponse response =
+                gateway.putKv(
+                                newPutKvRequest(
+                                        tableId,
+                                        null,
+                                        0,
+                                        -1,
+                                        genKvRecordBatch(
+                                                (short) 1, DATA1_SCHEMA_PK.getRowType(), rows)))
+                        .get();
+        assertThat(response.getBucketsRespsList()).hasSize(1);
+        assertThat(response.getBucketsRespsList().get(0).hasErrorCode()).isFalse();
+    }
+
+    /**
+     * Commits a lake snapshot as the tiering service does: its tiered offsets and, once a
+     * compaction made it readable, its readable offsets.
+     */
+    private void commitLakeSnapshot(
+            long tableId,
+            long tieringEpoch,
+            TableBucket tb,
+            long snapshotId,
+            long tieredOffset,
+            @Nullable Long readableOffset)
+            throws Exception {
+        renewTiering(FLUSS_CLUSTER_EXTENSION.newCoordinatorClient(), tableId, tieringEpoch);
+        CommitLakeTableSnapshotRequest request = new CommitLakeTableSnapshotRequest();
+        PbLakeTableSnapshotMetadata metadata =
+                request.addLakeTableSnapshotMetadata()
+                        .setTableId(tableId)
+                        .setSnapshotId(snapshotId)
+                        .setTieringEpoch(tieringEpoch)
+                        .setTieredBucketOffsetsFilePath(
+                                writeOffsets("tiered-" + snapshotId, tb, tieredOffset));
+        if (readableOffset != null) {
+            metadata.setReadableBucketOffsetsFilePath(
+                    writeOffsets("readable-" + snapshotId, tb, readableOffset));
+        }
+        request.addTablesReq()
+                .setTableId(tableId)
+                .setSnapshotId(snapshotId)
+                .addBucketsReq()
+                .setBucketId(tb.getBucket())
+                .setLogEndOffset(tieredOffset);
+        PbCommitLakeTableSnapshotRespForTable response =
+                FLUSS_CLUSTER_EXTENSION
+                        .newCoordinatorClient()
+                        .commitLakeTableSnapshot(request)
+                        .get()
+                        .getTableRespAt(0);
+        assertThat(response.hasErrorCode())
+                .as("%s", response.hasErrorMessage() ? response.getErrorMessage() : "")
+                .isFalse();
+    }
+
+    private String writeOffsets(String name, TableBucket tb, long offset) throws Exception {
+        File file = new File(tempDir, name + ".offsets");
+        Files.write(
+                file.toPath(),
+                new TableBucketOffsets(tb.getTableId(), Collections.singletonMap(tb, offset))
+                        .toJsonBytes());
+        return file.getAbsolutePath();
+    }
+
+    /** Publishes the position index change of a snapshot as the first one of the chain. */
+    private static void writeIndexChange(
+            TabletServer server, TablePath tablePath, TableBucket tb, long snapshotId)
+            throws Exception {
+        PositionIndexStore index =
+                PositionIndexStore.forTable(
+                        server.getReplicaManager().getKvSnapshotContext().getRemoteDataDir(),
+                        tablePath,
+                        tb.getTableId(),
+                        null);
+        byte[] key = ("k" + snapshotId).getBytes(StandardCharsets.UTF_8);
+        index.commitChange(
+                snapshotId,
+                Collections.singletonMap(
+                        tb,
+                        new PositionIndexStore.BucketChange(
+                                index.writeBucket(
+                                        snapshotId,
+                                        tb,
+                                        Collections.<Map.Entry<byte[], FilePos>>singletonList(
+                                                        new AbstractMap.SimpleEntry<>(
+                                                                key,
+                                                                new FilePos((int) snapshotId, 0)))
+                                                .iterator()),
+                                Collections.singletonMap((int) snapshotId, "f" + snapshotId),
+                                Collections.emptyList())));
+        index.register(-1L, snapshotId, snapshotId);
+    }
+
+    /** Asks for the masks of a union read until the bucket has rebuilt them. */
+    private static GetDvSnapshotResponse getDvSnapshot(
+            TabletServerGateway gateway, long tableId, long snapshotId) {
+        GetDvSnapshotRequest request =
+                new GetDvSnapshotRequest()
+                        .setTableId(tableId)
+                        .setBucketId(0)
+                        .setReadableSnapshotId(snapshotId);
+        return waitValue(
+                () -> {
+                    try {
+                        return Optional.of(gateway.getDvSnapshot(request).get());
+                    } catch (ExecutionException e) {
+                        if (ExceptionUtils.findThrowable(e, DeletionVectorsNotReadyException.class)
+                                .isPresent()) {
+                            return Optional.empty();
+                        }
+                        throw e;
+                    }
+                },
+                Duration.ofMinutes(2),
+                "the masks of snapshot " + snapshotId + " are not rebuilt");
     }
 
     private static Configuration initConfig() {

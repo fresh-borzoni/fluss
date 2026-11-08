@@ -25,6 +25,7 @@ import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringCommitResult;
 import org.apache.fluss.client.tiering.TieringCommitter;
+import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
@@ -52,7 +53,11 @@ import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox.MailboxClose
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -116,8 +121,9 @@ public class TieringCommitOperator<WriteResult, Committable>
     private final FlussTableLakeSnapshotCommitter flussTableLakeSnapshotCommitter;
     private final MailboxExecutor mailboxExecutor;
     private final int commitThreads;
-    // Mailbox-thread confined, including completed commits whose callbacks have not run yet.
-    private final Set<Long> committingTables = new HashSet<>();
+    // Table ID -> tiering epoch of the round committing. Mailbox-thread confined, including
+    // completed commits whose callbacks have not run yet.
+    private final Map<Long, Long> committingTables = new HashMap<>();
     private ExecutorService commitExecutor;
     private boolean closed;
     private TieringCommitter<WriteResult, Committable> tieringCommitter;
@@ -211,32 +217,121 @@ public class TieringCommitOperator<WriteResult, Committable>
         }
         TableBucket tableBucket = tableBucketWriteResult.tableBucket();
         long tableId = tableBucket.getTableId();
+        long epoch = tableBucketWriteResult.tieringEpoch();
         TableWriteResultAccumulator<WriteResult> accumulator =
-                tableWriteResultAccumulators.computeIfAbsent(
+                tableWriteResultAccumulators.get(tableId);
+        if (accumulator != null && isOlder(epoch, accumulator.tieringEpoch)) {
+            // A late result of a round the coordinator handed out again meanwhile.
+            LOG.info(
+                    "Dropping a write result of {} of tiering epoch {}; the table's round of"
+                            + " epoch {} is collected.",
+                    tableBucket,
+                    epoch,
+                    accumulator.tieringEpoch);
+            discardAsync(
+                    tableId,
+                    tableBucketWriteResult.tablePath(),
+                    null,
+                    Collections.singletonList(tableBucketWriteResult));
+            return;
+        }
+        if (accumulator == null || isOlder(accumulator.tieringEpoch, epoch)) {
+            if (accumulator != null) {
+                LOG.info(
+                        "Dropping {} write results of table {} of tiering epoch {}; the table's"
+                                + " round of epoch {} started.",
+                        accumulator.bucketWriteResults.size(),
                         tableId,
-                        ignored ->
-                                new TableWriteResultAccumulator<>(
-                                        tableBucketWriteResult.numberOfWriteResults()));
+                        accumulator.tieringEpoch,
+                        epoch);
+                discardAsync(
+                        tableId,
+                        tableBucketWriteResult.tablePath(),
+                        null,
+                        accumulator.bucketWriteResults);
+            }
+            accumulator =
+                    new TableWriteResultAccumulator<>(
+                            tableBucketWriteResult.numberOfWriteResults(), epoch);
+            tableWriteResultAccumulators.put(tableId, accumulator);
+        }
         accumulator.add(tableBucketWriteResult);
 
         if (accumulator.isComplete()) {
-            awaitCommitCapacity();
             tableWriteResultAccumulators.remove(tableId);
+            if (isStaleRound(tableId, epoch)) {
+                discardAsync(
+                        tableId,
+                        tableBucketWriteResult.tablePath(),
+                        null,
+                        accumulator.bucketWriteResults);
+                return;
+            }
+            // A round of an older epoch still commits: it is fenced, and ends first.
+            awaitOlderRound(tableId, epoch);
+            awaitCommitCapacity();
             HeldRound<WriteResult> stale = heldRounds.remove(tableId);
             if (stale != null) {
                 // The enumerator starts a table's next round only after the previous one ended,
-                // so the held round failed there, e.g. because its re-index could not be
-                // requested. This round registers any lake commit it made before it was held.
+                // or after it handed the table out again under a newer epoch. So the held round
+                // failed there, e.g. because its re-index could not be requested, or is stale.
+                // This round registers any lake commit it made before it was held.
                 LOG.warn(
                         "Dropping the held round of {} (re-index of snapshot {}), as the"
                                 + " table's next round started.",
                         stale.reindex.tablePath,
                         stale.reindex.compactSnapshotId);
+                discardAsync(tableId, stale);
             }
-            checkState(committingTables.add(tableId), "Table %s is already committing.", tableId);
+            checkState(
+                    committingTables.putIfAbsent(tableId, epoch) == null,
+                    "Table %s is already committing.",
+                    tableId);
             commitAsync(
                     tableId, tableBucketWriteResult.tablePath(), accumulator.bucketWriteResults);
         }
+    }
+
+    /**
+     * Whether a complete round of a table under {@code epoch} is stale, as a round of the table
+     * under a newer epoch commits or is held. The coordinator handed the table out again while the
+     * stale round ran, so the stale round is dropped.
+     */
+    private boolean isStaleRound(long tableId, long epoch) {
+        Long committing = committingTables.get(tableId);
+        HeldRound<WriteResult> held = heldRounds.get(tableId);
+        Long newer =
+                committing != null && isOlder(epoch, committing)
+                        ? committing
+                        : held != null && isOlder(epoch, held.tieringEpoch())
+                                ? Long.valueOf(held.tieringEpoch())
+                                : null;
+        if (newer == null) {
+            return false;
+        }
+        LOG.info(
+                "Dropping the round of table {} of tiering epoch {}; its round of epoch {} is"
+                        + " committing or held.",
+                tableId,
+                epoch,
+                newer);
+        return true;
+    }
+
+    /** Waits until a round of the table under an older epoch than {@code epoch} completed. */
+    private void awaitOlderRound(long tableId, long epoch) throws InterruptedException {
+        // Completions never wait for stream input, so yielding to them cannot deadlock.
+        while (committingTables.containsKey(tableId)
+                && isOlder(committingTables.get(tableId), epoch)) {
+            mailboxExecutor.yield();
+        }
+    }
+
+    /** Whether tiering epoch {@code epoch} is older than {@code other}; unknown epochs are not. */
+    private static boolean isOlder(long epoch, long other) {
+        return epoch != TieringSplit.UNKNOWN_TIERING_EPOCH
+                && other != TieringSplit.UNKNOWN_TIERING_EPOCH
+                && epoch < other;
     }
 
     /** Bounds submitted rounds as well as threads; yields so completions can free capacity. */
@@ -272,6 +367,23 @@ public class TieringCommitOperator<WriteResult, Committable>
                     held.reindex.changeId);
             return;
         }
+        if (result.isFailed()) {
+            // The round fails at once; the later results of its re-index find no round.
+            heldRounds.remove(tableId);
+            discardAsync(tableId, held);
+            reportFailed(
+                    tableId,
+                    held.reindex.tablePath,
+                    held.writeResults,
+                    new IOException(
+                            String.format(
+                                    "Re-index split %d of %s for index change %d failed: %s",
+                                    result.getSplit(),
+                                    tableBucketWriteResult.tableBucket(),
+                                    result.getChangeId(),
+                                    result.getFailure())));
+            return;
+        }
         if (held.rowPosResults
                         .computeIfAbsent(tableBucketWriteResult.tableBucket(), k -> new HashMap<>())
                         .put(result.getSplit(), result)
@@ -289,8 +401,17 @@ public class TieringCommitOperator<WriteResult, Committable>
             return;
         }
         heldRounds.remove(tableId);
+        long epoch = held.tieringEpoch();
+        if (isStaleRound(tableId, epoch)) {
+            discardAsync(tableId, held);
+            return;
+        }
+        awaitOlderRound(tableId, epoch);
         awaitCommitCapacity();
-        checkState(committingTables.add(tableId), "Table %s is already committing.", tableId);
+        checkState(
+                committingTables.putIfAbsent(tableId, epoch) == null,
+                "Table %s is already committing.",
+                tableId);
         resumeAsync(tableId, held);
     }
 
@@ -328,6 +449,30 @@ public class TieringCommitOperator<WriteResult, Committable>
                 });
     }
 
+    /** Discards a held round that will not resume. */
+    private void discardAsync(long tableId, HeldRound<WriteResult> held) {
+        discardAsync(tableId, held.reindex.tablePath, held.reindex, held.writeResults);
+    }
+
+    /**
+     * Deletes, in the background, what a round that will not commit wrote and no lake snapshot
+     * references: a stale round, or a held round that will not resume ({@code reindex} not null).
+     * Best effort: what is left is removed as an orphan later.
+     */
+    private void discardAsync(
+            long tableId,
+            TablePath tablePath,
+            @Nullable Reindex reindex,
+            List<TableBucketWriteResult<WriteResult>> writeResults) {
+        List<TableBucketWriteResult<WriteResult>> results = new ArrayList<>(writeResults);
+        try {
+            commitExecutor.execute(
+                    () -> dvCommitter.discardRound(tableId, tablePath, reindex, results));
+        } catch (RejectedExecutionException e) {
+            LOG.debug("Not discarding a dropped round of table {}: closing.", tableId, e);
+        }
+    }
+
     /** Publishes the re-index of a held round and commits the round again. */
     private void resumeAsync(long tableId, HeldRound<WriteResult> held) {
         submit(
@@ -354,7 +499,7 @@ public class TieringCommitOperator<WriteResult, Committable>
                                 tableId, TableBucketWriteResult.tieringEpochOf(results));
                         outcome = roundCommit.call();
                     } catch (Exception e) {
-                        postCompletion(tableId, () -> reportFailed(tableId, tablePath, e));
+                        postCompletion(tableId, () -> reportFailed(tableId, tablePath, results, e));
                         return;
                     }
                     postCompletion(tableId, () -> complete(tableId, results, outcome));
@@ -374,14 +519,17 @@ public class TieringCommitOperator<WriteResult, Committable>
         if (reindex == null) {
             reportFinished(
                     tableId,
+                    TableBucketWriteResult.tieringEpochOf(results),
                     outcome.result(),
                     results.stream().anyMatch(TableBucketWriteResult::endedEarly));
             return;
         }
         // Registered before the request is sent, so no result arrives without its held round.
         heldRounds.put(tableId, new HeldRound<>(results, reindex));
+        long epoch = TableBucketWriteResult.tieringEpochOf(results);
         for (RowPosRequestEvent request : reindex.requests) {
-            operatorEventGateway.sendEventToCoordinator(new SourceEventWrapper(request));
+            operatorEventGateway.sendEventToCoordinator(
+                    new SourceEventWrapper(request.withTieringEpoch(epoch)));
         }
         LOG.info(
                 "The round of {} is held until rewritten files are re-indexed" + " (snapshot {}).",
@@ -418,20 +566,31 @@ public class TieringCommitOperator<WriteResult, Committable>
      * table is tiered again at once.
      */
     private void reportFinished(
-            long tableId, TieringCommitResult<Committable> result, boolean moreToTier) {
+            long tableId,
+            long tieringEpoch,
+            TieringCommitResult<Committable> result,
+            boolean moreToTier) {
         consecutiveCommitFailures.recordSuccess(tableId);
         if (result.getCommittable() != null) {
             output.collect(new StreamRecord<>(new CommittableMessage<>(result.getCommittable())));
         }
         operatorEventGateway.sendEventToCoordinator(
                 new SourceEventWrapper(
-                        new FinishedTieringEvent(tableId, result.getStats(), moreToTier)));
+                        new FinishedTieringEvent(
+                                tableId, tieringEpoch, result.getStats(), moreToTier)));
     }
 
-    private void reportFailed(long tableId, TablePath tablePath, Exception cause) {
+    private void reportFailed(
+            long tableId,
+            TablePath tablePath,
+            List<TableBucketWriteResult<WriteResult>> results,
+            Exception cause) {
         operatorEventGateway.sendEventToCoordinator(
                 new SourceEventWrapper(
-                        new FailedTieringEvent(tableId, ExceptionUtils.stringifyException(cause))));
+                        new FailedTieringEvent(
+                                tableId,
+                                TableBucketWriteResult.tieringEpochOf(results),
+                                ExceptionUtils.stringifyException(cause))));
         int failures = consecutiveCommitFailures.recordFailure(tableId);
         // A permanent failure retries forever without failing the job, so escalate it to make a
         // table that stopped tiering visible.
@@ -468,6 +627,10 @@ public class TieringCommitOperator<WriteResult, Committable>
             this.reindex = reindex;
         }
 
+        private long tieringEpoch() {
+            return TableBucketWriteResult.tieringEpochOf(writeResults);
+        }
+
         private Map<TableBucket, List<RowPosResult>> results() {
             Map<TableBucket, List<RowPosResult>> results = new LinkedHashMap<>();
             rowPosResults.forEach(
@@ -479,12 +642,15 @@ public class TieringCommitOperator<WriteResult, Committable>
     /** Collects one table's tiering round with constant-time validation of each result. */
     private static final class TableWriteResultAccumulator<WriteResult> {
         private final int expectedNumberOfWriteResults;
+        // the tiering epoch of the round collected
+        private final long tieringEpoch;
         private final Set<TableBucket> collectedBuckets = new HashSet<>();
         private final List<TableBucketWriteResult<WriteResult>> bucketWriteResults =
                 new ArrayList<>();
 
-        private TableWriteResultAccumulator(int expectedNumberOfWriteResults) {
+        private TableWriteResultAccumulator(int expectedNumberOfWriteResults, long tieringEpoch) {
             this.expectedNumberOfWriteResults = expectedNumberOfWriteResults;
+            this.tieringEpoch = tieringEpoch;
         }
 
         private void add(TableBucketWriteResult<WriteResult> bucketWriteResult) {

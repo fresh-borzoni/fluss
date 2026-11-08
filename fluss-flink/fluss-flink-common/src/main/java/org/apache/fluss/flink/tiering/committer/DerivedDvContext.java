@@ -31,6 +31,7 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
 import org.apache.fluss.lake.committer.SupportsDeletionVectorCommit;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.committer.SupportsPrimaryKeyMergeCommit;
 import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.lake.source.LakeSource;
@@ -285,6 +286,20 @@ final class DerivedDvContext<WriteResult, Committable> {
     }
 
     /**
+     * Returns the identity of the lake commit that is snapshot {@code snapshotId} for a lake that
+     * reuses snapshot ids after a rollback (Paimon), or null for other lakes. Union reads use it to
+     * tell a reused id from the snapshot the chain covers.
+     */
+    @Nullable
+    String snapshotIdentity(TablePath tablePath, long snapshotId) throws Exception {
+        if (!dvTiering(tablePath).mergesByPrimaryKey()) {
+            return null;
+        }
+        return rewritePlanning(tablePath, admin.getTableInfo(tablePath).get())
+                .snapshotIdentity(snapshotId);
+    }
+
+    /**
      * The lake's tiering of tables with deletion vectors. The tiering enumerator refuses such a
      * table on a lake without it before any round, so this fails only if the table was created
      * otherwise.
@@ -304,9 +319,10 @@ final class DerivedDvContext<WriteResult, Committable> {
 
     /**
      * Creates the lake committer of a round of a table with deletion vectors, and checks that it
-     * commits the way the lake does: it takes deletes ({@link SupportsPositionDeleteCommit}). The
-     * round's other deletion-vector calls on it then need no check ({@link #dvCommit}, {@link
-     * #positionDeletes}).
+     * commits the way the lake does: it takes deletes ({@link SupportsPositionDeleteCommit}), or
+     * the lake merges by primary key ({@link SupportsPrimaryKeyMergeCommit}). The round's other
+     * deletion-vector calls on it then need no check ({@link #dvCommit}, {@link #positionDeletes},
+     * {@link #keyMerging}).
      */
     LakeCommitter<WriteResult, Committable> createDvLakeCommitter(
             TablePath tablePath, TableInfo tableInfo) throws IOException {
@@ -338,6 +354,11 @@ final class DerivedDvContext<WriteResult, Committable> {
             SupportsPositionDeleteCommit<WriteResult, Committable> positionDeletes(
                     LakeCommitter<WriteResult, Committable> lakeCommitter) {
         return (SupportsPositionDeleteCommit<WriteResult, Committable>) lakeCommitter;
+    }
+
+    /** The calls of a committer of {@link #createDvLakeCommitter} of a lake that merges by key. */
+    static SupportsPrimaryKeyMergeCommit keyMerging(LakeCommitter<?, ?> lakeCommitter) {
+        return (SupportsPrimaryKeyMergeCommit) lakeCommitter;
     }
 
     /** Prepares the partition mark-done of a round; returns whether the state changed. */

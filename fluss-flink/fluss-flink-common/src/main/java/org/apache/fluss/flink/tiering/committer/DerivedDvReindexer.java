@@ -19,10 +19,12 @@ package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableRolledBackException;
 import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
@@ -56,14 +58,17 @@ import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.partitio
 import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
- * Re-indexes lake files that another engine rewrote, on the tiering readers.
+ * Re-indexes lake files that another engine rewrote, or that a compaction rewrote without handing
+ * their positions over, on the tiering readers.
  *
  * <p>Before a round with deletes resolves its keys, {@link #triggerReindex} compares the base with
  * the lake's current snapshot. A rewrite since the base is re-indexed first: if it is already in
  * the chain only its Fluss registration is made, if it only removed files its change is published
  * at once, and otherwise the round is held ({@link RoundOutcome#held}) while the tiering readers
  * read the rewritten files. {@link #publishReindex} publishes and registers the change once they
- * reported. A round without data does the same ({@link #reindexIdleTable}).
+ * reported. A round without data does the same ({@link #reindexIdleTable}). For a lake that merges
+ * by key, {@link #indexReadableSnapshot} indexes a newly readable snapshot after the round's
+ * commit.
  *
  * <p>Crash rule: a re-index is registered in the chain before it is registered in Fluss, and a
  * change in the chain but not in Fluss is registered in Fluss by the next round. A re-index that
@@ -79,12 +84,15 @@ final class DerivedDvReindexer<WriteResult, Committable> {
     @VisibleForTesting static final int SPLITS_PER_REQUEST = 1_000;
 
     private final DerivedDvRegistrations<WriteResult, Committable> registrations;
+    private final DerivedDvCompactionPublisher<WriteResult, Committable> compaction;
 
     DerivedDvReindexer(
             DerivedDvContext<WriteResult, Committable> context,
-            DerivedDvRegistrations<WriteResult, Committable> registrations) {
+            DerivedDvRegistrations<WriteResult, Committable> registrations,
+            DerivedDvCompactionPublisher<WriteResult, Committable> compaction) {
         this.context = context;
         this.registrations = registrations;
+        this.compaction = compaction;
     }
 
     /**
@@ -172,7 +180,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
                     changeId,
                     Collections.emptyMap(),
                     plan.getDeletedFiles(),
-                    System.currentTimeMillis());
+                    System.currentTimeMillis(),
+                    true);
             throw new ReindexPending(null);
         }
         int firstFileId = store.allocateFileIds(plan.getSplits().size());
@@ -187,7 +196,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
                         firstFileId,
                         lakeDir,
                         base.getSnapshotId(),
-                        changeId);
+                        changeId,
+                        null);
         LOG.info(
                 "{} files of {} were rewritten since snapshot {}; snapshot {} is"
                         + " re-indexed on the tiering readers.",
@@ -210,7 +220,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
             long changeId,
             Map<TableBucket, List<RowPosResult>> results,
             @Nullable Map<String, Map<Integer, List<String>>> replacedFiles,
-            long startedAtMs)
+            long startedAtMs,
+            boolean registerInFluss)
             throws Exception {
         long t0 = System.currentTimeMillis();
         // Per bucket: the SSTs and new file ids of its splits, and the files that left the
@@ -276,9 +287,18 @@ final class DerivedDvReindexer<WriteResult, Committable> {
             }
         }
         store.commitChange(changeId, published);
-        store.register(baseSnapshotId, compactSnapshotId, changeId);
-        registrations.registerSnapshot(
-                tableId, tablePath, compactSnapshotId, context.getLatestLakeSnapshot(tablePath));
+        store.register(
+                baseSnapshotId,
+                compactSnapshotId,
+                changeId,
+                context.snapshotIdentity(tablePath, compactSnapshotId));
+        if (registerInFluss) {
+            registrations.registerSnapshot(
+                    tableId,
+                    tablePath,
+                    compactSnapshotId,
+                    context.getLatestLakeSnapshot(tablePath));
+        }
         context.metrics.reindexes.inc();
         context.metrics.lastReindexMs = System.currentTimeMillis() - startedAtMs;
         context.metrics.reindexMs.inc(context.metrics.lastReindexMs);
@@ -291,6 +311,133 @@ final class DerivedDvReindexer<WriteResult, Committable> {
                 replaced,
                 context.metrics.lastReindexMs,
                 System.currentTimeMillis() - t0);
+    }
+
+    /**
+     * Brings the chain up to the readable snapshot of a merging round's commit. Returns the
+     * re-index the round waits for, or null when the round can register: the chain has the readable
+     * snapshot now, or there is none.
+     */
+    @Nullable
+    @SuppressWarnings("unchecked")
+    Reindex indexReadableSnapshot(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            Registration<Committable> registration,
+            List<TableBucketWriteResult<WriteResult>> results)
+            throws Exception {
+        LakeCommitResult result = registration.result;
+        Long readable =
+                result.committedIsReadable()
+                        ? Long.valueOf(result.getCommittedSnapshotId())
+                        : result.getReadableSnapshot() == null
+                                ? null
+                                : result.getReadableSnapshot().getReadableSnapshotId();
+        PositionIndexStore store = context.indexStore(tableId, tablePath);
+        if (readable == null) {
+            compaction.discardHandedOverIndex(store, results);
+            return null;
+        }
+        // A fork a crashed registration left keeps the branch Fluss registered, or else the one
+        // this round is about to register.
+        LakeSnapshot registered = context.getLatestLakeSnapshot(tablePath);
+        if (registered != null) {
+            store.repairFork(registered.getSnapshotId());
+        }
+        store.repairFork(readable);
+        List<PositionIndexStore.ChainEntry> chain = store.chain();
+        for (PositionIndexStore.ChainEntry e : chain) {
+            if (e.snapshotId == readable) {
+                // nothing newly readable, so the compactions' positions have no change to make
+                compaction.discardHandedOverIndex(store, results);
+                return null;
+            }
+        }
+        long base = chain.isEmpty() ? -1L : chain.get(chain.size() - 1).snapshotId;
+        LakeSource<?> lakeSource =
+                context.dvTiering(tablePath).createLakeSource(tableInfo.getLakeTablePath());
+        return planIndexChange(
+                tableId,
+                tablePath,
+                (LakeSource<LakeSplit>) lakeSource,
+                store,
+                base,
+                readable,
+                registration,
+                results);
+    }
+
+    @Nullable
+    private <Split extends LakeSplit> Reindex planIndexChange(
+            long tableId,
+            TablePath tablePath,
+            LakeSource<Split> lakeSource,
+            PositionIndexStore store,
+            long base,
+            long readable,
+            Registration<Committable> registration,
+            List<TableBucketWriteResult<WriteResult>> results)
+            throws Exception {
+        long t0 = System.currentTimeMillis();
+        DataDeltaPlan<Split> plan =
+                DeletionVectorCapabilities.rewritePlanning(lakeSource, tablePath)
+                        .planRewrite(base, readable);
+        Map<String, Long> partitionIds = Collections.emptyMap();
+        if (plan != null) {
+            partitionIds = partitionIds(tablePath, plan);
+            plan = withoutFilesOfDroppedPartitions(tablePath, plan, partitionIds);
+        }
+        long changeId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+        if (plan == null || plan.getSplits().isEmpty()) {
+            // Nothing to read, e.g. a compaction whose output has no rows: publish at once.
+            compaction.discardHandedOverIndex(store, results);
+            publishReindex(
+                    tableId,
+                    tablePath,
+                    base,
+                    readable,
+                    changeId,
+                    Collections.emptyMap(),
+                    plan == null ? null : plan.getDeletedFiles(),
+                    t0,
+                    false);
+            return null;
+        }
+        checkState(
+                plan.getCompactSnapshotId() == readable,
+                "Planned the index of snapshot %s instead of the readable snapshot %s.",
+                plan.getCompactSnapshotId(),
+                readable);
+        if (compaction.publishHandedOverIndex(tablePath, store, plan, base, readable, results)) {
+            return null;
+        }
+        int firstFileId = store.allocateFileIds(plan.getSplits().size());
+        FsPath lakeDir = context.lakeTableDir(tableId, tablePath);
+        Reindex reindex =
+                planReindexScan(
+                        tableId,
+                        tablePath,
+                        lakeSource,
+                        plan,
+                        partitionIds,
+                        firstFileId,
+                        lakeDir,
+                        base,
+                        changeId,
+                        registration);
+        LOG.info(
+                "Readable snapshot {} of {} has {} new readable files since snapshot"
+                        + " {} ({} left); they are indexed on the tiering readers.",
+                readable,
+                tablePath,
+                plan.getSplits().size(),
+                base,
+                plan.getDeletedFiles().values().stream()
+                        .flatMap(m -> m.values().stream())
+                        .mapToInt(List::size)
+                        .sum());
+        return reindex;
     }
 
     /**
@@ -311,7 +458,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
             int firstFileId,
             FsPath lakeDir,
             long baseSnapshotId,
-            long changeId)
+            long changeId,
+            @Nullable Registration<Committable> registration)
             throws IOException {
         SimpleVersionedSerializer<Split> splitSerializer = lakeSource.getSplitSerializer();
         int filesPerSplit =
@@ -394,7 +542,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
                 plan.getDeletedFiles(),
                 requests,
                 splits.size(),
-                System.currentTimeMillis());
+                System.currentTimeMillis(),
+                registration);
     }
 
     /**

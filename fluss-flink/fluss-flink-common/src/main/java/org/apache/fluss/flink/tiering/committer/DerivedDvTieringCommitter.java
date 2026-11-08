@@ -21,11 +21,17 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
+import org.apache.fluss.client.tiering.TieringCommitResult;
+import org.apache.fluss.client.tiering.TieringCommitterInitContext;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableExternallyModifiedException;
+import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
+import org.apache.fluss.lake.dv.index.StagedIndexPartProvider;
 import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
+import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -37,6 +43,7 @@ import org.slf4j.Logger;
 import javax.annotation.Nullable;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -60,11 +67,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * changed no data file ({@link DerivedDvRound}), so a registered change from the base always covers
  * its snapshot.
  *
+ * <p>A lake that merges rows by primary key itself ({@link
+ * SupportsDeletionVectorTiering#mergesByPrimaryKey()}, Paimon) takes no deletes. A round commits
+ * its data as usual and the lake committer reports the readable snapshot, which may lag the commit.
+ * The index follows the readable snapshots: a newly readable one is indexed from the files that
+ * became readable since the last indexed one, while the round is held. It is registered in Fluss
+ * only once its index change is in the chain. See {@link DerivedDvMergingRound}.
+ *
  * <p>Each step of a round has a class of its own, which states what the step leaves behind and how
  * a crash after it is recovered:
  *
  * <ul>
  *   <li>{@link DerivedDvRound}: the round of a lake that takes deletes, and its phases;
+ *   <li>{@link DerivedDvMergingRound}: the round of a lake that merges by key;
  *   <li>{@link DerivedDvReindexer}: the re-index of rewritten lake files;
  *   <li>{@link DerivedDvCompactionPublisher}: the index changes of Fluss's own compactions;
  *   <li>{@link DerivedDvRegistrations}: registrations in Fluss, the chain's trim and the snapshots
@@ -89,6 +104,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
     private final DerivedDvCompactionPublisher<WriteResult, Committable> compaction;
     private final DerivedDvReindexer<WriteResult, Committable> reindexer;
     private final DerivedDvRound<WriteResult, Committable> round;
+    private final DerivedDvMergingRound<WriteResult, Committable> mergingRound;
 
     DerivedDvTieringCommitter(
             Admin admin,
@@ -109,10 +125,13 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                         localTmpDir);
         this.registrations = new DerivedDvRegistrations<>(context);
         this.compaction = new DerivedDvCompactionPublisher<>(context, registrations);
-        this.reindexer = new DerivedDvReindexer<>(context, registrations);
+        this.reindexer = new DerivedDvReindexer<>(context, registrations, compaction);
         DerivedDvRecovery<WriteResult, Committable> recovery =
-                new DerivedDvRecovery<>(context, registrations);
+                new DerivedDvRecovery<>(context, registrations, reindexer);
         this.round = new DerivedDvRound<>(context, recovery, reindexer, compaction, registrations);
+        this.mergingRound =
+                new DerivedDvMergingRound<>(
+                        context, recovery, reindexer, compaction, registrations);
     }
 
     /** Commits a round of a table with deletion vectors, or holds it for a re-index. */
@@ -125,7 +144,12 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         context.rememberLakeTableDir(tableId, tableInfo);
         return reportingRollback(
                 tableId,
-                () -> round.commitRound(tableId, tablePath, tableInfo, writeResults, false));
+                () ->
+                        context.dvTiering(tablePath).mergesByPrimaryKey()
+                                ? mergingRound.commitMergingRound(
+                                        tableId, tablePath, tableInfo, writeResults)
+                                : round.commitRound(
+                                        tableId, tablePath, tableInfo, writeResults, false));
     }
 
     /**
@@ -148,6 +172,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
             Map<TableBucket, List<RowPosResult>> rowPosResults,
             List<TableBucketWriteResult<WriteResult>> writeResults)
             throws Exception {
+        @SuppressWarnings("unchecked")
+        Registration<Committable> registration = (Registration<Committable>) reindex.registration;
         // The readers skip the splits of a table dropped during the re-index. The change then
         // misses their parts, so it is not published.
         TableInfo tableInfo = context.admin.getTableInfo(reindex.tablePath).get();
@@ -166,9 +192,83 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 reindex.changeId,
                 rowPosResults,
                 reindex.removedFiles,
-                reindex.startedAtMs);
+                reindex.startedAtMs,
+                registration == null);
+        if (registration != null) {
+            // The round committed to the lake before it was held; it only registers now.
+            TieringCommitResult<Committable> result =
+                    registrations.register(tableId, reindex.tablePath, registration);
+            if (registration.committable == null) {
+                // A lost commit of an earlier round was registered instead of this round's.
+                throw DerivedDvRecovery.lostCommitRegistered(
+                        reindex.tablePath, registration.result.getCommittedSnapshotId());
+            }
+            return RoundOutcome.committed(result);
+        }
         // The round committed its own compaction before it was held.
         return round.commitRound(tableId, reindex.tablePath, tableInfo, writeResults, true);
+    }
+
+    /**
+     * Deletes what a round that will not commit wrote and no lake snapshot references: a stale
+     * round, or a held one ({@code reindex} not null) that will not resume. That is its re-index
+     * change, its writers' staged index parts, and, if it did not commit to the lake before it was
+     * held, its data files and the positions its compactions handed over. Rounds of tables without
+     * deletion vectors have only data files. Best effort: leftovers are removed as orphans later.
+     */
+    void discardRound(
+            long tableId,
+            TablePath tablePath,
+            @Nullable Reindex reindex,
+            List<TableBucketWriteResult<WriteResult>> writeResults) {
+        try {
+            if (reindex != null) {
+                context.indexStore(tableId, tablePath).abortChange(reindex.changeId);
+            }
+            if (hasStagedParts(writeResults)) {
+                round.deleteStagedParts(tableId, tablePath, writeResults);
+            }
+            if (reindex != null && reindex.registration != null) {
+                return; // its data is in a lake snapshot, which a later round registers
+            }
+            if (hasHandedOverIndex(writeResults)) {
+                compaction.discardHandedOverIndex(
+                        context.indexStore(tableId, tablePath), writeResults);
+            }
+            List<WriteResult> data = new ArrayList<>();
+            for (TableBucketWriteResult<WriteResult> r : writeResults) {
+                if (r.writeResult() != null) {
+                    data.add(r.writeResult());
+                }
+            }
+            TableInfo tableInfo = context.admin.getTableInfo(tablePath).get();
+            if (data.isEmpty() || tableInfo.getTableId() != tableId) {
+                return;
+            }
+            try (LakeCommitter<WriteResult, Committable> lakeCommitter =
+                    context.lakeTieringFactory.createLakeCommitter(
+                            new TieringCommitterInitContext(
+                                    tablePath,
+                                    tableInfo,
+                                    context.lakeTieringConfig,
+                                    context.flussConfig))) {
+                lakeCommitter.abort(lakeCommitter.toCommittable(data));
+            }
+            LOG.info("Deleted the data files of a dropped round of {}.", tablePath);
+        } catch (Exception e) {
+            LOG.warn("Could not delete the files of a dropped round of {}.", tablePath, e);
+        }
+    }
+
+    private static <WriteResult> boolean hasStagedParts(
+            List<TableBucketWriteResult<WriteResult>> results) {
+        return results.stream().anyMatch(r -> r.writeResult() instanceof StagedIndexPartProvider);
+    }
+
+    private static <WriteResult> boolean hasHandedOverIndex(
+            List<TableBucketWriteResult<WriteResult>> results) {
+        return results.stream()
+                .anyMatch(r -> r.writeResult() instanceof CompactionIndexPartProvider);
     }
 
     /**

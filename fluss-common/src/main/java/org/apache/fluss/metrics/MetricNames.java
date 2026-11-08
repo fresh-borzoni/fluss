@@ -372,6 +372,7 @@ public class MetricNames {
     public static final String LOG_START_OFFSET = "startOffset";
     public static final String LOG_END_OFFSET = "endOffset";
     public static final String REMOTE_LOG_SIZE = "size";
+    public static final String REMOTE_LOG_DV_RETAINED_SIZE = "dvRetainedSize";
     public static final String LOG_LAKE_TIMESTAMP_LAG = "timestampLag";
 
     // for physical storage

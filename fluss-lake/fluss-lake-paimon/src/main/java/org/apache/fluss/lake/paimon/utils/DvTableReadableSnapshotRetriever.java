@@ -45,6 +45,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -72,6 +73,8 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
     private final Admin flussAdmin;
     private final Connection flussConnection;
     private final SnapshotManager snapshotManager;
+    // whether the Fluss table has table.deletion-vectors.enabled, not only Paimon's
+    private final boolean flussDeletionVectors;
 
     public DvTableReadableSnapshotRetriever(
             TablePath tablePath,
@@ -84,6 +87,8 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
         this.flussConnection = ConnectionFactory.createConnection(flussConfig);
         this.flussAdmin = flussConnection.getAdmin();
         this.snapshotManager = fileStoreTable.snapshotManager();
+        this.flussDeletionVectors =
+                PaimonConversions.isFlussDeletionVectorsTable(fileStoreTable.options());
     }
 
     /**
@@ -239,6 +244,8 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
         // Cache LakeSnapshot by snapshot ID to avoid repeated getLakeSnapshot RPCs when many
         // buckets share the same snapshot.
         Map<Long, LakeSnapshot> lakeSnapshotBySnapshotId = new HashMap<>();
+        // the registered readable snapshot, fetched once if needed
+        List<LakeSnapshot> registeredReadable = new ArrayList<>(1);
 
         // The current COMPACT is not registered in Fluss yet, so use this commit's complete
         // tiered offsets. For an older COMPACT, find the registered snapshot carrying the
@@ -358,7 +365,29 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
                                     latestCompactedSnapshot.id(),
                                     lakeSnapshotBySnapshotId);
                     if (lakeSnapshot == null) {
-                        return null;
+                        if (!flussDeletionVectors) {
+                            return null;
+                        }
+                        // Fluss dropped that registration: the readable snapshot registered since
+                        // needed none for this bucket, which had no level-0 files then. The
+                        // bucket's offset in that readable snapshot still holds, as every change
+                        // before it was in levels 1 and up, and compactions only move files up.
+                        // A table with deletion vectors relies on this, as Fluss keeps only the
+                        // registrations its position index needs; other tables pause instead.
+                        Long offset = registeredReadableOffset(tb, registeredReadable);
+                        if (offset == null) {
+                            return null;
+                        }
+                        LOG.info(
+                                "Bucket {} of {} reads from offset {} of the registered readable"
+                                        + " snapshot, as the registration of snapshot {} is gone.",
+                                tb,
+                                tablePath,
+                                offset,
+                                previousAppendSnapshot.id());
+                        readableOffsets.put(tb, offset);
+                        allBucketsToAdvance.remove(partitionBucket);
+                        continue;
                     }
                     long lakeSnapshotId = lakeSnapshot.getSnapshotId();
                     // Retain the oldest registered snapshot supplying an offset to this result.
@@ -470,6 +499,30 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
         checkTableConsistent(snapshot);
         cache.put(snapshotId, snapshot);
         return snapshot;
+    }
+
+    /**
+     * Returns the bucket's offset in the readable snapshot registered in Fluss, or null if there is
+     * none or it does not have the bucket. {@code fetched} keeps the snapshot after the first
+     * fetch.
+     */
+    @Nullable
+    private Long registeredReadableOffset(TableBucket bucket, List<LakeSnapshot> fetched) {
+        if (fetched.isEmpty()) {
+            try {
+                fetched.add(flussAdmin.getReadableLakeSnapshot(tablePath).get());
+            } catch (Exception e) {
+                Throwable cause = ExceptionUtils.stripExecutionException(e);
+                if (!(cause instanceof LakeTableSnapshotNotExistException)) {
+                    LOG.warn(
+                            "Failed to retrieve the readable snapshot of {} from Fluss.",
+                            tablePath,
+                            cause);
+                }
+                return null;
+            }
+        }
+        return fetched.get(0).getTableBucketsOffset().get(bucket);
     }
 
     /**

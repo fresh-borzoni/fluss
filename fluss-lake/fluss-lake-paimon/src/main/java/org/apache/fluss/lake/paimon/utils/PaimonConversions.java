@@ -45,6 +45,7 @@ import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.PartitionUtils;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.mergetree.compact.aggregate.factory.FieldBoolAndAggFactory;
@@ -59,6 +60,7 @@ import org.apache.paimon.mergetree.compact.aggregate.factory.FieldProductAggFact
 import org.apache.paimon.mergetree.compact.aggregate.factory.FieldRoaringBitmap32AggFactory;
 import org.apache.paimon.mergetree.compact.aggregate.factory.FieldRoaringBitmap64AggFactory;
 import org.apache.paimon.mergetree.compact.aggregate.factory.FieldSumAggFactory;
+import org.apache.paimon.options.FallbackKey;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
@@ -518,6 +520,22 @@ public class PaimonConversions {
                 .getCustomProperties()
                 .forEach((k, v) -> setFlussPropertyToPaimon(k, v, options));
 
+        // Deletion vector masks index the rows of Paimon's deletion-vector reads, which skip
+        // level-0 files and return one live row per key.
+        if (Configuration.fromMap(tableDescriptor.getProperties())
+                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            if (options.containsKey(CoreOptions.DELETION_VECTORS_ENABLED.key())
+                    && !options.get(CoreOptions.DELETION_VECTORS_ENABLED)) {
+                throw new InvalidTableException(
+                        String.format(
+                                "'%s' requires Paimon option '%s' = true.",
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                CoreOptions.DELETION_VECTORS_ENABLED.key()));
+            }
+            options.set(CoreOptions.DELETION_VECTORS_ENABLED, true);
+            validateDeletionVectorsOptions(null, options.toMap(), Collections.emptySet());
+        }
+
         // #4102: newly created lake tables are always clean (system columns are rejected above), so
         // a lake-enabled table must advertise its LakeStream state to Paimon.
         if (isDataLakeEnabled(tableDescriptor)) {
@@ -549,6 +567,127 @@ public class PaimonConversions {
         tableDescriptor.getComment().ifPresent(schemaBuilder::comment);
 
         return schemaBuilder.build();
+    }
+
+    /**
+     * Checks the effective Paimon options of a table with deletion vectors. Its masks index the
+     * rows of Paimon's deletion-vector reads, which skip level-0 files and must return the last row
+     * Fluss tiered for each key, and no row for a key Fluss deleted.
+     *
+     * @param table the lake table, named in the errors; null if not known yet
+     * @param options the table's options, including those the catalog's {@code table-default.*}
+     *     options set
+     * @param catalogDefaults the keys of {@code options} that come from the catalog's {@code
+     *     table-default.*} options, named as such in the errors
+     * @throws InvalidTableException if an option would break the table's deletion vectors
+     */
+    public static void validateDeletionVectorsOptions(
+            @Nullable String table, Map<String, String> options, Set<String> catalogDefaults) {
+        CoreOptions coreOptions = new CoreOptions(options);
+        String flussOption = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String prefix =
+                table == null
+                        ? String.format("'%s'", flussOption)
+                        : String.format("'%s' of Paimon table %s", flussOption, table);
+        if (!coreOptions.deletionVectorsEnabled()) {
+            throw new InvalidTableException(
+                    String.format(
+                            "%s requires Paimon option '%s' = true%s.",
+                            prefix,
+                            CoreOptions.DELETION_VECTORS_ENABLED.key(),
+                            origin(CoreOptions.DELETION_VECTORS_ENABLED.key(), catalogDefaults)));
+        }
+        // The tiered changelog holds rows that Fluss's merge engine, whichever it is, already
+        // merged. Only deduplicate keeps the last of them as written.
+        CoreOptions.MergeEngine mergeEngine = coreOptions.mergeEngine();
+        if (mergeEngine != CoreOptions.MergeEngine.DEDUPLICATE) {
+            throw new InvalidTableException(
+                    String.format(
+                            "%s requires Paimon option '%s' = '%s', but it is '%s'%s. Fluss"
+                                    + " tiers the rows its own merge engine produced, and"
+                                    + " union reads take the lake's row of every key the log"
+                                    + " has not changed since, so Paimon must keep the last"
+                                    + " row of each key as written instead of merging the"
+                                    + " rows again.",
+                            prefix,
+                            CoreOptions.MERGE_ENGINE.key(),
+                            CoreOptions.MergeEngine.DEDUPLICATE,
+                            mergeEngine,
+                            origin(CoreOptions.MERGE_ENGINE.key(), catalogDefaults)));
+        }
+        // With a sequence field, deduplicate keeps the row with the largest sequence value,
+        // which need not be the last row Fluss tiered.
+        if (options.containsKey(CoreOptions.SEQUENCE_FIELD.key())) {
+            throw new InvalidTableException(
+                    String.format(
+                            "%s does not support Paimon option '%s'%s. Paimon would keep the"
+                                    + " row of each key with the largest sequence value"
+                                    + " instead of the last row Fluss tiered, which union"
+                                    + " reads take.",
+                            prefix,
+                            CoreOptions.SEQUENCE_FIELD.key(),
+                            origin(CoreOptions.SEQUENCE_FIELD.key(), catalogDefaults)));
+        }
+        // Deletes Paimon ignores leave the deleted keys' rows live in the lake.
+        if (coreOptions.ignoreDelete()) {
+            String key = CoreOptions.IGNORE_DELETE.key();
+            for (FallbackKey fallback : CoreOptions.IGNORE_DELETE.fallbackKeys()) {
+                if (!options.containsKey(key) && options.containsKey(fallback.getKey())) {
+                    key = fallback.getKey();
+                }
+            }
+            throw new InvalidTableException(
+                    String.format(
+                            "%s does not support Paimon option '%s' = true (set as '%s'%s)."
+                                    + " Paimon would keep the lake row of every key Fluss"
+                                    + " deleted.",
+                            prefix,
+                            CoreOptions.IGNORE_DELETE.key(),
+                            key,
+                            origin(key, catalogDefaults)));
+        }
+        // Paimon drops expired rows when it compacts, and Fluss does not know which.
+        if (coreOptions.recordLevelExpireTime() != null) {
+            throw new InvalidTableException(
+                    String.format(
+                            "%s does not support Paimon option '%s'%s. Paimon would drop rows"
+                                    + " that Fluss still has when it compacts; use Fluss row TTL"
+                                    + " instead.",
+                            prefix,
+                            CoreOptions.RECORD_LEVEL_EXPIRE_TIME.key(),
+                            origin(CoreOptions.RECORD_LEVEL_EXPIRE_TIME.key(), catalogDefaults)));
+        }
+    }
+
+    /**
+     * Checks a Paimon table with deletion vectors as {@link #validateDeletionVectorsOptions} does,
+     * with the options the table has now: another engine may have changed them since Fluss created
+     * the table.
+     */
+    public static void validateDeletionVectorsTable(TablePath tablePath, FileStoreTable table) {
+        validateDeletionVectorsOptions(
+                tablePath.toString(), table.options(), Collections.emptySet());
+    }
+
+    /**
+     * Whether a Paimon table belongs to a Fluss table with {@code table.deletion-vectors.enabled}.
+     * Fluss mirrors its table options into the Paimon table's options when it creates it, and the
+     * option cannot be altered afterwards. A table with Paimon's own {@code
+     * deletion-vectors.enabled} alone does not count.
+     */
+    public static boolean isFlussDeletionVectorsTable(Map<String, String> paimonOptions) {
+        return Boolean.parseBoolean(
+                paimonOptions.get(
+                        FLUSS_CONF_PREFIX + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+    }
+
+    private static String origin(String key, Set<String> catalogDefaults) {
+        return catalogDefaults.contains(key)
+                ? ", set by the Paimon catalog option '"
+                        + Catalog.TABLE_DEFAULT_OPTION_PREFIX
+                        + key
+                        + "'"
+                : "";
     }
 
     private static void validateTable(TablePath tablePath, FileStoreTable table) {

@@ -19,6 +19,7 @@ package org.apache.fluss.lake.writer;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.committer.SupportsPrimaryKeyMergeCommit;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.SupportsDataFiles;
 import org.apache.fluss.lake.source.SupportsRewritePlanning;
@@ -38,7 +39,8 @@ import java.io.IOException;
  * <p>A factory with this capability promises, for tables with deletion vectors:
  *
  * <ul>
- *   <li>its lake committers implement {@link SupportsPositionDeleteCommit};
+ *   <li>its lake committers implement {@link SupportsPositionDeleteCommit} if {@link
+ *       #mergesByPrimaryKey()} is false, or {@link SupportsPrimaryKeyMergeCommit} if it is true;
  *   <li>the lake source of {@link #createLakeSource} implements {@link SupportsRewritePlanning};
  *       its record readers implement {@link SupportsRowPositions} and its splits {@link
  *       SupportsDataFiles};
@@ -50,6 +52,20 @@ import java.io.IOException;
  */
 @PublicEvolving
 public interface SupportsDeletionVectorTiering {
+
+    /**
+     * Returns whether the lake table merges rows by primary key itself, as a merge-tree table does.
+     *
+     * <p>Tiering a table with deletion vectors then commits no deletes: the lake supersedes old
+     * rows on its own, and the committer reports which snapshot is readable ({@link
+     * SupportsPrimaryKeyMergeCommit}). The position index follows the readable snapshots and learns
+     * their files through {@link SupportsRewritePlanning#planRewrite}. Otherwise tiering resolves
+     * the superseded rows and commits their deletes with the data ({@link
+     * SupportsPositionDeleteCommit}), so every commit is readable at its tiered offsets.
+     *
+     * <p>This check must not access lake resources.
+     */
+    boolean mergesByPrimaryKey();
 
     /**
      * Creates a {@link LakeSource} of the lake table using the factory's configuration. Tiering

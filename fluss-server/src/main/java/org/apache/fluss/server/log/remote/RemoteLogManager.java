@@ -174,7 +174,9 @@ public class RemoteLogManager implements Closeable {
             previous.unregisterMetrics();
         }
         // leader needs to register the remote log metrics
-        remoteLog.registerMetrics(replica.bucketMetrics());
+        remoteLog.registerMetrics(
+                replica.bucketMetrics(),
+                replica.getTableInfo().getTableConfig().isDeletionVectorsEnabled());
         remoteLogs.put(tableBucket, remoteLog);
     }
 

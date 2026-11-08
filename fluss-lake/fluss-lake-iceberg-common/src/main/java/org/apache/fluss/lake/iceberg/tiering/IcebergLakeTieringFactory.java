@@ -173,9 +173,15 @@ public class IcebergLakeTieringFactory
         return new IcebergCommittableSerializer();
     }
 
+    /** Tiering commits the deletes of the rows a round supersedes; Iceberg does not merge. */
+    @Override
+    public boolean mergesByPrimaryKey() {
+        return false;
+    }
+
     /** Creates the lake source of the Iceberg table at the given lake table path. */
     @Override
-    public LakeSource<?> createLakeSource(TablePath tablePath) {
-        return new IcebergLakeSource(icebergConfig, tablePath);
+    public LakeSource<?> createLakeSource(TablePath lakeTablePath) {
+        return new IcebergLakeSource(icebergConfig, lakeTablePath);
     }
 }

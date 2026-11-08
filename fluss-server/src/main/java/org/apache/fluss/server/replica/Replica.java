@@ -67,6 +67,7 @@ import org.apache.fluss.server.kv.KvStateLookupResult;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
@@ -392,6 +393,24 @@ public final class Replica {
 
     public long getLakeLogEndOffset() {
         return logTablet.getLakeLogEndOffset();
+    }
+
+    /**
+     * Returns, for a table with deletion vectors, the first log offset their state on this leader
+     * needs: the readable offset of the lake snapshot it covers, as registered in ZooKeeper. On
+     * Paimon it is the first offset still in level 0, before the tiered offset. Returns 0 while the
+     * leader covers no snapshot (before the first readable snapshot, before its KV tablet is
+     * created, or until its rebuild as a new leader is done), so all of the log is kept, and null
+     * for other tables.
+     */
+    @Nullable
+    public Long getDvLogRetainOffset() {
+        if (!getTableConfig().isDeletionVectorsEnabled()) {
+            return null;
+        }
+        KvTablet kv = this.kvTablet;
+        DerivedDvManager dvManager = kv == null ? null : kv.getDvManager();
+        return dvManager == null ? 0L : dvManager.logRetainOffset();
     }
 
     public boolean isDataLakeEnabled() {

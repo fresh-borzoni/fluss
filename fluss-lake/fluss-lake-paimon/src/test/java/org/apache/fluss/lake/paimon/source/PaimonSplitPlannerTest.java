@@ -20,6 +20,8 @@
 
 package org.apache.fluss.lake.paimon.source;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.lake.paimon.utils.PaimonConversions;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.PredicateBuilder;
@@ -27,22 +29,34 @@ import org.apache.fluss.predicate.PredicateBuilder;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog.TableNotExistException;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.sink.BatchTableWrite;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataTypes;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toFlussRowType;
@@ -97,6 +111,109 @@ class PaimonSplitPlannerTest extends PaimonSourceTestBase {
                         paimonSplits.stream()
                                 .map(PaimonSplit::dataSplit)
                                 .collect(Collectors.toList()));
+    }
+
+    /**
+     * A Fluss table with deletion vectors is planned as one split per data file, each with its
+     * file's deletion vector, so a union read can spread a bucket's files over its readers.
+     */
+    @Test
+    void testPlanWithFlussDeletionVectorsSplitsPerFile(@TempDir Path ioDir) throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "dv_per_file");
+        FileStoreTable table = createCompactedDvTable(tablePath, true, ioDir);
+        long snapshotId = table.latestSnapshot().get().id();
+        List<DataSplit> packed = paimonSplits(table);
+        Set<String> files = new HashSet<>();
+        long rows = 0;
+        for (DataSplit split : packed) {
+            for (DataFileMeta file : split.dataFiles()) {
+                files.add(file.fileName());
+                rows += file.rowCount();
+            }
+        }
+        assertThat(files.size()).isGreaterThan(packed.size());
+
+        List<PaimonSplit> splits =
+                lakeStorage.createLakeSource(tablePath).createPlanner(() -> snapshotId).plan();
+
+        assertThat(splits).hasSize(files.size());
+        Set<String> planned = new HashSet<>();
+        long plannedRows = 0;
+        for (PaimonSplit split : splits) {
+            DataSplit dataSplit = split.dataSplit();
+            assertThat(dataSplit.dataFiles()).hasSize(1);
+            dataSplit.deletionFiles().ifPresent(d -> assertThat(d).hasSize(1));
+            planned.add(dataSplit.dataFiles().get(0).fileName());
+            plannedRows += split.rowCount();
+        }
+        assertThat(planned).isEqualTo(files);
+        assertThat(plannedRows).isEqualTo(rows);
+    }
+
+    /**
+     * A table with Paimon deletion vectors only, without Fluss's {@code
+     * table.deletion-vectors.enabled}, keeps the splits Paimon packs by size.
+     */
+    @Test
+    void testPlanWithPaimonDeletionVectorsOnlyKeepsPaimonSplits(@TempDir Path ioDir)
+            throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "paimon_dv_packed");
+        FileStoreTable table = createCompactedDvTable(tablePath, false, ioDir);
+        long snapshotId = table.latestSnapshot().get().id();
+        List<DataSplit> packed = paimonSplits(table);
+        long files = packed.stream().mapToLong(split -> split.dataFiles().size()).sum();
+        assertThat(files).isGreaterThan(packed.size());
+
+        List<PaimonSplit> splits =
+                lakeStorage.createLakeSource(tablePath).createPlanner(() -> snapshotId).plan();
+
+        assertThat(splits.stream().map(split -> split.dataSplit().dataFiles()))
+                .containsExactlyElementsOf(
+                        packed.stream().map(DataSplit::dataFiles).collect(Collectors.toList()));
+    }
+
+    /**
+     * Creates a primary key table with Paimon deletion vectors, and Fluss's if {@code
+     * flussDeletionVectors}, whose one bucket is compacted into several files.
+     */
+    private FileStoreTable createCompactedDvTable(
+            TablePath tablePath, boolean flussDeletionVectors, Path ioDir) throws Exception {
+        Schema.Builder builder =
+                Schema.newBuilder().column("c1", DataTypes.INT()).column("c2", DataTypes.STRING());
+        builder.primaryKey("c1");
+        builder.option(CoreOptions.BUCKET.key(), "1");
+        builder.option(CoreOptions.DELETION_VECTORS_ENABLED.key(), "true");
+        if (flussDeletionVectors) {
+            // as the Fluss table's options are mirrored into the Paimon table
+            builder.option(
+                    PaimonConversions.FLUSS_CONF_PREFIX
+                            + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                    "true");
+        }
+        // the compaction rolls its output into several files
+        builder.option(CoreOptions.TARGET_FILE_SIZE.key(), "4 kb");
+        createTable(tablePath, builder.build());
+        FileStoreTable table = (FileStoreTable) getTable(tablePath);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write =
+                        writeBuilder.newWrite().withIOManager(IOManager.create(ioDir.toString()));
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (int i = 0; i < 5_000; i++) {
+                write.write(GenericRow.of(i, BinaryString.fromString("value-" + i)));
+            }
+            // level-0 files are not readable with deletion vectors; the compaction makes them so
+            write.compact(BinaryRow.EMPTY_ROW, 0, true);
+            commit.commit(write.prepareCommit());
+        }
+        return table;
+    }
+
+    private static List<DataSplit> paimonSplits(FileStoreTable table) {
+        List<DataSplit> packed = new ArrayList<>();
+        for (Split split : table.newScan().plan().splits()) {
+            packed.add((DataSplit) split);
+        }
+        return packed;
     }
 
     @Test

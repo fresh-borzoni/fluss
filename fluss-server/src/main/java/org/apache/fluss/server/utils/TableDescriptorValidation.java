@@ -338,15 +338,6 @@ public class TableDescriptorValidation {
                 tableConf
                         .getOptional(ConfigOptions.TABLE_DATALAKE_FORMAT)
                         .orElse(clusterDataLakeFormat);
-        // Paimon tables do not derive deletion vectors yet.
-        if (lakeFormat == DataLakeFormat.PAIMON) {
-            throw new InvalidConfigException(
-                    String.format(
-                            "'%s' is not supported yet for the %s lake format: its deletion vectors"
-                                    + " are not complete.",
-                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
-                            DataLakeFormat.PAIMON));
-        }
         if (lakeFormat != null
                 && lakeFormat != DataLakeFormat.ICEBERG
                 && lakeFormat != DataLakeFormat.PAIMON) {
