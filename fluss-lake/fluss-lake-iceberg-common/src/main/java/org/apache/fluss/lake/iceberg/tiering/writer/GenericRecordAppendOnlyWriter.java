@@ -55,6 +55,16 @@ public class GenericRecordAppendOnlyWriter extends BaseTaskWriter<Record> {
         currentWriter.write(record);
     }
 
+    /** The location of the data file the next record is written to. */
+    public CharSequence currentPath() {
+        return currentWriter.currentPath();
+    }
+
+    /** The position the next record gets in its data file. */
+    public long currentRows() {
+        return currentWriter.currentRows();
+    }
+
     @Override
     public void close() throws IOException {
         currentWriter.close();

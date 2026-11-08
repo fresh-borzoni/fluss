@@ -23,6 +23,8 @@ import org.apache.fluss.utils.function.ThrowingConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.io.EOFException;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -35,6 +37,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -50,6 +53,18 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 public class FileUtils {
 
     private static final Logger LOG = LoggerFactory.getLogger(FileUtils.class);
+
+    /**
+     * Returns the directory {@code name} under one of {@code dirs}, picked at random so that the
+     * temporary files of a process spread over its disks, or null if there are no directories.
+     */
+    @Nullable
+    public static File randomTmpDir(@Nullable String[] dirs, String name) {
+        if (dirs == null || dirs.length == 0) {
+            return null;
+        }
+        return new File(dirs[ThreadLocalRandom.current().nextInt(dirs.length)], name);
+    }
 
     // ------------------------------------------------------------------------
     //  IO Utilities

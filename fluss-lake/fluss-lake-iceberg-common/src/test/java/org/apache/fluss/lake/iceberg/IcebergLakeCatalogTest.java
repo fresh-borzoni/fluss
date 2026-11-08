@@ -172,6 +172,187 @@ class IcebergLakeCatalogTest {
     }
 
     @Test
+    void testCreatePrimaryKeyTableWithDeletionVectors() {
+        String database = "test_db";
+        String tableName = "dv_table";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .column("dt", DataTypes.STRING())
+                        .primaryKey("id", "dt")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder()
+                        .schema(flussSchema)
+                        .distributedBy(4, "id")
+                        .partitionedBy("dt")
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+
+        Table createdTable =
+                flussIcebergCatalog
+                        .getIcebergCatalog()
+                        .loadTable(TableIdentifier.of(database, tableName));
+
+        // format-version 3 is stripped into table metadata, not surfaced via properties()
+        assertThat(
+                        ((org.apache.iceberg.BaseTable) createdTable)
+                                .operations()
+                                .current()
+                                .formatVersion())
+                .isEqualTo(3);
+        assertThat(createdTable.properties()).containsEntry("write.delete.granularity", "file");
+        // the clean layout of every new table: no system columns, partitioned by the partition
+        // key and bucket(bucket key) with the Fluss bucket count, unsorted
+        assertThat(createdTable.schema().columns())
+                .extracting(Types.NestedField::name)
+                .containsExactly("id", "name", "dt");
+        assertThat(createdTable.spec().fields())
+                .extracting(f -> createdTable.schema().findColumnName(f.sourceId()))
+                .containsExactly("dt", "id");
+        assertThat(createdTable.spec().fields().get(0).transform().isIdentity()).isTrue();
+        assertThat(createdTable.spec().fields().get(1).transform().toString())
+                .isEqualTo("bucket[4]");
+        assertThat(createdTable.sortOrder().isUnsorted()).isTrue();
+
+        // re-enabling lake storage on the existing DV table is idempotent
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testDeletionVectorsAreRejectedOnLegacyTable() {
+        String database = "test_db";
+        String tableName = "legacy_dv_table";
+        TablePath tablePath = TablePath.of(database, tableName);
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor plain =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+        flussIcebergCatalog.createTable(tablePath, plain, new TestingLakeCatalogContext());
+        IcebergTestUtils.adjustToLegacyV1Table(
+                flussIcebergCatalog.getIcebergCatalog(), TableIdentifier.of(database, tableName));
+
+        TableDescriptor withDv =
+                plain.withProperties(
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"));
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, withDv, new TestingLakeCatalogContext()))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("legacy layout")
+                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+    }
+
+    /**
+     * Tables with deletion vectors take deletes by position, which Iceberg format version 1 does
+     * not have: such a lake table is refused, whether new or existing.
+     */
+    @Test
+    void testDeletionVectorsRequireFormatVersion2() {
+        String database = "test_db";
+        TablePath tablePath = TablePath.of(database, "dv_v1_table");
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor plainV1 =
+                TableDescriptor.builder()
+                        .schema(flussSchema)
+                        .distributedBy(4, "id")
+                        .customProperty("iceberg.format-version", "1")
+                        .build();
+        TableDescriptor dvV1 =
+                plainV1.withProperties(
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"));
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, dvV1, new TestingLakeCatalogContext()))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining("iceberg.format-version")
+                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+        assertThat(
+                        flussIcebergCatalog
+                                .getIcebergCatalog()
+                                .tableExists(TableIdentifier.of(database, "dv_v1_table")))
+                .isFalse();
+
+        // an existing lake table of format version 1 is refused as well
+        flussIcebergCatalog.createTable(tablePath, plainV1, new TestingLakeCatalogContext());
+        TableDescriptor dv =
+                TableDescriptor.builder()
+                        .schema(flussSchema)
+                        .distributedBy(4, "id")
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .build();
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, dv, new TestingLakeCatalogContext()))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("format version 1");
+        // format version 2 is allowed
+        TablePath v2Path = TablePath.of(database, "dv_v2_table");
+        flussIcebergCatalog.createTable(
+                v2Path,
+                plainV1.withProperties(
+                        Collections.singletonMap(
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"),
+                        Collections.singletonMap("iceberg.format-version", "2")),
+                new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testPrimaryKeyTableDefaultsToFormatV2WithoutDeletionVectors() {
+        String database = "test_db";
+        String tableName = "non_dv_table";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+
+        Table createdTable =
+                flussIcebergCatalog
+                        .getIcebergCatalog()
+                        .loadTable(TableIdentifier.of(database, tableName));
+
+        assertThat(
+                        ((org.apache.iceberg.BaseTable) createdTable)
+                                .operations()
+                                .current()
+                                .formatVersion())
+                .isEqualTo(2);
+        assertThat(createdTable.schema().findField("__offset")).isNull();
+    }
+
+    @Test
     void testCreatePartitionedPrimaryKeyTable() {
         String database = "test_db";
         String tableName = "pk_table";

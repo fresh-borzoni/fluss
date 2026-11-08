@@ -51,6 +51,14 @@ public class IcebergConversions {
         return TableIdentifier.of(tablePath.getDatabaseName(), tablePath.getTableName());
     }
 
+    /**
+     * Returns the name of the data file at {@code location}, which names the file in the position
+     * index and in the masks of union reads.
+     */
+    public static String fileName(String location) {
+        return location.substring(location.lastIndexOf('/') + 1);
+    }
+
     @Nullable
     public static PartitionKey toPartition(
             Table table, @Nullable String partitionName, int bucket) {
