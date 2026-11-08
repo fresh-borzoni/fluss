@@ -107,6 +107,40 @@ public interface WriterInitContext {
     }
 
     /**
+     * Returns the remote directory of the position index of a table with deletion vectors, or null
+     * if unknown. It is the table's lake directory under the Fluss remote data directory. A lake
+     * writer stores there the positions of the rows its compaction rewrote.
+     *
+     * @return the position index directory, or null
+     */
+    @Nullable
+    default String positionIndexDir() {
+        return null;
+    }
+
+    /**
+     * Returns the memory that the lake writers of the tiering task share for what they buffer of a
+     * round, or null if the lake writer should use its own.
+     *
+     * @return the shared writer memory, or null
+     */
+    @Nullable
+    default WriterMemoryPool writerMemoryPool() {
+        return null;
+    }
+
+    /**
+     * Returns whether the writer's records are a snapshot of the bucket's key-value state rather
+     * than its changelog: one insert per primary key, without updates or deletes. This is the case
+     * in the first tiering round of a primary key table's bucket, for example.
+     *
+     * @return whether the writer reads a KV snapshot
+     */
+    default boolean readsKvSnapshot() {
+        return false;
+    }
+
+    /**
      * Returns the actual bucket count of the target partition, or the table-level count for
      * non-partitioned tables. After an ALTER bucket.num old partitions keep their original count,
      * so lake writers must stamp bucket layouts with this value instead of the lake table's current

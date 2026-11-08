@@ -76,6 +76,12 @@ public class FlussRowAsIcebergRecord implements Record {
         this.internalRow = internalRow;
     }
 
+    /** Wraps another row of the same type; returns this record. */
+    public FlussRowAsIcebergRecord replace(InternalRow row) {
+        this.internalRow = row;
+        return this;
+    }
+
     @Override
     public Types.StructType struct() {
         return structType;

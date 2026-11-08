@@ -33,9 +33,20 @@ public class FinishedTieringEvent implements SourceEvent {
     /** Statistics collected during this tiering round. */
     @Nullable private final TieringStats stats;
 
+    /**
+     * Whether a bucket's round ended before the end of its split, so the table has more to tier at
+     * once instead of after its freshness interval.
+     */
+    private final boolean moreToTier;
+
     public FinishedTieringEvent(long tableId, @Nullable TieringStats stats) {
+        this(tableId, stats, false);
+    }
+
+    public FinishedTieringEvent(long tableId, @Nullable TieringStats stats, boolean moreToTier) {
         this.tableId = tableId;
         this.stats = stats;
+        this.moreToTier = moreToTier;
     }
 
     public FinishedTieringEvent(long tableId) {
@@ -49,5 +60,9 @@ public class FinishedTieringEvent implements SourceEvent {
     @Nullable
     public TieringStats getStats() {
         return stats;
+    }
+
+    public boolean hasMoreToTier() {
+        return moreToTier;
     }
 }

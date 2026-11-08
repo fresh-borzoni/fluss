@@ -341,7 +341,11 @@ public class TieringSourceEnumerator
                         "The finished table {} is not in tiering table, won't report it to Fluss to mark as finished.",
                         finishedTableId);
             } else {
-                boolean isForceFinished = tieringReachMaxDurationsTables.remove(finishedTableId);
+                // A round that reached its max duration, or whose buckets ended early on full
+                // lake writers, has more to tier. The table is tiered again at once.
+                boolean isForceFinished =
+                        tieringReachMaxDurationsTables.remove(finishedTableId)
+                                | finishedTieringEvent.hasMoreToTier();
                 finishedTables.put(
                         finishedTableId,
                         TieringFinishInfo.from(

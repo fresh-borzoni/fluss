@@ -18,6 +18,9 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.KeyPosition;
+import org.apache.fluss.lake.dv.index.PositionIndexDelta;
+import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles;
 import org.apache.fluss.utils.InstantiationUtils;
@@ -39,7 +42,9 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.WRITE_RESULT_DIR;
@@ -47,6 +52,7 @@ import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.assertWrite
 import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.goldenWriteResult;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 /** UT for {@link IcebergWriteResultSerializer}. */
@@ -97,6 +103,91 @@ class IcebergWriteResultSerializerTest {
         serializedData = serializer.serialize(originalResult);
         deserializedResult = serializer.deserialize(serializer.getVersion(), serializedData);
         assertThat(deserializedResult.toString()).isEqualTo(originalResult.toString());
+    }
+
+    @Test
+    void testSerializeAndDeserializeWithPositionIndexDelta() throws IOException {
+        IcebergWriteResult withoutDelta = goldenWriteResult();
+        PositionIndexDelta delta =
+                new PositionIndexDelta(
+                        Arrays.asList(new byte[] {1, 2}, new byte[] {3}),
+                        Collections.singletonList(
+                                new KeyPosition(new byte[] {4, 5, 6}, "file-1.parquet", 42L)),
+                        Collections.singletonList(new byte[0]));
+        IcebergWriteResult original =
+                new IcebergWriteResult(
+                        withoutDelta.getWriteResult(),
+                        withoutDelta.specs(),
+                        withoutDelta.rewriteDataFileResult(),
+                        null,
+                        delta);
+
+        // version 2 documents carried the delta; the committer stages it itself
+        IcebergWriteResult deserialized = serializer.deserialize(2, serializer.serialize(original));
+
+        assertWriteResultEquals(deserialized, withoutDelta);
+        PositionIndexDelta actual = deserialized.positionIndexDelta();
+        assertThat(actual).isNotNull();
+        assertThat(actual.changedKeys()).containsExactly(new byte[] {1, 2}, new byte[] {3});
+        assertThat(actual.puts()).hasSize(1);
+        assertThat(actual.puts().get(0).key()).isEqualTo(new byte[] {4, 5, 6});
+        assertThat(actual.puts().get(0).file()).isEqualTo("file-1.parquet");
+        assertThat(actual.puts().get(0).pos()).isEqualTo(42L);
+        assertThat(actual.deletes()).containsExactly(new byte[0]);
+
+        // a write result without a delta keeps the golden format and reads back without one
+        assertThat(
+                        serializer
+                                .deserialize(
+                                        serializer.getVersion(), serializer.serialize(withoutDelta))
+                                .positionIndexDelta())
+                .isNull();
+    }
+
+    @Test
+    void testSerializeAndDeserializeWithStagedIndexPart() throws IOException {
+        IcebergWriteResult withoutPart = goldenWriteResult();
+        Map<Integer, String> files = new HashMap<>();
+        files.put(0, "data-1.parquet");
+        files.put(1, "data-2.parquet");
+        StagedIndexPart part =
+                new StagedIndexPart(
+                        -77L,
+                        Arrays.asList("w1_sst_0.sst", "w1_sst_1.sst"),
+                        Arrays.asList(100L, 200L),
+                        files,
+                        30L,
+                        4L);
+        IcebergWriteResult original =
+                new IcebergWriteResult(
+                        withoutPart.getWriteResult(),
+                        withoutPart.specs(),
+                        withoutPart.rewriteDataFileResult(),
+                        part,
+                        null);
+
+        IcebergWriteResult deserialized =
+                serializer.deserialize(serializer.getVersion(), serializer.serialize(original));
+
+        assertWriteResultEquals(deserialized, withoutPart);
+        assertThat(deserialized.positionIndexDelta()).isNull();
+        StagedIndexPart read = deserialized.stagedIndexPart();
+        assertThat(read).isNotNull();
+        assertThat(read.stagingId()).isEqualTo(-77L);
+        assertThat(read.sstFileNames()).containsExactly("w1_sst_0.sst", "w1_sst_1.sst");
+        assertThat(read.sstFileSizes()).containsExactly(100L, 200L);
+        assertThat(read.files())
+                .containsExactly(entry(0, "data-1.parquet"), entry(1, "data-2.parquet"));
+        assertThat(read.keys()).isEqualTo(30L);
+        assertThat(read.deletes()).isEqualTo(4L);
+
+        // a write result without a part keeps the golden format and reads back without one
+        assertThat(
+                        serializer
+                                .deserialize(
+                                        serializer.getVersion(), serializer.serialize(withoutPart))
+                                .stagedIndexPart())
+                .isNull();
     }
 
     @Test
@@ -151,9 +242,9 @@ class IcebergWriteResultSerializerTest {
                 .hasStackTraceContaining("Missing field");
         assertThatThrownBy(() -> serializer.deserialize(2, "invalid".getBytes()))
                 .isInstanceOf(IOException.class);
-        assertThatThrownBy(() -> serializer.deserialize(3, serialized))
+        assertThatThrownBy(() -> serializer.deserialize(4, serialized))
                 .isInstanceOf(IOException.class)
-                .hasMessageContaining("Unsupported IcebergWriteResult serializer version 3");
+                .hasMessageContaining("Unsupported IcebergWriteResult serializer version 4");
     }
 
     /** Serializes a write result like version 1 of {@link IcebergWriteResultSerializer} did. */

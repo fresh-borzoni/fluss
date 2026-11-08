@@ -18,6 +18,7 @@
 package org.apache.fluss.client.tiering;
 
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -37,6 +38,9 @@ public class TieringWriterInitContext implements WriterInitContext {
     private final long tieringRoundTimestamp;
     private final int bucketCount;
     @Nullable private final String[] ioTmpDirs;
+    @Nullable private final String positionIndexDir;
+    @Nullable private final WriterMemoryPool writerMemoryPool;
+    private final boolean readsKvSnapshot;
 
     public TieringWriterInitContext(
             TablePath tablePath,
@@ -47,6 +51,57 @@ public class TieringWriterInitContext implements WriterInitContext {
             long tieringRoundTimestamp,
             @Nullable Integer bucketCount,
             @Nullable String[] ioTmpDirs) {
+        this(
+                tablePath,
+                tableBucket,
+                partition,
+                tableInfo,
+                splitIndex,
+                tieringRoundTimestamp,
+                bucketCount,
+                ioTmpDirs,
+                null);
+    }
+
+    public TieringWriterInitContext(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            TableInfo tableInfo,
+            int splitIndex,
+            long tieringRoundTimestamp,
+            @Nullable Integer bucketCount,
+            @Nullable String[] ioTmpDirs,
+            @Nullable String positionIndexDir) {
+        this(
+                tablePath,
+                tableBucket,
+                partition,
+                tableInfo,
+                splitIndex,
+                tieringRoundTimestamp,
+                bucketCount,
+                ioTmpDirs,
+                positionIndexDir,
+                null,
+                false);
+    }
+
+    public TieringWriterInitContext(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            TableInfo tableInfo,
+            int splitIndex,
+            long tieringRoundTimestamp,
+            @Nullable Integer bucketCount,
+            @Nullable String[] ioTmpDirs,
+            @Nullable String positionIndexDir,
+            @Nullable WriterMemoryPool writerMemoryPool,
+            boolean readsKvSnapshot) {
+        this.positionIndexDir = positionIndexDir;
+        this.writerMemoryPool = writerMemoryPool;
+        this.readsKvSnapshot = readsKvSnapshot;
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partition = partition;
@@ -90,6 +145,12 @@ public class TieringWriterInitContext implements WriterInitContext {
         return tableInfo;
     }
 
+    @Nullable
+    @Override
+    public String positionIndexDir() {
+        return positionIndexDir;
+    }
+
     @Override
     public int splitIndex() {
         return splitIndex;
@@ -104,6 +165,17 @@ public class TieringWriterInitContext implements WriterInitContext {
     @Override
     public String[] ioTmpDirs() {
         return ioTmpDirs;
+    }
+
+    @Nullable
+    @Override
+    public WriterMemoryPool writerMemoryPool() {
+        return writerMemoryPool;
+    }
+
+    @Override
+    public boolean readsKvSnapshot() {
+        return readsKvSnapshot;
     }
 
     @Override

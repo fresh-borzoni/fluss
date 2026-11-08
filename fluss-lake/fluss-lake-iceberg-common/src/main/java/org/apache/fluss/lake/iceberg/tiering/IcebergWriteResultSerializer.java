@@ -40,8 +40,14 @@ import static org.apache.fluss.lake.iceberg.utils.IcebergJsonSerdeUtils.toJsonBy
  *   <li><b>Version 1:</b> Initial version. Java serialization of the {@link WriteResult} and the
  *       optional {@link RewriteDataFileResult}, which can only be read by the Iceberg version that
  *       wrote them.
- *   <li><b>Version 2 (Current):</b> A JSON document written by {@link IcebergWriteResultJsonSerde},
- *       so that the write result can be read across Iceberg versions.
+ *   <li><b>Version 2:</b> A JSON document written by {@link IcebergWriteResultJsonSerde}, so that
+ *       the write result can be read across Iceberg versions. For tables with derived deletion
+ *       vectors, the document may carry a position index delta: the bucket's index change, held in
+ *       memory.
+ *   <li><b>Version 3 (Current):</b> The JSON document of version 2. For tables with derived
+ *       deletion vectors, it carries a reference to the index part the writer staged in the
+ *       position index store, instead of a position index delta. A version 2 reader would ignore
+ *       the reference and commit the round's rows without their deletes, hence the new version.
  * </ul>
  *
  * <p>This serializer can deserialize write results of all previous versions, but always produces
@@ -51,7 +57,8 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
 
     private static final int VERSION_1 = 1;
     private static final int VERSION_2 = 2;
-    private static final int CURRENT_VERSION = VERSION_2;
+    private static final int VERSION_3 = 3;
+    private static final int CURRENT_VERSION = VERSION_3;
 
     @Override
     public int getVersion() {
@@ -69,13 +76,14 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
             case VERSION_1:
                 return deserializeV1(serialized);
             case VERSION_2:
+            case VERSION_3:
                 return fromJsonBytes(
                         serialized, IcebergWriteResultJsonSerde.INSTANCE, "IcebergWriteResult");
             default:
                 throw new IOException(
                         String.format(
-                                "Unsupported IcebergWriteResult serializer version %s, the supported versions are %s and %s.",
-                                version, VERSION_1, VERSION_2));
+                                "Unsupported IcebergWriteResult serializer version %s, the supported versions are %s to %s.",
+                                version, VERSION_1, VERSION_3));
         }
     }
 

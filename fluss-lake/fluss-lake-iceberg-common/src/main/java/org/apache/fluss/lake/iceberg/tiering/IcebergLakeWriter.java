@@ -22,9 +22,11 @@ import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.AppendOnlyTaskWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.DeltaTaskWriter;
+import org.apache.fluss.lake.iceberg.tiering.writer.DerivedDvRecordWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
 import org.apache.fluss.lake.iceberg.utils.IcebergUtils;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecord;
@@ -54,7 +56,7 @@ import java.util.concurrent.TimeUnit;
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 
 /** Implementation of {@link LakeWriter} for Iceberg. */
-public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
+public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundBufferingLakeWriter {
 
     protected static final Logger LOG = LoggerFactory.getLogger(IcebergLakeWriter.class);
 
@@ -71,6 +73,14 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
         this.icebergCatalog = icebergCatalogProvider.get();
         this.icebergTable = getTable(writerInitContext.tableInfo().getLakeTablePath());
         IcebergPartitionSpecValidator.validate(icebergTable, writerInitContext.tableInfo());
+        if (writerInitContext.tableInfo().isDeletionVectorsEnabled()
+                && IcebergUtils.isLegacyTable(icebergTable.schema())) {
+            throw new IOException(
+                    String.format(
+                            "Iceberg table %s has the legacy layout (Fluss system columns), which "
+                                    + "does not support deletion vectors.",
+                            writerInitContext.tableInfo().getLakeTablePath()));
+        }
 
         // Create a record writer
         this.recordWriter = createRecordWriter(writerInitContext);
@@ -106,14 +116,18 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
     }
 
     private RecordWriter createRecordWriter(WriterInitContext writerInitContext) {
+        boolean dvEnabled = writerInitContext.tableInfo().isDeletionVectorsEnabled();
         List<Integer> equalityFieldIds =
                 new ArrayList<>(icebergTable.schema().identifierFieldIds());
         TaskWriter<Record> taskWriter =
                 TaskWriterFactory.createTaskWriter(
                         icebergTable,
                         writerInitContext.partition(),
-                        writerInitContext.tableBucket().getBucket());
-        if (equalityFieldIds.isEmpty()) {
+                        writerInitContext.tableBucket().getBucket(),
+                        dvEnabled);
+        if (dvEnabled) {
+            return new DerivedDvRecordWriter(icebergTable, writerInitContext, taskWriter);
+        } else if (equalityFieldIds.isEmpty()) {
             return new AppendOnlyTaskWriter(icebergTable, writerInitContext, taskWriter);
         } else {
             return new DeltaTaskWriter(icebergTable, writerInitContext, taskWriter);
@@ -130,6 +144,20 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
     }
 
     @Override
+    public long bufferedKeys() {
+        return recordWriter instanceof DerivedDvRecordWriter
+                ? ((DerivedDvRecordWriter) recordWriter).bufferedKeys()
+                : 0;
+    }
+
+    @Override
+    public long bufferedBytes() {
+        return recordWriter instanceof DerivedDvRecordWriter
+                ? ((DerivedDvRecordWriter) recordWriter).bufferedBytes()
+                : 0;
+    }
+
+    @Override
     public IcebergWriteResult complete() throws IOException {
         try {
             WriteResult writeResult = recordWriter.complete();
@@ -137,6 +165,14 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
             RewriteDataFileResult rewriteDataFileResult = null;
             if (compactionFuture != null) {
                 rewriteDataFileResult = compactionFuture.get();
+            }
+            if (recordWriter instanceof DerivedDvRecordWriter) {
+                return new IcebergWriteResult(
+                        writeResult,
+                        icebergTable.specs(),
+                        rewriteDataFileResult,
+                        ((DerivedDvRecordWriter) recordWriter).stagedIndexPart(),
+                        null);
             }
             return new IcebergWriteResult(writeResult, icebergTable.specs(), rewriteDataFileResult);
         } catch (Exception e) {

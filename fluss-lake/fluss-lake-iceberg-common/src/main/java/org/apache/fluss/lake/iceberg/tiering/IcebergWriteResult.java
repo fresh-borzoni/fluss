@@ -17,6 +17,10 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.PositionIndexDelta;
+import org.apache.fluss.lake.dv.index.PositionIndexDeltaProvider;
+import org.apache.fluss.lake.dv.index.StagedIndexPart;
+import org.apache.fluss.lake.dv.index.StagedIndexPartProvider;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 
 import org.apache.iceberg.PartitionSpec;
@@ -28,7 +32,8 @@ import java.io.Serializable;
 import java.util.Map;
 
 /** The write result of Iceberg lake writer to pass to committer to commit. */
-public class IcebergWriteResult implements Serializable {
+public class IcebergWriteResult
+        implements Serializable, StagedIndexPartProvider, PositionIndexDeltaProvider {
 
     private static final long serialVersionUID = 1L;
 
@@ -42,13 +47,43 @@ public class IcebergWriteResult implements Serializable {
     // the rewrite result
     @Nullable private final RewriteDataFileResult rewriteDataFileResult;
 
+    // the bucket's index part, staged by the writer of a table with deletion vectors
+    @Nullable private final StagedIndexPart stagedIndexPart;
+
+    // the bucket's index change held in memory; only restored from results written by version 2
+    // of the serializer
+    @Nullable private final PositionIndexDelta positionIndexDelta;
+
     public IcebergWriteResult(
             WriteResult writeResult,
             @Nullable Map<Integer, PartitionSpec> specs,
             @Nullable RewriteDataFileResult rewriteDataFileResult) {
+        this(writeResult, specs, rewriteDataFileResult, null, null);
+    }
+
+    public IcebergWriteResult(
+            WriteResult writeResult,
+            @Nullable Map<Integer, PartitionSpec> specs,
+            @Nullable RewriteDataFileResult rewriteDataFileResult,
+            @Nullable StagedIndexPart stagedIndexPart,
+            @Nullable PositionIndexDelta positionIndexDelta) {
         this.writeResult = writeResult;
         this.specs = specs;
         this.rewriteDataFileResult = rewriteDataFileResult;
+        this.stagedIndexPart = stagedIndexPart;
+        this.positionIndexDelta = positionIndexDelta;
+    }
+
+    @Override
+    @Nullable
+    public StagedIndexPart stagedIndexPart() {
+        return stagedIndexPart;
+    }
+
+    @Override
+    @Nullable
+    public PositionIndexDelta positionIndexDelta() {
+        return positionIndexDelta;
     }
 
     public WriteResult getWriteResult() {
@@ -75,6 +110,7 @@ public class IcebergWriteResult implements Serializable {
                 + (rewriteDataFileResult != null
                         ? (", rewriteDataFiles=" + rewriteDataFileResult)
                         : "")
+                + (stagedIndexPart != null ? (", stagedIndexPart=" + stagedIndexPart) : "")
                 + '}';
     }
 }

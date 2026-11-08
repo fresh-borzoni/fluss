@@ -161,6 +161,27 @@ class TableBucketWriteResultSerializerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testEndedEarlyRoundTrips(boolean endedEarly) throws Exception {
+        TableBucketWriteResult<TestingWriteResult> result =
+                new TableBucketWriteResult<>(
+                        TablePath.of("db1", "tb1"),
+                        new TableBucket(1, 2),
+                        null,
+                        new TestingWriteResult(3),
+                        7,
+                        30L,
+                        2,
+                        endedEarly);
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                tableBucketWriteResultSerializer.deserialize(
+                        tableBucketWriteResultSerializer.getVersion(),
+                        tableBucketWriteResultSerializer.serialize(result));
+        assertThat(deserialized.endedEarly()).isEqualTo(endedEarly);
+        assertThat(deserialized.logEndOffset()).isEqualTo(7);
+    }
+
+    @ParameterizedTest
     @ValueSource(longs = {TieringSplit.UNKNOWN_TIERING_EPOCH, 0, 42})
     void testTieringEpochRoundTrips(long tieringEpoch) throws Exception {
         TableBucketWriteResult<TestingWriteResult> result =
@@ -229,7 +250,7 @@ class TableBucketWriteResultSerializerTest {
         TableBucketWriteResultSerializer<TestingWriteResult> serializer =
                 new TableBucketWriteResultSerializer<>(lakeSerializer);
 
-        // the layout of VERSION_3: VERSION_2, then the tiering epoch
+        // the layout of VERSION_3: VERSION_2, then endedEarly and tiering epoch
         DataOutputSerializer out = new DataOutputSerializer(64);
         out.writeUTF("db1");
         out.writeUTF("tb1");
@@ -245,7 +266,8 @@ class TableBucketWriteResultSerializerTest {
         out.writeLong(10L);
         out.writeLong(30L);
         out.writeInt(3);
-        // tiering epoch
+        // endedEarly and tiering epoch
+        out.writeBoolean(true);
         out.writeLong(42L);
 
         TableBucketWriteResult<TestingWriteResult> deserialized =
@@ -258,6 +280,7 @@ class TableBucketWriteResultSerializerTest {
         assertThat(deserialized.logEndOffset()).isEqualTo(10L);
         assertThat(deserialized.maxTimestamp()).isEqualTo(30L);
         assertThat(deserialized.numberOfWriteResults()).isEqualTo(3);
+        assertThat(deserialized.endedEarly()).isTrue();
         assertThat(deserialized.tieringEpoch()).isEqualTo(42L);
 
         // and the current version writes exactly that layout
@@ -267,7 +290,7 @@ class TableBucketWriteResultSerializerTest {
 
     @Test
     void testDeserializeVersionTwoHasNoRoundFields() throws Exception {
-        // VERSION_2 predates the tiering epoch: the round is not fenced
+        // VERSION_2 predates endedEarly and the tiering epoch: the round is not fenced
         DataOutputSerializer out = new DataOutputSerializer(64);
         out.writeUTF("db1");
         out.writeUTF("tb1");
@@ -282,6 +305,7 @@ class TableBucketWriteResultSerializerTest {
         TableBucketWriteResult<TestingWriteResult> deserialized =
                 tableBucketWriteResultSerializer.deserialize(2, out.getCopyOfBuffer());
         assertThat(deserialized.writeResult()).isNull();
+        assertThat(deserialized.endedEarly()).isFalse();
         assertThat(deserialized.tieringEpoch()).isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
     }
 

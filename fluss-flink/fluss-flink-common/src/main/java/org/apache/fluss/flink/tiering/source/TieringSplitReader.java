@@ -31,7 +31,10 @@ import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringWriterInitContext;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.flink.source.reader.BoundedSplitReader;
 import org.apache.fluss.flink.source.reader.RecordAndPos;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
@@ -39,7 +42,9 @@ import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.lake.batch.ArrowRecordBatch;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
 import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
+import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -48,6 +53,8 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ArrowBatchData;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.function.SupplierWithException;
 
@@ -124,6 +131,8 @@ public class TieringSplitReader<WriteResult>
 
     // partition id -> actual bucket count for the current table's partitions
     private final Map<Long, Integer> currentTablePartitionBucketCounts = new HashMap<>();
+    // ids of the current table's partitions dropped since the reader listed them
+    private final Set<Long> currentTableDroppedPartitions = new HashSet<>();
 
     private final Map<TableBucket, LogOffsetAndTimestamp> currentTableTieredOffsetAndTimestamp;
 
@@ -132,6 +141,14 @@ public class TieringSplitReader<WriteResult>
     private final TieringMetrics tieringMetrics;
     private final boolean unshadedArrowAvailable;
     @Nullable private final String[] ioTmpDirs;
+
+    // A bucket's round ends early once its lake writer holds this many keys or bytes.
+    private final long maxRoundKeysPerBucket;
+    private final long maxRoundBytesPerBucket;
+    // The log offset where the round of the bucket handled last ended early, or null.
+    @Nullable private Long roundEndedAt;
+    // The memory this reader's lake writers share to buffer their rounds.
+    private final WriterMemoryPool writerMemoryPool;
 
     public TieringSplitReader(
             Connection connection,
@@ -181,6 +198,30 @@ public class TieringSplitReader<WriteResult>
         this.tieringMetrics = tieringMetrics;
         this.unshadedArrowAvailable = checkUnshadedArrowAvailable(userClassLoader);
         this.ioTmpDirs = ioTmpDirs;
+        this.maxRoundKeysPerBucket =
+                connection
+                        .getConfiguration()
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET);
+        this.maxRoundBytesPerBucket =
+                connection
+                        .getConfiguration()
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET)
+                        .getBytes();
+        checkArgument(
+                maxRoundKeysPerBucket > 0 && maxRoundBytesPerBucket > 0,
+                "%s and %s must be positive.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET.key(),
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET.key());
+        long writeBufferSize =
+                connection
+                        .getConfiguration()
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE)
+                        .getBytes();
+        checkArgument(
+                writeBufferSize > 0,
+                "%s must be positive.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE.key());
+        this.writerMemoryPool = new WriterMemoryPool(writeBufferSize);
     }
 
     @Override
@@ -295,7 +336,8 @@ public class TieringSplitReader<WriteResult>
         // may poll next snapshot split to read
         TieringSnapshotSplit nextSnapshotSplit = currentPendingSnapshotSplits.poll();
         if (nextSnapshotSplit != null) {
-            Table table = getOrMoveToTable(nextSnapshotSplit);
+            // the reader moved to the table when it took the table's splits
+            Table table = checkNotNull(getOrMoveToTable(nextSnapshotSplit));
             currentSnapshotSplit = nextSnapshotSplit;
             currentSnapshotSplitReader =
                     new BoundedSplitReader(
@@ -319,50 +361,98 @@ public class TieringSplitReader<WriteResult>
         }
 
         Set<TieringSplit> pendingSplits = pendingTieringSplits.remove(pendingTableId);
+        if (getOrMoveToTable(pendingSplits.iterator().next()) == null) {
+            // The table's round ends with no data; the committer fails it on the dropped table.
+            currentEmptySplits.addAll(pendingSplits);
+            return;
+        }
         for (TieringSplit split : pendingSplits) {
-            getOrMoveToTable(split);
             addSplitToCurrentTable(split);
         }
     }
 
+    /**
+     * Returns the split's table, moving the reader to it first if needed. Returns null if the table
+     * was dropped, or dropped and created again under its path, since the round's splits were
+     * planned.
+     */
+    @Nullable
     private Table getOrMoveToTable(TieringSplit split) {
         if (currentTable == null) {
             TablePath tablePath = split.getTablePath();
-            currentTable = connection.getTable(tablePath);
+            Table table;
+            try {
+                table = connection.getTable(tablePath);
+            } catch (RuntimeException e) {
+                if (!ExceptionUtils.findThrowable(e, TableNotExistException.class).isPresent()) {
+                    throw e;
+                }
+                LOG.info(
+                        "Table {} (id {}) was dropped; its splits end without tiering.",
+                        tablePath,
+                        split.getTableBucket().getTableId());
+                return null;
+            }
+            if (table.getTableInfo().getTableId() != split.getTableBucket().getTableId()) {
+                LOG.info(
+                        "Table {} (id {}) was dropped and created again as id {}; its splits end"
+                                + " without tiering.",
+                        tablePath,
+                        split.getTableBucket().getTableId(),
+                        table.getTableInfo().getTableId());
+                IOUtils.closeQuietly(table, "table " + tablePath);
+                return null;
+            }
+            currentTable = table;
             currentTablePath = tablePath;
             currentTableId = split.getTableBucket().getTableId();
             currentTableNumberOfSplits = split.getNumberOfSplits();
-            TableInfo currentTableInfo = checkNotNull(currentTable).getTableInfo();
-            // check currentTable's id for the table path is same with table id of the tiering
-            // split, if not, it means the tiering split is for a previous dropped table. let's fail
-            // directly
-            // todo: we should skip and notify enumerator that the table id is not tiering now
-            // instead of fail directly
-            checkArgument(
-                    currentTableInfo.getTableId() == split.getTableBucket().getTableId(),
-                    "The current table id %s for table path %s is different from the table id %s in TieringSplit split.",
-                    currentTableInfo.getTableId(),
-                    tablePath,
-                    split.getTableBucket().getTableId());
+            TableInfo currentTableInfo = table.getTableInfo();
             // Snapshot each partition's actual bucket count so lake writers can stamp per-partition
             // bucket layouts correctly after an ALTER bucket.num.
             if (currentTableInfo.isPartitioned()) {
-                try {
-                    // the admin is a shared per-connection instance, so it must not be closed here
-                    Admin admin = connection.getAdmin();
-                    for (PartitionInfo partitionInfo :
-                            admin.listPartitionInfos(tablePath, true).get()) {
-                        currentTablePartitionBucketCounts.put(
-                                partitionInfo.getPartitionId(), partitionInfo.getBucketCount());
-                    }
-                } catch (Exception e) {
-                    throw new FlussRuntimeException(
-                            "Failed to list partition infos for table " + tablePath, e);
-                }
+                listPartitionBucketCounts();
             }
             LOG.info("Start to tier table {} with table id {}.", currentTablePath, currentTableId);
         }
         return currentTable;
+    }
+
+    private void listPartitionBucketCounts() {
+        try {
+            // the admin is a shared per-connection instance, so it must not be closed here
+            Admin admin = connection.getAdmin();
+            for (PartitionInfo partitionInfo :
+                    admin.listPartitionInfos(currentTablePath, true).get()) {
+                currentTablePartitionBucketCounts.put(
+                        partitionInfo.getPartitionId(), partitionInfo.getBucketCount());
+            }
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to list partition infos for table " + currentTablePath, e);
+        }
+    }
+
+    /**
+     * Whether the bucket's partition was dropped. The reader lists the partitions when it moves to
+     * the table, after the splits were planned, so a partition dropped in between is missing from
+     * the list while its log may still be read. A partition missing from the list is looked up
+     * again.
+     */
+    private boolean isDroppedPartition(TableBucket bucket) {
+        Long partitionId = bucket.getPartitionId();
+        if (partitionId == null || currentTablePartitionBucketCounts.containsKey(partitionId)) {
+            return false;
+        }
+        if (currentTableDroppedPartitions.contains(partitionId)) {
+            return true;
+        }
+        listPartitionBucketCounts();
+        if (currentTablePartitionBucketCounts.containsKey(partitionId)) {
+            return false;
+        }
+        currentTableDroppedPartitions.add(partitionId);
+        return true;
     }
 
     private void mayCreateLogScanner() {
@@ -489,8 +579,33 @@ public class TieringSplitReader<WriteResult>
                     "Missing consumed-up-to offset for polled bucket %s.",
                     bucket);
 
+            if (!records.isEmpty()
+                    && !lakeWriters.containsKey(bucket)
+                    && isDroppedPartition(bucket)) {
+                // The split ends untiered: nothing reads a dropped partition's lake rows with its
+                // log, and the lake writer needs the partition's bucket count, which is gone.
+                currentTableStoppingOffsets.remove(bucket);
+                currentLogScanner.unsubscribe(bucket.getPartitionId(), bucket.getBucket());
+                TieringSplit split = currentTableSplitsByBucket.remove(bucket);
+                LOG.info(
+                        "Partition {} of table {} was dropped; split {} ends without tiering.",
+                        split.getPartitionName(),
+                        currentTablePath,
+                        split.splitId());
+                writeResults.put(
+                        bucket,
+                        completeLakeWriter(
+                                bucket,
+                                split.getPartitionName(),
+                                UNKNOWN_BUCKET_OFFSET,
+                                UNKNOWN_BUCKET_TIMESTAMP));
+                finishedSplitIds.put(bucket, split.splitId());
+                continue;
+            }
+
             // Write records to the lake; returns the last written timestamp,
             // or UNKNOWN_BUCKET_TIMESTAMP if no records were actually written.
+            roundEndedAt = null;
             long lastWrittenTimestamp =
                     handler.handleRecords(
                             records,
@@ -501,14 +616,20 @@ public class TieringSplitReader<WriteResult>
                                         bucket,
                                         split.getPartitionName(),
                                         split.getSplitIndex(),
-                                        split.getTieringRoundTimestamp());
+                                        split.getTieringRoundTimestamp(),
+                                        false);
                             },
                             stoppingOffset);
+            // A round-buffering lake writer that is full ends the bucket's round after the last
+            // record it took. The next round tiers the rest from there.
+            boolean endedEarly = roundEndedAt != null && roundEndedAt < stoppingOffset;
+            long splitEndOffset = endedEarly ? roundEndedAt : stoppingOffset;
+            roundEndedAt = null;
 
             // The split owns offsets before stoppingOffset only. If the scanner consumed past
             // the split boundary, cap the tiered progress at stoppingOffset so the next split
             // still owns later data.
-            long tieredLogEndOffset = Math.min(consumedUpToOffset, stoppingOffset);
+            long tieredLogEndOffset = Math.min(consumedUpToOffset, splitEndOffset);
             long tieredTimestamp;
             if (lastWrittenTimestamp >= 0) {
                 tieredTimestamp = lastWrittenTimestamp;
@@ -521,7 +642,7 @@ public class TieringSplitReader<WriteResult>
 
             // The split owns offsets below stoppingOffset. If the scanner has not consumed up
             // to that exclusive bound yet, keep the split active.
-            if (consumedUpToOffset < stoppingOffset) {
+            if (consumedUpToOffset < splitEndOffset) {
                 continue;
             }
 
@@ -540,14 +661,29 @@ public class TieringSplitReader<WriteResult>
                     completeLakeWriter(
                             bucket,
                             currentTieringSplit.getPartitionName(),
-                            stoppingOffset,
-                            tieredTimestamp));
+                            splitEndOffset,
+                            tieredTimestamp,
+                            endedEarly));
             finishedSplitIds.put(bucket, currentSplitId);
-            LOG.info(
-                    "Finish tier bucket {} for table {}, split: {}.",
-                    bucket,
-                    currentTablePath,
-                    currentSplitId);
+            if (endedEarly) {
+                LOG.info(
+                        "Finish tier bucket {} for table {} early at offset {} of split {}, which"
+                                + " ends at {}: its lake writer holds as much as one round may"
+                                + " ({} keys, {} bytes); the next round tiers the rest.",
+                        bucket,
+                        currentTablePath,
+                        splitEndOffset,
+                        currentSplitId,
+                        stoppingOffset,
+                        maxRoundKeysPerBucket,
+                        maxRoundBytesPerBucket);
+            } else {
+                LOG.info(
+                        "Finish tier bucket {} for table {}, split: {}.",
+                        bucket,
+                        currentTablePath,
+                        currentSplitId);
+            }
         }
 
         if (!finishedSplitIds.isEmpty()) {
@@ -579,9 +715,23 @@ public class TieringSplitReader<WriteResult>
                 if (record.getSizeInBytes() > 0) {
                     tieringMetrics.recordBytesRead(record.getSizeInBytes());
                 }
+                if (isRoundFull(lakeWriter)) {
+                    roundEndedAt = record.logOffset() + 1;
+                    break;
+                }
             }
         }
         return lastWrittenTimestamp;
+    }
+
+    /** Whether a round-buffering lake writer reached the round's key or byte limit. */
+    private boolean isRoundFull(LakeWriter<?> lakeWriter) {
+        if (!(lakeWriter instanceof RoundBufferingLakeWriter)) {
+            return false;
+        }
+        RoundBufferingLakeWriter buffering = (RoundBufferingLakeWriter) lakeWriter;
+        return buffering.bufferedKeys() >= maxRoundKeysPerBucket
+                || buffering.bufferedBytes() >= maxRoundBytesPerBucket;
     }
 
     /**
@@ -638,11 +788,16 @@ public class TieringSplitReader<WriteResult>
         return lastWrittenTimestamp;
     }
 
+    /**
+     * Returns the bucket's lake writer, created on its first record. {@code kvSnapshot} is true if
+     * the bucket's records are a KV snapshot, one record per key.
+     */
     private LakeWriter<WriteResult> getOrCreateLakeWriter(
             TableBucket bucket,
             @Nullable String partitionName,
             int splitIndex,
-            long tieringRoundTimestamp)
+            long tieringRoundTimestamp,
+            boolean kvSnapshot)
             throws IOException {
         LakeWriter<WriteResult> lakeWriter = lakeWriters.get(bucket);
         if (lakeWriter == null) {
@@ -660,10 +815,33 @@ public class TieringSplitReader<WriteResult>
                                     splitIndex,
                                     tieringRoundTimestamp,
                                     partitionBucketCount,
-                                    ioTmpDirs));
+                                    ioTmpDirs,
+                                    positionIndexDir(currentTable.getTableInfo()),
+                                    writerMemoryPool,
+                                    kvSnapshot));
             lakeWriters.put(bucket, lakeWriter);
         }
         return lakeWriter;
+    }
+
+    /**
+     * The remote directory of the position index of a table with deletion vectors, resolved as the
+     * committer resolves it. Null for other tables, or without a remote data directory.
+     */
+    @Nullable
+    private String positionIndexDir(TableInfo tableInfo) {
+        if (!tableInfo.isDeletionVectorsEnabled()) {
+            return null;
+        }
+        String remoteDataDir;
+        try {
+            remoteDataDir = FlussConfigUtils.getDefaultRemoteDataDir(connection.getConfiguration());
+        } catch (RuntimeException e) {
+            return null; // the committer fails such rounds anyway
+        }
+        return FlussPaths.remoteLakeTableSnapshotDir(
+                        remoteDataDir, tableInfo.getTablePath(), tableInfo.getTableId())
+                .toString();
     }
 
     private TableBucketWriteResult<WriteResult> completeLakeWriter(
@@ -671,6 +849,16 @@ public class TieringSplitReader<WriteResult>
             @Nullable String partitionName,
             long logEndOffset,
             long maxTimestamp)
+            throws IOException {
+        return completeLakeWriter(bucket, partitionName, logEndOffset, maxTimestamp, false);
+    }
+
+    private TableBucketWriteResult<WriteResult> completeLakeWriter(
+            TableBucket bucket,
+            @Nullable String partitionName,
+            long logEndOffset,
+            long maxTimestamp,
+            boolean endedEarly)
             throws IOException {
         LakeWriter<WriteResult> lakeWriter = lakeWriters.remove(bucket);
         WriteResult writeResult = null;
@@ -685,14 +873,15 @@ public class TieringSplitReader<WriteResult>
             }
             lakeWriter.close();
         }
-        return toTableBucketWriteResult(
+        return new TableBucketWriteResult<>(
                 currentTablePath,
                 bucket,
                 partitionName,
                 writeResult,
                 logEndOffset,
                 maxTimestamp,
-                checkNotNull(currentTableNumberOfSplits));
+                checkNotNull(currentTableNumberOfSplits),
+                endedEarly);
     }
 
     private TableBucketWriteResultWithSplitIds forEmptySplits(Set<TieringSplit> emptySplits) {
@@ -747,15 +936,21 @@ public class TieringSplitReader<WriteResult>
     private TableBucketWriteResultWithSplitIds forSnapshotSplitRecords(
             TableBucket bucket, CloseableIterator<RecordAndPos> recordIterator) throws IOException {
         LakeWriter<WriteResult> lakeWriter = null;
+        // as in the log path, the rows of a dropped partition are not tiered
+        boolean dropped = !lakeWriters.containsKey(bucket) && isDroppedPartition(bucket);
         while (recordIterator.hasNext()) {
             ScanRecord scanRecord = recordIterator.next().record();
+            if (dropped) {
+                continue;
+            }
             if (lakeWriter == null) {
                 lakeWriter =
                         getOrCreateLakeWriter(
                                 bucket,
                                 checkNotNull(currentSnapshotSplit).getPartitionName(),
                                 currentSnapshotSplit.getSplitIndex(),
-                                currentSnapshotSplit.getTieringRoundTimestamp());
+                                currentSnapshotSplit.getTieringRoundTimestamp(),
+                                true);
             }
             lakeWriter.write(scanRecord);
             if (scanRecord.getSizeInBytes() > 0) {
@@ -814,6 +1009,7 @@ public class TieringSplitReader<WriteResult>
         currentTableTieredOffsetAndTimestamp.clear();
         currentTableSplitsByBucket.clear();
         currentTablePartitionBucketCounts.clear();
+        currentTableDroppedPartitions.clear();
     }
 
     /**
