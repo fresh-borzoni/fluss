@@ -31,6 +31,7 @@ import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
 import org.apache.fluss.exception.DeletionDisabledException;
+import org.apache.fluss.exception.DeletionVectorsNotReadyException;
 import org.apache.fluss.exception.DiskWriteLockedException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -85,6 +86,7 @@ import org.apache.fluss.exception.SecurityTokenException;
 import org.apache.fluss.exception.ServerNotExistException;
 import org.apache.fluss.exception.ServerTagAlreadyExistException;
 import org.apache.fluss.exception.ServerTagNotExistException;
+import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.TableAlreadyExistException;
@@ -319,7 +321,17 @@ public enum Errors {
     CONSUMER_OFFSET_METADATA_TOO_LARGE(
             80,
             "The metadata field of the consumer offset request is too large.",
-            ConsumerOffsetMetadataTooLargeException::new);
+            ConsumerOffsetMetadataTooLargeException::new),
+    DELETION_VECTORS_NOT_READY(
+            81,
+            "The bucket's deletion vectors are catching up to the requested lake snapshot or"
+                    + " replaying their log tail; retry later.",
+            DeletionVectorsNotReadyException::new),
+    STALE_SNAPSHOT(
+            82,
+            "The bucket's deletion vectors cover another lake snapshot than the requested one, or"
+                    + " no longer hold the requested mask cut.",
+            StaleSnapshotException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

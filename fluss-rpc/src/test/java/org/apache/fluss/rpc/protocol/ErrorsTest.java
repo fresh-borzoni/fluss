@@ -17,9 +17,13 @@
 
 package org.apache.fluss.rpc.protocol;
 
+import org.apache.fluss.exception.ApiException;
+import org.apache.fluss.exception.StaleSnapshotException;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.concurrent.CompletionException;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,5 +36,27 @@ class ErrorsTest {
         int[] codes = Arrays.stream(Errors.values()).mapToInt(Errors::code).sorted().toArray();
         // Include UNKNOWN_SERVER_ERROR (-1) and NONE (0).
         assertThat(codes).containsExactly(IntStream.range(-1, -1 + codes.length).toArray());
+    }
+
+    /** A stale snapshot crosses the RPC as itself, with both snapshot ids. */
+    @Test
+    void testStaleSnapshotCrossesTheRpc() {
+        StaleSnapshotException stale =
+                new StaleSnapshotException(-7123456789L, 42L, "bucket 3, cut 30");
+        assertThat(Errors.forException(stale)).isEqualTo(Errors.STALE_SNAPSHOT);
+        assertThat(Errors.STALE_SNAPSHOT.code()).isEqualTo(82);
+
+        ApiError error = ApiError.fromThrowable(new CompletionException(stale));
+        ApiException received = ApiError.fromErrorMessage(error.toErrorResponse()).exception();
+
+        assertThat(received).isInstanceOf(StaleSnapshotException.class);
+        StaleSnapshotException receivedStale = (StaleSnapshotException) received;
+        assertThat(receivedStale.getCurrentSnapshotId()).isEqualTo(-7123456789L);
+        assertThat(receivedStale.getRequestedSnapshotId()).isEqualTo(42L);
+        assertThat(receivedStale).hasMessageContaining("cut 30");
+        assertThat(
+                        ((StaleSnapshotException) Errors.STALE_SNAPSHOT.exception())
+                                .getCurrentSnapshotId())
+                .isEqualTo(-1L);
     }
 }

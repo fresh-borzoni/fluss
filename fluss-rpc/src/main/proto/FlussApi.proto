@@ -1755,3 +1755,70 @@ message PbLiteralValue {
   optional int32 timestamp_nano_of_millis_value = 12; // Nano of millis
   optional bytes decimal_bytes = 13;   // Serialized decimal (non-compact mode)
 }
+
+// Deletion vectors (tablet server internal).
+
+message GetDvSnapshotRequest {
+  required int64 table_id = 1;
+  required int32 bucket_id = 2;
+  // The lake snapshot the read is planned on, or the base snapshot of a tiering round.
+  required int64 readable_snapshot_id = 3;
+  optional int64 partition_id = 4;
+  // Primary keys whose live position in readable_snapshot_id is requested. If set, the response
+  // carries key_positions; otherwise it carries the masks of a union read.
+  repeated bytes lookup_keys = 5;
+
+  // A union read that fetches its masks in parts. A request that sets none of the fields below
+  // gets all masks of the bucket up to the high watermark in one response.
+  //
+  // The cut to serve the masks of: the log_end_offset of an earlier response for the same
+  // readable_snapshot_id. The server answers with the masks of exactly that cut, or fails with a
+  // StaleSnapshotException once it no longer holds them.
+  optional int64 log_end_offset = 6;
+  // The reader takes the masks in parts: the response carries only the masks of the lake files in
+  // lake_dv_file_names and the log mask from log_dv_from_offset on, and sets paged.
+  optional bool paged = 7;
+  // Names (last path segment) of the lake data files whose masks are requested.
+  repeated string lake_dv_file_names = 8;
+  // The log offset from which the log mask is requested; none is requested if absent.
+  optional int64 log_dv_from_offset = 9;
+  // The most bytes of serialized log mask one response carries.
+  optional int32 max_log_dv_bytes = 10;
+}
+
+message GetDvSnapshotResponse {
+  // Masks of the lake data files (LakeDv): per file, the positions of rows whose keys changed in
+  // Fluss after the snapshot. Computed from the primary-key index for this request, not kept on
+  // the write path.
+  repeated PbLakeDvEntry lake_dv_entries = 1;
+  // Masks of the log: offsets to skip in [snapshot_start_offset, log_end_offset)
+  optional bytes log_dv_bitmap = 2;
+  // The offset the masks cover the log up to (exclusive), -1 for a key lookup
+  required int64 log_end_offset = 3;
+  // The tiered offset of the snapshot, where the log masks start, -1 for a key lookup
+  required int64 snapshot_start_offset = 4;
+  // Positions of the requested lookup_keys found in the snapshot
+  repeated PbDvKeyPosition key_positions = 5;
+  // The commit the snapshot's id named when Fluss registered it, for a lake that reuses snapshot
+  // ids after a rollback (Paimon): the reader checks the id names it still before using the masks
+  optional string lake_snapshot_identity = 6;
+  // Set if the request was paged and the server honored it: the response carries only the
+  // requested parts of the masks of cut log_end_offset, which later requests pin.
+  optional bool paged = 7;
+  // With paged: log_dv_bitmap holds the log mask of [log_dv_from_offset, log_dv_to_offset), where
+  // log_dv_to_offset > log_dv_from_offset unless it is log_end_offset.
+  optional int64 log_dv_to_offset = 8;
+}
+
+// The mask of one lake data file, computed from the primary-key index when a read asks for it.
+message PbLakeDvEntry {
+  required string file_path = 1;
+  // Serialized Roaring64Bitmap of the masked row positions
+  required bytes deleted_positions_bitmap = 2;
+}
+
+message PbDvKeyPosition {
+  optional bytes key = 1;
+  optional string file_path = 2;
+  optional int64 pos = 3;
+}

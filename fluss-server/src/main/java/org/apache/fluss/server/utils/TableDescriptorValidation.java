@@ -147,6 +147,8 @@ public class TableDescriptorValidation {
         validateStatisticsConfig(tableDescriptor);
         checkTableLakeFormatMatchesCluster(tableConf, clusterDataLakeFormat);
         checkCustomLakePathSupported(tableConf, clusterDataLakeFormat);
+        checkDeletionVectors(tableDescriptor, tableConf, clusterDataLakeFormat);
+        checkAutoCompaction(tableConf);
     }
 
     /** Validates the schema after altering table columns. */
@@ -261,6 +263,72 @@ public class TableDescriptorValidation {
         if (dataLakeFormat != DataLakeFormat.PAIMON && dataLakeFormat != DataLakeFormat.ICEBERG) {
             throw new InvalidConfigException(
                     "Custom lake table path is only supported for Paimon and Iceberg.");
+        }
+    }
+
+    private static void checkAutoCompaction(Configuration tableConf) {
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES) < 2) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' must be at least 2: a single small file is not rewritten on its"
+                                    + " own.",
+                            ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES.key()));
+        }
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL).isNegative()) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' must not be negative.",
+                            ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL.key()));
+        }
+    }
+
+    private static void checkDeletionVectors(
+            TableDescriptor tableDescriptor,
+            Configuration tableConf,
+            @Nullable DataLakeFormat clusterDataLakeFormat) {
+        if (!tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            return;
+        }
+
+        if (!tableDescriptor.hasPrimaryKey()) {
+            throw new InvalidConfigException(
+                    "'table.deletion-vectors.enabled' can only be enabled on primary key tables.");
+        }
+
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_ENABLED)) {
+            throw new InvalidConfigException(
+                    "'table.deletion-vectors.enabled' requires 'table.datalake.enabled' = true.");
+        }
+
+        // The historical partition keys its local state by partition-scoped keys. The position
+        // index and the log replay key rows by primary key alone, so its changes would never mask
+        // the lake rows they supersede.
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED)) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' cannot be combined with '%s': deletion vectors do not cover the"
+                                    + " historical partition yet.",
+                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key()));
+        }
+
+        // Either changelog image mode works: the deletion vectors are derived from the keys a
+        // change touches and their last versions, never from UPDATE_BEFORE records.
+
+        // Iceberg tiering commits the deletes. Paimon merges by key itself, and the masks follow
+        // its deletion-vector reads. Other formats implement neither.
+        DataLakeFormat lakeFormat =
+                tableConf
+                        .getOptional(ConfigOptions.TABLE_DATALAKE_FORMAT)
+                        .orElse(clusterDataLakeFormat);
+        if (lakeFormat != null
+                && lakeFormat != DataLakeFormat.ICEBERG
+                && lakeFormat != DataLakeFormat.PAIMON) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'table.deletion-vectors.enabled' is only supported for the %s and %s "
+                                    + "lake formats, but the table uses %s.",
+                            DataLakeFormat.ICEBERG, DataLakeFormat.PAIMON, lakeFormat));
         }
     }
 

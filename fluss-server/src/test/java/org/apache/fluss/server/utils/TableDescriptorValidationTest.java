@@ -512,6 +512,91 @@ class TableDescriptorValidationTest {
                 .hasMessageContaining("must match");
     }
 
+    @Test
+    void testDeletionVectorsRequirePrimaryKeyIcebergOrPaimonTableWithFullChangelog() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
+        assertThatCode(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+
+        assertThatThrownBy(() -> validate(logTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("primary key tables");
+        assertThatThrownBy(() -> validate(pkTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(lake);
+
+        Map<String, String> walImage = new HashMap<>();
+        walImage.put(dv, "true");
+        walImage.put(lake, "true");
+        walImage.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        Map<String, String> oneSmallFile = new HashMap<>();
+        oneSmallFile.put(dv, "true");
+        oneSmallFile.put(lake, "true");
+        oneSmallFile.put(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES.key(), "1");
+        assertThatThrownBy(
+                        () -> validate(pkTableWithProperties(oneSmallFile), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("must be at least 2");
+
+        // WAL mode has no UPDATE_BEFORE records, which the derived deletion vectors do not need
+        assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
+
+        assertThatCode(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
+        assertThatThrownBy(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.LANCE))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("only supported for the iceberg and paimon lake formats");
+    }
+
+    /**
+     * Deletion vectors reject the historical partition, which keys its rows by partition-scoped
+     * local keys. The position index and the log replay key rows by primary key alone, so masks
+     * would miss its rows.
+     */
+    @Test
+    void testDeletionVectorsRejectTheHistoricalPartition() {
+        TableDescriptor.Builder historical =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("dt", DataTypes.STRING())
+                                        .primaryKey("id", "dt")
+                                        .build())
+                        .distributedBy(1)
+                        .partitionedBy("dt")
+                        .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1)
+                        .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
+                        .property(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED, true);
+        assertThatCode(() -> validate(historical.build(), DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
+
+        historical.property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        assertThatThrownBy(() -> validate(historical.build(), DataLakeFormat.PAIMON))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(
+                        ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key());
+    }
+
     private static Stream<Arguments> supportedKvTTLTimeColumnTypes() {
         return Stream.of(
                 Arguments.of(DataTypes.BIGINT()),

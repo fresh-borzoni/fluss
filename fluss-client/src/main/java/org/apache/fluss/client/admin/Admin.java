@@ -71,6 +71,8 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metadata.TableStats;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 
@@ -979,4 +981,55 @@ public interface Admin extends AutoCloseable {
      * @return per-bucket active snapshot ids grouped by bucket
      */
     CompletableFuture<ActiveKvSnapshots> listKvSnapshots(long tableId, @Nullable Long partitionId);
+
+    /**
+     * Gets the deletion vector masks of a union read of a bucket planned on lake snapshot {@code
+     * readableSnapshotId}, from the bucket's leader. Fails with a stale-snapshot error if the
+     * leader does not cover that snapshot.
+     *
+     * @param tablePath the table path for leader discovery
+     * @param tableId the table ID
+     * @param partitionId the partition ID, null for non-partitioned tables
+     * @param bucketId the bucket ID
+     * @param readableSnapshotId the lake snapshot the read is planned on
+     * @return a CompletableFuture containing the masks
+     */
+    default CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(
+            TablePath tablePath,
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long readableSnapshotId) {
+        throw new UnsupportedOperationException("getDvSnapshot");
+    }
+
+    /**
+     * Sends a union read's deletion vector request to the leader of the bucket it names, e.g. one
+     * that fetches the masks in pages or pins the cut of an earlier response. A server that does
+     * not know the paging fields answers with all masks of the bucket, as {@link
+     * #getDvSnapshot(TablePath, long, Long, int, long)} does.
+     *
+     * @param tablePath the table path for leader discovery
+     * @param request the request, naming the table, partition and bucket
+     * @return a CompletableFuture containing the masks
+     */
+    default CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(
+            TablePath tablePath, GetDvSnapshotRequest request) {
+        throw new UnsupportedOperationException("getDvSnapshot");
+    }
+
+    /**
+     * Looks up the live data file and row position of each encoded primary key at readable snapshot
+     * {@code snapshotId}. Fails with a stale-snapshot error unless the leader's index covers
+     * exactly that snapshot.
+     */
+    default CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
+            TablePath tablePath,
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long snapshotId,
+            List<byte[]> keys) {
+        throw new UnsupportedOperationException("lookupDvPositions");
+    }
 }

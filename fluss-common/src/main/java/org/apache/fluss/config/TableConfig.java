@@ -162,6 +162,16 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION);
     }
 
+    /** The least time between two compactions of a bucket of a table with deletion vectors. */
+    public Duration getDataLakeAutoCompactionInterval() {
+        return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL);
+    }
+
+    /** The small lake files a bucket of a table with deletion vectors needs before compaction. */
+    public int getDataLakeAutoCompactionMinSmallFiles() {
+        return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES);
+    }
+
     /** Whether auto expire snapshot is enabled. */
     public boolean isDataLakeAutoExpireSnapshot() {
         return config.get(ConfigOptions.TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT);
@@ -195,6 +205,11 @@ public class TableConfig {
      */
     public ChangelogImage getChangelogImage() {
         return config.get(ConfigOptions.TABLE_CHANGELOG_IMAGE);
+    }
+
+    /** Returns true if deletion vectors are enabled for the table. */
+    public boolean isDeletionVectorsEnabled() {
+        return config.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
     }
 
     /** Gets the Arrow compression type and compression level of the table. */

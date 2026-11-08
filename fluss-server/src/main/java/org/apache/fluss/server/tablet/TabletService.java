@@ -58,6 +58,8 @@ import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetConsumerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetConsumerOffsetsResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -877,6 +879,14 @@ public final class TabletService extends RpcServiceBase
         CompletableFuture<DeleteConsumerGroupsResponse> response = new CompletableFuture<>();
         response.completeExceptionally(
                 new UnsupportedOperationException("deleteConsumerGroups is not supported yet"));
+        return response;
+    }
+
+    @Override
+    public CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(GetDvSnapshotRequest request) {
+        CompletableFuture<GetDvSnapshotResponse> response = new CompletableFuture<>();
+        response.completeExceptionally(
+                new UnsupportedOperationException("getDvSnapshot is not supported yet"));
         return response;
     }
 
