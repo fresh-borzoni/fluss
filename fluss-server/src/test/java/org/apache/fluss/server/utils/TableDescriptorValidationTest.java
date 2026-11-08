@@ -42,6 +42,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -497,17 +498,6 @@ class TableDescriptorValidationTest {
     }
 
     @Test
-    void testDeletionVectorsAreNotSupportedYet() {
-        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
-        assertThatThrownBy(() -> validate(pkTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining(dv)
-                .hasMessageContaining("not supported yet");
-        assertThatCode(() -> validate(pkTableWithProperty(dv, "false"), DataLakeFormat.ICEBERG))
-                .doesNotThrowAnyException();
-    }
-
-    @Test
     void testLakeFormatMustMatchClusterWhenLakeIsDisabled() {
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
@@ -521,6 +511,203 @@ class TableDescriptorValidationTest {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_FORMAT.key())
                 .hasMessageContaining("must match");
+    }
+
+    @Test
+    void testDeletionVectorsRequirePrimaryKeyIcebergOrPaimonTable() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
+        assertThatCode(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+
+        assertThatThrownBy(() -> validate(logTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("primary key tables");
+        assertThatThrownBy(() -> validate(pkTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(lake);
+
+        assertThatThrownBy(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.PAIMON))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("not supported yet for the paimon lake format");
+        assertThatThrownBy(
+                        () ->
+                                validate(
+                                        pkTableWithProperties(dv, "true", lake, "true"),
+                                        DataLakeFormat.LANCE))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("only supported for the iceberg and paimon lake formats");
+    }
+
+    /** WAL mode has no UPDATE_BEFORE records, which the derived deletion vectors do not need. */
+    @Test
+    void testDeletionVectorsTakeTheWalChangelogImage() {
+        Map<String, String> walImage = new HashMap<>();
+        walImage.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        walImage.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
+        walImage.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
+        assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * The {@code table.datalake.auto-compaction.*} tuning options apply only to tables with
+     * deletion vectors, so only those tables validate them. Other tables accept any value, as
+     * without the options.
+     */
+    @Test
+    void testAutoCompactionOptionsAreValidatedOnlyWithDeletionVectors() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
+        String minSmallFiles = ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES.key();
+
+        Map<String, String> oneSmallFile = new HashMap<>();
+        oneSmallFile.put(dv, "true");
+        oneSmallFile.put(lake, "true");
+        oneSmallFile.put(minSmallFiles, "1");
+        assertThatThrownBy(
+                        () -> validate(pkTableWithProperties(oneSmallFile), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(minSmallFiles)
+                .hasMessageContaining("must be at least 2");
+
+        Map<String, String> plain = new HashMap<>(oneSmallFile);
+        plain.remove(dv);
+        assertThatCode(() -> validate(pkTableWithProperties(plain), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        plain.remove(lake);
+        assertThatCode(() -> validate(pkTableWithProperties(plain), DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(logTableWithProperty(minSmallFiles, "0"), null))
+                .doesNotThrowAnyException();
+    }
+
+    /**
+     * Deletion vectors keep the log offset of each KV value's version, which names the version a
+     * change supersedes. A table without row TTL takes the tagged value layout, whose tag holds the
+     * offset. A table with row TTL takes the versioned layout, which has a slot for the offset and
+     * one for the TTL timestamp. Row TTL by event time is refused, at creation and by an alter.
+     */
+    @Test
+    void testDeletionVectorsKvValueLayouts() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
+        String layout = ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key();
+        String ttl = ConfigOptions.TABLE_KV_TTL.key();
+        Map<String, String> plain = new HashMap<>();
+        plain.put(dv, "true");
+        plain.put(lake, "true");
+        plain.put(layout, String.valueOf(KvValueLayout.PLAIN.version()));
+        assertThatThrownBy(() -> validate(pkTableWithProperties(plain), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(layout)
+                .hasMessageContaining(dv);
+
+        Map<String, String> tagged = new HashMap<>(plain);
+        tagged.put(layout, String.valueOf(KvValueLayout.TAGGED.version()));
+        assertThatCode(() -> validate(pkTableWithProperties(tagged), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+
+        Map<String, String> versioned = new HashMap<>(plain);
+        versioned.put(layout, String.valueOf(KvValueLayout.VERSIONED.version()));
+        assertThatThrownBy(() -> validate(pkTableWithProperties(versioned), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(layout)
+                .hasMessageContaining(dv);
+
+        // with row TTL, only the versioned layout fits
+        Map<String, String> versionedTtl = new HashMap<>(versioned);
+        versionedTtl.put(ttl, "1 h");
+        assertThatCode(() -> validate(pkTableWithProperties(versionedTtl), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        for (KvValueLayout other : Arrays.asList(KvValueLayout.PLAIN, KvValueLayout.TAGGED)) {
+            Map<String, String> wrong = new HashMap<>(versionedTtl);
+            wrong.put(layout, String.valueOf(other.version()));
+            assertThatThrownBy(() -> validate(pkTableWithProperties(wrong), DataLakeFormat.ICEBERG))
+                    .isInstanceOf(InvalidConfigException.class)
+                    .hasMessageContaining(layout)
+                    .hasMessageContaining(dv)
+                    .hasMessageContaining(ttl);
+        }
+
+        Map<String, String> eventTime = new HashMap<>(versionedTtl);
+        eventTime.put(ConfigOptions.TABLE_KV_TTL_TIME_COLUMN.key(), "event_time");
+        TableDescriptor eventTimeTable =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("event_time", DataTypes.BIGINT())
+                                        .primaryKey("id")
+                                        .build())
+                        .distributedBy(3)
+                        .properties(eventTime)
+                        .build()
+                        .withReplicationFactor(3);
+        // by event time, a late row would expire before it reaches the lake
+        assertThatThrownBy(() -> validate(eventTimeTable, DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(ConfigOptions.TABLE_KV_TTL_TIME_COLUMN.key())
+                .hasMessageContaining(dv);
+        TableInfo dvTable =
+                TableInfo.of(
+                        TablePath.of("db", "dv"),
+                        1L,
+                        1,
+                        pkTableWithProperties(versionedTtl),
+                        "/tmp",
+                        1L,
+                        1L);
+        assertThatThrownBy(
+                        () ->
+                                TableDescriptorValidation.validateAlterTableProperties(
+                                        dvTable,
+                                        Collections.singleton(
+                                                ConfigOptions.TABLE_KV_TTL_TIME_COLUMN.key())))
+                .isInstanceOf(InvalidAlterTableException.class)
+                .hasMessageContaining(ConfigOptions.TABLE_KV_TTL_TIME_COLUMN.key())
+                .hasMessageContaining(dv);
+    }
+
+    /**
+     * Deletion vectors reject the historical partition, which keys its rows by partition-scoped
+     * local keys. The position index and the log replay key rows by primary key alone, so masks
+     * would miss its rows.
+     */
+    @Test
+    void testDeletionVectorsRejectTheHistoricalPartition() {
+        TableDescriptor.Builder historical =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.INT())
+                                        .column("dt", DataTypes.STRING())
+                                        .primaryKey("id", "dt")
+                                        .build())
+                        .distributedBy(1)
+                        .partitionedBy("dt")
+                        .property(ConfigOptions.TABLE_REPLICATION_FACTOR, 1)
+                        .property(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
+                        .property(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED, true);
+        assertThatCode(() -> validate(historical.build(), DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
+
+        historical.property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        assertThatThrownBy(() -> validate(historical.build(), DataLakeFormat.PAIMON))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(
+                        ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key());
     }
 
     private static Stream<Arguments> supportedKvTTLTimeColumnTypes() {

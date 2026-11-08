@@ -22,11 +22,14 @@ import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.client.tiering.TieringCommitterInitContext;
 import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.LakeTableExternallyModifiedException;
+import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
@@ -34,8 +37,12 @@ import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.flink.tiering.source.state.TieringSourceEnumeratorState;
+import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.TieringStats;
+import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
+import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.lake.writer.TieringTableValidator;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -72,6 +79,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
@@ -113,6 +121,9 @@ public class TieringSourceEnumerator
     private final Configuration lakeTieringConfig;
     private final SplitEnumeratorContext<FlinkTieringSplit> context;
     private final LakeTieringFactory<?, ?> lakeTieringFactory;
+    // tables with deletion vectors whose lake committer was checked for the capability their rounds
+    // need, before the first round wrote any data
+    private final Set<Long> checkedDvCommitters = ConcurrentHashMap.newKeySet();
     private final ScheduledExecutorService timerService;
     private final SplitEnumeratorMetricGroup enumeratorMetricGroup;
     private final AutoCloseable tieringMetrics;
@@ -125,6 +136,9 @@ public class TieringSourceEnumerator
     private final Map<Long, Long> failedTableEpochs;
     private final Map<Long, TieringFinishInfo> finishedTables;
     private final Set<Long> tieringReachMaxDurationsTables;
+    // Tables whose lake table was rolled back or written by another engine. The error is logged
+    // once per table.
+    private final Set<Long> rolledBackTables = new HashSet<>();
 
     // lazily instantiated
     private RpcClient rpcClient;
@@ -538,9 +552,22 @@ public class TieringSourceEnumerator
         try {
             TablePath tablePath = tieringTable.f2;
             final TableInfo tableInfo = flussAdmin.getTableInfo(tablePath).get();
-            if (lakeTieringFactory instanceof TieringTableValidator) {
-                ((TieringTableValidator) lakeTieringFactory).validateTable(tableInfo);
+            validateTable(
+                    lakeTieringFactory,
+                    tableInfo,
+                    tableInfo.isDeletionVectorsEnabled()
+                            ? registeredSnapshotOfDvTable(tableInfo)
+                            : null);
+            if (tableInfo.isDeletionVectorsEnabled()
+                    && !checkedDvCommitters.contains(tableInfo.getTableId())) {
+                checkDeletionVectorCommitter(
+                        lakeTieringFactory,
+                        tableInfo,
+                        new TieringCommitterInitContext(
+                                tablePath, tableInfo, lakeTieringConfig, flussConf));
+                checkedDvCommitters.add(tableInfo.getTableId());
             }
+            rolledBackTables.remove(tieringTable.f0);
             List<TieringSplit> tieringSplits = splitGenerator.generateTableSplits(tableInfo);
             if (tieringSplits.isEmpty()
                     && lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
@@ -593,9 +620,82 @@ public class TieringSourceEnumerator
                         TimeUnit.MILLISECONDS);
             }
         } catch (Exception e) {
-            LOG.warn("Fail to generate Tiering splits for table {}.", tieringTable.f2, e);
+            // a rollback, or rows another engine wrote
+            Optional<LakeTableExternallyModifiedException> rollback =
+                    ExceptionUtils.findThrowable(e, LakeTableExternallyModifiedException.class);
+            if (!rollback.isPresent()) {
+                LOG.warn("Fail to generate Tiering splits for table {}.", tieringTable.f2, e);
+            } else if (rolledBackTables.add(tieringTable.f0)) {
+                // Reported once; the table fails every round until the rollback is undone.
+                LOG.error(rollback.get().getMessage());
+            } else {
+                LOG.debug("The lake table of {} is still changed outside Fluss.", tieringTable.f2);
+            }
             failedTableEpochs.put(tieringTable.f0, tieringTable.f1);
             tieringTableEpochs.remove(tieringTable.f0);
+        }
+    }
+
+    /**
+     * Validates a table before its round writes any data. A table with deletion vectors on a lake
+     * format without them ({@link SupportsDeletionVectorTiering}), or whose lake table was rolled
+     * back or written by another engine outside Fluss, fails here.
+     */
+    @VisibleForTesting
+    static void validateTable(
+            LakeTieringFactory<?, ?> lakeTieringFactory,
+            TableInfo tableInfo,
+            @Nullable Long registeredSnapshotId)
+            throws IOException {
+        if (lakeTieringFactory instanceof TieringTableValidator) {
+            ((TieringTableValidator) lakeTieringFactory).validateTable(tableInfo);
+        }
+        if (tableInfo.isDeletionVectorsEnabled()) {
+            // in addition to the checks of every table
+            DeletionVectorCapabilities.tiering(lakeTieringFactory, tableInfo.getTablePath())
+                    .validateDeletionVectorTable(tableInfo, registeredSnapshotId);
+        }
+    }
+
+    /**
+     * Checks that the lake committer of a table with deletion vectors commits the way its lake
+     * does, before the table's first round writes any data: a plugin that broke the promise of
+     * {@link SupportsDeletionVectorTiering} would otherwise fail only at the commit, with the
+     * round's files written.
+     */
+    @VisibleForTesting
+    static void checkDeletionVectorCommitter(
+            LakeTieringFactory<?, ?> lakeTieringFactory,
+            TableInfo tableInfo,
+            CommitterInitContext committerInitContext)
+            throws Exception {
+        SupportsDeletionVectorTiering tiering =
+                DeletionVectorCapabilities.tiering(lakeTieringFactory, tableInfo.getTablePath());
+        try (LakeCommitter<?, ?> lakeCommitter =
+                lakeTieringFactory.createLakeCommitter(committerInitContext)) {
+            DeletionVectorCapabilities.checkCommitter(
+                    tiering, lakeCommitter, tableInfo.getTablePath());
+        }
+    }
+
+    /**
+     * Returns the latest lake snapshot registered for a primary key table with deletion vectors.
+     * The lake table must not be rolled back past it. Returns null for other tables, or if nothing
+     * is tiered yet.
+     */
+    @Nullable
+    private Long registeredSnapshotOfDvTable(TableInfo tableInfo) throws Exception {
+        if (!tableInfo.hasPrimaryKey() || !tableInfo.isDeletionVectorsEnabled()) {
+            return null;
+        }
+        try {
+            return flussAdmin.getLatestLakeSnapshot(tableInfo.getTablePath()).get().getSnapshotId();
+        } catch (Exception e) {
+            if (ExceptionUtils.findThrowable(e, LakeTableSnapshotNotExistException.class)
+                    .isPresent()) {
+                return null;
+            }
+            throw e;
         }
     }
 

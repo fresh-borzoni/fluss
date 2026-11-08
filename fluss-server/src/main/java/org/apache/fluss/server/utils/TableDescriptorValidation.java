@@ -297,13 +297,65 @@ public class TableDescriptorValidation {
             return;
         }
 
-        // The deletion vectors of primary key tables are not complete yet: no lake format tiers
-        // or reads them so far.
-        throw new InvalidConfigException(
-                String.format(
-                        "'%s' is not supported yet: the deletion vectors of primary key tables are"
-                                + " not complete.",
-                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+        if (!tableDescriptor.hasPrimaryKey()) {
+            throw new InvalidConfigException(
+                    "'table.deletion-vectors.enabled' can only be enabled on primary key tables.");
+        }
+
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_ENABLED)) {
+            throw new InvalidConfigException(
+                    "'table.deletion-vectors.enabled' requires 'table.datalake.enabled' = true.");
+        }
+
+        // The historical partition keys its local state by partition-scoped keys. The position
+        // index and the log replay key rows by primary key alone, so its changes would never mask
+        // the lake rows they supersede.
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED)) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' cannot be combined with '%s': deletion vectors do not cover the"
+                                    + " historical partition yet.",
+                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key()));
+        }
+
+        // Either changelog image mode works: a change names the version it supersedes by the tag
+        // of the key's KV value, never by an UPDATE_BEFORE record.
+
+        // Each KV value carries the log offset of its version, which names the version a change
+        // supersedes. Row TTL by processing time is allowed: the value layout then has a slot for
+        // each (see checkKvValueLayout), and the write path looks up the lake row of a key it
+        // finds no value for, as row TTL may have removed it. A version that expires before it
+        // reaches the lake cannot be named, which processing time bounds by the TTL. By event
+        // time, a late or backfilled row expires at the next compaction, so it is refused.
+        if (tableConf.getOptional(ConfigOptions.TABLE_KV_TTL_TIME_COLUMN).isPresent()) {
+            throw new InvalidConfigException(kvTtlTimeColumnWithDeletionVectors());
+        }
+
+        // Iceberg tiering commits the deletes. Paimon merges by key itself, and the masks follow
+        // its deletion-vector reads. Other formats implement neither.
+        DataLakeFormat lakeFormat =
+                tableConf
+                        .getOptional(ConfigOptions.TABLE_DATALAKE_FORMAT)
+                        .orElse(clusterDataLakeFormat);
+        // Paimon tables do not derive deletion vectors yet.
+        if (lakeFormat == DataLakeFormat.PAIMON) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' is not supported yet for the %s lake format: its deletion vectors"
+                                    + " are not complete.",
+                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            DataLakeFormat.PAIMON));
+        }
+        if (lakeFormat != null
+                && lakeFormat != DataLakeFormat.ICEBERG
+                && lakeFormat != DataLakeFormat.PAIMON) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'table.deletion-vectors.enabled' is only supported for the %s and %s "
+                                    + "lake formats, but the table uses %s.",
+                            DataLakeFormat.ICEBERG, DataLakeFormat.PAIMON, lakeFormat));
+        }
     }
 
     public static void validateAlterTableProperties(
