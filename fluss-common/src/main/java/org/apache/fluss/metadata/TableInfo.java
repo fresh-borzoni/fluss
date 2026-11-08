@@ -287,6 +287,11 @@ public final class TableInfo {
         return tableConfig.isStatisticsEnabled();
     }
 
+    /** Returns true if deletion vectors are enabled for this table. */
+    public boolean isDeletionVectorsEnabled() {
+        return tableConfig.isDeletionVectorsEnabled();
+    }
+
     /**
      * Returns the column index mapping for statistics collection.
      *
