@@ -122,6 +122,35 @@ Keep these effects and restrictions in mind:
 Existing remote snapshot files have separate retention, controlled by
 [`kv.snapshot.num-retained`](../../maintenance/tiered-storage/remote-storage.md#remote-snapshot-of-primary-key-table).
 
+### Row TTL with Deletion Vectors
+
+A lakehouse table with deletion vectors (`table.deletion-vectors.enabled`) can use row TTL by
+processing time. Row TTL by event time (`table.kv.ttl.time-column`) is rejected for such a table:
+a late or backfilled row would expire at the next compaction, before it reaches the lake. Its KV
+values keep the log offset of their version and their TTL time in two fields of their own;
+Fluss picks this value layout when the table is created. Row TTL cleanup writes nothing to the
+changelog, while the lake can still hold a row of an expired key, so union reads behave as follows:
+
+- **An insert after expiry hides the old lake row.** A write that finds no value for its key may
+  follow an expired one, so its key is looked up in the lake. If the lake holds a row of the key,
+  union reads hide it and return the new row.
+- **A version that expires before it is tiered** cannot be named by a later write of its key, so
+  the masks would keep it next to the new row. This can happen only when `table.kv.ttl` is shorter
+  than the time a change takes to reach the lake. A bucket's leader knows when the oldest change
+  after its readable lake snapshot was written. Once `table.kv.ttl` has passed since, less a margin
+  for clocks (a tenth of the TTL, at least 5 and at most 60 seconds, but never more than half the
+  TTL), it has union reads read the bucket by key, as
+  when it rebuilds: the lake files and the log after the readable offset, folded to the last change
+  of each key. That is exact, also for reads that wait, but reads all lake keys of the bucket, so
+  it is slower. It lasts until the bucket covers a newer lake snapshot, and the metric
+  `dvRowTtlFoldPerSecond` counts it. Clients that do not know this answer use the masks, and can
+  still return the expired version next to the new row until the bucket covers a lake snapshot
+  that holds it. The check relies on the tablet servers' clocks staying synchronised within the
+  margin, for example with NTP.
+- **Deleting a key whose row has expired is a no-op**, as for any table with row TTL: nothing is
+  written to the changelog, so a row of the key that was tiered stays in the lake and visible in
+  union reads.
+
 ## Partition Retention
 
 Use [auto partitioning](partitioning.md#auto-partitioning) when data should expire in whole time
