@@ -23,6 +23,8 @@ import org.apache.fluss.lake.committer.LakeCommitRejectedException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.dv.FormatVersions;
+import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.IcebergDvFileWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.IcebergPositionDeleteFileWriter;
@@ -45,6 +47,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -58,7 +61,9 @@ import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.WriteResult;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.util.ContentFileUtil;
+import org.apache.iceberg.util.PropertyUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,7 +76,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -94,11 +101,17 @@ public class IcebergLakeCommitter
 
     private final Catalog icebergCatalog;
     private final Table icebergTable;
+    private final boolean autoExpireSnapshots;
     private final IcebergCommitterState state;
     // The table's current snapshot when this committer loaded the table, null if none. The round
     // plans on it, and a commit whose base is not in the lake is fenced on it.
     @Nullable private Long plannedSnapshotId;
     private static final ThreadLocal<Long> currentCommitSnapshotId = new ThreadLocal<>();
+
+    // The defaults of Paimon's snapshot.time-retained and snapshot.num-retained.min, which Fluss's
+    // Paimon tables expire with.
+    private static final long DEFAULT_MAX_SNAPSHOT_AGE_MS = 60 * 60_000L;
+    private static final int DEFAULT_MIN_SNAPSHOTS_TO_KEEP = 10;
 
     static {
         Listeners.register(new IcebergSnapshotCreateListener(), CreateSnapshotEvent.class);
@@ -106,20 +119,27 @@ public class IcebergLakeCommitter
 
     public IcebergLakeCommitter(IcebergCatalogProvider icebergCatalogProvider, TablePath tablePath)
             throws IOException {
-        this(icebergCatalogProvider, tablePath, new IcebergCommitterState());
+        this(
+                icebergCatalogProvider,
+                tablePath,
+                false,
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS));
     }
 
     /**
-     * Creates the committer of a table. It keeps what it learns for the next rounds in {@code
+     * Creates the committer of a table. With {@code autoExpireSnapshots}, it expires the table's
+     * old snapshots after its commits. It keeps what it learns for the next rounds in {@code
      * state}.
      */
     IcebergLakeCommitter(
             IcebergCatalogProvider icebergCatalogProvider,
             TablePath tablePath,
+            boolean autoExpireSnapshots,
             IcebergCommitterState state)
             throws IOException {
         this.icebergCatalog = icebergCatalogProvider.get();
         this.icebergTable = getTable(tablePath);
+        this.autoExpireSnapshots = autoExpireSnapshots;
         this.state = state;
         Snapshot current = icebergTable.currentSnapshot();
         this.plannedSnapshotId = current == null ? null : current.snapshotId();
@@ -191,7 +211,11 @@ public class IcebergLakeCommitter
                     committable.rewriteDataFileResults();
             if (!rewriteDataFileResults.isEmpty()) {
                 Long rewriteCommitSnapshotId =
-                        commitRewrite(rewriteDataFileResults, snapshotProperties);
+                        commitRewrite(
+                                rewriteDataFileResults,
+                                snapshotProperties,
+                                FLUSS_LAKE_TIERING_COMMIT_USER,
+                                false);
                 if (rewriteCommitSnapshotId != null) {
                     snapshotId = rewriteCommitSnapshotId;
                 }
@@ -201,6 +225,44 @@ public class IcebergLakeCommitter
         } catch (Exception e) {
             throw new IOException("Failed to commit to Iceberg table.", e);
         }
+    }
+
+    @Override
+    @Nullable
+    public Long commitPendingRewrite(IcebergCommittable committable) {
+        if (committable.rewriteDataFileResults().isEmpty()) {
+            return null;
+        }
+        // Runs before the round's deletes and lands only on the snapshot the compaction read: its
+        // writers may have handed the positions of the rewritten rows to the index as a change
+        // from that snapshot. If another commit changed data files since, the rewrite fails and is
+        // dropped, which is safe.
+        // The compacted buckets tell the next rounds' writers when each bucket was compacted.
+        Set<String> buckets = new TreeSet<>();
+        for (RewriteDataFileResult result : committable.rewriteDataFileResults()) {
+            if (result.bucketKey() != null) {
+                buckets.add(result.bucketKey());
+            }
+        }
+        Map<String, String> properties = new HashMap<>();
+        if (!buckets.isEmpty()) {
+            properties.put(
+                    IcebergRewriteDataFiles.COMPACTED_BUCKETS_PROPERTY, String.join(",", buckets));
+            FormatVersions.putSnapshotVersion(properties);
+        }
+        Long id =
+                commitRewrite(
+                        committable.rewriteDataFileResults(),
+                        properties,
+                        FLUSS_LAKE_COMPACTION_COMMIT_USER,
+                        true);
+        LOG.info("Committed a Fluss compaction rewrite as snapshot {}.", id);
+        Snapshot rewrite = id == null ? null : icebergTable.snapshot(id);
+        if (rewrite != null && Objects.equals(rewrite.parentId(), plannedSnapshotId)) {
+            // The round's own rewrite: the round plans on top of it.
+            plannedSnapshotId = id;
+        }
+        return id;
     }
 
     /**
@@ -355,6 +417,7 @@ public class IcebergLakeCommitter
                     newDvs.size(),
                     superseded.size(),
                     dangling.size());
+            protectReadable(snapshotId);
             return LakeCommitResult.unknownReadableSnapshot(snapshotId);
         } catch (LakeCommitRejectedException e) {
             deleteWrittenDeleteFiles(newDvs);
@@ -492,11 +555,183 @@ public class IcebergLakeCommitter
         return out;
     }
 
+    @Override
+    public void protectReadableSnapshot(long snapshotId) {
+        protectReadable(snapshotId);
+    }
+
+    /** Tag prefix of the snapshots Fluss made readable; tagged snapshots survive expiration. */
+    public static final String READABLE_TAG_PREFIX = "fluss-readable-";
+
+    // how many recent readable snapshots stay tagged
+    private static final int PROTECTED_SNAPSHOTS = 10;
+
+    /**
+     * Tags the readable snapshot and untags all but the most recent ones, so expiration keeps the
+     * files an in-flight union read needs. Best effort: a failure never fails the data commit.
+     */
+    private void protectReadable(long snapshotId) {
+        try {
+            icebergTable.refresh();
+            List<Map.Entry<String, org.apache.iceberg.SnapshotRef>> tags = new ArrayList<>();
+            for (Map.Entry<String, org.apache.iceberg.SnapshotRef> e :
+                    icebergTable.refs().entrySet()) {
+                if (e.getKey().startsWith(READABLE_TAG_PREFIX) && e.getValue().isTag()) {
+                    tags.add(e);
+                }
+            }
+            // Newest first.
+            tags.sort(
+                    (a, b) ->
+                            Long.compare(
+                                    sequenceOf(b.getValue().snapshotId()),
+                                    sequenceOf(a.getValue().snapshotId())));
+            org.apache.iceberg.ManageSnapshots ms = icebergTable.manageSnapshots();
+            String tag = READABLE_TAG_PREFIX + snapshotId;
+            boolean exists = icebergTable.refs().containsKey(tag);
+            if (!exists) {
+                ms.createTag(tag, snapshotId);
+            }
+            int kept = 1; // the new tag
+            int removed = 0;
+            for (Map.Entry<String, org.apache.iceberg.SnapshotRef> e : tags) {
+                if (e.getKey().equals(tag)) {
+                    continue;
+                }
+                if (kept < PROTECTED_SNAPSHOTS) {
+                    kept++;
+                } else {
+                    ms.removeTag(e.getKey());
+                    removed++;
+                }
+            }
+            if (!exists || removed > 0) {
+                ms.commit();
+            }
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not tag readable snapshot {}; the next round tries again.",
+                    snapshotId,
+                    e);
+        }
+    }
+
+    /**
+     * Expires the table's old snapshots, at most once per interval of the committer state per
+     * table, and deletes the files no remaining snapshot references.
+     *
+     * <p>It expires the snapshots older than {@code history.expire.max-snapshot-age-ms} (1 hour
+     * unless the table sets it, as Paimon's {@code snapshot.time-retained}) except the last {@code
+     * history.expire.min-snapshots-to-keep} (10 unless the table sets it, as Paimon's {@code
+     * snapshot.num-retained.min}). It never expires the snapshots Fluss still needs: the readable
+     * ones it tagged, which their tags keep, and {@code keepFromSnapshotId} and those after it,
+     * whatever the clocks of their committers. {@code keepFromSnapshotId} is tagged {@value
+     * #KEEP_FROM_TAG}. Best effort: a failure never fails a commit.
+     */
+    @Override
+    public void expireSnapshots(@Nullable Long keepFromSnapshotId) {
+        if (!autoExpireSnapshots) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!state.expirationDue(icebergTable.location(), now)) {
+            return;
+        }
+        try {
+            icebergTable.refresh();
+            long olderThan =
+                    now
+                            - PropertyUtil.propertyAsLong(
+                                    icebergTable.properties(),
+                                    TableProperties.MAX_SNAPSHOT_AGE_MS,
+                                    DEFAULT_MAX_SNAPSHOT_AGE_MS);
+            int retainLast =
+                    PropertyUtil.propertyAsInt(
+                            icebergTable.properties(),
+                            TableProperties.MIN_SNAPSHOTS_TO_KEEP,
+                            DEFAULT_MIN_SNAPSHOTS_TO_KEEP);
+            if (keepFromSnapshotId != null) {
+                Snapshot keepFrom = icebergTable.snapshot(keepFromSnapshotId);
+                if (keepFrom != null) {
+                    tagKeepFrom(keepFrom.snapshotId());
+                    // Iceberg keeps a branch's history only up to its first snapshot older than
+                    // the cut-off, and the clocks of committers differ. So the cut-off is the
+                    // oldest timestamp from the current snapshot back to keepFrom.
+                    olderThan = Math.min(olderThan, oldestTimestampSince(keepFrom));
+                }
+            }
+            int before = Iterables.size(icebergTable.snapshots());
+            icebergTable
+                    .expireSnapshots()
+                    .expireOlderThan(olderThan)
+                    .retainLast(Math.max(1, retainLast))
+                    .cleanExpiredFiles(true)
+                    .commit();
+            icebergTable.refresh();
+            LOG.info(
+                    "Expired {} snapshots of {} older than {} (keeping the last {}{}); {} left.",
+                    before - Iterables.size(icebergTable.snapshots()),
+                    icebergTable.name(),
+                    olderThan,
+                    retainLast,
+                    keepFromSnapshotId == null ? "" : ", and from " + keepFromSnapshotId,
+                    Iterables.size(icebergTable.snapshots()));
+        } catch (Exception e) {
+            LOG.warn("Could not expire the snapshots of {}.", icebergTable.name(), e);
+        }
+    }
+
+    /** Tag of the oldest snapshot the index chain needs; expiry keeps tagged snapshots. */
+    public static final String KEEP_FROM_TAG = "fluss-keep-from";
+
+    /** Points {@link #KEEP_FROM_TAG} at {@code snapshotId}. */
+    private void tagKeepFrom(long snapshotId) {
+        org.apache.iceberg.SnapshotRef tag = icebergTable.refs().get(KEEP_FROM_TAG);
+        if (tag != null && tag.snapshotId() == snapshotId) {
+            return;
+        }
+        org.apache.iceberg.ManageSnapshots ms = icebergTable.manageSnapshots();
+        if (tag == null) {
+            ms.createTag(KEEP_FROM_TAG, snapshotId);
+        } else {
+            ms.replaceTag(KEEP_FROM_TAG, snapshotId);
+        }
+        ms.commit();
+        icebergTable.refresh();
+    }
+
+    /**
+     * The oldest timestamp of the current snapshot, {@code keepFrom} and the snapshots in between,
+     * or that of {@code keepFrom} if the current snapshot does not descend from it.
+     */
+    private long oldestTimestampSince(Snapshot keepFrom) {
+        long oldest = keepFrom.timestampMillis();
+        for (Snapshot s = icebergTable.currentSnapshot(); s != null; ) {
+            oldest = Math.min(oldest, s.timestampMillis());
+            if (s.snapshotId() == keepFrom.snapshotId()) {
+                return oldest;
+            }
+            s = s.parentId() == null ? null : icebergTable.snapshot(s.parentId());
+        }
+        return keepFrom.timestampMillis();
+    }
+
+    private long sequenceOf(long snapshotId) {
+        Snapshot s = icebergTable.snapshot(snapshotId);
+        return s == null ? -1 : s.sequenceNumber();
+    }
+
+    /**
+     * Commits a compaction's rewrite. The rewrite of a table with deletion vectors ({@code
+     * derived}) lands only on the snapshot it read, and also removes the position delete files of
+     * the files it replaced; a rewrite of another table does neither.
+     */
     private Long commitRewrite(
             List<RewriteDataFileResult> rewriteDataFileResults,
-            Map<String, String> snapshotProperties) {
+            Map<String, String> snapshotProperties,
+            String committerUser,
+            boolean derived) {
         icebergTable.refresh();
-        RewriteFiles rewriteFiles = icebergTable.newRewrite();
         boolean commitAttempted = false;
         try {
             if (rewriteDataFileResults.stream()
@@ -507,13 +742,21 @@ public class IcebergLakeCommitter
                 throw new IllegalArgumentException(
                         "Rewrite data file results must have same snapshot id.");
             }
-            rewriteFiles.validateFromSnapshot(rewriteDataFileResults.get(0).snapshotId());
+            long readSnapshotId = rewriteDataFileResults.get(0).snapshotId();
+            RewriteFiles rewriteFiles =
+                    derived
+                            ? IcebergBaseFence.on(icebergTable, readSnapshotId).newRewrite()
+                            : icebergTable.newRewrite();
+            rewriteFiles.validateFromSnapshot(readSnapshotId);
             for (RewriteDataFileResult rewriteDataFileResult : rewriteDataFileResults) {
                 rewriteDataFileResult.addedDataFiles().forEach(rewriteFiles::addFile);
                 rewriteDataFileResult.deletedDataFiles().forEach(rewriteFiles::deleteFile);
+                if (derived) {
+                    rewriteDataFileResult.deletedDeleteFiles().forEach(rewriteFiles::deleteFile);
+                }
             }
             commitAttempted = true;
-            return commit(rewriteFiles, snapshotProperties);
+            return commit(rewriteFiles, snapshotProperties, committerUser);
         } catch (Exception e) {
             List<String> rewriteAddedDataFiles =
                     rewriteDataFileResults.stream()
@@ -550,8 +793,15 @@ public class IcebergLakeCommitter
     }
 
     private long commit(SnapshotUpdate<?> snapshotUpdate, Map<String, String> snapshotProperties) {
+        return commit(snapshotUpdate, snapshotProperties, FLUSS_LAKE_TIERING_COMMIT_USER);
+    }
+
+    private long commit(
+            SnapshotUpdate<?> snapshotUpdate,
+            Map<String, String> snapshotProperties,
+            String committerUser) {
         // add snapshot properties
-        snapshotUpdate.set(COMMITTER_USER, FLUSS_LAKE_TIERING_COMMIT_USER);
+        snapshotUpdate.set(COMMITTER_USER, committerUser);
         for (Map.Entry<String, String> entry : snapshotProperties.entrySet()) {
             snapshotUpdate.set(entry.getKey(), entry.getValue());
         }
@@ -598,15 +848,49 @@ public class IcebergLakeCommitter
         if (latestLakeSnapshotIdOfFluss != null) {
             Snapshot latestLakeSnapshotOfFluss = icebergTable.snapshot(latestLakeSnapshotIdOfFluss);
             if (latestLakeSnapshotOfFluss == null) {
-                throw new IllegalStateException(
-                        "Referenced Fluss snapshot "
-                                + latestLakeSnapshotIdOfFluss
-                                + " not found in Iceberg table");
+                String base =
+                        latestLakeSnapshot.summary() == null
+                                ? null
+                                : latestLakeSnapshot.summary().get(FLUSS_LAKE_SNAP_BASE_PROPERTY);
+                if (base == null) {
+                    throw new IllegalStateException(
+                            "Referenced Fluss snapshot "
+                                    + latestLakeSnapshotIdOfFluss
+                                    + " not found in Iceberg table");
+                }
+                FormatVersions.checkSnapshotVersion(
+                        latestLakeSnapshot.snapshotId(), latestLakeSnapshot.summary());
+                // A round of a table with deletion vectors records its base, the snapshot Fluss
+                // had registered last. Here the registered snapshot expired, e.g. a rewrite by
+                // another engine whose tag was rotated away. The latest tiered snapshot is missing
+                // in Fluss only if a round committed it on top of the registered one. Otherwise
+                // the round re-indexes the current snapshot.
+                if (!base.equals(String.valueOf(latestLakeSnapshotIdOfFluss))) {
+                    LOG.warn(
+                            "Snapshot {} registered in Fluss expired from {}; the round re-indexes"
+                                    + " the table's current snapshot.",
+                            latestLakeSnapshotIdOfFluss,
+                            icebergTable.name());
+                    return null;
+                }
+                return new CommittedLakeSnapshot(
+                        latestLakeSnapshot.snapshotId(), latestLakeSnapshot.summary());
             }
             // note: we need to use sequence number to compare,
             // we can't use snapshot id as the snapshot id is not ordered
             if (latestLakeSnapshot.sequenceNumber() <= latestLakeSnapshotOfFluss.sequenceNumber()) {
                 return null;
+            }
+            if (isDerivedRound(latestLakeSnapshot)) {
+                Snapshot inHistory =
+                        missingDerivedRoundInHistory(
+                                latestLakeSnapshot, latestLakeSnapshotOfFluss.snapshotId());
+                if (inHistory != latestLakeSnapshot) {
+                    if (inHistory == null) {
+                        return null;
+                    }
+                    latestLakeSnapshot = inHistory;
+                }
             }
         }
 
@@ -618,6 +902,60 @@ public class IcebergLakeCommitter
         }
 
         return new CommittedLakeSnapshot(latestLakeSnapshot.snapshotId(), properties);
+    }
+
+    /** Whether a round of a table with deletion vectors committed the snapshot. */
+    private static boolean isDerivedRound(Snapshot snapshot) {
+        Map<String, String> summary = snapshot.summary();
+        return summary != null && summary.containsKey(FLUSS_LAKE_SNAP_BASE_PROPERTY);
+    }
+
+    /**
+     * Returns the round of a table with deletion vectors missing in Fluss among the snapshots from
+     * the current one back to {@code registered}, the snapshot Fluss registered last. It is {@code
+     * latest}, the latest round this tiering committed, if the current snapshot descends from it.
+     *
+     * <p>Otherwise the lake table was rolled back while it descends from the registered snapshot,
+     * e.g. to the registered snapshot itself, after a round committed on top of it but was lost
+     * before registering it. That round is no longer part of the table, so it is not missing:
+     * rounds go on from the registered snapshot. The latest round in the current snapshot's history
+     * since the registered one is returned instead, or null if there is none. If the current
+     * snapshot does not descend from the registered one, {@code latest} is returned, and the
+     * rollback check reports the rollback.
+     */
+    @Nullable
+    private Snapshot missingDerivedRoundInHistory(Snapshot latest, long registered) {
+        Snapshot newestRound = null;
+        boolean descendsFromLatest = false;
+        for (Snapshot s = icebergTable.currentSnapshot(); s != null; ) {
+            if (s.snapshotId() == registered) {
+                if (descendsFromLatest) {
+                    return latest;
+                }
+                if (newestRound == null) {
+                    LOG.warn(
+                            "Lake snapshot {} of {}, committed by a round that was not"
+                                    + " registered, is not in the history of the current"
+                                    + " snapshot, which descends from the registered snapshot {};"
+                                    + " the round is dropped.",
+                            latest.snapshotId(),
+                            icebergTable.name(),
+                            registered);
+                }
+                return newestRound;
+            }
+            if (s.snapshotId() == latest.snapshotId()) {
+                descendsFromLatest = true;
+            }
+            if (newestRound == null
+                    && isDerivedRound(s)
+                    && FLUSS_LAKE_TIERING_COMMIT_USER.equals(s.summary().get(COMMITTER_USER))) {
+                newestRound = s;
+            }
+            s = s.parentId() == null ? null : icebergTable.snapshot(s.parentId());
+        }
+        // not a descendant of the registered snapshot: a rollback past it
+        return latest;
     }
 
     @Override

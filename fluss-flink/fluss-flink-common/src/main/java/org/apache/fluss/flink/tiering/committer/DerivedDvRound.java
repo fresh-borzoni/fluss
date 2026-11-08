@@ -70,6 +70,10 @@ import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCK
  *       unregistered is registered first ({@link
  *       DerivedDvRecovery#checkFlussNotMissingLakeSnapshot}), after which the round fails and runs
  *       again. A round without rows re-indexes only ({@link DerivedDvReindexer#reindexIdleTable}).
+ *   <li>Still {@code STARTED}, on its first attempt: the round's own compaction commits to the lake
+ *       after a tiering epoch check, and its hand-off is registered as B → rewrite, in the chain
+ *       and in Fluss ({@link DerivedDvCompactionPublisher#publishCompactionIndex}). The round then
+ *       runs again on the rewrite.
  *   <li>Still {@code STARTED}: files rewritten since B are re-indexed ({@link
  *       DerivedDvReindexer#triggerReindex}). The round is held until the tiering readers report, or
  *       runs again at once if the re-index is already published.
@@ -162,16 +166,19 @@ final class DerivedDvRound<WriteResult, Committable> {
 
     private final DerivedDvRecovery<WriteResult, Committable> recovery;
     private final DerivedDvReindexer<WriteResult, Committable> reindexer;
+    private final DerivedDvCompactionPublisher<WriteResult, Committable> compaction;
     private final DerivedDvRegistrations<WriteResult, Committable> registrations;
 
     DerivedDvRound(
             DerivedDvContext<WriteResult, Committable> context,
             DerivedDvRecovery<WriteResult, Committable> recovery,
             DerivedDvReindexer<WriteResult, Committable> reindexer,
+            DerivedDvCompactionPublisher<WriteResult, Committable> compaction,
             DerivedDvRegistrations<WriteResult, Committable> registrations) {
         this.context = context;
         this.recovery = recovery;
         this.reindexer = reindexer;
+        this.compaction = compaction;
         this.registrations = registrations;
     }
 
@@ -356,9 +363,21 @@ final class DerivedDvRound<WriteResult, Committable> {
         long base =
                 flussCurrentLakeSnapshot == null ? -1L : flussCurrentLakeSnapshot.getSnapshotId();
         long t0 = System.currentTimeMillis();
-        // A rewrite since the base by another engine is re-indexed and made readable before the
-        // round resolves its keys.
+        // A compaction since the base, by Fluss or another engine, is re-indexed and made
+        // readable before the round resolves its keys.
         if (base > 0) {
+            // The round's own compaction is committed first, so the round's deletes never
+            // invalidate it. A resumed round did so before it was held. The compaction is a lake
+            // commit too, so a round of a table taken from this service stops before it.
+            if (!resuming) {
+                context.flussTableLakeSnapshotCommitter.checkTieringEpoch(tableId);
+                Long rewrite = positionDeletes(lakeCommitter).commitPendingRewrite(committable);
+                if (compaction.publishCompactionIndex(
+                        tableId, tablePath, flussCurrentLakeSnapshot, rewrite, nonEmptyResults)) {
+                    // The rewrite is in the index chain and registered: run the round on it.
+                    throw new ReindexPending(null);
+                }
+            }
             // Holds the round while the tiering readers re-index the rewritten files.
             reindexer.triggerReindex(tableId, tablePath, tableInfo, flussCurrentLakeSnapshot);
         }
@@ -470,6 +489,12 @@ final class DerivedDvRound<WriteResult, Committable> {
                 logEndOffsets,
                 logMaxTieredTimestamps);
         round.advance(Phase.FLUSS_REGISTERED);
+        // Only now: a tablet server rebuilds from the registered snapshot, which the trim keeps
+        // rebuildable, and before the registration that is the base.
+        registrations.maybeTrimIndexChain(tableId, tablePath, store, readableOffsets);
+        // Old lake snapshots are expired if the table expires them, except those of the chain.
+        positionDeletes(lakeCommitter)
+                .expireSnapshots(registrations.earliestSnapshotToKeep(tableId, tablePath));
         long t4 = System.currentTimeMillis();
         context.metrics.rounds.inc();
         context.metrics.changedKeys.inc(published.keys);

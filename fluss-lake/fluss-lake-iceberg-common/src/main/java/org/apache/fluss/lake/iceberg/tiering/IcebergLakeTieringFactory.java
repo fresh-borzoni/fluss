@@ -17,6 +17,8 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
@@ -34,6 +36,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.IOUtils;
 
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 
 import javax.annotation.Nullable;
@@ -52,12 +55,20 @@ public class IcebergLakeTieringFactory
 
     private final Configuration icebergConfig;
     private final IcebergCatalogProvider icebergCatalogProvider;
+    private final long expireIntervalMs;
     // what the job's committers keep across rounds, created where they run
     @Nullable private transient IcebergCommitterState committerState;
 
     public IcebergLakeTieringFactory(Configuration icebergConfig) {
+        this(icebergConfig, IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+    }
+
+    /** Creates a factory whose committers expire a table's snapshots at most this often. */
+    @VisibleForTesting
+    public IcebergLakeTieringFactory(Configuration icebergConfig, long expireIntervalMs) {
         this.icebergConfig = icebergConfig;
         this.icebergCatalogProvider = new IcebergCatalogProvider(icebergConfig);
+        this.expireIntervalMs = expireIntervalMs;
     }
 
     @Override
@@ -78,19 +89,24 @@ public class IcebergLakeTieringFactory
     }
 
     /**
-     * Checks the Iceberg table of a table with deletion vectors: no rollback past {@code
+     * Checks the Iceberg table of a table with deletion vectors: format version 2 or later, no rows
+     * written by another engine before Fluss tiered any, and no rollback past {@code
      * registeredSnapshotId}.
      */
     @Override
     public void validateDeletionVectorTable(
             TableInfo tableInfo, @Nullable Long registeredSnapshotId) throws IOException {
-        if (registeredSnapshotId == null) {
-            return;
-        }
         Catalog icebergCatalog = icebergCatalogProvider.get();
         try {
             Table icebergTable = icebergCatalog.loadTable(toIceberg(tableInfo.getLakeTablePath()));
-            IcebergSnapshotLineage.checkDescendsFrom(icebergTable, registeredSnapshotId);
+            checkDeletesByPosition(icebergTable, tableInfo);
+            if (registeredSnapshotId == null) {
+                // nothing registered yet: no other engine may have written rows before
+                IcebergSnapshotLineage.checkNoExternalWrites(
+                        icebergTable, icebergTable.currentSnapshot());
+            } else {
+                IcebergSnapshotLineage.checkDescendsFrom(icebergTable, registeredSnapshotId);
+            }
         } finally {
             closeQuietly(icebergCatalog);
         }
@@ -99,6 +115,25 @@ public class IcebergLakeTieringFactory
     private static void closeQuietly(Catalog icebergCatalog) {
         if (icebergCatalog instanceof AutoCloseable) {
             IOUtils.closeQuietly((AutoCloseable) icebergCatalog, "iceberg-catalog-table-validator");
+        }
+    }
+
+    /**
+     * Refuses a table with deletion vectors whose lake table has Iceberg format version 1, which
+     * has no deletes by position: every round would fail at its first delete.
+     */
+    static void checkDeletesByPosition(Table icebergTable, TableInfo tableInfo) throws IOException {
+        int formatVersion = TableUtil.formatVersion(icebergTable);
+        if (formatVersion < 2) {
+            throw new IOException(
+                    String.format(
+                            "Iceberg table %s has format version %d, which has no deletes by"
+                                    + " position, so the Fluss table %s with '%s' is not tiered."
+                                    + " Upgrade the Iceberg table to format version 2 or 3.",
+                            icebergTable.name(),
+                            formatVersion,
+                            tableInfo.getTablePath(),
+                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
         }
     }
 
@@ -113,12 +148,22 @@ public class IcebergLakeTieringFactory
         return new IcebergLakeCommitter(
                 icebergCatalogProvider,
                 committerInitContext.tableInfo().getLakeTablePath(),
+                // Only the committer of a table with deletion vectors expires snapshots; it keeps
+                // those the index chain needs. The engine expires the snapshots of other tables.
+                committerInitContext.tableInfo().isDeletionVectorsEnabled()
+                        && (committerInitContext
+                                        .tableInfo()
+                                        .getTableConfig()
+                                        .isDataLakeAutoExpireSnapshot()
+                                || committerInitContext
+                                        .lakeTieringConfig()
+                                        .get(ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT)),
                 committerState());
     }
 
     private synchronized IcebergCommitterState committerState() {
         if (committerState == null) {
-            committerState = new IcebergCommitterState();
+            committerState = new IcebergCommitterState(expireIntervalMs);
         }
         return committerState;
     }

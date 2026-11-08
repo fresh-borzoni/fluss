@@ -18,11 +18,15 @@
 package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
+import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.ExceptionUtils;
 
@@ -30,20 +34,31 @@ import org.slf4j.Logger;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.dvCommit;
 
 /**
  * Registers lake snapshots in Fluss and keeps what the index chain needs.
  *
  * <p>A snapshot is registered in Fluss only once its index change is in the chain, so a tablet
  * server can always cover it. Each registration keeps the registered snapshots from the chain's
- * oldest one on ({@link #earliestSnapshotToKeep}).
+ * oldest one on ({@link #earliestSnapshotToKeep}). After a round registered its snapshot, every
+ * {@code lake.tiering.deletion-vectors.trim-interval} changes the chain is trimmed and orphan index
+ * changes are removed ({@link #maybeTrimIndexChain}); only then, as a tablet server rebuilds from
+ * the registered snapshot. Snapshots Fluss registers but did not commit itself are protected from
+ * expiry first ({@link #protectReadableSnapshot}).
  *
  * <p>Crash rule: every step here is repeatable. A registration the chain already has is registered
- * again as a no-op.
+ * again as a no-op, and a trim cut short is finished by the next one.
  */
 final class DerivedDvRegistrations<WriteResult, Committable> {
 
@@ -59,12 +74,14 @@ final class DerivedDvRegistrations<WriteResult, Committable> {
     }
 
     /**
-     * Registers a rewritten snapshot in Fluss, readable at the base's tiered offsets: union reads
-     * plan on it, and the next round looks it up as its base.
+     * Registers a rewritten snapshot in Fluss, readable at the base's tiered offsets. It is
+     * protected from expiration first, like the snapshots rounds commit: union reads plan on it,
+     * and the next round looks it up as its base.
      */
     void registerSnapshot(
             long tableId, TablePath tablePath, long snapshotId, LakeSnapshot baseSnapshot)
             throws Exception {
+        protectReadableSnapshot(tablePath, snapshotId);
         Map<TableBucket, Long> offsets =
                 context.withoutDroppedPartitions(tablePath, baseSnapshot.getTableBucketsOffset());
         String offsetsFile =
@@ -78,6 +95,23 @@ final class DerivedDvRegistrations<WriteResult, Committable> {
                 offsetsFile,
                 Collections.emptyMap(),
                 Collections.emptyMap());
+    }
+
+    /** Best effort: a snapshot left unprotected is re-indexed once it expires. */
+    private void protectReadableSnapshot(TablePath tablePath, long snapshotId) {
+        try {
+            TableInfo tableInfo = context.admin.getTableInfo(tablePath).get();
+            try (LakeCommitter<WriteResult, Committable> lakeCommitter =
+                    context.createDvLakeCommitter(tablePath, tableInfo)) {
+                dvCommit(lakeCommitter).protectReadableSnapshot(snapshotId);
+            }
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not protect readable snapshot {} of {} from expiration.",
+                    snapshotId,
+                    tablePath,
+                    e);
+        }
     }
 
     /**
@@ -134,6 +168,124 @@ final class DerivedDvRegistrations<WriteResult, Committable> {
                 return false;
             }
             throw e;
+        }
+    }
+
+    /**
+     * The buckets with data in Fluss's latest registration of the table (or else in {@code
+     * fallback}), without those of dropped partitions.
+     */
+    private List<TableBucket> bucketsWithData(
+            long tableId, TablePath tablePath, Map<TableBucket, Long> fallback) throws IOException {
+        try {
+            LakeSnapshot registered = context.getLatestLakeSnapshot(tablePath);
+            Map<TableBucket, Long> offsets =
+                    context.withoutDroppedPartitions(
+                            tablePath,
+                            registered == null ? fallback : registered.getTableBucketsOffset());
+            List<TableBucket> withData = new ArrayList<>();
+            for (Map.Entry<TableBucket, Long> e : offsets.entrySet()) {
+                if (e.getValue() != null && e.getValue() > 0) {
+                    withData.add(e.getKey());
+                }
+            }
+            return withData;
+        } catch (Exception e) {
+            throw new IOException(
+                    "Cannot read the buckets with data of " + tablePath + " (" + tableId + ")", e);
+        }
+    }
+
+    /**
+     * The partitions of the table Fluss dropped, read once when the trim first asks, after it
+     * listed the chain: a partition whose changes are on the chain then is either live or dropped
+     * for good, as partition ids are never reused.
+     */
+    private PositionIndexStore.DroppedPartitions droppedPartitions(TablePath tablePath) {
+        AtomicReference<Set<Long>> live = new AtomicReference<>();
+        return partitionId -> {
+            if (live.get() == null) {
+                Set<Long> ids = new HashSet<>();
+                try {
+                    // Includes system partitions such as the historical partition.
+                    for (PartitionInfo partition :
+                            context.admin.listPartitionInfos(tablePath, true).get()) {
+                        ids.add(partition.getPartitionId());
+                    }
+                } catch (Exception e) {
+                    throw new IOException("Cannot list the partitions of " + tablePath, e);
+                }
+                live.set(ids);
+            }
+            return !live.get().contains(partitionId);
+        };
+    }
+
+    void maybeTrimIndexChain(
+            long tableId,
+            TablePath tablePath,
+            PositionIndexStore store,
+            Map<TableBucket, Long> readableOffsets) {
+        try {
+            // Counted in the index store rather than here, so a tiering service that fails over
+            // more often than the interval still trims.
+            if (store.changesSinceTrim()
+                    < context.lakeTieringConfig.get(
+                            ConfigOptions.LAKE_TIERING_DELETION_VECTORS_TRIM_INTERVAL)) {
+                return;
+            }
+            store.startTrim();
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not tell whether the position index chain of {} is due for a" + " trim.",
+                    tablePath,
+                    e);
+            return;
+        }
+        try {
+            // Right before the trim: a service that lost the table meanwhile (paused) trims
+            // nothing. The buckets come from Fluss's latest registration, read only once the
+            // trim listed the chain, so it is no older than that listing; the store keeps the
+            // buckets of entries added since.
+            context.flussTableLakeSnapshotCommitter.checkTieringEpoch(tableId);
+            List<TableBucket> withData = new ArrayList<>();
+            long t0 = System.currentTimeMillis();
+            PositionIndexStore.TrimResult result =
+                    store.trim(
+                            () -> {
+                                withData.clear();
+                                withData.addAll(
+                                        bucketsWithData(tableId, tablePath, readableOffsets));
+                                return withData;
+                            },
+                            context.lakeTieringConfig.get(
+                                    ConfigOptions.LAKE_TIERING_DELETION_VECTORS_TRIM_RETAIN),
+                            droppedPartitions(tablePath));
+            int trimmed = result.trimmed;
+            context.metrics.trimmed(tableId, result.chainLength, result.holdingBuckets);
+            context.metrics.checkpointBuildsFailed.inc(result.failedBuilds);
+            // Only failed attempts' changes are orphans here. This round's change is registered,
+            // and repairSnapshot registers a crashed round's change before any later commit.
+            int orphans =
+                    store.deleteOrphanChanges(
+                            context.lakeTieringConfig
+                                    .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_ORPHAN_MIN_AGE)
+                                    .toMillis());
+            context.metrics.chainEntriesTrimmed.inc(trimmed);
+            context.metrics.orphanChangesRemoved.inc(orphans);
+            if (orphans > 0) {
+                LOG.info("Removed {} orphan position index changes of {}.", orphans, tablePath);
+            }
+            LOG.info(
+                    "Trimmed the position index chain of {} by {} entries in {} ms ({}"
+                            + " buckets with data).",
+                    tablePath,
+                    trimmed,
+                    System.currentTimeMillis() - t0,
+                    withData.size());
+        } catch (Exception e) {
+            context.metrics.indexTrimsFailed.inc();
+            LOG.warn("Trimming the position index chain of {} failed.", tablePath, e);
         }
     }
 

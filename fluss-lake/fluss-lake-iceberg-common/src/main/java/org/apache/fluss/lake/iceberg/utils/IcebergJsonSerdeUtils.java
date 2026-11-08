@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.iceberg.utils;
 
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
@@ -33,13 +34,17 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.util.DataFileSet;
+import org.apache.iceberg.util.DeleteFileSet;
 import org.apache.iceberg.util.JsonUtil;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -59,7 +64,11 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  *   <li>Files: {@code "<field>": [{...}, ...]}, where each data or delete file is written by {@link
  *       ContentFileParser} with the spec of the file.
  *   <li>Rewrite result: {@code {"snapshot_id": 42, "deleted_data_files": [...], "added_data_files":
- *       [...]}}.
+ *       [...]}}, plus {@code "deleted_delete_files": [...]} if the rewrite removes delete files,
+ *       {@code "bucket_key": "<partition id>|<bucket>"} for the bucket it compacted, if known, and
+ *       {@code "index_part": {"change_id": 7, "read_snapshot_id": 42, "ssts": [{"name": ...,
+ *       "size": ...}], "added_files": {"<id>": "<name>"}, "removed_files": [...]}} if it handed its
+ *       positions to the position index of a table with deletion vectors.
  * </ul>
  */
 public class IcebergJsonSerdeUtils {
@@ -70,6 +79,16 @@ public class IcebergJsonSerdeUtils {
     private static final String SNAPSHOT_ID_FIELD = "snapshot_id";
     private static final String DELETED_DATA_FILES_FIELD = "deleted_data_files";
     private static final String ADDED_DATA_FILES_FIELD = "added_data_files";
+    private static final String DELETED_DELETE_FILES_FIELD = "deleted_delete_files";
+    private static final String INDEX_PART_FIELD = "index_part";
+    private static final String BUCKET_KEY_FIELD = "bucket_key";
+    private static final String CHANGE_ID_FIELD = "change_id";
+    private static final String READ_SNAPSHOT_ID_FIELD = "read_snapshot_id";
+    private static final String SSTS_FIELD = "ssts";
+    private static final String NAME_FIELD = "name";
+    private static final String SIZE_FIELD = "size";
+    private static final String ADDED_FILES_FIELD = "added_files";
+    private static final String REMOVED_FILES_FIELD = "removed_files";
 
     private IcebergJsonSerdeUtils() {}
 
@@ -202,7 +221,71 @@ public class IcebergJsonSerdeUtils {
         generator.writeNumberField(SNAPSHOT_ID_FIELD, result.snapshotId());
         writeContentFiles(generator, DELETED_DATA_FILES_FIELD, result.deletedDataFiles(), specs);
         writeContentFiles(generator, ADDED_DATA_FILES_FIELD, result.addedDataFiles(), specs);
+        if (!result.deletedDeleteFiles().isEmpty()) {
+            writeContentFiles(
+                    generator, DELETED_DELETE_FILES_FIELD, result.deletedDeleteFiles(), specs);
+        }
+        if (result.bucketKey() != null) {
+            generator.writeStringField(BUCKET_KEY_FIELD, result.bucketKey());
+        }
+        CompactionIndexPart part = result.indexPart();
+        if (part != null) {
+            generator.writeObjectFieldStart(INDEX_PART_FIELD);
+            generator.writeNumberField(CHANGE_ID_FIELD, part.changeId());
+            generator.writeNumberField(READ_SNAPSHOT_ID_FIELD, part.readSnapshotId());
+            generator.writeArrayFieldStart(SSTS_FIELD);
+            for (int i = 0; i < part.sstFileNames().size(); i++) {
+                generator.writeStartObject();
+                generator.writeStringField(NAME_FIELD, part.sstFileNames().get(i));
+                generator.writeNumberField(SIZE_FIELD, part.sstFileSizes().get(i));
+                generator.writeEndObject();
+            }
+            generator.writeEndArray();
+            generator.writeObjectFieldStart(ADDED_FILES_FIELD);
+            for (Map.Entry<Integer, String> e : part.addedFiles().entrySet()) {
+                generator.writeStringField(String.valueOf(e.getKey()), e.getValue());
+            }
+            generator.writeEndObject();
+            generator.writeArrayFieldStart(REMOVED_FILES_FIELD);
+            for (String f : part.removedFiles()) {
+                generator.writeString(f);
+            }
+            generator.writeEndArray();
+            generator.writeEndObject();
+        }
         generator.writeEndObject();
+    }
+
+    @Nullable
+    private static CompactionIndexPart readIndexPart(JsonNode node) {
+        JsonNode partNode = node.get(INDEX_PART_FIELD);
+        if (partNode == null || partNode.isNull()) {
+            return null;
+        }
+        List<String> sstNames = new ArrayList<>();
+        List<Long> sstSizes = new ArrayList<>();
+        for (JsonNode sst : getArrayField(partNode, SSTS_FIELD)) {
+            sstNames.add(getField(sst, NAME_FIELD).asText());
+            sstSizes.add(getField(sst, SIZE_FIELD).asLong());
+        }
+        Map<Integer, String> addedFiles = new HashMap<>();
+        Iterator<Map.Entry<String, JsonNode>> added =
+                getField(partNode, ADDED_FILES_FIELD).fields();
+        while (added.hasNext()) {
+            Map.Entry<String, JsonNode> e = added.next();
+            addedFiles.put(Integer.parseInt(e.getKey()), e.getValue().asText());
+        }
+        List<String> removedFiles = new ArrayList<>();
+        for (JsonNode f : getArrayField(partNode, REMOVED_FILES_FIELD)) {
+            removedFiles.add(f.asText());
+        }
+        return new CompactionIndexPart(
+                getField(partNode, CHANGE_ID_FIELD).asLong(),
+                getField(partNode, READ_SNAPSHOT_ID_FIELD).asLong(),
+                sstNames,
+                sstSizes,
+                addedFiles,
+                removedFiles);
     }
 
     /** Reads the rewrite result written by {@link #writeRewriteDataFileResult}. */
@@ -214,7 +297,12 @@ public class IcebergJsonSerdeUtils {
         return new RewriteDataFileResult(
                 snapshotIdNode.asLong(),
                 DataFileSet.of(readDataFiles(node, DELETED_DATA_FILES_FIELD, specs)),
-                DataFileSet.of(readDataFiles(node, ADDED_DATA_FILES_FIELD, specs)));
+                DataFileSet.of(readDataFiles(node, ADDED_DATA_FILES_FIELD, specs)),
+                node.has(DELETED_DELETE_FILES_FIELD)
+                        ? DeleteFileSet.of(readDeleteFiles(node, DELETED_DELETE_FILES_FIELD, specs))
+                        : DeleteFileSet.create(),
+                readIndexPart(node),
+                node.has(BUCKET_KEY_FIELD) ? node.get(BUCKET_KEY_FIELD).asText() : null);
     }
 
     private static List<ContentFile<?>> readContentFiles(

@@ -17,11 +17,35 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * What the committers of a tiering job keep across rounds: the live files of each table's last
- * base. The job's {@link IcebergLakeTieringFactory} owns it.
+ * base, and when each table's snapshots were expired last. The job's {@link
+ * IcebergLakeTieringFactory} owns it.
  */
 final class IcebergCommitterState {
 
+    /** How often a table's snapshots are expired at most. */
+    static final long DEFAULT_EXPIRE_INTERVAL_MS = 10 * 60_000L;
+
     final LiveFilesIndex.Cache liveFiles = new LiveFilesIndex.Cache();
+    // when each table's snapshots were expired last, by table location
+    private final Map<String, Long> lastExpiration = new ConcurrentHashMap<>();
+    private final long expireIntervalMs;
+
+    IcebergCommitterState(long expireIntervalMs) {
+        this.expireIntervalMs = expireIntervalMs;
+    }
+
+    /** Whether the table's snapshots are due to expire at {@code now}; records it if so. */
+    boolean expirationDue(String tableLocation, long now) {
+        Long last = lastExpiration.get(tableLocation);
+        if (last != null && now - last < expireIntervalMs) {
+            return false;
+        }
+        lastExpiration.put(tableLocation, now);
+        return true;
+    }
 }

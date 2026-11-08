@@ -19,6 +19,8 @@ package org.apache.fluss.lake.committer;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.util.Map;
 
@@ -72,4 +74,25 @@ public interface SupportsPositionDeleteCommit<WriteResult, CommittableT>
             Map<String, long[]> deletedPositionsByFile,
             long baseSnapshotId)
             throws IOException;
+
+    /**
+     * Commits this round's compaction rewrite, if any, before the round's deletes, so that it
+     * validates against the files it read. It commits only on the snapshot the compaction read, or
+     * on snapshots after it that changed no data file, so the positions the compaction handed to
+     * the index are a change from that snapshot. Returns the rewrite's snapshot id, or null if
+     * there is none or it was rejected because the table changed. A rejected rewrite is safe to
+     * skip.
+     */
+    @Nullable
+    Long commitPendingRewrite(CommittableT committable) throws IOException;
+
+    /**
+     * Expires old snapshots of the lake table if its snapshots expire automatically ({@code
+     * table.datalake.auto-expire-snapshot} or {@code lake.tiering.auto-expire-snapshot}). Keeps
+     * {@code keepFromSnapshotId} and the snapshots after it, which Fluss still needs. If null,
+     * keeps only the snapshots the lake protects. Called only after a round's commit; the snapshots
+     * of tables without deletion vectors expire as they do otherwise. A lake that expires snapshots
+     * on commit, or not at all, does nothing. Best effort: a failure must not fail the round.
+     */
+    void expireSnapshots(@Nullable Long keepFromSnapshotId);
 }
