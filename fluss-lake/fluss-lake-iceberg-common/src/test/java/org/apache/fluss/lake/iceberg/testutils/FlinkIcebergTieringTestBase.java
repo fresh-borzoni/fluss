@@ -29,6 +29,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.flink.tiering.LakeTieringJobBuilder;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -55,6 +56,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.RegisterExtension;
+
+import javax.annotation.Nullable;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -147,15 +150,90 @@ public class FlinkIcebergTieringTestBase {
     }
 
     protected JobClient buildTieringJob(StreamExecutionEnvironment execEnv) throws Exception {
+        return buildTieringJob(execEnv, getIcebergCatalogConf());
+    }
+
+    /** Builds the tiering job on the Iceberg catalog of {@code icebergCatalogConf}. */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv, Map<String, String> icebergCatalogConf)
+            throws Exception {
+        return buildTieringJob(execEnv, icebergCatalogConf, new Configuration());
+    }
+
+    /**
+     * Builds the tiering job on the Iceberg catalog of {@code icebergCatalogConf}, with {@code
+     * lakeTieringConfig} on top of the {@link #defaultLakeTieringConfig}, as the {@code
+     * --lake.tiering.*} arguments of the tiering service set them.
+     */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv,
+            Map<String, String> icebergCatalogConf,
+            Configuration lakeTieringConfig)
+            throws Exception {
+        return buildTieringJob(execEnv, icebergCatalogConf, lakeTieringConfig, null);
+    }
+
+    /**
+     * Builds the tiering job as above, tiering with {@code lakeTieringFactory} if not null, else
+     * with the factory of the Iceberg plugin.
+     */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv,
+            Map<String, String> icebergCatalogConf,
+            Configuration lakeTieringConfig,
+            @Nullable LakeTieringFactory<?, ?> lakeTieringFactory)
+            throws Exception {
+        return buildTieringJob(
+                execEnv,
+                icebergCatalogConf,
+                new Configuration(),
+                lakeTieringConfig,
+                lakeTieringFactory);
+    }
+
+    /**
+     * Builds the tiering job as above, with {@code flussOverrides} on top of the Fluss client
+     * configuration the job connects with.
+     */
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv,
+            Map<String, String> icebergCatalogConf,
+            Configuration flussOverrides,
+            Configuration lakeTieringConfig,
+            @Nullable LakeTieringFactory<?, ?> lakeTieringFactory)
+            throws Exception {
         Configuration flussConfig = new Configuration(clientConf);
         flussConfig.set(POLL_TIERING_TABLE_INTERVAL, Duration.ofMillis(500L));
-        return LakeTieringJobBuilder.newBuilder(
+        flussConfig.addAll(flussOverrides);
+        Configuration tieringConfig = defaultLakeTieringConfig();
+        tieringConfig.addAll(lakeTieringConfig);
+        LakeTieringJobBuilder builder =
+                LakeTieringJobBuilder.newBuilder(
                         execEnv,
                         flussConfig,
-                        Configuration.fromMap(getIcebergCatalogConf()),
-                        new Configuration(),
-                        DataLakeFormat.ICEBERG.toString())
-                .build();
+                        Configuration.fromMap(icebergCatalogConf),
+                        tieringConfig,
+                        DataLakeFormat.ICEBERG.toString());
+        if (lakeTieringFactory != null) {
+            builder.withLakeTieringFactory(lakeTieringFactory);
+        }
+        return builder.build();
+    }
+
+    /** The lake tiering configuration of every tiering job of the test class. */
+    protected Configuration defaultLakeTieringConfig() {
+        return new Configuration();
+    }
+
+    /**
+     * The catalog configuration of a tiering job whose commits run the hooks of {@link
+     * CommitHookCatalog}, on the same warehouse.
+     */
+    protected static Map<String, String> getCommitHookCatalogConf() {
+        Map<String, String> icebergConf = new HashMap<>();
+        icebergConf.put("catalog-impl", CommitHookCatalog.class.getName());
+        icebergConf.put("warehouse", warehousePath);
+        return icebergConf;
     }
 
     protected static Map<String, String> getIcebergCatalogConf() {

@@ -186,7 +186,11 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
                                                                     null,
                                                                     0)))))
                     .hasMessageContaining(
-                            "Table ID mismatch: expected 0, but split contains 1 for table 'test-flink-db.test-only-snapshot-table'. "
+                            "Table ID mismatch: expected "
+                                    + tableId
+                                    + ", but split contains "
+                                    + (tableId + 1)
+                                    + " for table 'test-flink-db.test-only-snapshot-table'. "
                                     + "This usually happens when a table with the same name was dropped and recreated between job runs, "
                                     + "causing metadata inconsistency. To resolve this, please restart the job **without** using "
                                     + "the previous savepoint or checkpoint.");
@@ -523,8 +527,6 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
                             split1.splitId(), split2.splitId(), split3.splitId());
         }
     }
-
-    // ------------------
 
     private void assignSplitsAndFetchUntilRetrieveRecords(
             FlinkSourceSplitReader reader,

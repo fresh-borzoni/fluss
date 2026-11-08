@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.tiering;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.tiering.committer.CommittableMessageTypeInfo;
 import org.apache.fluss.flink.tiering.committer.TieringCommitOperatorFactory;
@@ -34,6 +35,8 @@ import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
 
+import javax.annotation.Nullable;
+
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_LOG_READ_PREFERENCE;
 import static org.apache.fluss.flink.tiering.source.TieringSource.TIERING_SOURCE_TRANSFORMATION_UID;
 import static org.apache.fluss.flink.tiering.source.TieringSourceOptions.POLL_TIERING_TABLE_INTERVAL;
@@ -50,6 +53,7 @@ public class LakeTieringJobBuilder {
     private final Configuration dataLakeConfig;
     private final Configuration lakeTieringConfig;
     private final String dataLakeFormat;
+    @Nullable private LakeTieringFactory<?, ?> lakeTieringFactory;
 
     private LakeTieringJobBuilder(
             StreamExecutionEnvironment env,
@@ -74,15 +78,32 @@ public class LakeTieringJobBuilder {
                 env, flussConfig, dataLakeConfig, lakeTieringConfig, dataLakeFormat);
     }
 
-    @SuppressWarnings({"rawtypes", "unchecked"})
-    public JobClient build() throws Exception {
+    /**
+     * Tiers with {@code lakeTieringFactory} instead of the factory of the lake format's plugin, so
+     * a test can configure it or wrap it.
+     */
+    @VisibleForTesting
+    public LakeTieringJobBuilder withLakeTieringFactory(
+            LakeTieringFactory<?, ?> lakeTieringFactory) {
+        this.lakeTieringFactory = lakeTieringFactory;
+        return this;
+    }
+
+    private LakeTieringFactory<?, ?> createLakeTieringFactory() {
         // get the lake storage plugin
         LakeStoragePlugin lakeStoragePlugin =
                 LakeStoragePluginSetUp.fromDataLakeFormat(dataLakeFormat, null);
         // create lake storage from configurations
         LakeStorage lakeStorage = checkNotNull(lakeStoragePlugin).createLakeStorage(dataLakeConfig);
+        return lakeStorage.createLakeTieringFactory();
+    }
 
-        LakeTieringFactory lakeTieringFactory = lakeStorage.createLakeTieringFactory();
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public JobClient build() throws Exception {
+        LakeTieringFactory lakeTieringFactory =
+                this.lakeTieringFactory != null
+                        ? this.lakeTieringFactory
+                        : createLakeTieringFactory();
 
         // tiering prefers remote-first fetch to offload reads from tablet servers,
         // unless users explicitly configure the read preference

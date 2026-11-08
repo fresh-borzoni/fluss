@@ -564,7 +564,7 @@ class DvPartMachineTest {
     /**
      * What an engine checkpoints of a part of the standard bucket in {@code state}: the part as
      * assigned until it resolved, then as resolved, then with its position and the masks it still
-     * needs. Null once the part was read to the end.
+     * needs (as Flink's DvBucketSplitState does). Null once the part was read to the end.
      */
     @Nullable
     private Checkpoint checkpointIn(DvPartState state) throws Exception {

@@ -20,12 +20,15 @@ package org.apache.fluss.flink.source.reader;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.scanner.DroppedPartitionDetector;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.scanner.batch.KvSnapshotAndLogBatchScanner;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.flink.lake.LakeSplitReaderGenerator;
@@ -121,6 +124,14 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     // Set to collect table buckets that are unsubscribed.
     private Set<TableBucket> unsubscribedTableBuckets = new HashSet<>();
 
+    // created on first use, for deletion vector masks and partition checks
+    @Nullable private Admin admin;
+    // splits of tables with deletion vectors whose bucket's log stops making progress ask whether
+    // its partition was dropped
+    private final DroppedPartitionDetector droppedPartitions;
+    // whether the splits of tables with deletion vectors wait for their buckets' leaders
+    private final boolean dvWaitForCatchUp;
+
     public FlinkSourceSplitReader(
             Configuration flussConf,
             TablePath tablePath,
@@ -135,6 +146,9 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
                         Collections.singleton(MetricNames.SCANNER_RECORDS_LAG));
         this.connection = ConnectionFactory.createConnection(flussConf, flinkMetricRegistry);
         this.table = connection.getTable(tablePath);
+        this.droppedPartitions = new DroppedPartitionDetector(this::admin, tablePath);
+        this.dvWaitForCatchUp =
+                flussConf.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP);
         this.tableId = table.getTableInfo().getTableId();
         this.sourceOutputType = sourceOutputType;
         this.boundedSplits = new ArrayDeque<>();
@@ -263,9 +277,23 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
     private LakeSplitReaderGenerator getLakeSplitReader() {
         if (lakeSplitReaderGenerator == null) {
             lakeSplitReaderGenerator =
-                    new LakeSplitReaderGenerator(table, projectedFields, checkNotNull(lakeSource));
+                    new LakeSplitReaderGenerator(
+                            table,
+                            projectedFields,
+                            checkNotNull(lakeSource),
+                            this::admin,
+                            droppedPartitions,
+                            flinkSourceReaderMetrics.getSourceReaderMetricGroup());
+            lakeSplitReaderGenerator.setDvWaitForCatchUp(dvWaitForCatchUp);
         }
         return lakeSplitReaderGenerator;
+    }
+
+    private synchronized Admin admin() {
+        if (admin == null) {
+            admin = connection.getAdmin();
+        }
+        return admin;
     }
 
     private void subscribeLog(SourceSplitBase split, long startingOffset) {
@@ -651,6 +679,9 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
         }
         if (logScanner != null) {
             logScanner.close();
+        }
+        if (admin != null) {
+            admin.close();
         }
         table.close();
         connection.close();

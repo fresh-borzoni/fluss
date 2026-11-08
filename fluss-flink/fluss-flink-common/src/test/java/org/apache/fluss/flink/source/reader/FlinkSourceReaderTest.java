@@ -23,19 +23,24 @@ import org.apache.fluss.client.table.writer.UpsertResult;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
+import org.apache.fluss.flink.lake.state.DvBucketSplitState;
 import org.apache.fluss.flink.source.deserializer.DeserializerInitContextImpl;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
+import org.apache.fluss.flink.source.event.DvSplitsFinishedEvent;
 import org.apache.fluss.flink.source.event.FinishedKvSnapshotConsumeEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
 import org.apache.fluss.flink.source.metrics.FlinkSourceReaderMetrics;
 import org.apache.fluss.flink.source.split.HybridSnapshotLogSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
+import org.apache.fluss.flink.source.split.LogSplitState;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.source.split.SourceSplitSerializer;
+import org.apache.fluss.flink.source.split.SourceSplitState;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
@@ -492,6 +497,38 @@ class FlinkSourceReaderTest extends FlinkTestBase {
                             .map(row -> row.replace("(", "[").replace(")", "]").replace(",", ", "))
                             .collect(Collectors.toList());
             assertThat(actualRows).containsExactlyInAnyOrderElementsOf(expectRows);
+        }
+    }
+
+    /**
+     * A reader tells the enumerator which splits of union reads of tables with deletion vectors it
+     * finished, so their holds of their buckets' mask cuts are released.
+     */
+    @Test
+    void testFinishedDvSplitsAreReported() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test_finished_dv_splits");
+        TestingReaderContext readerContext = new TestingReaderContext();
+        TableBucket bucket = new TableBucket(1L, 0);
+        DvBucketSplit logSplit =
+                DvBucketSplit.pinned(
+                        bucket, null, 5L, 100L, 150L, null, DvBucketSplit.BUCKET_LOG, 107L, 100L);
+        LogSplit plainSplit = new LogSplit(new TableBucket(1L, 1), null, 0);
+        try (TestingFlinkSourceReader<RowData> reader =
+                createReader(
+                        clientConf,
+                        tablePath,
+                        DEFAULT_PK_TABLE_SCHEMA.getRowType(),
+                        readerContext,
+                        null)) {
+            Map<String, SourceSplitState> finished = new HashMap<>();
+            finished.put(logSplit.splitId(), new DvBucketSplitState(logSplit));
+            finished.put(plainSplit.splitId(), new LogSplitState(plainSplit));
+
+            reader.onSplitFinished(finished);
+
+            assertThat(readerContext.getSentEvents())
+                    .containsExactly(
+                            new DvSplitsFinishedEvent(Collections.singleton(logSplit.splitId())));
         }
     }
 

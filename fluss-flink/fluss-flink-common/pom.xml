@@ -141,6 +141,15 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- the fakes of the union read tests with deletion vectors -->
+        <dependency>
+            <groupId>org.apache.fluss</groupId>
+            <artifactId>fluss-client</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
         <!-- for curator TestingServer  -->
         <dependency>
             <groupId>org.apache.curator</groupId>

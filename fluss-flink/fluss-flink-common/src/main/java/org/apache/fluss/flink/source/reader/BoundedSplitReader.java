@@ -19,8 +19,10 @@ package org.apache.fluss.flink.source.reader;
 
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
-import org.apache.fluss.flink.lake.reader.IndexedLakeSplitRecordIterator;
+import org.apache.fluss.client.table.scanner.batch.IndexedRowIterator;
+import org.apache.fluss.client.table.scanner.batch.LogRowIterator;
 import org.apache.fluss.flink.source.split.SnapshotSplit;
+import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.MemoryAwareGetters;
 import org.apache.fluss.row.ProjectedRow;
@@ -166,9 +168,8 @@ public class BoundedSplitReader implements AutoCloseable {
 
         public ScanRecordBatch(CloseableIterator<InternalRow> rowIterator) {
             this.rowIterator = rowIterator;
-            if (rowIterator instanceof IndexedLakeSplitRecordIterator) {
-                currentSplitIndex =
-                        ((IndexedLakeSplitRecordIterator) rowIterator).getCurrentLakeSplitIndex();
+            if (rowIterator instanceof IndexedRowIterator) {
+                currentSplitIndex = ((IndexedRowIterator) rowIterator).getCurrentLakeSplitIndex();
             }
         }
 
@@ -187,6 +188,16 @@ public class BoundedSplitReader implements AutoCloseable {
                     row instanceof ProjectedRow ? ((ProjectedRow) row).getUnderlyingRow() : row;
             if (underlyingRow instanceof MemoryAwareGetters) {
                 sizeInBytes = ((MemoryAwareGetters) underlyingRow).getSizeInBytes();
+            }
+            if (rowIterator instanceof LogRowIterator) {
+                // a row read from the log keeps its offset, which the split's state resumes after
+                LogRowIterator logRows = (LogRowIterator) rowIterator;
+                return new ScanRecord(
+                        logRows.currentLogOffset(),
+                        logRows.currentTimestamp(),
+                        ChangeType.INSERT,
+                        row,
+                        sizeInBytes);
             }
             return new ScanRecord(row, sizeInBytes);
         }

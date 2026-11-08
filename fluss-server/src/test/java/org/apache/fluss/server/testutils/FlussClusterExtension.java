@@ -49,6 +49,7 @@ import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.rebalance.RebalanceManager;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.kv.dv.TestingDvHooks;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.PeriodicSnapshotManager;
@@ -95,6 +96,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropDatabaseRequest;
@@ -135,6 +137,8 @@ public final class FlussClusterExtension
     private File tempDir;
 
     private final Map<Integer, TabletServer> tabletServers;
+    // the deletion vector test hooks of every tablet server, also of servers started later
+    private final TestingDvHooks dvTestHooks = new TestingDvHooks();
     private final Map<Integer, ServerInfo> tabletServerInfos;
     private final Configuration clusterConf;
     private final Clock clock;
@@ -364,6 +368,7 @@ public final class FlussClusterExtension
         setRemoteDataDirs(tabletServerConf);
 
         TabletServer tabletServer = new TabletServer(tabletServerConf, clock);
+        tabletServer.setDvTestHooks(dvTestHooks);
         tabletServer.start();
         ServerInfo serverInfo =
                 new ServerInfo(
@@ -374,6 +379,22 @@ public final class FlussClusterExtension
 
         tabletServers.put(serverId, tabletServer);
         tabletServerInfos.put(serverId, serverInfo);
+    }
+
+    /**
+     * Holds the deletion vector rebuilds of the tablet servers' new leaders, also of servers
+     * started later, until {@code gate} counts down; none if null.
+     */
+    public void holdDvRebuilds(@Nullable CountDownLatch gate) {
+        dvTestHooks.holdRebuilds(gate);
+    }
+
+    /**
+     * Holds the switches of the tablet servers' leaders to newer lake snapshots, also of servers
+     * started later, until {@code gate} counts down; none if null.
+     */
+    public void holdDvSwitches(@Nullable CountDownLatch gate) {
+        dvTestHooks.holdSwitches(gate);
     }
 
     public void restartTabletServer(int serverId, Configuration overwriteConfig) throws Exception {

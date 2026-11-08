@@ -20,7 +20,9 @@ package org.apache.fluss.flink.source.reader;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.adapter.SingleThreadMultiplexSourceReaderBaseAdapter;
 import org.apache.fluss.flink.lake.LakeSplitStateInitializer;
+import org.apache.fluss.flink.lake.state.DvBucketSplitState;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
+import org.apache.fluss.flink.source.event.DvSplitsFinishedEvent;
 import org.apache.fluss.flink.source.event.FinishedKvSnapshotConsumeEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
@@ -97,7 +99,17 @@ public class FlinkSourceReader<OUT>
 
     @Override
     protected void onSplitFinished(Map<String, SourceSplitState> map) {
-        // do nothing
+        // Each split of a union read of a table with deletion vectors takes one hold of its
+        // bucket's mask cut, which the enumerator releases once the split is read.
+        Set<String> dvSplits = new HashSet<>();
+        for (Map.Entry<String, SourceSplitState> finished : map.entrySet()) {
+            if (finished.getValue() instanceof DvBucketSplitState) {
+                dvSplits.add(finished.getKey());
+            }
+        }
+        if (!dvSplits.isEmpty()) {
+            context.sendSourceEventToCoordinator(new DvSplitsFinishedEvent(dvSplits));
+        }
     }
 
     @Override
