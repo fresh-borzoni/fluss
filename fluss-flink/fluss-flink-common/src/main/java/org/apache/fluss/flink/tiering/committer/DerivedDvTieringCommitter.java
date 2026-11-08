@@ -33,6 +33,7 @@ import org.apache.fluss.exception.LakeTableRolledBackException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.LakeBaseChangedException;
@@ -68,6 +69,8 @@ import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.PbDvKeyPosition;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.json.TableBucketOffsets;
 
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Gauge;
@@ -77,6 +80,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -88,6 +92,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -121,6 +126,13 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * ({@link LakeBaseChangedException}); the round then runs again and re-indexes the rewrite like one
  * before the round. A registered change from the base thus always covers its snapshot, also when a
  * crashed round's snapshot is registered later.
+ *
+ * <p>A lake that merges rows by primary key itself ({@link
+ * LakeTieringFactory#mergesByPrimaryKey()}, Paimon) takes no deletes. A round commits its data as
+ * usual and the lake committer reports the readable snapshot, which may lag the commit. The index
+ * follows the readable snapshots: a newly readable one is indexed from the files that became
+ * readable since the last indexed one, while the round is held. It is registered in Fluss only once
+ * its index change is in the chain. See {@link #commitMergingRound}.
  *
  * <p>Rounds run on the commit threads of the {@link TieringCommitOperator}. Rounds of different
  * tables run concurrently, at most one round of a table at a time. The state kept across rounds is
@@ -240,7 +252,11 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
             List<TableBucketWriteResult<WriteResult>> writeResults)
             throws Exception {
         return reportingRollback(
-                tableId, () -> commitRound(tableId, tablePath, tableInfo, writeResults, false));
+                tableId,
+                () ->
+                        lakeTieringFactory.mergesByPrimaryKey()
+                                ? commitMergingRound(tableId, tablePath, tableInfo, writeResults)
+                                : commitRound(tableId, tablePath, tableInfo, writeResults, false));
     }
 
     /**
@@ -263,6 +279,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
             List<RowPosResult> rowPosResults,
             List<TableBucketWriteResult<WriteResult>> writeResults)
             throws Exception {
+        @SuppressWarnings("unchecked")
+        Registration<Committable> registration = (Registration<Committable>) reindex.registration;
         // The readers skip the splits of a table dropped during the re-index. The change then
         // misses their parts, so it is not published.
         TableInfo tableInfo = admin.getTableInfo(reindex.tablePath).get();
@@ -281,7 +299,18 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 rowPosResults,
                 reindex.removedFiles,
                 reindex.startedAtMs,
-                true);
+                registration == null);
+        if (registration != null) {
+            // The round committed to the lake before it was held; it only registers now.
+            TieringCommitResult<Committable> result =
+                    register(tableId, reindex.tablePath, registration);
+            if (registration.committable == null) {
+                // A lost commit of an earlier round was registered instead of this round's.
+                throw lostCommitRegistered(
+                        reindex.tablePath, registration.result.getCommittedSnapshotId());
+            }
+            return Outcome.committed(result);
+        }
         // The round committed its own compaction before it was held.
         return commitRound(tableId, reindex.tablePath, tableInfo, writeResults, true);
     }
@@ -635,6 +664,470 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 "Derived DV: idle round of {} found no rewrite since snapshot {}.",
                 tablePath,
                 base.getSnapshotId());
+    }
+
+    /**
+     * Commits a round of a lake that merges rows by primary key (Paimon with deletion vectors).
+     *
+     * <p>The Paimon committer reports the readable snapshot and offsets. The readable snapshot R is
+     * the latest COMPACT snapshot. A bucket without level-0 files in R reads from its tiered offset
+     * at R. A bucket with level-0 files reads from the tiered offset of the last APPEND at or
+     * before the latest snapshot whose level-0 files of the bucket are exactly those its last
+     * compaction up to R moved up. If no such snapshot is found, R is not readable yet.
+     *
+     * <p>Paimon's deletion-vector read of R skips level 0 and keeps one live row per key. Every
+     * change of the bucket below its readable offset X is in levels 1 and up. The union read takes
+     * R's rows minus the masks (the rows of keys changed at or after X), plus the log from X with
+     * superseded versions masked. A key not changed since X has its state at X from the lake. A
+     * changed key has its latest version, or none if deleted, from the log only. A change at or
+     * after X that a compaction already moved up is masked too, as its key changed at or after X.
+     *
+     * <p>The round commits without deletes. If the readable snapshot moved to one the chain does
+     * not have, the files that became readable since the chain's end are indexed first, and the
+     * round is held while the tiering readers read them. The snapshot is registered in Fluss only
+     * after its change is in the chain, so a tablet server can always cover the readable snapshot.
+     * An APPEND only adds level-0 files and changes no index. The change is planned after the
+     * commit, from the readable files of the chain's end and of the readable snapshot. A compaction
+     * another engine committed during the round is thus part of it: unlike a round with deletes,
+     * nothing of it is relative to the round's base.
+     *
+     * <p>A round without data commits only if another engine compacted the table since the latest
+     * registered snapshot. It commits no data at the registered offsets, so the compaction becomes
+     * the readable snapshot and is indexed without waiting for a write. The registered snapshot
+     * thus stays a commit of this tiering, which tells a rollback of the lake table apart from the
+     * snapshot Fluss registered.
+     */
+    private Outcome<Committable> commitMergingRound(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            List<TableBucketWriteResult<WriteResult>> committableWriteResults)
+            throws Exception {
+        if (tableInfo.getTableId() != tableId) {
+            throw new IllegalStateException(
+                    String.format(
+                            "The current table id %s for table path %s is different from the table id %s in the committable. "
+                                    + "This usually happens when a table was dropped and recreated during tiering. "
+                                    + "Aborting commit to prevent dirty commit.",
+                            tableInfo.getTableId(), tablePath, tableId));
+        }
+        List<TableBucketWriteResult<WriteResult>> results =
+                withoutResultsOfDroppedPartitions(tablePath, tableInfo, committableWriteResults);
+        List<TableBucketWriteResult<WriteResult>> nonEmptyResults =
+                results.stream().filter(r -> r.writeResult() != null).collect(Collectors.toList());
+        try (LakeCommitter<WriteResult, Committable> lakeCommitter =
+                lakeTieringFactory.createLakeCommitter(
+                        new TieringCommitterInitContext(
+                                tablePath, tableInfo, lakeTieringConfig, flussConfig))) {
+            if (nonEmptyResults.isEmpty()) {
+                // The readable snapshot is computed on commits. After another engine compacted an
+                // idle table, a round commits the registered offsets again, without data, so the
+                // compaction becomes readable and is indexed without waiting for a write.
+                LakeSnapshot registered = getLatestLakeSnapshot(tablePath);
+                if (registered == null
+                        || !lakeCommitter.readableSnapshotMayAdvanceSince(
+                                registered.getSnapshotId())) {
+                    LOG.info(
+                            "Commit tiering write results is empty for table {} ({}).",
+                            tablePath,
+                            tableId);
+                    return Outcome.committed(new TieringCommitResult<>(null, null));
+                }
+                LOG.info(
+                        "Derived DV: idle round of {} found a compaction since snapshot {}; it"
+                                + " commits no data to make the compaction readable.",
+                        tablePath,
+                        registered.getSnapshotId());
+            }
+            Map<TableBucket, Long> logEndOffsets = new HashMap<>();
+            Map<TableBucket, Long> logMaxTieredTimestamps = new HashMap<>();
+            for (TableBucketWriteResult<WriteResult> writeResult : results) {
+                if (writeResult.logEndOffset() < 0) {
+                    continue;
+                }
+                logEndOffsets.put(writeResult.tableBucket(), writeResult.logEndOffset());
+                if (writeResult.maxTimestamp() >= 0) {
+                    logMaxTieredTimestamps.put(
+                            writeResult.tableBucket(), writeResult.maxTimestamp());
+                }
+            }
+            Committable committable =
+                    lakeCommitter.toCommittable(
+                            nonEmptyResults.stream()
+                                    .map(TableBucketWriteResult::writeResult)
+                                    .collect(Collectors.toList()));
+            RoundFiles round = new RoundFiles();
+            String offsetsFile;
+            Map<TableBucket, Long> tieredLogEndOffsets = new HashMap<>();
+            LakeSnapshot flussCurrentLakeSnapshot;
+            Reindex lostCommitReindex;
+            try {
+                flussCurrentLakeSnapshot = getLatestLakeSnapshot(tablePath);
+                if (flussCurrentLakeSnapshot != null) {
+                    lakeCommitter.checkCurrentSnapshotDescendsFrom(
+                            flussCurrentLakeSnapshot.getSnapshotId());
+                }
+                lostCommitReindex =
+                        registerLostCommit(
+                                tableId,
+                                tablePath,
+                                tableInfo,
+                                lakeCommitter,
+                                flussCurrentLakeSnapshot == null
+                                        ? null
+                                        : flussCurrentLakeSnapshot.getSnapshotId());
+            } catch (Exception e) {
+                cleanUpFailedRound(tableId, tablePath, lakeCommitter, committable, round);
+                throw e;
+            }
+            if (lostCommitReindex != null) {
+                // This round runs again on top of the lost commit once that is registered.
+                cleanUpFailedRound(tableId, tablePath, lakeCommitter, committable, round);
+                discardHandedOverIndex(indexStore(tableId, tablePath), nonEmptyResults);
+                return Outcome.held(lostCommitReindex);
+            }
+            try {
+                if (lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
+                        && lakeTieringFactory.supportsPartitionMarkDone()) {
+                    preparePartitionMarkDone(lakeCommitter, committable);
+                }
+                if (flussCurrentLakeSnapshot != null) {
+                    tieredLogEndOffsets.putAll(
+                            withoutDroppedPartitions(
+                                    tablePath, flussCurrentLakeSnapshot.getTableBucketsOffset()));
+                }
+                tieredLogEndOffsets.putAll(logEndOffsets);
+                // The offsets file lists every bucket, so dropped partitions' offsets end here.
+                offsetsFile =
+                        flussTableLakeSnapshotCommitter.prepareCompleteLakeSnapshot(
+                                tableId, tablePath, tieredLogEndOffsets);
+                round.offsetsFile = offsetsFile;
+                // No base fence guards a merging commit. A round of a table taken from this
+                // service would commit its older rows on top of the new owner's round.
+                flussTableLakeSnapshotCommitter.checkTieringEpoch(tableId);
+            } catch (Exception e) {
+                cleanUpFailedRound(tableId, tablePath, lakeCommitter, committable, round);
+                throw e;
+            }
+            long t0 = System.currentTimeMillis();
+            Map<String, String> snapshotProperties = new HashMap<>();
+            snapshotProperties.put(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, offsetsFile);
+            FormatVersions.putSnapshotVersion(snapshotProperties);
+            // Records the registered snapshot the commit descends from, so a commit that raced a
+            // rollback of the lake table is told apart from the registered snapshot it replaced.
+            snapshotProperties.put(
+                    DERIVED_BASE_PROPERTY,
+                    String.valueOf(
+                            flussCurrentLakeSnapshot == null
+                                    ? -1L
+                                    : flussCurrentLakeSnapshot.getSnapshotId()));
+            // The outcome of a failed commit is unknown, so its files are kept.
+            LakeCommitResult result =
+                    lakeCommitter.commit(
+                            committable,
+                            new LakeCommitter.CommitContext(
+                                    snapshotProperties, tieredLogEndOffsets));
+            lastLakeCommitMs = System.currentTimeMillis() - t0;
+            if (flussCurrentLakeSnapshot != null) {
+                // A rollback during the round leaves the commit on the rolled-back table. The
+                // commit is not registered, and the next rounds stop until the rollback is undone.
+                lakeCommitter.checkCurrentSnapshotDescendsFrom(
+                        flussCurrentLakeSnapshot.getSnapshotId());
+            }
+            rounds.inc();
+            Registration<Committable> registration =
+                    new Registration<>(
+                            result,
+                            offsetsFile,
+                            logEndOffsets,
+                            logMaxTieredTimestamps,
+                            committable);
+            Reindex reindex =
+                    indexReadableSnapshot(
+                            tableId, tablePath, tableInfo, registration, nonEmptyResults);
+            if (reindex != null) {
+                return Outcome.held(reindex);
+            }
+            return Outcome.committed(register(tableId, tablePath, registration));
+        }
+    }
+
+    /**
+     * Brings the chain up to the readable snapshot of a merging round's commit. Returns the
+     * re-index the round waits for, or null when the round can register: the chain has the readable
+     * snapshot now, or there is none.
+     */
+    @Nullable
+    @SuppressWarnings("unchecked")
+    private Reindex indexReadableSnapshot(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            Registration<Committable> registration,
+            List<TableBucketWriteResult<WriteResult>> results)
+            throws Exception {
+        LakeCommitResult result = registration.result;
+        Long readable =
+                result.committedIsReadable()
+                        ? Long.valueOf(result.getCommittedSnapshotId())
+                        : result.getReadableSnapshot() == null
+                                ? null
+                                : result.getReadableSnapshot().getReadableSnapshotId();
+        PositionIndexStore store = indexStore(tableId, tablePath);
+        if (readable == null) {
+            discardHandedOverIndex(store, results);
+            return null;
+        }
+        List<PositionIndexStore.ChainEntry> chain = store.chain();
+        for (PositionIndexStore.ChainEntry e : chain) {
+            if (e.snapshotId == readable) {
+                // nothing newly readable, so the compactions' positions have no change to make
+                discardHandedOverIndex(store, results);
+                return null;
+            }
+        }
+        long base = chain.isEmpty() ? -1L : chain.get(chain.size() - 1).snapshotId;
+        LakeSource<?> lakeSource =
+                lakeTieringFactory.createLakeSource(tableInfo.getLakeTablePath());
+        checkState(
+                lakeSource != null,
+                "Lake tiering factory %s merges by primary key but creates no lake source.",
+                lakeTieringFactory.getClass().getName());
+        return planIndexChange(
+                tableId,
+                tablePath,
+                (LakeSource<LakeSplit>) lakeSource,
+                store,
+                base,
+                readable,
+                registration,
+                results);
+    }
+
+    @Nullable
+    private <Split extends LakeSplit> Reindex planIndexChange(
+            long tableId,
+            TablePath tablePath,
+            LakeSource<Split> lakeSource,
+            PositionIndexStore store,
+            long base,
+            long readable,
+            Registration<Committable> registration,
+            List<TableBucketWriteResult<WriteResult>> results)
+            throws Exception {
+        long t0 = System.currentTimeMillis();
+        DataDeltaPlan<Split> plan = lakeSource.planRewrite(base, readable);
+        Map<String, Long> partitionIds = Collections.emptyMap();
+        if (plan != null) {
+            partitionIds = partitionIds(tablePath, plan);
+            plan = withoutFilesOfDroppedPartitions(tablePath, plan, partitionIds);
+        }
+        long changeId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+        if (plan == null || plan.getSplits().isEmpty()) {
+            // Nothing to read, e.g. a compaction whose output has no rows: publish at once.
+            discardHandedOverIndex(store, results);
+            publishReindex(
+                    tableId,
+                    tablePath,
+                    base,
+                    readable,
+                    changeId,
+                    Collections.emptyList(),
+                    plan == null ? null : plan.getDeletedFiles(),
+                    t0,
+                    false);
+            return null;
+        }
+        checkState(
+                plan.getCompactSnapshotId() == readable,
+                "Planned the index of snapshot %s instead of the readable snapshot %s.",
+                plan.getCompactSnapshotId(),
+                readable);
+        if (publishHandedOverIndex(tablePath, store, plan, base, readable, results)) {
+            return null;
+        }
+        int firstFileId = store.allocateFileIds(plan.getSplits().size());
+        FsPath lakeDir =
+                FlussPaths.remoteLakeTableSnapshotDir(
+                        FlussConfigUtils.getDefaultRemoteDataDir(flussConfig), tablePath, tableId);
+        Reindex reindex =
+                planReindexScan(
+                        tableId,
+                        tablePath,
+                        lakeSource,
+                        plan,
+                        partitionIds,
+                        firstFileId,
+                        lakeDir,
+                        base,
+                        changeId,
+                        registration);
+        LOG.info(
+                "Derived DV: readable snapshot {} of {} has {} new readable files since snapshot {}"
+                        + " ({} left); indexing them on the tiering readers.",
+                readable,
+                tablePath,
+                plan.getSplits().size(),
+                base,
+                plan.getDeletedFiles().values().stream()
+                        .flatMap(m -> m.values().stream())
+                        .mapToInt(List::size)
+                        .sum());
+        return reindex;
+    }
+
+    /**
+     * Publishes the index change of a merging round's newly readable snapshot from the positions
+     * the round's compactions in the tiering writers handed over ({@link CompactionIndexPart}),
+     * instead of re-indexing the snapshot's new files. In every bucket, the compactions must have
+     * written exactly the files that became readable since the chain's end and replaced exactly
+     * those that left it. Otherwise returns false and the files are re-indexed, e.g. for another
+     * engine's compaction, one without a hand-off, or an earlier round's files not yet indexed.
+     */
+    private <Split extends LakeSplit> boolean publishHandedOverIndex(
+            TablePath tablePath,
+            PositionIndexStore store,
+            DataDeltaPlan<Split> plan,
+            long base,
+            long readable,
+            List<TableBucketWriteResult<WriteResult>> results) {
+        Map<TableBucket, CompactionIndexPart> parts = new HashMap<>();
+        // partition name (null if unpartitioned) -> bucket id -> bucket
+        Map<String, Map<Integer, TableBucket>> buckets = new HashMap<>();
+        Set<Long> changeIds = new HashSet<>();
+        String reason = null;
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            Object wr = r.writeResult();
+            if (!(wr instanceof CompactionIndexPartProvider)
+                    || !((CompactionIndexPartProvider) wr).compacted()) {
+                continue;
+            }
+            CompactionIndexPart part = ((CompactionIndexPartProvider) wr).compactionIndexPart();
+            if (part == null) {
+                reason = "a compacted bucket handed no positions over";
+                continue;
+            }
+            parts.put(r.tableBucket(), part);
+            changeIds.add(part.changeId());
+            buckets.computeIfAbsent(r.partitionName(), k -> new HashMap<>())
+                    .put(r.tableBucket().getBucket(), r.tableBucket());
+        }
+        if (parts.isEmpty() && reason == null) {
+            return false; // no compaction of this round
+        }
+        if (reason == null && changeIds.size() > 1) {
+            reason = "the compactions handed over different changes";
+        }
+        if (reason == null) {
+            Map<TableBucket, Set<String>> added = new HashMap<>();
+            for (Split split : plan.getSplits()) {
+                String partitionName = partitionName(split);
+                TableBucket tb =
+                        buckets.getOrDefault(partitionName, Collections.emptyMap())
+                                .get(split.bucket());
+                if (tb == null) {
+                    reason =
+                            "files of bucket "
+                                    + split.bucket()
+                                    + " of partition "
+                                    + partitionName
+                                    + " became readable that no compaction of the round wrote";
+                    break;
+                }
+                added.computeIfAbsent(tb, k -> new HashSet<>()).add(split.fileName());
+            }
+            Map<TableBucket, Set<String>> removed = new HashMap<>();
+            for (Map.Entry<String, Map<Integer, List<String>>> pe :
+                    plan.getDeletedFiles().entrySet()) {
+                for (Map.Entry<Integer, List<String>> be : pe.getValue().entrySet()) {
+                    TableBucket tb =
+                            buckets.getOrDefault(pe.getKey(), Collections.emptyMap())
+                                    .get(be.getKey());
+                    if (tb == null) {
+                        reason =
+                                "files of bucket "
+                                        + be.getKey()
+                                        + " of partition "
+                                        + pe.getKey()
+                                        + " left the readable snapshot that no compaction of"
+                                        + " the round replaced";
+                        break;
+                    }
+                    removed.computeIfAbsent(tb, k -> new HashSet<>()).addAll(be.getValue());
+                }
+            }
+            for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {
+                if (reason != null) {
+                    break;
+                }
+                TableBucket tb = e.getKey();
+                if (!new HashSet<>(e.getValue().addedFiles().values())
+                                .equals(added.getOrDefault(tb, Collections.emptySet()))
+                        || !new HashSet<>(e.getValue().removedFiles())
+                                .equals(removed.getOrDefault(tb, Collections.emptySet()))) {
+                    reason =
+                            "the files the compaction of "
+                                    + tb
+                                    + " wrote or replaced are not those of readable snapshot "
+                                    + readable;
+                }
+            }
+        }
+        if (reason == null) {
+            long changeId = changeIds.iterator().next();
+            try {
+                long t0 = System.currentTimeMillis();
+                String identity = snapshotIdentity(tablePath, readable);
+                store.commitChange(changeId, assignFileIds(store, changeId, parts));
+                store.register(base, readable, changeId, identity);
+                compactionHandOffs.inc();
+                LOG.info(
+                        "Derived DV: the compactions of {} in the tiering writers handed the"
+                                + " positions of readable snapshot {} to index change {} ({}"
+                                + " buckets, no re-index), published in {} ms.",
+                        tablePath,
+                        readable,
+                        changeId,
+                        parts.size(),
+                        System.currentTimeMillis() - t0);
+                return true;
+            } catch (Exception e) {
+                reason = "publishing failed: " + e;
+            }
+        }
+        LOG.info(
+                "Derived DV: readable snapshot {} of {} is re-indexed from the lake: {}.",
+                readable,
+                tablePath,
+                reason);
+        for (long changeId : changeIds) {
+            try {
+                store.abortChange(changeId);
+            } catch (Exception e) {
+                LOG.debug("Derived DV: could not delete index change {}.", changeId, e);
+            }
+        }
+        return false;
+    }
+
+    /** Deletes the positions the round's compactions handed over, which no change publishes. */
+    private void discardHandedOverIndex(
+            PositionIndexStore store, List<TableBucketWriteResult<WriteResult>> results) {
+        Set<Long> changeIds = new HashSet<>();
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            Object wr = r.writeResult();
+            if (wr instanceof CompactionIndexPartProvider
+                    && ((CompactionIndexPartProvider) wr).compactionIndexPart() != null) {
+                changeIds.add(((CompactionIndexPartProvider) wr).compactionIndexPart().changeId());
+            }
+        }
+        for (long changeId : changeIds) {
+            try {
+                store.abortChange(changeId);
+            } catch (Exception e) {
+                LOG.debug("Derived DV: could not delete index change {}.", changeId, e);
+            }
+        }
     }
 
     /**
@@ -1551,7 +2044,11 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         }
         PositionIndexStore store = indexStore(tableId, tablePath);
         store.commitChange(changeId, published);
-        store.register(baseSnapshotId, compactSnapshotId, changeId);
+        store.register(
+                baseSnapshotId,
+                compactSnapshotId,
+                changeId,
+                snapshotIdentity(tablePath, compactSnapshotId));
         if (registerInFluss) {
             registerSnapshot(
                     tableId, tablePath, compactSnapshotId, getLatestLakeSnapshot(tablePath));
@@ -1568,6 +2065,22 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 replaced,
                 lastReindexMs,
                 System.currentTimeMillis() - t0);
+    }
+
+    /**
+     * Returns the identity of the lake commit that is snapshot {@code snapshotId} for a lake that
+     * reuses snapshot ids after a rollback (Paimon), or null for other lakes. Union reads use it to
+     * tell a reused id from the snapshot the chain covers.
+     */
+    @Nullable
+    private String snapshotIdentity(TablePath tablePath, long snapshotId) throws Exception {
+        if (!lakeTieringFactory.mergesByPrimaryKey()) {
+            return null;
+        }
+        LakeSource<?> lakeSource =
+                lakeTieringFactory.createLakeSource(
+                        admin.getTableInfo(tablePath).get().getLakeTablePath());
+        return lakeSource == null ? null : lakeSource.snapshotIdentity(snapshotId);
     }
 
     /**
@@ -1671,6 +2184,43 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
     }
 
     /**
+     * Returns the result of a merging round's lake commit, keeping the registered snapshots the
+     * chain needs as well as those the lake committer asked to keep. Lakes that merge by key number
+     * their snapshots in commit order, so the smaller id is the earlier one.
+     */
+    private LakeCommitResult keepingIndexedSnapshots(
+            long tableId, TablePath tablePath, LakeCommitResult result) throws Exception {
+        LakeCommitResult.ReadableSnapshot readable = result.getReadableSnapshot();
+        Long lakeKeeps = result.getEarliestSnapshotIDToKeep();
+        if (readable == null
+                || result.committedIsReadable()
+                || LakeCommitResult.KEEP_ALL_PREVIOUS.equals(lakeKeeps)) {
+            return result;
+        }
+        Long indexKeeps = earliestSnapshotToKeep(tableId, tablePath);
+        // Both are null on the first readable snapshot of a table; a conditional expression of
+        // Long and long would unbox them.
+        Long keep;
+        if (indexKeeps == null) {
+            keep = lakeKeeps;
+        } else if (lakeKeeps == null) {
+            keep = indexKeeps;
+        } else {
+            keep = Math.min(lakeKeeps, indexKeeps);
+        }
+        if (Objects.equals(keep, lakeKeeps)) {
+            return result;
+        }
+        return LakeCommitResult.withReadableSnapshot(
+                result.getCommittedSnapshotId(),
+                readable.getReadableSnapshotId(),
+                readable.getTieredLogEndOffsets(),
+                readable.getReadableLogEndOffsets(),
+                keep,
+                result.getTieringStats());
+    }
+
+    /**
      * Plans the re-index of files rewritten since the base and returns if nothing was rewritten.
      * Otherwise throws {@link ReindexPending}: with the {@link Reindex} the round waits for, or
      * without one if the re-index is already published.
@@ -1751,7 +2301,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                         firstFileId,
                         lakeDir,
                         base.getSnapshotId(),
-                        changeId);
+                        changeId,
+                        null);
         LOG.info(
                 "Derived DV: {} files of {} rewritten since snapshot {}; re-indexing snapshot {} on the tiering readers.",
                 plan.getSplits().size(),
@@ -1779,7 +2330,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
             int firstFileId,
             FsPath lakeDir,
             long baseSnapshotId,
-            long changeId)
+            long changeId,
+            @Nullable Registration<Committable> registration)
             throws IOException {
         SimpleVersionedSerializer<Split> splitSerializer = lakeSource.getSplitSerializer();
         int filesPerSplit =
@@ -1861,7 +2413,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 plan.getDeletedFiles(),
                 requests,
                 splits.size(),
-                System.currentTimeMillis());
+                System.currentTimeMillis(),
+                registration);
     }
 
     /**
@@ -2068,7 +2621,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
 
     /**
      * Registers a lake snapshot a previous attempt committed but did not register, and fails the
-     * round so it runs again on top of it. The caller deletes the round's files.
+     * round so it runs again on top of it. The caller deletes the round's files. Used for lakes
+     * that take deletes; a merging round registers a lost commit with {@link #registerLostCommit}.
      */
     private void checkFlussNotMissingLakeSnapshot(
             TablePath tablePath,
@@ -2167,6 +2721,76 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         return missingCommittedSnapshot;
     }
 
+    /**
+     * Registers the lake commit of an earlier merging round that was lost before it registered it,
+     * e.g. because the job failed over while the round was held. It registers the commit as that
+     * round would have: with its readable snapshot, once the chain has that snapshot. Registering
+     * it without one would leave the readable snapshot behind until a later round's compaction, and
+     * for good if the table stays idle. Fails this round once the commit is registered, so the
+     * round runs again on top of it. Returns the re-index the registration waits for, which this
+     * round is held for instead, or null if no commit is unregistered.
+     */
+    @Nullable
+    private Reindex registerLostCommit(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            @Nullable Long flussCurrentLakeSnapshot)
+            throws Exception {
+        CommittedLakeSnapshot lost =
+                unregisteredCommit(tablePath, tableId, lakeCommitter, flussCurrentLakeSnapshot);
+        if (lost == null) {
+            return null;
+        }
+        // Not registered if the lake table was rolled back past it.
+        lakeCommitter.checkCurrentSnapshotDescendsFrom(lost.getLakeSnapshotId());
+        String offsetsFile =
+                lost.getSnapshotProperties().get(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY);
+        LakeCommitResult result =
+                lakeCommitter.getCommitResult(
+                        lost.getLakeSnapshotId(), readOffsets(new FsPath(offsetsFile)));
+        if (result == null) {
+            result = LakeCommitResult.unknownReadableSnapshot(lost.getLakeSnapshotId(), null);
+        }
+        Registration<Committable> registration =
+                new Registration<>(
+                        result, offsetsFile, Collections.emptyMap(), Collections.emptyMap(), null);
+        Reindex reindex =
+                indexReadableSnapshot(
+                        tableId, tablePath, tableInfo, registration, Collections.emptyList());
+        if (reindex != null) {
+            LOG.warn(
+                    "Derived DV: lake snapshot {} of {} was committed by a round lost before it"
+                            + " registered it; this round registers it once its readable"
+                            + " snapshot {} is indexed, and runs again after.",
+                    lost.getLakeSnapshotId(),
+                    tablePath,
+                    reindex.compactSnapshotId);
+            return reindex;
+        }
+        register(tableId, tablePath, registration);
+        throw lostCommitRegistered(tablePath, lost.getLakeSnapshotId());
+    }
+
+    private static IllegalStateException lostCommitRegistered(
+            TablePath tablePath, long snapshotId) {
+        return new IllegalStateException(
+                String.format(
+                        "Derived DV: registered lake snapshot %d of %s, which a round lost before"
+                                + " registering it had committed; this round runs again on top"
+                                + " of it.",
+                        snapshotId, tablePath));
+    }
+
+    private static Map<TableBucket, Long> readOffsets(FsPath offsetsFile) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (FSDataInputStream in = offsetsFile.getFileSystem().open(offsetsFile)) {
+            IOUtils.copyBytes(in, bytes, false);
+        }
+        return TableBucketOffsets.fromJsonBytes(bytes.toByteArray()).getOffsets();
+    }
+
     @SuppressWarnings("unchecked")
     private void preparePartitionMarkDone(
             LakeCommitter<WriteResult, Committable> lakeCommitter, Committable committable)
@@ -2177,6 +2801,73 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 lakeTieringFactory.getClass().getName());
         ((PartitionMarkDoneCommitter<WriteResult, Committable>) lakeCommitter)
                 .preparePartitionMarkDone(committable);
+    }
+
+    /**
+     * Registers a merging round's lake commit in Fluss; its readable snapshot is in the index chain
+     * by now.
+     */
+    private TieringCommitResult<Committable> register(
+            long tableId, TablePath tablePath, Registration<Committable> registration)
+            throws Exception {
+        LakeCommitResult result = registration.result;
+        if (result.committedIsReadable()) {
+            protectReadableSnapshot(tablePath, result.getCommittedSnapshotId());
+        } else if (result.getReadableSnapshot() != null) {
+            protectReadableSnapshot(
+                    tablePath, result.getReadableSnapshot().getReadableSnapshotId());
+        }
+        flussTableLakeSnapshotCommitter.commit(
+                tableId,
+                tablePath,
+                keepingIndexedSnapshots(tableId, tablePath, result),
+                registration.offsetsFile,
+                registration.logEndOffsets,
+                registration.logMaxTieredTimestamps);
+        LakeCommitResult.ReadableSnapshot readable = result.getReadableSnapshot();
+        if (readable != null) {
+            maybeTrimIndexChain(
+                    tableId,
+                    tablePath,
+                    indexStore(tableId, tablePath),
+                    withoutDroppedPartitions(tablePath, readable.getReadableLogEndOffsets()));
+        }
+        LOG.info(
+                "Derived DV merging round {}: lake snapshot {}, readable snapshot {}.",
+                tablePath,
+                result.getCommittedSnapshotId(),
+                result.committedIsReadable()
+                        ? String.valueOf(result.getCommittedSnapshotId())
+                        : readable == null
+                                ? "unchanged"
+                                : String.valueOf(readable.getReadableSnapshotId()));
+        return new TieringCommitResult<>(registration.committable, result.getTieringStats());
+    }
+
+    /**
+     * A merging round committed to the lake, registered in Fluss once its readable snapshot is
+     * indexed.
+     */
+    static final class Registration<Committable> {
+        final LakeCommitResult result;
+        final String offsetsFile;
+        final Map<TableBucket, Long> logEndOffsets;
+        final Map<TableBucket, Long> logMaxTieredTimestamps;
+        // null for the lost commit of an earlier round
+        @Nullable final Committable committable;
+
+        private Registration(
+                LakeCommitResult result,
+                String offsetsFile,
+                Map<TableBucket, Long> logEndOffsets,
+                Map<TableBucket, Long> logMaxTieredTimestamps,
+                @Nullable Committable committable) {
+            this.result = result;
+            this.offsetsFile = offsetsFile;
+            this.logEndOffsets = logEndOffsets;
+            this.logMaxTieredTimestamps = logMaxTieredTimestamps;
+            this.committable = committable;
+        }
     }
 
     /** The outcome of a round: committed, or held until a re-index is done. */
@@ -2224,6 +2915,9 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         // one result per split
         final int expectedResults;
         final long startedAtMs;
+        // The registration of a round that committed to the lake before it was held, or null if
+        // the round commits once the re-index is published.
+        @Nullable final Registration<?> registration;
 
         private Reindex(
                 TablePath tablePath,
@@ -2233,7 +2927,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 @Nullable Map<String, Map<Integer, List<String>>> removedFiles,
                 List<RowPosRequestEvent> requests,
                 int expectedResults,
-                long startedAtMs) {
+                long startedAtMs,
+                @Nullable Registration<?> registration) {
             this.tablePath = tablePath;
             this.baseSnapshotId = baseSnapshotId;
             this.compactSnapshotId = compactSnapshotId;
@@ -2242,6 +2937,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
             this.requests = requests;
             this.expectedResults = expectedResults;
             this.startedAtMs = startedAtMs;
+            this.registration = registration;
         }
     }
 

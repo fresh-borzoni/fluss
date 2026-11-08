@@ -544,22 +544,30 @@ class DvTableReadableSnapshotRetrieverTest {
                 .rootCause()
                 .isInstanceOf(LakeTableSnapshotNotExistException.class);
 
-        // Step 9: Compact bucket2 only. Bucket0 still has L0 from snapshot12, so resolving its
-        // readable offset needs the deleted snapshot6. Readable advancement pauses.
+        // Step 9: Compact bucket2 only. Bucket0 still has L0 from snapshot12, and the registration
+        // of snapshot6, where its last flush ended, is deleted. Its offset in the registered
+        // readable snapshot11 still holds, as compactions only move files up, so the readable
+        // snapshot advances.
         compactHelper.compactBucket(bucket2).commit();
+        long snapshot13 = latestSnapshot(fileStoreTable);
         long snapshot14 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
         readableSnapshotAndOffsets =
                 retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot14);
-        assertThat(readableSnapshotAndOffsets).isNull();
-        commitSnapshot(tableId, tablePath, snapshot14, Collections.emptyMap(), null);
+        assertThat(readableSnapshotAndOffsets).isNotNull();
+        assertThat(readableSnapshotAndOffsets.getReadableSnapshotId()).isEqualTo(snapshot13);
+        expectedReadableOffsets.put(tb2, 11L);
+        assertThat(readableSnapshotAndOffsets.getReadableOffsets())
+                .isEqualTo(expectedReadableOffsets);
+        commitSnapshot(
+                tableId, tablePath, snapshot14, Collections.emptyMap(), readableSnapshotAndOffsets);
         assertThat(flussAdmin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
                 .isEqualTo(snapshot14);
         assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getSnapshotId())
-                .isEqualTo(snapshot11);
+                .isEqualTo(snapshot13);
         assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getTableBucketsOffset())
                 .isEqualTo(expectedReadableOffsets);
 
-        // Another APPEND alone cannot recover the missing flush offsets.
+        // Snapshot13 is registered, so another APPEND does not recompute it.
         long snapshot15 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
         assertThat(retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot15))
                 .isNull();

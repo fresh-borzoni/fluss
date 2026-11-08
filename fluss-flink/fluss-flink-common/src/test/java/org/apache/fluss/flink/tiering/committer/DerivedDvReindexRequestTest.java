@@ -225,7 +225,8 @@ class DerivedDvReindexRequestTest {
                 firstFileId,
                 new FsPath(tempDir.toUri().toString()),
                 41L,
-                99L);
+                99L,
+                null);
     }
 
     private static DerivedDvTieringCommitter<Object, Object> committer(Configuration flussConfig) {

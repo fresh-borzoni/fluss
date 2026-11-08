@@ -518,6 +518,50 @@ public class PaimonConversions {
                 .getCustomProperties()
                 .forEach((k, v) -> setFlussPropertyToPaimon(k, v, options));
 
+        // Deletion vector masks index the rows of Paimon's deletion-vector reads, which skip
+        // level-0 files and return one live row per key.
+        if (Configuration.fromMap(tableDescriptor.getProperties())
+                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            if (options.containsKey(CoreOptions.DELETION_VECTORS_ENABLED.key())
+                    && !options.get(CoreOptions.DELETION_VECTORS_ENABLED)) {
+                throw new InvalidTableException(
+                        String.format(
+                                "'%s' requires Paimon option '%s' = true.",
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                CoreOptions.DELETION_VECTORS_ENABLED.key()));
+            }
+            options.set(CoreOptions.DELETION_VECTORS_ENABLED, true);
+            // The tiered changelog holds rows that Fluss's merge engine, whichever it is, already
+            // merged. Only deduplicate keeps the last of them as written.
+            CoreOptions.MergeEngine mergeEngine = options.get(CoreOptions.MERGE_ENGINE);
+            if (mergeEngine != CoreOptions.MergeEngine.DEDUPLICATE) {
+                throw new InvalidTableException(
+                        String.format(
+                                "'%s' requires Paimon option '%s' = '%s', but it is '%s'. Fluss"
+                                        + " tiers the rows its own merge engine produced, and"
+                                        + " union reads take the lake's row of every key the log"
+                                        + " has not changed since, so Paimon must keep the last"
+                                        + " row of each key as written instead of merging the"
+                                        + " rows again.",
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                CoreOptions.MERGE_ENGINE.key(),
+                                CoreOptions.MergeEngine.DEDUPLICATE,
+                                mergeEngine));
+            }
+            // With a sequence field, deduplicate keeps the row with the largest sequence value,
+            // which need not be the last row Fluss tiered.
+            if (options.containsKey(CoreOptions.SEQUENCE_FIELD.key())) {
+                throw new InvalidTableException(
+                        String.format(
+                                "'%s' does not support Paimon option '%s'. Paimon would keep the"
+                                        + " row of each key with the largest sequence value"
+                                        + " instead of the last row Fluss tiered, which union"
+                                        + " reads take.",
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                CoreOptions.SEQUENCE_FIELD.key()));
+            }
+        }
+
         // #4102: newly created lake tables are always clean (system columns are rejected above), so
         // a lake-enabled table must advertise its LakeStream state to Paimon.
         if (isDataLakeEnabled(tableDescriptor)) {

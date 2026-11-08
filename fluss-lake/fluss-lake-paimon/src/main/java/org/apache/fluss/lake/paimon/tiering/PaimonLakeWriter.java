@@ -19,12 +19,15 @@ package org.apache.fluss.lake.paimon.tiering;
 
 import org.apache.fluss.lake.batch.ArrowRecordBatch;
 import org.apache.fluss.lake.batch.RecordBatch;
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.paimon.tiering.append.AppendOnlyWriter;
 import org.apache.fluss.lake.paimon.tiering.mergetree.MergeTreeWriter;
 import org.apache.fluss.lake.paimon.utils.PaimonUtils;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.types.RowType;
@@ -32,13 +35,19 @@ import org.apache.fluss.types.RowType;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
@@ -46,13 +55,19 @@ import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 /** Implementation of {@link LakeWriter} for Paimon. */
 public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, SupportsRecordBatchWrite {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PaimonLakeWriter.class);
+
     private final Catalog paimonCatalog;
     private final RecordWriter<?> recordWriter;
+    // hands the positions of a compaction to the index of a table with deletion vectors, or null
+    @Nullable private final PaimonCompactionIndexWriter compactionIndexWriter;
+    private final TableBucket tableBucket;
 
     public PaimonLakeWriter(
             PaimonCatalogProvider paimonCatalogProvider, WriterInitContext writerInitContext)
             throws IOException {
         this.paimonCatalog = paimonCatalogProvider.get();
+        this.tableBucket = writerInitContext.tableBucket();
         // Only Fixed Bucket tables (bucket keys non-empty) carry a positive BUCKET in Paimon.
         // Overriding on an Unaware Bucket table (BUCKET = -1) would change its bucket mode.
         // The context always resolves the actual bucket count.
@@ -96,6 +111,35 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
                                 writerInitContext.ioTmpDirs(),
                                 paimonIncludingSystemColumns,
                                 historicalPartition);
+        boolean autoCompaction =
+                writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction();
+        this.compactionIndexWriter =
+                writerInitContext.tableInfo().isDeletionVectorsEnabled()
+                                && autoCompaction
+                                && !historicalPartition
+                                && !fileStoreTable.primaryKeys().isEmpty()
+                                && writerInitContext.positionIndexDir() != null
+                        ? new PaimonCompactionIndexWriter(
+                                fileStoreTable,
+                                writerInitContext.tableInfo(),
+                                writerInitContext.tableBucket(),
+                                writerInitContext.partition() == null || partitionKeys.isEmpty()
+                                        ? Collections.emptyList()
+                                        : ResolvedPartitionSpec.fromPartitionName(
+                                                        partitionKeys,
+                                                        writerInitContext.partition())
+                                                .getPartitionValues(),
+                                writerInitContext.positionIndexDir(),
+                                writerInitContext.tieringRoundTimestamp(),
+                                localTmpDir(writerInitContext.ioTmpDirs()))
+                        : null;
+    }
+
+    @Nullable
+    private static File localTmpDir(@Nullable String[] ioTmpDirs) {
+        return ioTmpDirs == null || ioTmpDirs.length == 0
+                ? null
+                : new File(ioTmpDirs[ThreadLocalRandom.current().nextInt(ioTmpDirs.length)], "dv");
     }
 
     @Override
@@ -128,11 +172,29 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
 
     @Override
     public PaimonWriteResult complete() throws IOException {
+        List<CommitMessage> messages;
         try {
-            return new PaimonWriteResult(recordWriter.complete());
+            messages = recordWriter.complete();
         } catch (Exception e) {
             throw new IOException("Failed to complete Paimon write.", e);
         }
+        if (compactionIndexWriter == null || !PaimonCompactionIndexWriter.compacted(messages)) {
+            return new PaimonWriteResult(messages);
+        }
+        // The compaction's positions go to the index with the round, so the committer does not
+        // re-index the files it wrote. If the hand-off fails, it re-indexes them, as for another
+        // engine's compaction.
+        CompactionIndexPart part = null;
+        try {
+            part = compactionIndexWriter.handOff(messages);
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not hand the positions of the Paimon compaction of {} to the index;"
+                            + " its files are re-indexed.",
+                    tableBucket,
+                    e);
+        }
+        return new PaimonWriteResult(messages, true, part);
     }
 
     @Override

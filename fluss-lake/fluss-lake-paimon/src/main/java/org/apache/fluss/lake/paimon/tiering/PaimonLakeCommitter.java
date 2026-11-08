@@ -30,6 +30,8 @@ import org.apache.fluss.lake.paimon.tiering.markdone.PaimonPartitionMarkDone;
 import org.apache.fluss.lake.paimon.tiering.markdone.PartitionMarkDoneState;
 import org.apache.fluss.lake.paimon.tiering.markdone.PartitionMarkDoneStateJsonSerde;
 import org.apache.fluss.lake.paimon.utils.DvTableReadableSnapshotRetriever;
+import org.apache.fluss.lake.paimon.utils.PaimonSnapshotLineage;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 
@@ -37,6 +39,8 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.consumer.Consumer;
+import org.apache.paimon.consumer.ConsumerManager;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.TableSnapshot;
@@ -80,6 +84,11 @@ public class PaimonLakeCommitter
     private TableCommitImpl tableCommit;
 
     private static final ThreadLocal<Long> currentCommitSnapshotId = new ThreadLocal<>();
+
+    /** The consumer whose next snapshot is the readable snapshot Fluss registers. */
+    public static final String READABLE_CONSUMER = "fluss-readable";
+    /** The consumer whose next snapshot is the readable snapshot Fluss registered before. */
+    public static final String PREVIOUS_READABLE_CONSUMER = "fluss-readable-previous";
 
     public PaimonLakeCommitter(
             PaimonCatalogProvider paimonCatalogProvider, CommitterInitContext committerInitContext)
@@ -129,44 +138,60 @@ public class PaimonLakeCommitter
 
             // Collect cumulative table stats from the exact snapshot that was just committed.
             TieringStats stats = computeTableStats();
-
-            // deletion vector is disabled, committed snapshot is readable
-            if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
-                return LakeCommitResult.committedIsReadable(committedSnapshotId, stats);
-            } else {
-                // retrieve the readable snapshot during commit
-                try (DvTableReadableSnapshotRetriever retriever =
-                        new DvTableReadableSnapshotRetriever(
-                                tablePath, tableId, fileStoreTable, flussClientConfig)) {
-                    DvTableReadableSnapshotRetriever.ReadableSnapshotResult readableSnapshotResult =
-                            retriever.getReadableSnapshotAndOffsets(
-                                    committedSnapshotId, context.tieredLogEndOffsets());
-                    if (readableSnapshotResult == null) {
-                        return LakeCommitResult.unknownReadableSnapshot(committedSnapshotId, stats);
-                    } else {
-                        Long earliestSnapshotIdToKeep =
-                                readableSnapshotResult.getEarliestSnapshotIdToKeep();
-                        if (earliestSnapshotIdToKeep != null && earliestSnapshotIdToKeep >= 0) {
-                            LOG.info(
-                                    "earliest snapshot ID to keep for table {} is {}. "
-                                            + "Snapshots before this ID can be safely deleted from Fluss.",
-                                    tablePath,
-                                    earliestSnapshotIdToKeep);
-                        }
-                        return LakeCommitResult.withReadableSnapshot(
-                                committedSnapshotId,
-                                readableSnapshotResult.getReadableSnapshotId(),
-                                readableSnapshotResult.getTieredOffsets(),
-                                readableSnapshotResult.getReadableOffsets(),
-                                earliestSnapshotIdToKeep,
-                                stats);
-                    }
-                }
-            }
+            return commitResult(committedSnapshotId, context.tieredLogEndOffsets(), stats);
         } catch (Throwable t) {
             throw new IOException(t);
         } finally {
             currentCommitSnapshotId.remove();
+        }
+    }
+
+    @Override
+    public LakeCommitResult getCommitResult(
+            long snapshotId, Map<TableBucket, Long> tieredLogEndOffsets) throws IOException {
+        fileStoreTable.snapshotManager().invalidateCache();
+        try {
+            return commitResult(snapshotId, tieredLogEndOffsets, null);
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    /** The result of the commit of {@code committedSnapshotId} with the given tiered offsets. */
+    private LakeCommitResult commitResult(
+            long committedSnapshotId,
+            Map<TableBucket, Long> tieredLogEndOffsets,
+            @Nullable TieringStats stats)
+            throws Exception {
+        // deletion vector is disabled, committed snapshot is readable
+        if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
+            return LakeCommitResult.committedIsReadable(committedSnapshotId, stats);
+        }
+        // retrieve the readable snapshot during commit
+        try (DvTableReadableSnapshotRetriever retriever =
+                new DvTableReadableSnapshotRetriever(
+                        tablePath, tableId, fileStoreTable, flussClientConfig)) {
+            DvTableReadableSnapshotRetriever.ReadableSnapshotResult readableSnapshotResult =
+                    retriever.getReadableSnapshotAndOffsets(
+                            committedSnapshotId, tieredLogEndOffsets);
+            if (readableSnapshotResult == null) {
+                return LakeCommitResult.unknownReadableSnapshot(committedSnapshotId, stats);
+            }
+            Long earliestSnapshotIdToKeep = readableSnapshotResult.getEarliestSnapshotIdToKeep();
+            if (earliestSnapshotIdToKeep != null && earliestSnapshotIdToKeep >= 0) {
+                LOG.info(
+                        "earliest snapshot ID to keep for table {} is {}. "
+                                + "Snapshots before this ID can be safely deleted from Fluss.",
+                        tablePath,
+                        earliestSnapshotIdToKeep);
+            }
+            return LakeCommitResult.withReadableSnapshot(
+                    committedSnapshotId,
+                    readableSnapshotResult.getReadableSnapshotId(),
+                    readableSnapshotResult.getTieredOffsets(),
+                    readableSnapshotResult.getReadableOffsets(),
+                    earliestSnapshotIdToKeep,
+                    stats);
         }
     }
 
@@ -382,6 +407,69 @@ public class PaimonLakeCommitter
             }
         }
         return null;
+    }
+
+    @Override
+    public void checkCurrentSnapshotDescendsFrom(long snapshotId) throws IOException {
+        // Snapshot ids are reused after a rollback, so no snapshot is read from a cache.
+        fileStoreTable.snapshotManager().invalidateCache();
+        PaimonSnapshotLineage.checkDescendsFrom(
+                fileStoreTable, lakeTablePath.toString(), tableId, snapshotId);
+    }
+
+    /**
+     * Returns whether a COMPACT snapshot follows {@code snapshotId} in a table with deletion
+     * vectors. The readable snapshot is the latest COMPACT one, so another engine's compaction of
+     * an idle table may make a newer snapshot readable.
+     */
+    @Override
+    public boolean readableSnapshotMayAdvanceSince(long snapshotId) throws IOException {
+        if (!fileStoreTable.coreOptions().deletionVectorsEnabled()) {
+            return false;
+        }
+        SnapshotManager snapshotManager = fileStoreTable.snapshotManager();
+        snapshotManager.invalidateCache();
+        Long latestId = snapshotManager.latestSnapshotId();
+        if (latestId == null) {
+            return false;
+        }
+        for (long id = latestId; id > snapshotId; id--) {
+            try {
+                Snapshot snapshot = snapshotManager.tryGetSnapshot(id);
+                if (snapshot.commitKind() == Snapshot.CommitKind.COMPACT) {
+                    return true;
+                }
+            } catch (FileNotFoundException ignored) {
+                // expired meanwhile
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Keeps the readable snapshot Fluss registers next, and the one it registered before, from
+     * expiring. Union reads plan on the registered one, and reads planned before the registration
+     * still read the one before it. Paimon expires no snapshot at or after the next snapshot of a
+     * consumer, so the snapshots in between stay too until the readable snapshot moves on.
+     */
+    @Override
+    public void protectReadableSnapshot(long snapshotId) {
+        try {
+            ConsumerManager consumers = fileStoreTable.consumerManager();
+            Optional<Consumer> registered = consumers.consumer(READABLE_CONSUMER);
+            if (registered.isPresent() && registered.get().nextSnapshot() == snapshotId) {
+                return;
+            }
+            consumers.resetConsumer(
+                    PREVIOUS_READABLE_CONSUMER, registered.orElse(new Consumer(snapshotId)));
+            consumers.resetConsumer(READABLE_CONSUMER, new Consumer(snapshotId));
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not keep readable snapshot {} of {} from expiring.",
+                    snapshotId,
+                    tablePath,
+                    e);
+        }
     }
 
     @Override

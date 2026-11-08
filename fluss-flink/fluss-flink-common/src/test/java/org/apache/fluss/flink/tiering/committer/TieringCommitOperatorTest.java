@@ -996,7 +996,8 @@ class TieringCommitOperatorTest extends FlinkTestBase {
                         null,
                         null,
                         buckets,
-                        System.currentTimeMillis());
+                        System.currentTimeMillis(),
+                        null);
         Class<?> heldRoundClass = null;
         for (Class<?> c : TieringCommitOperator.class.getDeclaredClasses()) {
             if (c.getSimpleName().equals("HeldRound")) {

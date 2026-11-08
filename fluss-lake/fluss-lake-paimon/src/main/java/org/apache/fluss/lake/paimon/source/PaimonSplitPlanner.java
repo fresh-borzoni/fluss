@@ -27,6 +27,7 @@ import org.apache.fluss.types.RowType;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
@@ -79,6 +80,10 @@ public class PaimonSplitPlanner implements Planner<PaimonSplit> {
                 if (predicate != null) {
                     tableScan = tableScan.withFilter(predicate);
                 }
+                // With deletion vectors, each data file is read on its own with its vector. One
+                // split per file lets a union read spread a bucket's files over its readers,
+                // instead of the splits Paimon packs by size.
+                boolean perFile = fileStoreTable.coreOptions().deletionVectorsEnabled();
                 for (Split split : tableScan.plan().splits()) {
                     DataSplit dataSplit = (DataSplit) split;
                     BinaryRow partitionRow = dataSplit.partition();
@@ -86,7 +91,18 @@ public class PaimonSplitPlanner implements Planner<PaimonSplit> {
                             partitionRow.getFieldCount() == 0
                                     ? Collections.emptyList()
                                     : toFlussPartitionValues(partitionRow, flussPartitionType);
-                    splits.add(new PaimonSplit(dataSplit, isBucketUnAware, partition));
+                    if (perFile && dataSplit.rawConvertible() && dataSplit.dataFiles().size() > 1) {
+                        for (DataFileMeta file : dataSplit.dataFiles()) {
+                            String fileName = file.fileName();
+                            DataSplit single =
+                                    dataSplit
+                                            .filterDataFile(f -> f.fileName().equals(fileName))
+                                            .orElseThrow(IllegalStateException::new);
+                            splits.add(new PaimonSplit(single, isBucketUnAware, partition));
+                        }
+                    } else {
+                        splits.add(new PaimonSplit(dataSplit, isBucketUnAware, partition));
+                    }
                 }
             }
             return splits;
