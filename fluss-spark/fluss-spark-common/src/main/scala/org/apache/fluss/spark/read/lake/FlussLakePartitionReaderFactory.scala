@@ -39,7 +39,9 @@ class FlussLakePartitionReaderFactory(
     flussConfig: Configuration)
   extends PartitionReaderFactory {
 
-  @transient private lazy val lakeSource: LakeSource[LakeSplit] = {
+  @transient private lazy val lakeSource: LakeSource[LakeSplit] = newLakeSource()
+
+  private def newLakeSource(): LakeSource[LakeSplit] = {
     val source = FlussLakeUtils.createLakeSource(flussConfig.toMap, tableProperties, tablePath)
     source.withProject(FlussLakeUtils.lakeProjection(projection))
     flussPredicate.foreach(FlussLakeUtils.applyLakeFilters(source, _))
@@ -71,6 +73,14 @@ class FlussLakePartitionReaderFactory(
           projection,
           limit,
           mixedSplit,
+          flussConfig)
+      case dvPart: FlussLakeDvInputPartition =>
+        new FlussLakeDvPartitionReader(
+          tablePath,
+          dvPart,
+          newLakeSource(),
+          projection,
+          limit,
           flussConfig)
       case _ =>
         throw new IllegalArgumentException(s"Unexpected partition type: ${partition.getClass}")

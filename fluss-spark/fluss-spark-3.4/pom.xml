@@ -117,13 +117,27 @@
                                 <includes combine.children="append">
                                     <include>org.apache.fluss:fluss-spark-common_${scala.binary.version}</include>
                                     <include>org.apache.fluss:fluss-client</include>
+                                    <!-- deletion vector masks; Spark has its own, older RoaringBitmap -->
+                                    <include>org.roaringbitmap:RoaringBitmap</include>
                                 </includes>
                             </artifactSet>
+                            <relocations combine.children="append">
+                                <relocation>
+                                    <pattern>org.roaringbitmap</pattern>
+                                    <shadedPattern>org.apache.fluss.shaded.org.roaringbitmap</shadedPattern>
+                                </relocation>
+                            </relocations>
                             <filters>
                                 <filter>
                                     <artifact>*:*</artifact>
                                     <excludes>
                                         <exclude>org/slf4j/**</exclude>
+                                    </excludes>
+                                </filter>
+                                <filter>
+                                    <artifact>org.roaringbitmap:RoaringBitmap</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/versions/**</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
