@@ -34,6 +34,7 @@ import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.InvalidMetadataException;
 import org.apache.fluss.exception.InvalidServerTypeException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.NotCoordinatorLeaderException;
@@ -54,6 +55,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metadata.TableStats;
 import org.apache.fluss.rpc.GatewayClientProxy;
@@ -84,6 +86,8 @@ import org.apache.fluss.rpc.messages.DropDatabaseRequest;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
 import org.apache.fluss.rpc.messages.GetLakeSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetLatestKvSnapshotsRequest;
@@ -133,6 +137,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -162,7 +167,7 @@ import static org.apache.fluss.utils.StringUtils.isNullOrWhitespaceOnly;
  *
  * <p>This class is thread-safe. The API of this class is evolving, see {@link Admin} for details.
  */
-public class FlussAdmin implements Admin {
+public class FlussAdmin implements Admin, DvAdmin {
 
     private final AdminGateway gateway;
     private final AdminReadOnlyGateway readOnlyGateway;
@@ -1219,6 +1224,85 @@ public class FlussAdmin implements Admin {
         return retryableCoordinatorGateway
                 .describeCluster(new DescribeClusterRequest())
                 .thenApply(ClientRpcMessageUtils::toClusterDescription);
+    }
+
+    @Override
+    public CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(
+            TablePath tablePath, GetDvSnapshotRequest request) {
+        Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
+        return sendDvSnapshotRequest(
+                tablePath, request.getTableId(), partitionId, request.getBucketId(), request);
+    }
+
+    @Override
+    public CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
+            TablePath tablePath,
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long snapshotId,
+            List<byte[]> keys) {
+        GetDvSnapshotRequest request =
+                new GetDvSnapshotRequest()
+                        .setTableId(tableId)
+                        .setBucketId(bucketId)
+                        .setReadableSnapshotId(snapshotId);
+        if (partitionId != null) {
+            request.setPartitionId(partitionId);
+        }
+        for (byte[] key : keys) {
+            request.addLookupKey(key);
+        }
+        return sendDvSnapshotRequest(tablePath, tableId, partitionId, bucketId, request);
+    }
+
+    /**
+     * Sends a deletion vector request to the bucket's leader. On a leader error, including a leader
+     * whose server is not in the metadata cache (e.g. it restarted), the cached bucket metadata is
+     * dropped so that a retry resolves the leader and the servers again.
+     */
+    private CompletableFuture<GetDvSnapshotResponse> sendDvSnapshotRequest(
+            TablePath tablePath,
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            GetDvSnapshotRequest request) {
+        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+        if (partitionId != null) {
+            // Partition metadata can only be fetched once the table is cached.
+            metadataUpdater.checkAndUpdateTableMetadata(Collections.singleton(tablePath));
+        }
+        int leader = metadataUpdater.leaderFor(tablePath, tb);
+        TabletServerGateway tsGateway = metadataUpdater.newTabletServerClientForNode(leader);
+        if (tsGateway == null) {
+            invalidateBucketMetadata(tablePath, tableId, partitionId);
+            return FutureUtils.completedExceptionally(
+                    new LeaderNotAvailableException(
+                            "Server " + leader + " is not found in metadata cache."));
+        }
+        return tsGateway
+                .getDvSnapshot(request)
+                .whenComplete(
+                        (resp, t) -> {
+                            if (t != null
+                                    && ExceptionUtils.findThrowable(
+                                                    t, InvalidMetadataException.class)
+                                            .isPresent()) {
+                                invalidateBucketMetadata(tablePath, tableId, partitionId);
+                            }
+                        });
+    }
+
+    /** Drops the cached bucket leaders so the next request resolves them again. */
+    private void invalidateBucketMetadata(
+            TablePath tablePath, long tableId, @Nullable Long partitionId) {
+        Set<PhysicalTablePath> paths =
+                partitionId == null
+                        ? Collections.singleton(PhysicalTablePath.of(tablePath))
+                        : metadataUpdater.getPhysicalTablePathByIds(
+                                null,
+                                Collections.singleton(new TablePartition(tableId, partitionId)));
+        metadataUpdater.invalidPhysicalTableBucketMeta(paths);
     }
 
     @VisibleForTesting

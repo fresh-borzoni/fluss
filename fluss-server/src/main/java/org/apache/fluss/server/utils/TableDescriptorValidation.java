@@ -147,6 +147,8 @@ public class TableDescriptorValidation {
         validateStatisticsConfig(tableDescriptor);
         checkTableLakeFormatMatchesCluster(tableConf, clusterDataLakeFormat);
         checkCustomLakePathSupported(tableConf, clusterDataLakeFormat);
+        checkDeletionVectors(tableDescriptor, tableConf, clusterDataLakeFormat);
+        checkAutoCompaction(tableConf);
     }
 
     /** Validates the schema after altering table columns. */
@@ -262,6 +264,46 @@ public class TableDescriptorValidation {
             throw new InvalidConfigException(
                     "Custom lake table path is only supported for Paimon and Iceberg.");
         }
+    }
+
+    /**
+     * Checks the {@code table.datalake.auto-compaction.*} tuning options, which only the compaction
+     * of tables with deletion vectors reads. Other tables ignore them.
+     */
+    private static void checkAutoCompaction(Configuration tableConf) {
+        if (!tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            return;
+        }
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES) < 2) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' must be at least 2: a single small file is not rewritten on its"
+                                    + " own.",
+                            ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES.key()));
+        }
+        if (tableConf.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL).isNegative()) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' must not be negative.",
+                            ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL.key()));
+        }
+    }
+
+    private static void checkDeletionVectors(
+            TableDescriptor tableDescriptor,
+            Configuration tableConf,
+            @Nullable DataLakeFormat clusterDataLakeFormat) {
+        if (!tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            return;
+        }
+
+        // The deletion vectors of primary key tables are not complete yet: no lake format tiers
+        // or reads them so far.
+        throw new InvalidConfigException(
+                String.format(
+                        "'%s' is not supported yet: the deletion vectors of primary key tables are"
+                                + " not complete.",
+                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
     }
 
     public static void validateAlterTableProperties(
