@@ -17,7 +17,12 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.iceberg.maintenance.CompactionIndexWriter;
 import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.AppendOnlyTaskWriter;
@@ -28,6 +33,7 @@ import org.apache.fluss.lake.iceberg.utils.IcebergUtils;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -45,13 +51,16 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 
@@ -66,10 +75,19 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
 
     @Nullable private final ExecutorService compactionExecutor;
     @Nullable private CompletableFuture<RewriteDataFileResult> compactionFuture;
+    // the compaction of a table with deletion vectors, which a round waits for only so long
+    @Nullable private IcebergRewriteDataFiles boundedRewriter;
+    private final TableBucket tableBucket;
+
+    /** How long a round with deletion vectors waits for its compaction after writing its data. */
+    @VisibleForTesting public static final long COMPACTION_MAX_WAIT_MS = 10_000;
+    // a stopped compaction finishes its index hand-off within this
+    private static final long COMPACTION_STOP_WAIT_MS = 60_000;
 
     public IcebergLakeWriter(
             IcebergCatalogProvider icebergCatalogProvider, WriterInitContext writerInitContext)
             throws IOException {
+        this.tableBucket = writerInitContext.tableBucket();
         this.icebergCatalog = icebergCatalogProvider.get();
         this.icebergTable = getTable(writerInitContext.tableInfo().getLakeTablePath());
         IcebergPartitionSpecValidator.validate(icebergTable, writerInitContext.tableInfo());
@@ -89,11 +107,14 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
         // an exclusive file set. Clean tables have no __bucket column, so different buckets'
         // compaction jobs would plan overlapping files and race on rewrite/commit. Only schedule
         // compaction for legacy tables until a bucket-scoped ownership model for clean tables
-        // exists.
+        // exists. Tables with deletion vectors are compacted on the clean layout: each writer
+        // rewrites only the files of its own bucket(bucketKey) partition. The order of rows does
+        // not matter, as every key has one live row.
         boolean autoCompaction =
                 writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction();
         boolean isLegacyTable = IcebergUtils.isLegacyTable(icebergTable.schema());
-        if (autoCompaction && isLegacyTable) {
+        boolean dvEnabled = writerInitContext.tableInfo().isDeletionVectorsEnabled();
+        if (autoCompaction && (isLegacyTable || dvEnabled)) {
             this.compactionExecutor =
                     Executors.newSingleThreadExecutor(
                             new ExecutorThreadFactory(
@@ -164,7 +185,10 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
 
             RewriteDataFileResult rewriteDataFileResult = null;
             if (compactionFuture != null) {
-                rewriteDataFileResult = compactionFuture.get();
+                rewriteDataFileResult =
+                        boundedRewriter == null
+                                ? compactionFuture.get()
+                                : awaitBoundedCompaction(boundedRewriter);
             }
             if (recordWriter instanceof DerivedDvRecordWriter) {
                 return new IcebergWriteResult(
@@ -184,6 +208,11 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
     public void close() throws IOException {
         try {
             if (compactionFuture != null && !compactionFuture.isDone()) {
+                if (boundedRewriter != null) {
+                    // cancel() does not interrupt a running compaction. Nothing takes its result,
+                    // so it stops at the next row and drops its sorted runs.
+                    boundedRewriter.requestStop();
+                }
                 compactionFuture.cancel(true);
             }
 
@@ -213,18 +242,97 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
         }
     }
 
+    /**
+     * Waits at most {@link #COMPACTION_MAX_WAIT_MS} for the bucket's compaction once the round's
+     * data is written, so a slow compaction never holds the data commit. Then stops the compaction
+     * and takes the file groups it finished. The rest is compacted again later; deferring its
+     * commit would fail once the round's deletes reach its files.
+     */
+    @Nullable
+    private RewriteDataFileResult awaitBoundedCompaction(IcebergRewriteDataFiles rewriter)
+            throws Exception {
+        long start = System.currentTimeMillis();
+        try {
+            return awaitBounded(
+                    compactionFuture,
+                    rewriter::requestStop,
+                    COMPACTION_MAX_WAIT_MS,
+                    COMPACTION_STOP_WAIT_MS);
+        } finally {
+            LOG.info(
+                    "Waited {} ms for the compaction of {} after the round's data was written.",
+                    System.currentTimeMillis() - start,
+                    tableBucket);
+        }
+    }
+
+    /**
+     * Waits at most {@code maxWaitMs} for {@code future}, then runs {@code stop}, which makes the
+     * future complete with what it has. Waits at most {@code stopWaitMs} more, then gives up on the
+     * future and returns null.
+     */
+    @Nullable
+    @VisibleForTesting
+    static <T> T awaitBounded(
+            CompletableFuture<T> future, Runnable stop, long maxWaitMs, long stopWaitMs)
+            throws Exception {
+        try {
+            return future.get(maxWaitMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            stop.run();
+            try {
+                return future.get(stopWaitMs, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException stuck) {
+                future.cancel(true);
+                LOG.warn("A compaction did not stop in time; the round commits without it.");
+                return null;
+            }
+        }
+    }
+
     private void scheduleCompaction(WriterInitContext writerInitContext) {
+        Table table = icebergTable;
+        IcebergRewriteDataFiles rewriter;
+        try {
+            rewriter =
+                    new IcebergRewriteDataFiles(
+                                    table,
+                                    writerInitContext.partition(),
+                                    writerInitContext.tableBucket())
+                            .targetSizeInBytes(compactionTargetSize(table));
+        } catch (Exception e) {
+            // a compaction never fails the write path
+            LOG.info("Fail to compact iceberg data files.", e);
+            return;
+        }
+        if (writerInitContext.tableInfo().isDeletionVectorsEnabled()) {
+            // rows climb size tiers, at most once per interval, instead of re-merging one growing
+            // file with every batch of new small files
+            TableConfig tableConfig = writerInitContext.tableInfo().getTableConfig();
+            rewriter.tiered(
+                    tableConfig.getDataLakeAutoCompactionMinSmallFiles(),
+                    tableConfig.getDataLakeAutoCompactionInterval());
+            this.boundedRewriter = rewriter;
+        }
         compactionFuture =
                 CompletableFuture.supplyAsync(
                         () -> {
                             try {
-                                Table table = icebergTable;
-                                IcebergRewriteDataFiles rewriter =
-                                        new IcebergRewriteDataFiles(
-                                                        table,
-                                                        writerInitContext.partition(),
-                                                        writerInitContext.tableBucket())
-                                                .targetSizeInBytes(compactionTargetSize(table));
+                                String indexDir = writerInitContext.positionIndexDir();
+                                if (writerInitContext.tableInfo().isDeletionVectorsEnabled()
+                                        && indexDir != null) {
+                                    // the rewrite hands its rows' new positions to the index, so
+                                    // the round needs no re-index of the rewritten files
+                                    File localTmpDir = localTmpDir(writerInitContext.ioTmpDirs());
+                                    rewriter.handOffPositions(
+                                            new CompactionIndexWriter(
+                                                    PositionIndexStore.forTable(
+                                                            new FsPath(indexDir), localTmpDir),
+                                                    writerInitContext.tableInfo(),
+                                                    writerInitContext.tableBucket(),
+                                                    writerInitContext.tieringRoundTimestamp(),
+                                                    localTmpDir));
+                                }
                                 return rewriter.execute();
                             } catch (Exception e) {
                                 LOG.info("Fail to compact iceberg data files.", e);
@@ -233,6 +341,13 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
                             }
                         },
                         compactionExecutor);
+    }
+
+    @Nullable
+    private static File localTmpDir(@Nullable String[] ioTmpDirs) {
+        return ioTmpDirs == null || ioTmpDirs.length == 0
+                ? null
+                : new File(ioTmpDirs[ThreadLocalRandom.current().nextInt(ioTmpDirs.length)], "dv");
     }
 
     private static long compactionTargetSize(Table icebergTable) {

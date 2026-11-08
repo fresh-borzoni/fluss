@@ -17,6 +17,7 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
@@ -94,7 +95,12 @@ public class IcebergLakeTieringFactory
     public LakeCommitter<IcebergWriteResult, IcebergCommittable> createLakeCommitter(
             CommitterInitContext committerInitContext) throws IOException {
         return new IcebergLakeCommitter(
-                icebergCatalogProvider, committerInitContext.tableInfo().getLakeTablePath());
+                icebergCatalogProvider,
+                committerInitContext.tableInfo().getLakeTablePath(),
+                committerInitContext.tableInfo().getTableConfig().isDataLakeAutoExpireSnapshot()
+                        || committerInitContext
+                                .lakeTieringConfig()
+                                .get(ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT));
     }
 
     @Override

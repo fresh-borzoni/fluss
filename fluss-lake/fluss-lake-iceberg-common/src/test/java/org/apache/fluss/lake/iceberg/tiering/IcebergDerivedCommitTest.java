@@ -21,10 +21,22 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableExternallyModifiedException;
 import org.apache.fluss.exception.LakeTableRolledBackException;
+import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.LakeBaseChangedException;
 import org.apache.fluss.lake.committer.LakeCommitRejectedException;
+import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.LakeCommitter.CommitContext;
+import org.apache.fluss.lake.dv.FilePos;
+import org.apache.fluss.lake.dv.FormatVersions;
+import org.apache.fluss.lake.dv.RowPosSstIndex;
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+import org.apache.fluss.lake.dv.index.FlussPositionIndexStore;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.lake.iceberg.IcebergLakeCatalog;
+import org.apache.fluss.lake.iceberg.maintenance.CompactionIndexWriter;
+import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
+import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.testutils.CommitHookCatalog;
 import org.apache.fluss.lake.iceberg.testutils.ExternalWrites;
 import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
@@ -41,8 +53,14 @@ import org.apache.fluss.record.GenericRecord;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.DataTypes;
 
+import io.github.fluss_contrib.rocksdb.Options;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.SstFileReader;
+import io.github.fluss_contrib.rocksdb.SstFileReaderIterator;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
@@ -51,11 +69,13 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.IcebergGenericReader;
@@ -68,6 +88,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.TaskWriter;
+import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.BeforeEach;
@@ -81,8 +102,10 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -91,6 +114,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -448,6 +472,436 @@ class IcebergDerivedCommitTest {
     }
 
     /**
+     * Fluss's compaction of a bucket hands the positions of the rows it rewrote to the index. Its
+     * index change maps every key that survived the deletes to its row in the new files, with keys
+     * encoded as the re-index encodes them, and drops the replaced files.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {2, 3})
+    void testCompactionHandsItsPositionsToTheIndex(int formatVersion) throws Exception {
+        Table table = createTable(formatVersion);
+        List<String> inputs = new ArrayList<>();
+        for (int from = 0; from < 9; from += 3) {
+            long snapshotId = commitRows(from, 3);
+            inputs.add(addedDataFile(refreshed(table), snapshotId));
+        }
+        long third = table.currentSnapshot().snapshotId();
+        // keys 1 and 7 are deleted before the compaction, by a deletion vector or position deletes
+        long read;
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            Map<String, long[]> deletes = new HashMap<>();
+            deletes.put(fileName(inputs.get(0)), new long[] {1L});
+            deletes.put(fileName(inputs.get(2)), new long[] {1L});
+            read =
+                    committer
+                            .commitWithDeletes(
+                                    committer.toCommittable(Collections.emptyList()),
+                                    Collections.emptyMap(),
+                                    deletes,
+                                    third)
+                            .getCommittedSnapshotId();
+        }
+
+        FlussPositionIndexStore store =
+                new FlussPositionIndexStore(
+                        new FsPath(new File(tempWarehouseDir, "index").toURI()));
+        TableBucket bucket = new TableBucket(tableInfo.getTableId(), 0);
+        long roundTimestamp = 1234L;
+        RewriteDataFileResult result =
+                new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                        .handOffPositions(
+                                new CompactionIndexWriter(
+                                        store, tableInfo, bucket, roundTimestamp, null))
+                        .execute();
+        assertThat(result).isNotNull();
+        CompactionIndexPart part = result.indexPart();
+        assertThat(part).isNotNull();
+        // Compactions of different buckets run concurrently, so they leave the table's file-id
+        // counter to the committer, which gives the part's files their ids when it publishes it.
+        assertThat(new File(tempWarehouseDir, "index/rowPos/_next_file_id")).doesNotExist();
+        assertThat(part.readSnapshotId()).isEqualTo(read);
+        assertThat(part.changeId())
+                .isEqualTo(
+                        CompactionIndexPart.changeIdOf(
+                                tableInfo.getTableId(), roundTimestamp, read));
+        assertThat(part.removedFiles())
+                .containsExactlyInAnyOrderElementsOf(
+                        inputs.stream().map(f -> fileName(f)).collect(Collectors.toList()));
+        List<DataFile> outputs = new ArrayList<>();
+        result.addedDataFiles().forEach(outputs::add);
+        assertThat(part.addedFiles().values())
+                .containsExactlyInAnyOrderElementsOf(
+                        outputs.stream()
+                                .map(f -> fileName(f.location()))
+                                .collect(Collectors.toList()));
+
+        Map<String, String> indexed = handedOver(store, bucket, part);
+
+        // The rewrite commits on the snapshot it read.
+        long rewrite;
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            rewrite =
+                    committer.commitPendingRewrite(
+                            committer.toCommittable(
+                                    Collections.singletonList(
+                                            new IcebergWriteResult(
+                                                    WriteResult.builder().build(),
+                                                    table.specs(),
+                                                    result))));
+        }
+        assertThat(refreshed(table).snapshot(rewrite).parentId()).isEqualTo(read);
+        assertThat(lineage(table).keySet()).containsExactly(0, 2, 3, 4, 5, 6, 8);
+        assertThat(indexed).isEqualTo(reindexed(table));
+    }
+
+    /**
+     * A hand-off that holds fewer keys in memory than the compaction writes spills them in sorted
+     * runs and merges them into what a re-index of the new files finds. No run is left behind.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {2, 3})
+    void testCompactionHandOffSpillsSortedRuns(int formatVersion) throws Exception {
+        Table table = createTable(formatVersion);
+        // every file spans the key range, so the sorted runs overlap
+        for (int i = 0; i < 8; i++) {
+            commitKeys(i, i + 8, i + 16);
+        }
+        FlussPositionIndexStore store =
+                new FlussPositionIndexStore(
+                        new FsPath(new File(tempWarehouseDir, "index").toURI()));
+        TableBucket bucket = new TableBucket(tableInfo.getTableId(), 0);
+        File sortDir = new File(tempWarehouseDir, "sort");
+        List<Integer> runsAfterGroup = new ArrayList<>();
+        // at a 4 KB target the test's files are medium: two groups of four, of 12 rows each
+        RewriteDataFileResult result =
+                new IcebergRewriteDataFiles(refreshed(table), null, bucket) {
+                    @Override
+                    protected void groupCompleted(int groupIndex) {
+                        runsAfterGroup.add(filesUnder(sortDir).size());
+                    }
+                }.targetSizeInBytes(4096)
+                        .tiered(3, Duration.ZERO)
+                        .handOffPositions(
+                                new CompactionIndexWriter(
+                                        store, tableInfo, bucket, 1234L, sortDir, 5))
+                        .execute();
+        assertThat(result).isNotNull();
+        assertThat(result.deletedDataFiles()).hasSize(8);
+        assertThat(runsAfterGroup).containsExactly(2, 4);
+        assertThat(filesUnder(sortDir)).isEmpty();
+        CompactionIndexPart part = result.indexPart();
+        assertThat(part).isNotNull();
+        Map<String, String> indexed = handedOver(store, bucket, part);
+
+        commitRewrite(result);
+        assertThat(lineage(refreshed(table)).keySet()).hasSize(24);
+        assertThat(indexed).isEqualTo(reindexed(table));
+    }
+
+    /**
+     * A compaction stopped after its first file group keeps that group: the round commits it, the
+     * other files stay as they are, and nothing of the stopped group is left behind.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {2, 3})
+    void testStoppedCompactionKeepsTheFileGroupsItFinished(int formatVersion) throws Exception {
+        Table table = createTable(formatVersion);
+        for (int i = 0; i < 8; i++) {
+            commitRows(3 * i, 3);
+        }
+        TableBucket bucket = new TableBucket(tableInfo.getTableId(), 0);
+        // at a 4 KB target the test's files are medium: two groups of four
+        IcebergRewriteDataFiles stopping =
+                new IcebergRewriteDataFiles(refreshed(table), null, bucket) {
+                    @Override
+                    protected void groupCompleted(int groupIndex) {
+                        requestStop();
+                    }
+                }.targetSizeInBytes(4096).tiered(3, Duration.ZERO);
+        Set<String> filesBefore = filesOnDisk();
+        RewriteDataFileResult result = stopping.execute();
+        assertThat(result).isNotNull();
+        assertThat(result.deletedDataFiles()).hasSize(4);
+        assertThat(result.addedDataFiles()).hasSize(1);
+        assertThat(result.bucketKey()).isEqualTo(IcebergRewriteDataFiles.bucketKey(bucket));
+        Set<String> added = new HashSet<>(filesOnDisk());
+        added.removeAll(filesBefore);
+        assertThat(filesOf(added, "/data/"))
+                .containsExactly(fileName(result.addedDataFiles().iterator().next().location()));
+
+        commitRewrite(result);
+        assertThat(dataFiles(refreshed(table))).hasSize(5);
+        assertThat(countRows(table)).isEqualTo(24);
+
+        // a compaction stopped before it starts returns nothing
+        IcebergRewriteDataFiles stopped =
+                new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                        .targetSizeInBytes(4096)
+                        .tiered(3, Duration.ZERO);
+        stopped.requestStop();
+        assertThat(stopped.execute()).isNull();
+    }
+
+    /**
+     * A bucket is compacted again only once the interval passed since its last compaction, which
+     * the compaction snapshot records.
+     */
+    @Test
+    void testCompactionWaitsForTheInterval() throws Exception {
+        Table table = createTable(3);
+        for (int i = 0; i < 3; i++) {
+            commitRows(3 * i, 3);
+        }
+        TableBucket bucket = new TableBucket(tableInfo.getTableId(), 0);
+        RewriteDataFileResult first =
+                new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                        .tiered(3, Duration.ofHours(1))
+                        .execute();
+        assertThat(first).isNotNull();
+        long compaction = commitRewrite(first);
+        assertThat(
+                        refreshed(table)
+                                .snapshot(compaction)
+                                .summary()
+                                .get(IcebergRewriteDataFiles.COMPACTED_BUCKETS_PROPERTY))
+                .isEqualTo(IcebergRewriteDataFiles.bucketKey(bucket));
+        assertThat(refreshed(table).snapshot(compaction).summary())
+                .containsEntry(FormatVersions.SNAPSHOT_FORMAT_VERSION_PROPERTY, "1");
+
+        for (int i = 3; i < 6; i++) {
+            commitRows(3 * i, 3);
+        }
+        assertThat(
+                        new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                                .tiered(3, Duration.ofHours(1))
+                                .execute())
+                .isNull();
+        assertThat(
+                        new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                                .tiered(3, Duration.ZERO)
+                                .execute())
+                .isNotNull();
+    }
+
+    /** The compacted buckets of a compaction snapshot of a newer format are not read. */
+    @Test
+    void testCompactionSnapshotOfANewerFormatIsRejected() throws Exception {
+        Table table = createTable(3);
+        for (int i = 0; i < 3; i++) {
+            commitRows(3 * i, 3);
+        }
+        TableBucket bucket = new TableBucket(tableInfo.getTableId(), 0);
+        refreshed(table)
+                .newAppend()
+                .set(
+                        IcebergRewriteDataFiles.COMPACTED_BUCKETS_PROPERTY,
+                        IcebergRewriteDataFiles.bucketKey(bucket))
+                .set(FormatVersions.SNAPSHOT_FORMAT_VERSION_PROPERTY, "2")
+                .commit();
+        long compaction = refreshed(table).currentSnapshot().snapshotId();
+
+        assertThatThrownBy(
+                        () ->
+                                new IcebergRewriteDataFiles(refreshed(table), null, bucket)
+                                        .tiered(3, Duration.ofHours(1))
+                                        .execute())
+                .rootCause()
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(
+                        "Cannot read the deletion vector properties of lake snapshot "
+                                + compaction
+                                + ": its format version 2 is unknown; this Fluss version reads"
+                                + " format versions up to 1.");
+    }
+
+    /** Commits a compaction's rewrite as the tiering committer does; returns its snapshot. */
+    private long commitRewrite(RewriteDataFileResult result) throws Exception {
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            Long id =
+                    committer.commitPendingRewrite(
+                            committer.toCommittable(
+                                    Collections.singletonList(
+                                            new IcebergWriteResult(
+                                                    WriteResult.builder().build(),
+                                                    refreshed(loadTable()).specs(),
+                                                    result))));
+            assertThat(id).isNotNull();
+            return id;
+        }
+    }
+
+    private static List<DataFile> dataFiles(Table table) throws IOException {
+        List<DataFile> files = new ArrayList<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                files.add(task.file());
+            }
+        }
+        return files;
+    }
+
+    /** A compaction's index part as a tablet server reads it once registered: key to file@pos. */
+    private Map<String, String> handedOver(
+            FlussPositionIndexStore store, TableBucket bucket, CompactionIndexPart part)
+            throws Exception {
+        List<RowPosSstIndex.SstFileEntry> ssts = new ArrayList<>();
+        for (int i = 0; i < part.sstFileNames().size(); i++) {
+            ssts.add(
+                    new RowPosSstIndex.SstFileEntry(
+                            part.sstFileNames().get(i), part.sstFileSizes().get(i)));
+        }
+        store.commitChange(
+                part.changeId(),
+                Collections.singletonMap(
+                        bucket,
+                        new PositionIndexStore.BucketChange(
+                                new PositionIndexStore.BucketPart(ssts),
+                                part.addedFiles(),
+                                part.removedFiles())));
+        store.register(-1, 100, part.changeId());
+        PositionIndexStore.BucketData data =
+                store.readChange(
+                        store.chain().get(0),
+                        bucket,
+                        Files.createTempDirectory(tempWarehouseDir.toPath(), "download").toFile());
+        assertThat(data.removedFiles).containsExactlyInAnyOrderElementsOf(part.removedFiles());
+        Map<String, String> indexed = new TreeMap<>();
+        for (String sst : data.localSsts) {
+            indexed.putAll(readSst(sst, data.fileId2Name));
+        }
+        return indexed;
+    }
+
+    /**
+     * What a re-index of the table's data files finds: every live row at its position, keyed as the
+     * re-index keys rows. The files must have no deletes, so a file's rows come in position order.
+     */
+    private Map<String, String> reindexed(Table table) throws IOException {
+        KeyEncoder reindexKeys =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        tableInfo.getRowType().project(new int[] {0}),
+                        tableInfo.getPhysicalPrimaryKeys(),
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
+        Map<String, String> out = new TreeMap<>();
+        try (CloseableIterable<FileScanTask> tasks = refreshed(table).newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                assertThat(task.deletes()).isEmpty();
+                long pos = 0;
+                try (CloseableIterable<Record> records =
+                        new IcebergGenericReader(table.newScan(), true).open(task)) {
+                    for (Record record : records) {
+                        int key = (Integer) record.getField("c1");
+                        out.put(
+                                Arrays.toString(reindexKeys.encodeKey(GenericRow.of(key))),
+                                fileName(task.file().location()) + "@" + pos++);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    private static List<Path> filesUnder(File dir) {
+        if (!dir.exists()) {
+            return Collections.emptyList();
+        }
+        try (Stream<Path> files = Files.walk(dir.toPath())) {
+            return files.filter(Files::isRegularFile).collect(Collectors.toList());
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Reads an index SST as key bytes to "file@position". */
+    private static Map<String, String> readSst(String sst, Map<Integer, String> fileNames)
+            throws Exception {
+        RocksDB.loadLibrary();
+        Map<String, String> out = new TreeMap<>();
+        try (Options options = new Options();
+                SstFileReader reader = new SstFileReader(options);
+                ReadOptions readOptions = new ReadOptions()) {
+            reader.open(sst);
+            try (SstFileReaderIterator it = reader.newIterator(readOptions)) {
+                for (it.seekToFirst(); it.isValid(); it.next()) {
+                    FilePos pos = FilePos.decode(it.value());
+                    out.put(
+                            Arrays.toString(it.key()),
+                            fileNames.get(pos.fileId()) + "@" + pos.rowPosition());
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * After the snapshot Fluss registered last expired, as a rewrite by another engine whose tag
+     * was rotated away can, the latest tiered snapshot is missing in Fluss only if a round
+     * committed it on top of the registered one. The round runs on and re-indexes the table from
+     * its current snapshot instead of failing every time.
+     */
+    @Test
+    void testMissingSnapshotAfterTheRegisteredOneExpired() throws Exception {
+        createTable(3);
+        long expired = 4242L;
+        long older = 4141L;
+        long onExpired;
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            Map<String, String> properties = new HashMap<>();
+            properties.put(LakeCommitter.FLUSS_LAKE_SNAP_BASE_PROPERTY, String.valueOf(expired));
+            FormatVersions.putSnapshotVersion(properties);
+            onExpired =
+                    committer
+                            .commitWithDeletes(
+                                    committer.toCommittable(Collections.emptyList()),
+                                    properties,
+                                    Collections.emptyMap(),
+                                    -1)
+                            .getCommittedSnapshotId();
+            // committed on the expired snapshot and never registered: missing
+            assertThat(committer.getMissingLakeSnapshot(expired))
+                    .isNotNull()
+                    .extracting(CommittedLakeSnapshot::getLakeSnapshotId)
+                    .isEqualTo(onExpired);
+            // committed before the expired snapshot was registered: nothing is missing
+            assertThat(committer.getMissingLakeSnapshot(older)).isNull();
+        }
+    }
+
+    /** The properties of a snapshot of a newer format are not read for a missing snapshot. */
+    @Test
+    void testMissingSnapshotOfANewerFormatIsRejected() throws Exception {
+        createTable(3);
+        long expired = 4242L;
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            Map<String, String> properties = new HashMap<>();
+            properties.put(LakeCommitter.FLUSS_LAKE_SNAP_BASE_PROPERTY, String.valueOf(expired));
+            properties.put(FormatVersions.SNAPSHOT_FORMAT_VERSION_PROPERTY, "2");
+            long onExpired =
+                    committer
+                            .commitWithDeletes(
+                                    committer.toCommittable(Collections.emptyList()),
+                                    properties,
+                                    Collections.emptyMap(),
+                                    -1)
+                            .getCommittedSnapshotId();
+
+            assertThatThrownBy(() -> committer.getMissingLakeSnapshot(expired))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage(
+                            "Cannot read the deletion vector properties of lake snapshot "
+                                    + onExpired
+                                    + ": its format version 2 is unknown; this Fluss version"
+                                    + " reads format versions up to 1.");
+        }
+    }
+
+    /**
      * A round without its base in the lake, here the table's first, lands only on the state it
      * planned on. Of two rounds planned on the empty table, as by the tiering service the table was
      * taken from and the one it was handed to, the second to commit is rejected and may run again
@@ -644,6 +1098,88 @@ class IcebergDerivedCommitTest {
             deleted.add(fileName(ContentFileUtil.referencedDataFileLocation(delete)));
         }
         assertThat(deleted).containsExactlyInAnyOrderElementsOf(files.subList(0, 2 * rounds));
+    }
+
+    /**
+     * A Fluss compaction of a table with row lineage (format version 3) keeps every row's {@code
+     * _row_id} and {@code _last_updated_sequence_number}, as the spec requires of a writer that
+     * moves rows: the rewritten files store the values the rows had, stored or inherited. A version
+     * 2 table has no lineage, and its compaction writes the table's columns only.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {2, 3})
+    void testCompactionKeepsRowLineage(int formatVersion) throws Exception {
+        Table table = createTable(formatVersion);
+        List<String> inputs = new ArrayList<>();
+        for (int from = 0; from < 9; from += 3) {
+            long snapshotId = commitRows(from, 3);
+            inputs.add(addedDataFile(refreshed(table), snapshotId));
+        }
+        long third = table.currentSnapshot().snapshotId();
+        // key 4 is deleted before the compaction
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            committer.commitWithDeletes(
+                    committer.toCommittable(Collections.emptyList()),
+                    Collections.emptyMap(),
+                    Collections.singletonMap(fileName(inputs.get(1)), new long[] {1L}),
+                    third);
+        }
+        Map<Integer, List<Long>> before = lineage(refreshed(table));
+        assertThat(before).hasSize(8).doesNotContainKey(4);
+
+        RewriteDataFileResult result =
+                new IcebergRewriteDataFiles(
+                                refreshed(table), null, new TableBucket(tableInfo.getTableId(), 0))
+                        .execute();
+        assertThat(result).isNotNull();
+        commitRewrite(result);
+        assertThat(dataFiles(refreshed(table))).hasSize(1);
+
+        Map<Integer, List<Long>> after = lineage(refreshed(table));
+        assertThat(after).isEqualTo(before);
+        if (formatVersion >= 3) {
+            Set<Long> rowIds = new HashSet<>();
+            for (List<Long> rowLineage : after.values()) {
+                assertThat(rowLineage).doesNotContainNull();
+                rowIds.add(rowLineage.get(0));
+            }
+            assertThat(rowIds).hasSize(after.size());
+        } else {
+            assertThat(after.values()).allSatisfy(l -> assertThat(l).isEmpty());
+        }
+    }
+
+    /**
+     * Every live row's lineage by key, read through Iceberg's metadata columns: [{@code _row_id},
+     * {@code _last_updated_sequence_number}], or nothing on a table without row lineage.
+     */
+    private static Map<Integer, List<Long>> lineage(Table table) throws IOException {
+        boolean rowLineage = TableUtil.supportsRowLineage(table);
+        org.apache.iceberg.Schema projection =
+                rowLineage ? MetadataColumns.schemaWithRowLineage(table.schema()) : table.schema();
+        Map<Integer, List<Long>> out = new TreeMap<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                try (CloseableIterable<Record> records =
+                        new IcebergGenericReader(table.newScan().project(projection), false)
+                                .open(task)) {
+                    for (Record record : records) {
+                        List<Long> values = new ArrayList<>();
+                        if (rowLineage) {
+                            values.add((Long) record.getField(MetadataColumns.ROW_ID.name()));
+                            values.add(
+                                    (Long)
+                                            record.getField(
+                                                    MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER
+                                                            .name()));
+                        }
+                        out.put((Integer) record.getField("c1"), values);
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     // ------------------------------------------------------------------------------------------

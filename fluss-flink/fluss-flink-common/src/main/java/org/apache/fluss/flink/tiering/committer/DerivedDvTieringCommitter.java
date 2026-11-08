@@ -44,6 +44,8 @@ import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.dv.FilePos;
 import org.apache.fluss.lake.dv.FormatVersions;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
 import org.apache.fluss.lake.dv.index.KeyPosition;
 import org.apache.fluss.lake.dv.index.PositionIndexChangeBuilder;
 import org.apache.fluss.lake.dv.index.PositionIndexDelta;
@@ -108,9 +110,11 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  *
  * <p>A round looks up the lake positions of the rows it supersedes in the base's index, on the
  * buckets' leaders. It publishes its index change and commits data and deletes in one lake commit,
- * so every lake snapshot is consistent at its tiered offsets. Files rewritten since the base by
- * another engine are re-indexed first. The round is then held ({@link Outcome#held}) until the
- * tiering readers report the re-index; {@link #resumeRound} resumes it.
+ * so every lake snapshot is consistent at its tiered offsets. The round's own compaction hands the
+ * index the new positions of the rows it rewrote ({@link CompactionIndexPart}), so its rewrite
+ * needs no re-index. Files rewritten since the base by another engine, or by a compaction that
+ * could not hand its positions over, are re-indexed first. The round is then held ({@link
+ * Outcome#held}) until the tiering readers report the re-index; {@link #resumeRound} resumes it.
  *
  * <p>The base fence lets the lake commit land only on the base, or on snapshots after it that
  * changed no data file. A rewrite committed while the round runs makes the lake reject the commit
@@ -177,6 +181,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
     private final Counter changedKeys;
     private final Counter reindexes;
     private final Counter reindexMs;
+    private final Counter compactionHandOffs;
     private final Counter chainEntriesTrimmed;
     private final Counter orphanChangesRemoved;
     private volatile long lastLookupMs;
@@ -219,6 +224,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         this.changedKeys = dv.counter("changedKeys", new ConcurrentCounter());
         this.reindexes = dv.counter("reindexes", new ConcurrentCounter());
         this.reindexMs = dv.counter("reindexMs", new ConcurrentCounter());
+        this.compactionHandOffs = dv.counter("compactionHandOffs", new ConcurrentCounter());
         this.chainEntriesTrimmed = dv.counter("chainEntriesTrimmed", new ConcurrentCounter());
         this.orphanChangesRemoved = dv.counter("orphanChangesRemoved", new ConcurrentCounter());
         dv.gauge("lastLookupMs", (Gauge<Long>) () -> lastLookupMs);
@@ -276,6 +282,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 reindex.removedFiles,
                 reindex.startedAtMs,
                 true);
+        // The round committed its own compaction before it was held.
         return commitRound(tableId, reindex.tablePath, tableInfo, writeResults, true);
     }
 
@@ -652,9 +659,19 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
         long base =
                 flussCurrentLakeSnapshot == null ? -1L : flussCurrentLakeSnapshot.getSnapshotId();
         long t0 = System.currentTimeMillis();
-        // Compaction since the base is re-indexed and made readable before this round resolves its
-        // keys.
+        // A compaction since the base, by Fluss or another engine, is re-indexed and made
+        // readable before the round resolves its keys.
         if (base > 0) {
+            // The round's own compaction is committed first, so the round's deletes never
+            // invalidate it. A resumed round did so before it was held.
+            if (!resuming) {
+                Long rewrite = lakeCommitter.commitPendingRewrite(committable);
+                if (publishCompactionIndex(
+                        tableId, tablePath, flussCurrentLakeSnapshot, rewrite, nonEmptyResults)) {
+                    // The rewrite is in the index chain and registered: run the round on it.
+                    throw new ReindexPending(null);
+                }
+            }
             // Holds the round while the tiering readers re-index the rewritten files.
             triggerReindex(tableId, tablePath, tableInfo, flussCurrentLakeSnapshot);
         }
@@ -757,6 +774,8 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 lakeBucketTieredOffsetsFile,
                 logEndOffsets,
                 logMaxTieredTimestamps);
+        // Old lake snapshots are expired if the table expires them, except those of the chain.
+        lakeCommitter.expireSnapshots(earliestSnapshotToKeep(tableId, tablePath));
         long t4 = System.currentTimeMillis();
         rounds.inc();
         changedKeys.inc(published.keys);
@@ -1136,6 +1155,160 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                             (TableBucket tb) ->
                                     tb.getPartitionId() == null ? -1L : tb.getPartitionId())
                     .thenComparingInt(TableBucket::getBucket);
+
+    /**
+     * Publishes the index change of this round's own compaction from the positions its writers
+     * handed over ({@link CompactionIndexPart}), so the round needs no re-index. The change is
+     * registered as the step from the base to the rewrite, and the rewrite in Fluss. Returns false
+     * if a compacted bucket handed nothing over, the compaction read a snapshot other than the
+     * base, or publishing fails; the rewrite is then re-indexed like another engine's.
+     *
+     * <p>The rewrite commits only on the snapshot its compaction read (see {@link
+     * LakeCommitter#commitPendingRewrite}), so a change from the base covers it exactly.
+     */
+    private boolean publishCompactionIndex(
+            long tableId,
+            TablePath tablePath,
+            LakeSnapshot base,
+            @Nullable Long rewriteSnapshotId,
+            List<TableBucketWriteResult<WriteResult>> results) {
+        Map<TableBucket, CompactionIndexPart> parts = new HashMap<>();
+        boolean complete = true;
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            Object wr = r.writeResult();
+            if (wr instanceof CompactionIndexPartProvider
+                    && ((CompactionIndexPartProvider) wr).compacted()) {
+                CompactionIndexPart part = ((CompactionIndexPartProvider) wr).compactionIndexPart();
+                if (part == null) {
+                    complete = false;
+                } else {
+                    parts.put(r.tableBucket(), part);
+                }
+            }
+        }
+        if (parts.isEmpty()) {
+            return false;
+        }
+        PositionIndexStore store = indexStore(tableId, tablePath);
+        Set<Long> changeIds = new HashSet<>();
+        Set<Long> readSnapshots = new HashSet<>();
+        for (CompactionIndexPart part : parts.values()) {
+            changeIds.add(part.changeId());
+            readSnapshots.add(part.readSnapshotId());
+        }
+        String reason =
+                rewriteSnapshotId == null
+                        ? "the rewrite was not committed"
+                        : !complete
+                                ? "a compacted bucket handed no positions over"
+                                : changeIds.size() > 1 || readSnapshots.size() > 1
+                                        ? "the compactions read different snapshots"
+                                        : readSnapshots.iterator().next() != base.getSnapshotId()
+                                                ? "the compactions read snapshot "
+                                                        + readSnapshots.iterator().next()
+                                                        + ", not the base"
+                                                : null;
+        if (reason == null) {
+            long changeId = changeIds.iterator().next();
+            try {
+                long t0 = System.currentTimeMillis();
+                Map<TableBucket, PositionIndexStore.BucketChange> change =
+                        assignFileIds(store, changeId, parts);
+                store.commitChange(changeId, change);
+                store.register(base.getSnapshotId(), rewriteSnapshotId, changeId);
+                registerSnapshot(tableId, tablePath, rewriteSnapshotId, base);
+                compactionHandOffs.inc();
+                LOG.info(
+                        "Derived DV: Fluss compaction of {} committed as snapshot {}; {} buckets"
+                                + " handed their positions to index change {} (no re-index),"
+                                + " published in {} ms.",
+                        tablePath,
+                        rewriteSnapshotId,
+                        parts.size(),
+                        changeId,
+                        System.currentTimeMillis() - t0);
+                return true;
+            } catch (Exception e) {
+                reason = "publishing failed: " + e;
+            }
+        }
+        LOG.info(
+                "Derived DV: the compaction of {} is re-indexed from the lake: {}.",
+                tablePath,
+                reason);
+        for (long changeId : changeIds) {
+            try {
+                store.abortChange(changeId);
+            } catch (Exception e) {
+                LOG.debug("Derived DV: could not delete index change {}.", changeId, e);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Gives the files of the compactions' parts their ids from the table's counter. Compactions of
+     * different buckets run concurrently and may outlive their round, so their writers number the
+     * files of their part from 0. This committer is the single allocator of a table's ids. The
+     * parts' SSTs are rewritten with the ids, in parallel.
+     */
+    private static Map<TableBucket, PositionIndexStore.BucketChange> assignFileIds(
+            PositionIndexStore store, long changeId, Map<TableBucket, CompactionIndexPart> parts)
+            throws Exception {
+        int files = 0;
+        for (CompactionIndexPart part : parts.values()) {
+            files += part.addedFiles().size();
+        }
+        int nextId = files == 0 ? 0 : store.allocateFileIds(files);
+        Map<TableBucket, Map<Integer, Integer>> newIds = new HashMap<>();
+        Map<TableBucket, Map<Integer, String>> addedFiles = new HashMap<>();
+        for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {
+            Map<Integer, Integer> ids = new HashMap<>();
+            Map<Integer, String> added = new HashMap<>();
+            for (Map.Entry<Integer, String> f :
+                    new TreeMap<>(e.getValue().addedFiles()).entrySet()) {
+                ids.put(f.getKey(), nextId);
+                added.put(nextId, f.getValue());
+                nextId++;
+            }
+            newIds.put(e.getKey(), ids);
+            addedFiles.put(e.getKey(), added);
+        }
+        Map<TableBucket, PositionIndexStore.BucketChange> change = new HashMap<>();
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(8, parts.size()));
+        try {
+            Map<TableBucket, Future<PositionIndexStore.BucketPart>> remapped = new HashMap<>();
+            for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {
+                CompactionIndexPart part = e.getValue();
+                List<RowPosSstIndex.SstFileEntry> ssts = new ArrayList<>();
+                for (int i = 0; i < part.sstFileNames().size(); i++) {
+                    ssts.add(
+                            new RowPosSstIndex.SstFileEntry(
+                                    part.sstFileNames().get(i), part.sstFileSizes().get(i)));
+                }
+                PositionIndexStore.BucketPart stored =
+                        ssts.isEmpty()
+                                ? PositionIndexStore.BucketPart.NONE
+                                : new PositionIndexStore.BucketPart(ssts);
+                TableBucket tb = e.getKey();
+                remapped.put(
+                        tb,
+                        pool.submit(
+                                () -> store.remapFileIds(changeId, tb, stored, newIds.get(tb))));
+            }
+            for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {
+                change.put(
+                        e.getKey(),
+                        new PositionIndexStore.BucketChange(
+                                remapped.get(e.getKey()).get(),
+                                addedFiles.get(e.getKey()),
+                                new ArrayList<>(e.getValue().removedFiles())));
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        return change;
+    }
 
     private void maybeTrimIndexChain(
             long tableId,
