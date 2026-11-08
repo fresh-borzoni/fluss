@@ -26,6 +26,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.StorageBackpressureException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.KvFormat;
@@ -43,6 +44,9 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DerivedDvMetrics;
+import org.apache.fluss.server.kv.dv.DvRocksDB;
 import org.apache.fluss.server.kv.historical.HistoricalKvTombstone;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
@@ -115,6 +119,8 @@ import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 @ThreadSafe
 public final class KvTablet {
     private static final Logger LOG = LoggerFactory.getLogger(KvTablet.class);
+    // How long a new tablet of a dropped bucket, or a shutdown, waits for a DV RocksDB to close.
+    static final long DV_CLOSE_WAIT_MS = 60_000;
 
     private static final long MIN_FLUSH_RETRY_DELAY_MS = 100L;
 
@@ -175,6 +181,10 @@ public final class KvTablet {
     // RocksDB statistics accessor for this tablet
     @Nullable private final RocksDBStatistics rocksDBStatistics;
 
+    // the deletion vector state of the bucket, null when deletion vectors are disabled
+    @Nullable private final DvRocksDB dvRocksDB;
+    @Nullable private final DerivedDvManager dvManager;
+
     /**
      * The kv data in pre-write buffer whose log offset is less than the flushedLogOffset has been
      * flushed into kv.
@@ -233,7 +243,9 @@ public final class KvTablet {
             @Nullable RowTtlTimestampProvider rowTtlTimestampProvider,
             Clock clock,
             boolean rowTtlEnabled,
-            boolean skipUnchangedUpsert) {
+            boolean skipUnchangedUpsert,
+            @Nullable DvRocksDB dvRocksDB,
+            @Nullable DerivedDvManager dvManager) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.historicalPartition =
@@ -249,8 +261,9 @@ public final class KvTablet {
         this.kvStateAccessor =
                 new KvStateAccessor(kvPreWriteBuffer, rocksDBKv, historicalPartition);
         this.kvValueLayout = kvValueLayout;
+        // historical state and deletion vectors tag values with their offset
         this.stateValueEncoder =
-                historicalPartition
+                historicalPartition || valueEncoder.takesExplicitTags()
                         ? valueEncoder::encodeValue
                         : (value, logOffset) -> valueEncoder.encodeValue(value);
         this.historicalCleanupOffset = historicalCleanupOffset;
@@ -273,8 +286,11 @@ public final class KvTablet {
                         valueDecoder,
                         rowTtlTimestampProvider,
                         clock,
-                        skipUnchangedUpsert);
+                        skipUnchangedUpsert,
+                        dvManager);
         this.rocksDBStatistics = rocksDBStatistics;
+        this.dvRocksDB = dvRocksDB;
+        this.dvManager = dvManager;
         this.autoIncrementManager = autoIncrementManager;
         this.flushCompleteListener = flushCompleteListener;
         // TODO: Support row count for historical partitions.
@@ -469,9 +485,18 @@ public final class KvTablet {
                 historicalPartition
                         ? KvValueLayout.TAGGED
                         : KvValueLayout.fromTableConfig(tableConfig);
+        // Deletion vectors tag each value with the log offset of its version.
+        boolean versionTags = !historicalPartition && tableConfig.isDeletionVectorsEnabled();
+        if (versionTags && !kvValueLayout.hasValueTag()) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Table %s has deletion vectors but its KV value layout %d has no tag"
+                                    + " for the offset of a value's version.",
+                            tablePath, kvValueLayout.version()));
+        }
         @Nullable
         RowTtlTimestampProvider rowTtlTimestampProvider =
-                !historicalPartition && kvValueLayout.hasValueTag()
+                !historicalPartition && !versionTags && kvValueLayout.hasValueTag()
                         ? RowTtlTimestampProvider.create(
                                 tableConfig, schemaGetter, ZoneId.systemDefault())
                         : null;
@@ -516,6 +541,24 @@ public final class KvTablet {
                         kv.getDefaultColumnFamilyHandle(),
                         sharedBlockCache == null ? kv.getBlockCache() : null);
 
+        DvRocksDB dvRocksDB = null;
+        DerivedDvManager dvManager = null;
+        if (tableConfig.isDeletionVectorsEnabled()) {
+            dvRocksDB =
+                    DvRocksDB.open(
+                            new File(kvTabletDir, "dv").getAbsolutePath(),
+                            sharedBlockCache,
+                            sharedWriteBufferManager);
+            dvManager =
+                    new DerivedDvManager(
+                            dvRocksDB,
+                            logTablet::getHighWatermark,
+                            serverConf.get(ConfigOptions.KV_DELETION_VECTORS_CHECKPOINT_INTERVAL),
+                            DerivedDvMetrics.of(serverMetricGroup));
+            // the write path hands over the log end of every batch it appends
+            dvManager.trackHandOffs();
+        }
+
         return new KvTablet(
                 tablePath,
                 tableBucket,
@@ -544,7 +587,9 @@ public final class KvTablet {
                 rowTtlTimestampProvider,
                 clock,
                 rowTtl.isPresent(),
-                tableConfig.isUpsertSkipUnchanged());
+                tableConfig.isUpsertSkipUnchanged(),
+                dvRocksDB,
+                dvManager);
     }
 
     public static KvTablet create(
@@ -1454,6 +1499,12 @@ public final class KvTablet {
                     // Close outside kvLock so active reads and async flushes can release leases.
                     rocksDBKv.close(closeMode);
                 }
+                if (dvManager != null) {
+                    // The manager closes the DV RocksDB once its background readers are done.
+                    dvManager.close();
+                } else if (dvRocksDB != null) {
+                    dvRocksDB.close();
+                }
                 closeCompletion.complete(null);
             } catch (Throwable t) {
                 closeCompletion.completeExceptionally(t);
@@ -1467,11 +1518,43 @@ public final class KvTablet {
         }
     }
 
-    /** Completely delete the kv directory and all contents form the file system with no delay. */
-    public void drop() throws Exception {
+    /**
+     * Closes the tablet and deletes the kv directory and all its contents. The deletion vector
+     * RocksDB, in this directory, may stay open after the close for a background reader; then the
+     * directory is deleted once it closes. The returned future completes when the directory is
+     * deleted.
+     */
+    public CompletableFuture<Void> drop() throws Exception {
         // Do not hold kvLock while waiting for a concurrent close to finish its flush scheduler.
         close(KvCloseMode.DISCARD_UNPERSISTED_STATE);
-        inWriteLock(kvLock, () -> FileUtils.deleteDirectory(kvTabletDir));
+        CompletableFuture<Void> dvClosed = dvClosed();
+        if (dvClosed.isDone()) {
+            inWriteLock(kvLock, () -> FileUtils.deleteDirectory(kvTabletDir));
+            return CompletableFuture.completedFuture(null);
+        }
+        LOG.warn(
+                "The deletion vector RocksDB of {} is still open for a background reader; the kv"
+                        + " directory {} is deleted once it closes.",
+                tableBucket,
+                kvTabletDir);
+        return dvClosed.handle(
+                (v, t) -> {
+                    try {
+                        FileUtils.deleteDirectory(kvTabletDir);
+                    } catch (IOException e) {
+                        LOG.warn("Failed to delete the kv directory {}.", kvTabletDir, e);
+                    }
+                    return null;
+                });
+    }
+
+    /**
+     * Completes once the bucket's deletion vector RocksDB is closed. After {@link #close} it may
+     * still be open for a background reader, and it uses the tablet server's shared block cache and
+     * write buffer manager until then.
+     */
+    public CompletableFuture<Void> dvClosed() {
+        return dvManager != null ? dvManager.dbClosed() : CompletableFuture.completedFuture(null);
     }
 
     /** Creates an incremental snapshot with the table's thread-safe upload byte counter. */
@@ -1500,6 +1583,35 @@ public final class KvTablet {
     @VisibleForTesting
     public RocksDBKv getRocksDBKv() {
         return rocksDBKv;
+    }
+
+    /**
+     * The tag of the key's value in the pre-write buffer or RocksDB, or null if the key has no
+     * value. For a table with deletion vectors, the log offset of the value's version.
+     */
+    @VisibleForTesting
+    @Nullable
+    public Long valueTag(byte[] key) throws IOException {
+        return inReadLock(
+                kvLock,
+                () -> {
+                    byte[] raw =
+                            kvStateAccessor
+                                    .lookupLocal(kvStateAccessor.encodeKey(key, null))
+                                    .value();
+                    return raw == null ? null : kvValueLayout.readValueTag(MemorySegment.wrap(raw));
+                });
+    }
+
+    /** Returns the deletion vector manager of this tablet, or null if they are disabled. */
+    @Nullable
+    public DerivedDvManager getDvManager() {
+        return dvManager;
+    }
+
+    /** Returns whether deletion vectors are enabled for this tablet. */
+    public boolean isDvEnabled() {
+        return dvManager != null;
     }
 
     /** Returns the recent normalized backpressure pressure in {@code [0, 1)}. */

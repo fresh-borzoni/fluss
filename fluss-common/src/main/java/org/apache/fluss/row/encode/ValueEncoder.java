@@ -69,6 +69,14 @@ public final class ValueEncoder {
         return new ValueEncoder(kvValueLayout, valueTagProvider);
     }
 
+    /**
+     * Whether the encoder writes a tag that each caller supplies ({@link #encodeValue(BinaryValue,
+     * long)}).
+     */
+    public boolean takesExplicitTags() {
+        return kvValueLayout.hasValueTag() && valueTagProvider == null;
+    }
+
     /** Returns whether this encoder writes an internal value tag before the row bytes. */
     public boolean hasValueTag() {
         return kvValueLayout.hasValueTag();

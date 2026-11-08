@@ -173,6 +173,17 @@ public class LakeTable {
      */
     @Nullable
     public LakeTableSnapshot getOrReadLatestReadableTableSnapshot() throws IOException {
+        return getOrReadLatestReadableTableSnapshot(LakeTable::readOffsets);
+    }
+
+    /**
+     * Like {@link #getOrReadLatestReadableTableSnapshot()}, but reads offsets files with {@code
+     * offsetsReader}. An offsets file is written once under a unique name, so the reader may cache
+     * it.
+     */
+    @Nullable
+    public LakeTableSnapshot getOrReadLatestReadableTableSnapshot(OffsetsReader offsetsReader)
+            throws IOException {
         // only happen in v1
         if (lakeTableSnapshot != null) {
             return lakeTableSnapshot;
@@ -185,11 +196,62 @@ public class LakeTable {
         for (int i = checkNotNull(lakeSnapshotMetadatas).size() - 1; i >= 0; i--) {
             LakeSnapshotMetadata snapshotMetadata = lakeSnapshotMetadatas.get(i);
             if (snapshotMetadata.readableOffsetsFilePath != null) {
-                return toLakeTableSnapshot(
-                        snapshotMetadata.snapshotId, snapshotMetadata.readableOffsetsFilePath);
+                return new LakeTableSnapshot(
+                        snapshotMetadata.snapshotId,
+                        offsetsReader.read(snapshotMetadata.readableOffsetsFilePath));
             }
         }
         return null;
+    }
+
+    /**
+     * Gets the readable offsets of the given snapshot: the log offsets from which a union read of
+     * it continues in each bucket.
+     *
+     * @return the snapshot with its readable offsets, or null if it is not registered as readable
+     */
+    @Nullable
+    public LakeTableSnapshot getOrReadReadableTableSnapshot(long snapshotId) throws IOException {
+        return getOrReadReadableTableSnapshot(snapshotId, LakeTable::readOffsets);
+    }
+
+    /**
+     * Like {@link #getOrReadReadableTableSnapshot(long)}, but reads offsets files with {@code
+     * offsetsReader}. An offsets file is written once under a unique name, so the reader may cache
+     * it.
+     */
+    @Nullable
+    public LakeTableSnapshot getOrReadReadableTableSnapshot(
+            long snapshotId, OffsetsReader offsetsReader) throws IOException {
+        // only happen in v1
+        if (lakeTableSnapshot != null) {
+            return lakeTableSnapshot.getSnapshotId() == snapshotId ? lakeTableSnapshot : null;
+        }
+        for (int i = checkNotNull(lakeSnapshotMetadatas).size() - 1; i >= 0; i--) {
+            LakeSnapshotMetadata snapshotMetadata = lakeSnapshotMetadatas.get(i);
+            if (snapshotMetadata.snapshotId == snapshotId
+                    && snapshotMetadata.readableOffsetsFilePath != null) {
+                return new LakeTableSnapshot(
+                        snapshotMetadata.snapshotId,
+                        offsetsReader.read(snapshotMetadata.readableOffsetsFilePath));
+            }
+        }
+        return null;
+    }
+
+    /** Reads the bucket offsets of an offsets file. */
+    @FunctionalInterface
+    public interface OffsetsReader {
+        Map<TableBucket, Long> read(FsPath offsetsFile) throws IOException;
+    }
+
+    /** Reads the bucket offsets of an offsets file from its file system. */
+    public static Map<TableBucket, Long> readOffsets(FsPath offsetsFile) throws IOException {
+        FSDataInputStream inputStream = offsetsFile.getFileSystem().open(offsetsFile);
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            IOUtils.copyBytes(inputStream, outputStream, true);
+            return TableBucketOffsets.fromJsonBytes(outputStream.toByteArray()).getOffsets();
+        }
     }
 
     private LakeTableSnapshot toLakeTableSnapshot(LakeSnapshotMetadata lakeSnapshotMetadata)

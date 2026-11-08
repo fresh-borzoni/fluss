@@ -513,7 +513,7 @@ class TableDescriptorValidationTest {
     }
 
     @Test
-    void testDeletionVectorsRequirePrimaryKeyIcebergOrPaimonTableWithFullChangelog() {
+    void testDeletionVectorsRequirePrimaryKeyIcebergOrPaimonTable() {
         String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
         String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
         assertThatCode(
@@ -562,6 +562,41 @@ class TableDescriptorValidationTest {
                                         DataLakeFormat.LANCE))
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining("only supported for the iceberg and paimon lake formats");
+    }
+
+    /**
+     * Deletion vectors tag each KV value with the log offset of its version, which names the
+     * version a change supersedes. Row TTL uses that tag for the value's time, so the two are
+     * rejected together, and a table with deletion vectors takes the tagged value layout.
+     */
+    @Test
+    void testDeletionVectorsTagKvValues() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String lake = ConfigOptions.TABLE_DATALAKE_ENABLED.key();
+        String layout = ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key();
+        Map<String, String> ttl = new HashMap<>();
+        ttl.put(dv, "true");
+        ttl.put(lake, "true");
+        ttl.put(ConfigOptions.TABLE_KV_TTL.key(), "1 h");
+        ttl.put(layout, String.valueOf(KvValueLayout.TAGGED.version()));
+        assertThatThrownBy(() -> validate(pkTableWithProperties(ttl), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(dv)
+                .hasMessageContaining(ConfigOptions.TABLE_KV_TTL.key());
+
+        Map<String, String> plain = new HashMap<>();
+        plain.put(dv, "true");
+        plain.put(lake, "true");
+        plain.put(layout, String.valueOf(KvValueLayout.PLAIN.version()));
+        assertThatThrownBy(() -> validate(pkTableWithProperties(plain), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(layout)
+                .hasMessageContaining(dv);
+
+        Map<String, String> tagged = new HashMap<>(plain);
+        tagged.put(layout, String.valueOf(KvValueLayout.TAGGED.version()));
+        assertThatCode(() -> validate(pkTableWithProperties(tagged), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
     }
 
     /**

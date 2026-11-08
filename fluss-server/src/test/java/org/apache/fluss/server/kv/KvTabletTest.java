@@ -113,6 +113,7 @@ import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -613,6 +614,33 @@ class KvTabletTest {
 
         assertThatCode(kvTablet::drop).doesNotThrowAnyException();
         assertThat(kvTablet.getKvTabletDir()).doesNotExist();
+    }
+
+    @Test
+    void testDvEnabledInsertFlushAndClose() throws Exception {
+        PhysicalTablePath path = PhysicalTablePath.of(TablePath.of("db", "dv_kv"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, path);
+        Map<String, String> conf = new HashMap<>();
+        conf.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        TableBucket bucket = logTablet.getTableBucket();
+        kvTablet = createKvTablet(path, bucket, logTablet, tmpKvDir, schemaGetter, conf);
+        assertThat(kvTablet.isDvEnabled()).isTrue();
+        // an insert is appended and flushed, then closing also closes the DV RocksDB
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        KvRecordTestUtils.KvRecordFactory.of(DATA1_SCHEMA_PK.getRowType())
+                                .ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+        assertThat(logTablet.localLogEndOffset()).isGreaterThan(0L);
+        flushAndWait(kvTablet, logTablet.localLogEndOffset());
+        Future<?> closed =
+                executor.submit(
+                        () -> {
+                            kvTablet.close();
+                            return null;
+                        });
+        assertThatCode(() -> closed.get(15, TimeUnit.SECONDS)).doesNotThrowAnyException();
     }
 
     @Test

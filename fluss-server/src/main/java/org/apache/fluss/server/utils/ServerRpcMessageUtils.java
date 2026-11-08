@@ -76,6 +76,7 @@ import org.apache.fluss.rpc.messages.DescribeClusterResponse;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
 import org.apache.fluss.rpc.messages.GetLakeSnapshotResponse;
@@ -192,6 +193,7 @@ import org.apache.fluss.server.entity.ProduceLogDataForBucket;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
+import org.apache.fluss.server.kv.dv.DvSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
@@ -2533,5 +2535,25 @@ public class ServerRpcMessageUtils {
             pb.setRemoteLogEndOffset(entry.getManifestHandle().getRemoteLogEndOffset());
         }
         return response;
+    }
+
+    /** Builds a {@link GetDvSnapshotResponse} carrying the masks of a union read. */
+    public static GetDvSnapshotResponse buildGetDvSnapshotResponse(DvSnapshot snapshot) {
+        GetDvSnapshotResponse resp =
+                new GetDvSnapshotResponse()
+                        .setLogEndOffset(snapshot.getLogEndOffset())
+                        .setSnapshotStartOffset(snapshot.getSnapshotStartOffset());
+        if (snapshot.getLogDvBitmap() != null) {
+            resp.setLogDvBitmap(snapshot.getLogDvBitmap());
+        }
+        if (snapshot.getLakeSnapshotIdentity() != null) {
+            resp.setLakeSnapshotIdentity(snapshot.getLakeSnapshotIdentity());
+        }
+        for (Map.Entry<String, byte[]> entry : snapshot.getLakeDvEntries().entrySet()) {
+            resp.addLakeDvEntry()
+                    .setFilePath(entry.getKey())
+                    .setDeletedPositionsBitmap(entry.getValue());
+        }
+        return resp;
     }
 }

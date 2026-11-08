@@ -45,6 +45,8 @@ import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementUpdater;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DvEntry;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
@@ -68,7 +70,10 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -115,6 +120,8 @@ public final class KvWriteProcessor {
     @Nullable private final RowTtlTimestampProvider rowTtlTimestampProvider;
     private final Clock clock;
     private final boolean skipUnchangedUpsert;
+    // receives the key changes of each batch when deletion vectors are enabled, otherwise null
+    @Nullable private final DerivedDvManager dvManager;
 
     /** Creates a KV write processor. */
     public KvWriteProcessor(
@@ -133,7 +140,8 @@ public final class KvWriteProcessor {
             ValueDecoder valueDecoder,
             @Nullable RowTtlTimestampProvider rowTtlTimestampProvider,
             Clock clock,
-            boolean skipUnchangedUpsert) {
+            boolean skipUnchangedUpsert,
+            @Nullable DerivedDvManager dvManager) {
         this.tableBucket = tableBucket;
         this.logTablet = logTablet;
         this.arrowWriterProvider = arrowWriterProvider;
@@ -155,6 +163,7 @@ public final class KvWriteProcessor {
         this.rowTtlTimestampProvider = rowTtlTimestampProvider;
         this.clock = clock;
         this.skipUnchangedUpsert = skipUnchangedUpsert;
+        this.dvManager = dvManager;
     }
 
     /** Processes a KV batch against the supplied state and appends its WAL. */
@@ -177,21 +186,24 @@ public final class KvWriteProcessor {
         // get offset to track the offset corresponded to the kv record
         long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
+        List<DvEntry> dvEntries;
+        LogAppendInfo logAppendInfo;
         try {
             if (rowTtlTimestampProvider != null) {
                 rowTtlTimestampProvider.prepareForBatch(clock.milliseconds());
             }
-            processKvRecords(
-                    kvRecords,
-                    kvRecords.schemaId(),
-                    writeContext.rowMerger,
-                    writeContext.autoIncrementUpdater,
-                    walBuilder,
-                    latestSchemaRow,
-                    logEndOffsetOfPrevBatch,
-                    stateAccessor,
-                    originalPartitionName,
-                    historicalValueLookup);
+            dvEntries =
+                    processKvRecords(
+                            kvRecords,
+                            kvRecords.schemaId(),
+                            writeContext.rowMerger,
+                            writeContext.autoIncrementUpdater,
+                            walBuilder,
+                            latestSchemaRow,
+                            logEndOffsetOfPrevBatch,
+                            stateAccessor,
+                            originalPartitionName,
+                            historicalValueLookup);
 
             // There will be a situation that these batches of kvRecordBatch have not
             // generated any CDC logs, for example, when client attempts to delete
@@ -203,14 +215,13 @@ public final class KvWriteProcessor {
             // put a batch into file with recordCount 0 and offset plus 1L, it will
             // update the batchSequence corresponding to the writerId and also increment
             // the CDC log offset by 1.
-            LogAppendInfo logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
+            logAppendInfo = logTablet.appendAsLeader(walBuilder.build());
 
             // if the batch is duplicated, we should truncate the state pre-write
             // buffer already written.
             if (logAppendInfo.duplicated()) {
                 stateAccessor.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
             }
-            return logAppendInfo;
         } catch (Throwable t) {
             // While encounter error here, the CDC logs may fail writing to disk,
             // and the client probably will resend the batch. If we do not remove the
@@ -224,6 +235,22 @@ public final class KvWriteProcessor {
             // deallocate the memory and arrow writer used by the wal builder
             walBuilder.deallocate();
         }
+        // The batch is in the log from here on, so a failed hand-off must not undo its KV state.
+        // The deletion vectors drop their log tail instead and replay it from the log. A batch
+        // without changes still hands over the log end: masks go no further than it.
+        if (!logAppendInfo.duplicated() && dvManager != null) {
+            try {
+                dvManager.handleChangelogSynced(dvEntries, logTablet.localLogEndOffset());
+            } catch (Throwable t) {
+                LOG.warn(
+                        "Failed to hand the key changes of an appended batch to the deletion"
+                                + " vectors of {}; their log tail is replayed.",
+                        logTablet.getTableBucket(),
+                        t);
+                dvManager.handOffFailed(t);
+            }
+        }
+        return logAppendInfo;
     }
 
     /**
@@ -310,7 +337,7 @@ public final class KvWriteProcessor {
         }
     }
 
-    private void processKvRecords(
+    private List<DvEntry> processKvRecords(
             KvRecordBatch kvRecords,
             short schemaIdOfNewData,
             RowMerger currentMerger,
@@ -323,6 +350,7 @@ public final class KvWriteProcessor {
             @Nullable HistoricalValueLookup historicalValueLookup)
             throws Exception {
         long logOffset = startLogOffset;
+        List<DvEntry> dvEntries = dvManager != null ? new ArrayList<>() : Collections.emptyList();
 
         // TODO: reuse the read context
         KvRecordBatch.ReadContext readContext =
@@ -344,7 +372,8 @@ public final class KvWriteProcessor {
                                 logOffset,
                                 stateAccessor,
                                 keyBytes,
-                                historicalValueLookup);
+                                historicalValueLookup,
+                                dvEntries);
             } else {
                 logOffset =
                         processUpsert(
@@ -357,9 +386,11 @@ public final class KvWriteProcessor {
                                 logOffset,
                                 stateAccessor,
                                 keyBytes,
-                                historicalValueLookup);
+                                historicalValueLookup,
+                                dvEntries);
             }
         }
+        return dvEntries;
     }
 
     private long processDeletion(
@@ -370,14 +401,23 @@ public final class KvWriteProcessor {
             long logOffset,
             KvStateAccessor stateAccessor,
             byte[] primaryKey,
-            @Nullable HistoricalValueLookup historicalValueLookup)
+            @Nullable HistoricalValueLookup historicalValueLookup,
+            List<DvEntry> dvEntries)
             throws Exception {
         if (shouldIgnoreDeletion(currentMerger)) {
             return logOffset;
         }
 
-        BinaryValue oldValue =
-                getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
+        long previousOffset = -1;
+        BinaryValue oldValue;
+        if (dvManager != null && historicalValueLookup == null) {
+            // the tag of the old value is the offset of the version the delete supersedes
+            KvStateAccessor.TaggedValue tagged = stateAccessor.lookupTagged(key, valueDecoder);
+            oldValue = tagged == null ? null : tagged.value;
+            previousOffset = tagged == null ? -1 : tagged.tag;
+        } else {
+            oldValue = getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
+        }
         if (oldValue == null) {
             LOG.debug(
                     "The specific key can't be found in kv tablet although the kv record is for deletion, "
@@ -397,11 +437,24 @@ public final class KvWriteProcessor {
 
         // if newValue is null, it means the row should be deleted
         if (newValue == null) {
-            return applyDelete(
-                    key, oldValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
+            long nextOffset =
+                    applyDelete(
+                            key, oldValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
+            addDvEntry(dvEntries, key, logOffset, -1, false, previousOffset);
+            return nextOffset;
         } else {
-            return applyUpdate(
-                    key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
+            long nextOffset =
+                    applyUpdate(
+                            key,
+                            oldValue,
+                            newValue,
+                            walBuilder,
+                            latestSchemaRow,
+                            logOffset,
+                            stateAccessor);
+            // the +U is the last record applyUpdate writes
+            addDvEntry(dvEntries, key, nextOffset - 1, nextOffset - 1, false, previousOffset);
+            return nextOffset;
         }
     }
 
@@ -415,25 +468,48 @@ public final class KvWriteProcessor {
             long logOffset,
             KvStateAccessor stateAccessor,
             byte[] primaryKey,
-            @Nullable HistoricalValueLookup historicalValueLookup)
+            @Nullable HistoricalValueLookup historicalValueLookup,
+            List<DvEntry> dvEntries)
             throws Exception {
-        if (canSkipOldValueLookup(currentMerger, autoIncrementUpdater)) {
-            return applyUpdate(
-                    key, null, currentValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
+        // Deletion vectors need the old value's tag, the offset of the version it supersedes.
+        boolean versionTags = dvManager != null;
+        if (!versionTags && canSkipOldValueLookup(currentMerger, autoIncrementUpdater)) {
+            long nextOffset =
+                    applyUpdate(
+                            key,
+                            null,
+                            currentValue,
+                            walBuilder,
+                            latestSchemaRow,
+                            logOffset,
+                            stateAccessor);
+            addDvEntry(dvEntries, key, nextOffset - 1, nextOffset - 1, false);
+            return nextOffset;
         }
 
-        BinaryValue oldValue =
-                getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
+        long previousOffset = -1;
+        BinaryValue oldValue;
+        if (versionTags && historicalValueLookup == null) {
+            // the tag of the old value is the offset of the version the change supersedes
+            KvStateAccessor.TaggedValue tagged = stateAccessor.lookupTagged(key, valueDecoder);
+            oldValue = tagged == null ? null : tagged.value;
+            previousOffset = tagged == null ? -1 : tagged.tag;
+        } else {
+            oldValue = getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
+        }
         if (oldValue == null) {
             BinaryValue valueToInsert = currentMerger.merge(null, currentValue);
-            return applyInsert(
-                    key,
-                    valueToInsert,
-                    walBuilder,
-                    latestSchemaRow,
-                    logOffset,
-                    autoIncrementUpdater,
-                    stateAccessor);
+            long nextOffset =
+                    applyInsert(
+                            key,
+                            valueToInsert,
+                            walBuilder,
+                            latestSchemaRow,
+                            logOffset,
+                            autoIncrementUpdater,
+                            stateAccessor);
+            addDvEntry(dvEntries, key, logOffset, logOffset, true);
+            return nextOffset;
         }
 
         BinaryValue newValue = currentMerger.merge(oldValue, currentValue);
@@ -447,8 +523,47 @@ public final class KvWriteProcessor {
             return logOffset;
         }
 
-        return applyUpdate(
-                key, oldValue, newValue, walBuilder, latestSchemaRow, logOffset, stateAccessor);
+        long nextOffset =
+                applyUpdate(
+                        key,
+                        oldValue,
+                        newValue,
+                        walBuilder,
+                        latestSchemaRow,
+                        logOffset,
+                        stateAccessor);
+        // the +U is the last record applyUpdate writes
+        addDvEntry(dvEntries, key, nextOffset - 1, nextOffset - 1, false, previousOffset);
+        return nextOffset;
+    }
+
+    /**
+     * Records a change of {@code key} for the deletion vectors: {@code recordOffset} is the last
+     * log record of the change and {@code versionOffset} the record of the new version, or -1 if
+     * the key was deleted. {@code insert} is set if the key had no previous value, so no lake row
+     * holds it either.
+     */
+    private void addDvEntry(
+            List<DvEntry> dvEntries,
+            KvPreWriteBuffer.Key key,
+            long recordOffset,
+            long versionOffset,
+            boolean insert) {
+        addDvEntry(dvEntries, key, recordOffset, versionOffset, insert, -1);
+    }
+
+    /** As above; {@code previousOffset} is the offset of the superseded version, else -1. */
+    private void addDvEntry(
+            List<DvEntry> dvEntries,
+            KvPreWriteBuffer.Key key,
+            long recordOffset,
+            long versionOffset,
+            boolean insert,
+            long previousOffset) {
+        if (dvManager != null) {
+            dvEntries.add(
+                    new DvEntry(key.get(), recordOffset, versionOffset, insert, previousOffset));
+        }
     }
 
     private long applyDelete(

@@ -84,7 +84,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -173,6 +177,16 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     @Nullable private final Cache sharedWriteBufferAccountingCache;
 
     private final KvFlushScheduler kvFlushScheduler;
+
+    /**
+     * Dropped tablets whose deletion vector RocksDB a background reader still held open at the
+     * drop, by bucket. Each completes once that RocksDB closed and the tablet's directory is
+     * deleted. A new tablet of the bucket waits for it, since RocksDB locks a directory per path
+     * within the process, and a shutdown waits for it before it frees the shared block cache and
+     * write buffer manager the RocksDB uses.
+     */
+    private final Map<TableBucket, CompletableFuture<Void>> pendingDrops =
+            new ConcurrentHashMap<>();
 
     private volatile boolean isShutdown = false;
 
@@ -502,10 +516,25 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         closeTabletsConcurrently(
                         kvs, "kv-tablet-closing", kvTablet -> closeKvTablet(kvTablet, closeMode))
                 .join();
-        IOUtils.closeQuietly(sharedWriteBufferManager);
-        IOUtils.closeQuietly(sharedWriteBufferAccountingCache);
+        // A deletion vector RocksDB may outlive its tablet's close for a background reader, also
+        // of a tablet dropped earlier. It uses the shared block cache and write buffer manager,
+        // which must not be freed under it.
+        List<CompletableFuture<Void>> dvClosings = new ArrayList<>(pendingDrops.values());
+        for (KvTablet kv : kvs) {
+            dvClosings.add(kv.dvClosed());
+        }
+        boolean dvClosed = awaitAll(dvClosings);
         arrowBufferAllocator.close();
         memorySegmentPool.close();
+        if (!dvClosed) {
+            LOG.warn(
+                    "Deletion vector RocksDBs are still open; the shared RocksDB block cache,"
+                            + " write buffer manager and rate limiter are left to the process exit.");
+            LOG.info("Shut down KvManager complete.");
+            return;
+        }
+        IOUtils.closeQuietly(sharedWriteBufferManager);
+        IOUtils.closeQuietly(sharedWriteBufferAccountingCache);
         if (sharedRocksDBRateLimiter != null) {
             sharedRocksDBRateLimiter.close();
         }
@@ -513,6 +542,45 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             sharedBlockCache.close();
         }
         LOG.info("Shut down KvManager complete.");
+    }
+
+    /** Waits, bounded, until the DV RocksDBs of closed and dropped tablets are closed. */
+    private static boolean awaitAll(List<CompletableFuture<Void>> dvClosings) {
+        try {
+            CompletableFuture.allOf(dvClosings.toArray(new CompletableFuture[0]))
+                    .get(KvTablet.DV_CLOSE_WAIT_MS, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (TimeoutException e) {
+            return false;
+        } catch (ExecutionException e) {
+            return true; // a failed close does not use the shared resources any more
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
+     * Waits, bounded, until a dropped tablet of the bucket deleted its directory. Its deletion
+     * vector RocksDB stays open in that directory for a background reader, and a new one cannot
+     * open there meanwhile.
+     */
+    private void awaitPendingDrop(TableBucket tableBucket) throws Exception {
+        CompletableFuture<Void> pending = pendingDrops.get(tableBucket);
+        if (pending == null) {
+            return;
+        }
+        try {
+            pending.get(KvTablet.DV_CLOSE_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new KvStorageException(
+                    String.format(
+                            "The dropped kv tablet of %s still holds its deletion vector RocksDB"
+                                    + " open after %d ms.",
+                            tableBucket, KvTablet.DV_CLOSE_WAIT_MS));
+        } catch (ExecutionException e) {
+            // its directory is deleted however its RocksDB closed
+        }
     }
 
     private void closeKvTablet(KvTablet kvTablet, KvCloseMode closeMode) {
@@ -557,6 +625,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                     if (currentKvs.containsKey(tableBucket)) {
                         return currentKvs.get(tableBucket);
                     }
+                    awaitPendingDrop(tableBucket);
 
                     File tabletDir =
                             getOrCreateTabletDir(logTablet.getDataDir(), tablePath, tableBucket);
@@ -651,7 +720,11 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         if (dropKvTablet != null) {
             TablePath tablePath = dropKvTablet.getTablePath();
             try {
-                dropKvTablet.drop();
+                CompletableFuture<Void> deleted = dropKvTablet.drop();
+                if (!deleted.isDone()) {
+                    pendingDrops.put(tableBucket, deleted);
+                    deleted.whenComplete((v, t) -> pendingDrops.remove(tableBucket, deleted));
+                }
                 if (dropKvTablet.getPartitionName() == null) {
                     LOG.info(
                             "Deleted kv bucket {} for table {} in file path {}.",

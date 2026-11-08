@@ -1087,8 +1087,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         String.valueOf(CURRENT_KV_FORMAT_VERSION));
             }
 
+            // Row TTL tags a value with its time; deletion vectors tag it with the log offset of
+            // its version.
             int layoutVersion =
                     newTableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent()
+                                    || newTableConf.get(
+                                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)
                             ? KvValueLayout.TAGGED.version()
                             : KvValueLayout.PLAIN.version();
             newProperties.put(

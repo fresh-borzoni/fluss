@@ -65,6 +65,7 @@ import org.apache.fluss.server.kv.KvStateLookupResult;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
@@ -976,6 +977,26 @@ public final class Replica {
                         .advanceHistoricalCleanupOffset(restoreStartOffset);
             }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
+            // Rebuild the position index and the log tail in the background, so the leader
+            // takes writes meanwhile. Union reads of the bucket are answered as not ready.
+            if (kvTablet.getDvManager() != null) {
+                kvTablet.getDvManager().useTailBudget(snapshotContext.getDvTailBudget());
+                kvTablet.getDvManager()
+                        .recoverInBackground(
+                                new DerivedDvRecoverySource(
+                                        snapshotContext.getRemoteDataDir(),
+                                        tableInfo,
+                                        tableBucket,
+                                        logTablet,
+                                        remoteLogManager,
+                                        snapshotContext.getZooKeeperClient(),
+                                        schemaGetter,
+                                        new File(logTablet.getLogDir(), "derived-dv-recovery"),
+                                        snapshotContext.remoteLogPrefetchNumInRecoverKv(),
+                                        snapshotContext.remoteLogDownloadThreadsInRecoverKv(),
+                                        snapshotContext.getDvMetadataCache()),
+                                snapshotContext.getDvRebuildLimiter());
+            }
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(

@@ -49,6 +49,11 @@ public class ValueDecoder {
         this.kvValueLayout = kvValueLayout;
     }
 
+    /** Returns the tag of tagged value bytes. */
+    public long decodeValueTag(byte[] valueBytes) {
+        return kvValueLayout.readValueTag(MemorySegment.wrap(valueBytes));
+    }
+
     /** Decode the value bytes and return the schema id and the row encoded in the value bytes. */
     public BinaryValue decodeValue(byte[] valueBytes) {
         MemorySegment memorySegment = MemorySegment.wrap(valueBytes);

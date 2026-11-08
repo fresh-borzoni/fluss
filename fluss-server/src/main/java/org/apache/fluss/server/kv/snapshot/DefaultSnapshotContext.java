@@ -19,10 +19,14 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.KvSnapshotResource;
+import org.apache.fluss.server.kv.dv.DerivedDvMetadataCache;
+import org.apache.fluss.server.kv.dv.DerivedDvRebuildLimiter;
+import org.apache.fluss.server.kv.dv.DerivedDvTailBudget;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
 
@@ -59,6 +63,14 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     private final int remoteLogDownloadThreadsInRecoverKv;
 
+    private final String remoteDataDir;
+
+    private final DerivedDvRebuildLimiter dvRebuildLimiter;
+
+    private final DerivedDvTailBudget dvTailBudget;
+    // one per tablet server: its buckets read a round's remote metadata once
+    private final DerivedDvMetadataCache dvMetadataCache = new DerivedDvMetadataCache();
+
     private DefaultSnapshotContext(
             ZooKeeperClient zooKeeperClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -68,10 +80,16 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             KvSnapshotDataDownloader kvSnapshotDataDownloader,
             long kvSnapshotIntervalMs,
             int writeBufferSizeInBytes,
+            String remoteDataDir,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
             int maxFetchLogSizeInRecoverKv,
             int remoteLogPrefetchNumInRecoverKv,
-            int remoteLogDownloadThreadsInRecoverKv) {
+            int remoteLogDownloadThreadsInRecoverKv,
+            DerivedDvRebuildLimiter dvRebuildLimiter,
+            DerivedDvTailBudget dvTailBudget) {
+        this.remoteDataDir = remoteDataDir;
+        this.dvRebuildLimiter = dvRebuildLimiter;
+        this.dvTailBudget = dvTailBudget;
         this.zooKeeperClient = zooKeeperClient;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.snapshotScheduler = snapshotScheduler;
@@ -101,10 +119,34 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 kvSnapshotResource.getKvSnapshotDataDownloader(),
                 conf.get(ConfigOptions.KV_SNAPSHOT_INTERVAL).toMillis(),
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
+                FlussConfigUtils.getDefaultRemoteDataDir(conf),
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_PREFETCH_NUM),
-                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
+                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS),
+                new DerivedDvRebuildLimiter(
+                        conf.get(ConfigOptions.KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS)),
+                DerivedDvTailBudget.of(conf));
+    }
+
+    @Override
+    public String getRemoteDataDir() {
+        return remoteDataDir;
+    }
+
+    @Override
+    public DerivedDvRebuildLimiter getDvRebuildLimiter() {
+        return dvRebuildLimiter;
+    }
+
+    @Override
+    public DerivedDvTailBudget getDvTailBudget() {
+        return dvTailBudget;
+    }
+
+    @Override
+    public DerivedDvMetadataCache getDvMetadataCache() {
+        return dvMetadataCache;
     }
 
     @Override

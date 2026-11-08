@@ -81,7 +81,11 @@ public final class KvValueLayout {
 
     /** Returns the layout persisted in the table config, defaulting to the plain layout. */
     public static KvValueLayout fromTableConfig(TableConfig tableConfig) {
-        return fromVersion(tableConfig.getKvValueLayoutVersion().orElse(PLAIN.version()));
+        if (tableConfig.getKvValueLayoutVersion().isPresent()) {
+            return fromVersion(tableConfig.getKvValueLayoutVersion().get());
+        }
+        // deletion vectors tag each value with the log offset of its version
+        return tableConfig.isDeletionVectorsEnabled() ? TAGGED : PLAIN;
     }
 
     /** Returns the persisted version of this layout. */

@@ -312,8 +312,18 @@ public class TableDescriptorValidation {
                             ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key()));
         }
 
-        // Either changelog image mode works: the deletion vectors are derived from the keys a
-        // change touches and their last versions, never from UPDATE_BEFORE records.
+        // Either changelog image mode works: a change names the version it supersedes by the tag
+        // of the key's KV value, never by an UPDATE_BEFORE record.
+
+        // Each KV value is tagged with the log offset of its version, which names the version a
+        // change supersedes. Row TTL uses the same tag for the value's time.
+        if (tableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent()) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' = true cannot be combined with '%s': both tag each KV value.",
+                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            ConfigOptions.TABLE_KV_TTL.key()));
+        }
 
         // Iceberg tiering commits the deletes. Paimon merges by key itself, and the masks follow
         // its deletion-vector reads. Other formats implement neither.
@@ -485,6 +495,8 @@ public class TableDescriptorValidation {
 
     private static void checkKvValueLayout(Configuration tableConf, boolean hasPrimaryKey) {
         boolean rowTtlEnabled = tableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent();
+        // deletion vectors tag each value with the log offset of its version
+        boolean taggedVersions = tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
         Optional<Integer> layoutVersion =
                 tableConf.getOptional(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION);
         if (!layoutVersion.isPresent()) {
@@ -515,13 +527,15 @@ public class TableDescriptorValidation {
                             layoutVersion.get()));
         }
 
-        if (layout.hasValueTag() != rowTtlEnabled) {
+        if (layout.hasValueTag() != (rowTtlEnabled || taggedVersions)) {
             throw new InvalidConfigException(
                     String.format(
                             "'%s' version %d is incompatible with '%s'.",
                             ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
                             layout.version(),
-                            ConfigOptions.TABLE_KV_TTL.key()));
+                            taggedVersions
+                                    ? ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()
+                                    : ConfigOptions.TABLE_KV_TTL.key()));
         }
     }
 

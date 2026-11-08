@@ -19,8 +19,13 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.server.kv.dv.DerivedDvMetadataCache;
+import org.apache.fluss.server.kv.dv.DerivedDvRebuildLimiter;
+import org.apache.fluss.server.kv.dv.DerivedDvTailBudget;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
+
+import javax.annotation.Nullable;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -53,6 +58,27 @@ public interface SnapshotContext {
 
     /** Get the size of the write buffer for writing the kv snapshot file to remote filesystem. */
     int getSnapshotFsWriteBufferSize();
+
+    /** Returns the default remote data directory, which holds the DV position index. */
+    @Nullable
+    default String getRemoteDataDir() {
+        return null;
+    }
+
+    /** Returns the limiter of this server's derived deletion vector rebuilds. */
+    default DerivedDvRebuildLimiter getDvRebuildLimiter() {
+        return DerivedDvRebuildLimiter.DEFAULT;
+    }
+
+    /** Returns the heap budget the deletion vector log tails of the tablet server share. */
+    default DerivedDvTailBudget getDvTailBudget() {
+        return DerivedDvTailBudget.DEFAULT;
+    }
+
+    /** Returns the tablet server's cache of the remote metadata the deletion vectors read. */
+    default DerivedDvMetadataCache getDvMetadataCache() {
+        return DerivedDvMetadataCache.DEFAULT;
+    }
 
     /**
      * Get the provider of latest CompletedSnapshot for a table bucket. When no completed snapshot
