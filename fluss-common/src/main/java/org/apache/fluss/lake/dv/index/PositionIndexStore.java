@@ -216,8 +216,9 @@ public interface PositionIndexStore {
 
     /**
      * Like {@link #register(long, long, long)}, and records {@code snapshotIdentity}, which
-     * describes the lake commit of snapshot {@code snapshotId}. Readers use it to check that the id
-     * still names that commit.
+     * describes the lake commit of snapshot {@code snapshotId} (see {@code
+     * SupportsRewritePlanning#snapshotIdentity}). Readers use it to check that the id still names
+     * that commit.
      */
     void register(
             long parentSnapshotId,
