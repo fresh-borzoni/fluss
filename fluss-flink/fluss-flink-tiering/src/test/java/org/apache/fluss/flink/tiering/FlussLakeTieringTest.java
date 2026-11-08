@@ -17,12 +17,45 @@
 
 package org.apache.fluss.flink.tiering;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.MemorySize;
+
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link FlussLakeTiering}. */
 class FlussLakeTieringTest {
+
+    /** The deletion vector options of the tiering service are lake tiering options. */
+    @Test
+    void testDeletionVectorOptionsAreLakeTieringOptions() {
+        String[] args = {
+            "--fluss.bootstrap.servers",
+            "localhost:9123",
+            "--datalake.format",
+            "iceberg",
+            "--lake.tiering.deletion-vectors.write-buffer-size",
+            "32kb",
+            "--lake.tiering.deletion-vectors.trim-interval",
+            "5",
+        };
+        FlussLakeTiering tiering = new FlussLakeTiering(args);
+
+        assertThat(
+                        tiering.lakeTieringConfig.get(
+                                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE))
+                .isEqualTo(MemorySize.parse("32kb"));
+        assertThat(
+                        tiering.lakeTieringConfig.get(
+                                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_TRIM_INTERVAL))
+                .isEqualTo(5);
+        assertThat(
+                        tiering.flussConfig.getRawValue(
+                                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE
+                                        .key()))
+                .isNotPresent();
+    }
 
     @Test
     void testMultipleDecoratorsApplied() {
