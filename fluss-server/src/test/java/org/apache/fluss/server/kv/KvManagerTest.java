@@ -39,6 +39,8 @@ import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.TestData;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DvTestManagers;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -799,6 +801,46 @@ final class KvManagerTest {
         assertThat(kvManager.getKv(tableBucket1)).isPresent();
     }
 
+    /**
+     * A tablet dropped while a background reader holds its deletion vector RocksDB open deletes its
+     * directory only once that RocksDB closes. A new tablet of the bucket, e.g. one a new leader
+     * restores from a KV snapshot, waits for that before it creates its directory, so the late
+     * delete never takes the new tablet's files.
+     */
+    @Test
+    void testNewTabletDirectoryWaitsForTheDroppedTabletsDvRocksDb() throws Exception {
+        initTableBuckets(null);
+        KvTablet dropped = getOrCreateDvKv(tablePath1, tableBucket1);
+        DerivedDvManager dv = dropped.getDvManager();
+        DvTestManagers.setCloseWaitMillis(dv, 100);
+        DvTestManagers.holdReader(dv);
+        kvManager.dropKv(tableBucket1);
+        assertThat(dv.dbClosed()).isNotDone();
+        assertThat(dropped.getKvTabletDir()).exists();
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            // the background reader ends a moment later
+            executor.submit(
+                    () -> {
+                        Thread.sleep(300);
+                        DvTestManagers.releaseReader(dv);
+                        return null;
+                    });
+            File tabletDir =
+                    kvManager.createTabletDir(
+                            tempDir, PhysicalTablePath.of(tablePath1), tableBucket1);
+            assertThat(dv.dbClosed()).isDone();
+            // a KV snapshot is downloaded into the new directory
+            File restored = new File(tabletDir, "restored.sst");
+            assertThat(restored.createNewFile()).isTrue();
+            Thread.sleep(500);
+            assertThat(restored).exists();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     @Test
     void testKvRunConcurrentlyForDifferentBuckets() throws Exception {
         initTableBuckets(null);
@@ -1056,6 +1098,26 @@ final class KvManagerTest {
         kvTablet.putAsLeader(kvRecordBatch, null);
         // flush to make sure data is visible
         flushAndWait(kvTablet, Long.MAX_VALUE);
+    }
+
+    /** Creates the KV tablet of a table with deletion vectors. */
+    private KvTablet getOrCreateDvKv(TablePath tablePath, TableBucket tableBucket)
+            throws Exception {
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
+        LogTablet logTablet =
+                logManager.getOrCreateLog(
+                        tempDir, physicalTablePath, tableBucket, LogFormat.ARROW, 1, true);
+        Configuration tableConf = new Configuration();
+        tableConf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        return kvManager.getOrCreateKv(
+                physicalTablePath,
+                tableBucket,
+                logTablet,
+                KvFormat.COMPACTED,
+                new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, 1)),
+                new TableConfig(tableConf),
+                DEFAULT_COMPRESSION,
+                null);
     }
 
     private KvTablet getOrCreateKv(

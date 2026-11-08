@@ -2141,7 +2141,9 @@ public class ConfigOptions {
                                     + "If not set, row-level TTL uses processing time. "
                                     + "If set, the column must be BIGINT epoch milliseconds, TIMESTAMP, or TIMESTAMP_LTZ. "
                                     + "TIMESTAMP values are interpreted in the TabletServer's system time zone. "
-                                    + "Rows with null event-time values do not expire through TTL.");
+                                    + "Rows with null event-time values do not expire through TTL. "
+                                    + "On a table with deletion vectors, a late or backfilled row written "
+                                    + "after the readable lake snapshot expires only after it is tiered.");
 
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")

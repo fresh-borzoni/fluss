@@ -41,6 +41,7 @@ import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TabletServerNotAvailableException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -1037,7 +1038,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
             // if the table is lake table, we need to add it to lake table tiering manager
             lakeTableTieringManager.addNewLakeTable(newTableInfo);
         } else if (toDisableDataLake) {
-            lakeTableTieringManager.removeLakeTable(newTableInfo.getTableId());
+            lakeTableTieringManager.disableLakeTable(newTableInfo.getTableId());
         } else if (dataLakeEnabled) {
             // The table is still a lake table, check if freshness has changed
             Duration oldFreshness = oldTableInfo.getTableConfig().getDataLakeFreshness();
@@ -1168,9 +1169,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
         if (dropTableEvent.isAutoPartitionTable()) {
             autoPartitionManager.removeAutoPartitionTable(tableId);
         }
-        if (dropTableEvent.isDataLakeEnabled()) {
-            lakeTableTieringManager.removeLakeTable(tableId);
-        }
+        // Every dropped table, also one whose datalake was disabled: its tiering epoch is kept.
+        lakeTableTieringManager.removeLakeTable(tableId);
 
         // for partitioned table, if all the partitions of this table have been deleted,
         // there's no event to trigger resumeTableDeletions, so we need to trigger here
@@ -2392,6 +2392,33 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
     }
 
+    /** The tables among {@code tableIds} that have deletion vectors. */
+    private Set<Long> deletionVectorTableIds(Set<Long> tableIds) {
+        Set<Long> deletionVectorTableIds = new HashSet<>();
+        for (Long tableId : tableIds) {
+            TableInfo tableInfo = coordinatorContext.getTableInfoById(tableId);
+            if (tableInfo != null && tableInfo.getTableConfig().isDeletionVectorsEnabled()) {
+                deletionVectorTableIds.add(tableId);
+            }
+        }
+        return deletionVectorTableIds;
+    }
+
+    /**
+     * The error for a lake snapshot commit of a table with deletion vectors that carries no tiering
+     * epoch. Only tiering services that predate deletion vectors send none, and they commit a
+     * round's rows without deleting the old versions of its keys.
+     */
+    private static UnsupportedVersionException unfencedCommitOfDeletionVectorTable(long tableId) {
+        return new UnsupportedVersionException(
+                String.format(
+                        "Table %d has '%s' enabled, but the commit of its lake snapshot carries no"
+                                + " tiering epoch. It comes from a tiering service that does not"
+                                + " support deletion vectors, which would leave the old rows of"
+                                + " changed keys live in the lake.",
+                        tableId, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+    }
+
     private void tryProcessCommitLakeTableSnapshot(
             CommitLakeTableSnapshotEvent commitLakeTableSnapshotEvent,
             CompletableFuture<CommitLakeTableSnapshotResponse> callback) {
@@ -2421,6 +2448,10 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 tablePathById.put(tableId, tablePath);
             }
         }
+        // this request carries no tiering epoch
+        Set<Long> deletionVectorTableIds =
+                deletionVectorTableIds(
+                        commitLakeTableSnapshotsData.getLakeTableSnapshot().keySet());
 
         ioExecutor.execute(
                 () -> {
@@ -2443,6 +2474,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                             "Table "
                                                     + tableId
                                                     + " not found in coordinator context.");
+                                }
+                                if (deletionVectorTableIds.contains(tableId)) {
+                                    throw unfencedCommitOfDeletionVectorTable(tableId);
                                 }
 
                                 // this involves IO operation (ZK), so we do it in ioExecutor
@@ -2494,6 +2528,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 unavailableTableIds.add(tableId);
             }
         }
+        Set<Long> deletionVectorTableIds =
+                deletionVectorTableIds(commitLakeTableSnapshotByTableId.keySet());
         ioExecutor.execute(
                 () -> {
                     try {
@@ -2523,7 +2559,10 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                         snapshot.getLakeSnapshotMetadata();
                                 Long toKeep = snapshot.getEarliestSnapshotIDToKeep();
                                 Long tieringEpoch = snapshot.getTieringEpoch();
-                                if (tieringEpoch == null) {
+                                if (tieringEpoch == null
+                                        && deletionVectorTableIds.contains(tableId)) {
+                                    throw unfencedCommitOfDeletionVectorTable(tableId);
+                                } else if (tieringEpoch == null) {
                                     // an older client, whose commits are not fenced
                                     lakeTableHelper.registerLakeTableSnapshotV2(
                                             tableId, metadata, toKeep);

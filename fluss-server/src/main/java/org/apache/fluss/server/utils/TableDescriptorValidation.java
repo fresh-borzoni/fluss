@@ -459,6 +459,7 @@ public class TableDescriptorValidation {
 
     private static void checkKvValueLayout(Configuration tableConf, boolean hasPrimaryKey) {
         boolean rowTtlEnabled = tableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent();
+        boolean deletionVectors = tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
         Optional<Integer> layoutVersion =
                 tableConf.getOptional(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION);
         if (!layoutVersion.isPresent()) {
@@ -489,14 +490,45 @@ public class TableDescriptorValidation {
                             layoutVersion.get()));
         }
 
-        if (layout.hasValueTag() != rowTtlEnabled) {
+        if (layout != expectedKvValueLayout(rowTtlEnabled, deletionVectors)) {
             throw new InvalidConfigException(
                     String.format(
-                            "'%s' version %d is incompatible with '%s'.",
+                            "'%s' version %d is incompatible with %s.",
                             ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
                             layout.version(),
-                            ConfigOptions.TABLE_KV_TTL.key()));
+                            describeKvValueOptions(rowTtlEnabled, deletionVectors)));
         }
+    }
+
+    /**
+     * The KV value layout of a primary key table. Deletion vectors keep the log offset of each
+     * value's version in the tag of the tagged layout, and row TTL keeps the value's time there.
+     * With both, the versioned layout has a slot for each.
+     */
+    private static KvValueLayout expectedKvValueLayout(
+            boolean rowTtlEnabled, boolean deletionVectors) {
+        if (rowTtlEnabled && deletionVectors) {
+            return KvValueLayout.VERSIONED;
+        }
+        return rowTtlEnabled || deletionVectors ? KvValueLayout.TAGGED : KvValueLayout.PLAIN;
+    }
+
+    private static String describeKvValueOptions(boolean rowTtlEnabled, boolean deletionVectors) {
+        if (rowTtlEnabled && deletionVectors) {
+            return String.format(
+                    "'%s' = true and '%s'",
+                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                    ConfigOptions.TABLE_KV_TTL.key());
+        }
+        if (deletionVectors) {
+            return String.format(
+                    "'%s' = true without '%s'",
+                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                    ConfigOptions.TABLE_KV_TTL.key());
+        }
+        return String.format(
+                "'%s' %s on a table without deletion vectors",
+                ConfigOptions.TABLE_KV_TTL.key(), rowTtlEnabled ? "set" : "unset");
     }
 
     private static void checkDistribution(TableDescriptor tableDescriptor, int maxBucketNum) {

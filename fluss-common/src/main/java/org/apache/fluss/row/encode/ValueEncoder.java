@@ -35,8 +35,9 @@ public final class ValueEncoder {
     private final KvValueLayout kvValueLayout;
 
     /**
-     * Generates tags for {@link #encodeValue(BinaryValue)}. {@code null} for plain values or when
-     * callers supply each tag to {@link #encodeValue(BinaryValue, long)}.
+     * Generates tags for {@link #encodeValue(BinaryValue)}, or the TTL timestamps of the versioned
+     * layout. {@code null} for plain values, when callers supply each tag to {@link
+     * #encodeValue(BinaryValue, long)}, or for versioned values that never expire.
      */
     @Nullable private final ToLongFunction<BinaryRow> valueTagProvider;
 
@@ -48,7 +49,8 @@ public final class ValueEncoder {
 
     /**
      * Returns an encoder for the given layout. Tagged values must supply their tag to {@link
-     * #encodeValue(BinaryValue, long)}.
+     * #encodeValue(BinaryValue, long)}, and versioned values their version offset, with a TTL
+     * timestamp that never expires.
      */
     public static ValueEncoder forLayout(KvValueLayout kvValueLayout) {
         checkNotNull(kvValueLayout, "kvValueLayout must not be null.");
@@ -57,16 +59,29 @@ public final class ValueEncoder {
                 : new ValueEncoder(kvValueLayout, null);
     }
 
-    /** Returns an encoder for a layout with an internal value tag. */
+    /**
+     * Returns an encoder for a layout with an internal value tag, or for the versioned layout,
+     * whose TTL timestamps {@code valueTagProvider} gives. Versioned values must supply their
+     * version offset to {@link #encodeValue(BinaryValue, long)}.
+     */
     public static ValueEncoder forLayout(
             KvValueLayout kvValueLayout, ToLongFunction<BinaryRow> valueTagProvider) {
         checkNotNull(kvValueLayout, "kvValueLayout must not be null.");
         checkNotNull(valueTagProvider, "valueTagProvider must not be null.");
-        if (!kvValueLayout.hasValueTag()) {
+        if (!kvValueLayout.hasValueTag() && !kvValueLayout.hasTtlTimestampSlot()) {
             throw new IllegalArgumentException(
                     "A value tag provider is not supported for this KV value layout.");
         }
         return new ValueEncoder(kvValueLayout, valueTagProvider);
+    }
+
+    /**
+     * Whether the encoder writes a tag, or a version offset, that each caller supplies ({@link
+     * #encodeValue(BinaryValue, long)}).
+     */
+    public boolean takesExplicitTags() {
+        return kvValueLayout.hasVersionOffsetSlot()
+                || (kvValueLayout.hasValueTag() && valueTagProvider == null);
     }
 
     /** Returns whether this encoder writes an internal value tag before the row bytes. */
@@ -80,9 +95,13 @@ public final class ValueEncoder {
      * <p>For tagged layouts, this method requires a value tag provider supplied when creating the
      * encoder. Callers supplying tags explicitly must use {@link #encodeValue(BinaryValue, long)}.
      *
-     * @throws IllegalStateException if the layout is tagged and no value tag provider was supplied
+     * @throws IllegalStateException if the layout is tagged and no value tag provider was supplied,
+     *     or the layout is versioned, whose values need their version offset
      */
     public byte[] encodeValue(BinaryValue value) {
+        checkState(
+                !kvValueLayout.hasVersionOffsetSlot(),
+                "An explicit version offset is required for this KV value encoder.");
         if (kvValueLayout.hasValueTag()) {
             checkState(
                     valueTagProvider != null,
@@ -92,8 +111,22 @@ public final class ValueEncoder {
         return encodeValueBody(value);
     }
 
-    /** Encodes a binary value with the supplied opaque value tag. */
+    /**
+     * Encodes a binary value with the supplied opaque value tag, or, in the versioned layout, with
+     * the supplied version offset and the TTL timestamp of its row.
+     */
     public byte[] encodeValue(BinaryValue value, long valueTag) {
+        if (kvValueLayout.hasVersionOffsetSlot()) {
+            byte[] values = encodeValueBody(value);
+            kvValueLayout.writeVersionOffset(values, 0, valueTag);
+            kvValueLayout.writeTtlTimestamp(
+                    values,
+                    0,
+                    valueTagProvider == null
+                            ? KvValueLayout.NEVER_EXPIRE_TIMESTAMP
+                            : valueTagProvider.applyAsLong(value.row));
+            return values;
+        }
         checkState(
                 kvValueLayout.hasValueTag(),
                 "An explicit value tag is not supported for this KV value layout.");

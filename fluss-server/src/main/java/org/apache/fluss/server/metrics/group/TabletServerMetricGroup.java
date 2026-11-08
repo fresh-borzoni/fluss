@@ -34,6 +34,8 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -70,6 +72,22 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     // aggregated kv metrics
     private final Counter kvFlushCount;
     private final Histogram kvFlushLatencyHistogram;
+
+    // derived deletion vectors
+    private final Counter dvSwitchCount;
+    private final Histogram dvSwitchLatencyHistogram;
+    private final Counter dvRebuildCount;
+    private final Histogram dvRebuildLatencyHistogram;
+    private final Counter dvCheckpointCount;
+    private final Histogram dvCheckpointLatencyHistogram;
+    private final Counter dvStaleSnapshotCount;
+    private final Counter dvOwnerFaultCount;
+    // the longest step of a bucket's owner, and the longest wait of a step in its mailbox, since
+    // each gauge was last read, in nanoseconds
+    private final AtomicLong dvOwnerStepMaxNanos = new AtomicLong();
+    private final AtomicLong dvOwnerMailboxDelayMaxNanos = new AtomicLong();
+    private final AtomicInteger dvRebuildsInProgress = new AtomicInteger();
+    private final AtomicLong dvLastRebuildMs = new AtomicLong();
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
 
@@ -136,6 +154,32 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
                 new DescriptiveStatisticsHistogram(
                         WINDOW_SIZE, DescriptiveStatisticsHistogram.DEFAULT_MAX_AGE);
         histogram(MetricNames.KV_FLUSH_LATENCY_MS, kvFlushLatencyHistogram);
+
+        // about derived deletion vectors
+        dvSwitchCount = new SimpleCounter();
+        meter(MetricNames.DV_SWITCH_RATE, new MeterView(dvSwitchCount));
+        dvSwitchLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_SWITCH_LATENCY_MS, dvSwitchLatencyHistogram);
+        dvRebuildCount = new SimpleCounter();
+        meter(MetricNames.DV_REBUILD_RATE, new MeterView(dvRebuildCount));
+        dvRebuildLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_REBUILD_LATENCY_MS, dvRebuildLatencyHistogram);
+        dvCheckpointCount = new SimpleCounter();
+        meter(MetricNames.DV_CHECKPOINT_RATE, new MeterView(dvCheckpointCount));
+        dvCheckpointLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_CHECKPOINT_LATENCY_MS, dvCheckpointLatencyHistogram);
+        dvStaleSnapshotCount = new SimpleCounter();
+        meter(MetricNames.DV_STALE_SNAPSHOT_RATE, new MeterView(dvStaleSnapshotCount));
+        dvOwnerFaultCount = new SimpleCounter();
+        meter(MetricNames.DV_OWNER_FAULT_RATE, new MeterView(dvOwnerFaultCount));
+        gauge(
+                MetricNames.DV_OWNER_STEP_MAX_MS,
+                () -> dvOwnerStepMaxNanos.getAndSet(0) / 1_000_000L);
+        gauge(
+                MetricNames.DV_OWNER_MAILBOX_DELAY_MAX_MS,
+                () -> dvOwnerMailboxDelayMaxNanos.getAndSet(0) / 1_000_000L);
+        gauge(MetricNames.DV_REBUILDS_IN_PROGRESS, dvRebuildsInProgress::get);
+        gauge(MetricNames.DV_LAST_REBUILD_MS, dvLastRebuildMs::get);
         kvTruncateAsDuplicatedCount = new SimpleCounter();
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
@@ -295,6 +339,54 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Histogram kvFlushLatencyHistogram() {
         return kvFlushLatencyHistogram;
+    }
+
+    public Counter dvSwitchCount() {
+        return dvSwitchCount;
+    }
+
+    public Histogram dvSwitchLatencyHistogram() {
+        return dvSwitchLatencyHistogram;
+    }
+
+    public Counter dvRebuildCount() {
+        return dvRebuildCount;
+    }
+
+    public Histogram dvRebuildLatencyHistogram() {
+        return dvRebuildLatencyHistogram;
+    }
+
+    public Counter dvCheckpointCount() {
+        return dvCheckpointCount;
+    }
+
+    public Histogram dvCheckpointLatencyHistogram() {
+        return dvCheckpointLatencyHistogram;
+    }
+
+    public Counter dvStaleSnapshotCount() {
+        return dvStaleSnapshotCount;
+    }
+
+    public Counter dvOwnerFaultCount() {
+        return dvOwnerFaultCount;
+    }
+
+    public AtomicLong dvOwnerStepMaxNanos() {
+        return dvOwnerStepMaxNanos;
+    }
+
+    public AtomicLong dvOwnerMailboxDelayMaxNanos() {
+        return dvOwnerMailboxDelayMaxNanos;
+    }
+
+    public AtomicInteger dvRebuildsInProgress() {
+        return dvRebuildsInProgress;
+    }
+
+    public AtomicLong dvLastRebuildMs() {
+        return dvLastRebuildMs;
     }
 
     public Counter kvTruncateAsDuplicatedCount() {

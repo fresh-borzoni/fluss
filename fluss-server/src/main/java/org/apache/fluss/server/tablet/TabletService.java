@@ -118,6 +118,8 @@ import org.apache.fluss.server.entity.ProduceLogDataForBucket;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DerivedDvRequestExecutor;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
 import org.apache.fluss.server.kv.scan.ScannerManager;
@@ -204,6 +206,9 @@ public final class TabletService extends RpcServiceBase
     private final ExecutorService replicaStateChangeExecutor;
     private final GroupManager groupManager;
     private final ConsumerOffsetTableManager consumerOffsetTableManager;
+    // deletion vector requests run on threads of their own, never on the RPC threads; the
+    // server's deletion vector runtime owns and shuts them down
+    private final DerivedDvRequestExecutor dvRequests;
 
     public TabletService(
             int serverId,
@@ -230,6 +235,7 @@ public final class TabletService extends RpcServiceBase
                 ioExecutor);
         this.serviceName = "server-" + serverId;
         this.replicaManager = replicaManager;
+        this.dvRequests = replicaManager.getDvRuntime().requests();
         this.metadataCache = metadataCache;
         this.metadataFunctionProvider =
                 new TabletServerMetadataProvider(zkClient, metadataManager, metadataCache);
@@ -884,9 +890,34 @@ public final class TabletService extends RpcServiceBase
 
     @Override
     public CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(GetDvSnapshotRequest request) {
+        // A lookup tells whether a key exists; the tiering service reads the table anyway.
+        authorizeTable(READ, request.getTableId());
+        Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
+        if (request.getLookupKeysCount() > 0) {
+            // Tiering resolves the positions of its base snapshot by key.
+            if (request.getLookupKeysCount() > DerivedDvManager.MAX_LOOKUP_KEYS) {
+                CompletableFuture<GetDvSnapshotResponse> refused = new CompletableFuture<>();
+                refused.completeExceptionally(
+                        DerivedDvManager.tooManyLookupKeys(request.getLookupKeysCount()));
+                return refused;
+            }
+            List<byte[]> keys = new ArrayList<>(request.getLookupKeysCount());
+            for (int i = 0; i < request.getLookupKeysCount(); i++) {
+                keys.add(request.getLookupKeyAt(i));
+            }
+            return dvRequests.submit(
+                    () ->
+                            replicaManager.lookupDvPositions(
+                                    request.getTableId(),
+                                    partitionId,
+                                    request.getBucketId(),
+                                    request.getReadableSnapshotId(),
+                                    keys));
+        }
         CompletableFuture<GetDvSnapshotResponse> response = new CompletableFuture<>();
         response.completeExceptionally(
-                new UnsupportedOperationException("getDvSnapshot is not supported yet"));
+                new UnsupportedOperationException(
+                        "getDvSnapshot without lookup keys is not supported yet"));
         return response;
     }
 
