@@ -17,6 +17,8 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.dv.index.StagedIndexPartProvider;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
@@ -30,7 +32,8 @@ import java.io.Serializable;
 import java.util.Map;
 
 /** The write result of Iceberg lake writer to pass to committer to commit. */
-public class IcebergWriteResult implements Serializable, StagedIndexPartProvider {
+public class IcebergWriteResult
+        implements Serializable, StagedIndexPartProvider, CompactionIndexPartProvider {
 
     private static final long serialVersionUID = 1L;
 
@@ -69,6 +72,17 @@ public class IcebergWriteResult implements Serializable, StagedIndexPartProvider
     @Nullable
     public StagedIndexPart stagedIndexPart() {
         return stagedIndexPart;
+    }
+
+    @Override
+    public boolean compacted() {
+        return rewriteDataFileResult != null;
+    }
+
+    @Override
+    @Nullable
+    public CompactionIndexPart compactionIndexPart() {
+        return rewriteDataFileResult == null ? null : rewriteDataFileResult.indexPart();
     }
 
     public WriteResult getWriteResult() {

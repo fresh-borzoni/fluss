@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles;
@@ -34,6 +35,7 @@ import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.DataFileSet;
+import org.apache.iceberg.util.DeleteFileSet;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -101,6 +103,56 @@ class IcebergWriteResultSerializerTest {
         serializedData = serializer.serialize(originalResult);
         deserializedResult = serializer.deserialize(serializer.getVersion(), serializedData);
         assertThat(deserializedResult.toString()).isEqualTo(originalResult.toString());
+
+        // with a rewrite result that also removes delete files
+        rewriteDataFileResult =
+                new RewriteDataFileResult(
+                        1L,
+                        DataFileSet.of(Collections.singletonList(dataFile)),
+                        DataFileSet.of(Collections.singletonList(dataFile)),
+                        DeleteFileSet.of(Collections.singletonList(deleteFile)),
+                        null,
+                        null);
+        originalResult = new IcebergWriteResult(writeResult, specs(), rewriteDataFileResult);
+        deserializedResult =
+                serializer.deserialize(
+                        serializer.getVersion(), serializer.serialize(originalResult));
+        assertThat(deserializedResult.toString()).isEqualTo(originalResult.toString());
+        assertThat(deserializedResult.rewriteDataFileResult().deletedDeleteFiles())
+                .extracting(DeleteFile::location)
+                .containsExactly("/data/deletes1.parquet");
+
+        // with the index part of a compaction of a table with deletion vectors
+        CompactionIndexPart part =
+                new CompactionIndexPart(
+                        7L,
+                        1L,
+                        Arrays.asList("sst_0.sst", "sst_1.sst"),
+                        Arrays.asList(10L, 20L),
+                        Collections.singletonMap(5, "file1.parquet"),
+                        Arrays.asList("old1.parquet", "old2.parquet"));
+        rewriteDataFileResult =
+                new RewriteDataFileResult(
+                        1L,
+                        DataFileSet.of(Collections.singletonList(dataFile)),
+                        DataFileSet.of(Collections.singletonList(dataFile)),
+                        DeleteFileSet.create(),
+                        part,
+                        null);
+        originalResult = new IcebergWriteResult(writeResult, specs(), rewriteDataFileResult);
+        deserializedResult =
+                serializer.deserialize(
+                        serializer.getVersion(), serializer.serialize(originalResult));
+        assertThat(deserializedResult.toString()).isEqualTo(originalResult.toString());
+        assertThat(deserializedResult.compacted()).isTrue();
+        CompactionIndexPart read = deserializedResult.compactionIndexPart();
+        assertThat(read).isNotNull();
+        assertThat(read.changeId()).isEqualTo(7L);
+        assertThat(read.readSnapshotId()).isEqualTo(1L);
+        assertThat(read.sstFileNames()).containsExactly("sst_0.sst", "sst_1.sst");
+        assertThat(read.sstFileSizes()).containsExactly(10L, 20L);
+        assertThat(read.addedFiles()).containsExactly(entry(5, "file1.parquet"));
+        assertThat(read.removedFiles()).containsExactly("old1.parquet", "old2.parquet");
     }
 
     @Test

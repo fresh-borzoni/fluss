@@ -23,6 +23,7 @@ import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableExternallyModifiedException;
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.metadata.TableBucket;
@@ -48,9 +49,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>A round looks up the lake positions of the rows it supersedes in the base's index, on the
  * buckets' leaders. It publishes its index change and commits data and deletes in one lake commit,
- * so every lake snapshot is consistent at its tiered offsets. Files rewritten since the base by
- * another engine are re-indexed first. The round is then held ({@link RoundOutcome#held}) until the
- * tiering readers report the re-index; {@link #resumeRound} resumes it.
+ * so every lake snapshot is consistent at its tiered offsets. The round's own compaction hands the
+ * index the new positions of the rows it rewrote ({@link CompactionIndexPart}), so its rewrite
+ * needs no re-index. Files rewritten since the base by another engine, or by a compaction that
+ * could not hand its positions over, are re-indexed first. The round is then held ({@link
+ * RoundOutcome#held}) until the tiering readers report the re-index; {@link #resumeRound} resumes
+ * it.
  *
  * <p>The base fence lets the lake commit land only on the base, or on snapshots after it that
  * changed no data file ({@link DerivedDvRound}), so a registered change from the base always covers
@@ -62,7 +66,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li>{@link DerivedDvRound}: the round of a lake that takes deletes, and its phases;
  *   <li>{@link DerivedDvReindexer}: the re-index of rewritten lake files;
- *   <li>{@link DerivedDvRegistrations}: registrations in Fluss and the snapshots kept for them;
+ *   <li>{@link DerivedDvCompactionPublisher}: the index changes of Fluss's own compactions;
+ *   <li>{@link DerivedDvRegistrations}: registrations in Fluss, the chain's trim and the snapshots
+ *       kept for it;
  *   <li>{@link DerivedDvRecovery}: failed and lost rounds.
  * </ul>
  *
@@ -80,6 +86,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
     private final Set<Long> rolledBackTables = ConcurrentHashMap.newKeySet();
 
     private final DerivedDvRegistrations<WriteResult, Committable> registrations;
+    private final DerivedDvCompactionPublisher<WriteResult, Committable> compaction;
     private final DerivedDvReindexer<WriteResult, Committable> reindexer;
     private final DerivedDvRound<WriteResult, Committable> round;
 
@@ -101,10 +108,11 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                         new DerivedDvMetrics(metricGroup),
                         localTmpDir);
         this.registrations = new DerivedDvRegistrations<>(context);
+        this.compaction = new DerivedDvCompactionPublisher<>(context, registrations);
         this.reindexer = new DerivedDvReindexer<>(context, registrations);
         DerivedDvRecovery<WriteResult, Committable> recovery =
                 new DerivedDvRecovery<>(context, registrations);
-        this.round = new DerivedDvRound<>(context, recovery, reindexer, registrations);
+        this.round = new DerivedDvRound<>(context, recovery, reindexer, compaction, registrations);
     }
 
     /** Commits a round of a table with deletion vectors, or holds it for a re-index. */
@@ -159,6 +167,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                 rowPosResults,
                 reindex.removedFiles,
                 reindex.startedAtMs);
+        // The round committed its own compaction before it was held.
         return round.commitRound(tableId, reindex.tablePath, tableInfo, writeResults, true);
     }
 
