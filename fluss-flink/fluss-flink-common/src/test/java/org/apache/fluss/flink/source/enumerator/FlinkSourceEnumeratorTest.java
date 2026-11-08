@@ -20,6 +20,7 @@ package org.apache.fluss.flink.source.enumerator;
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
@@ -28,10 +29,12 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.KvBatchStrategy;
 import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.FlinkSource;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
+import org.apache.fluss.flink.source.event.DvSplitsFinishedEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
 import org.apache.fluss.flink.source.reader.LeaseContext;
@@ -84,6 +87,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -2197,5 +2201,151 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                 .map(s -> s.getTableBucket().getBucket())
                                 .collect(Collectors.toList()))
                 .containsExactlyInAnyOrder(0, 1, 2, 3);
+    }
+
+    // ---- Splits of union reads of tables with deletion vectors ----
+
+    /**
+     * When a partition is dropped, the log split of a bucket read in several splits is kept, so its
+     * reader fails the read instead of the read losing the keys the other splits masked. A split
+     * that reads the lake files of the bucket is kept too; one that reads a whole bucket without
+     * lake files is removed, as a read planned after the drop reads nothing of it.
+     */
+    @Test
+    void testDroppedPartitionKeepsTheLogSplitOfASplitBucket() {
+        TableBucket bucket = new TableBucket(1L, 7L, 0);
+        Map<Long, String> removed = Collections.singletonMap(7L, "p");
+        List<LakeSplit> files =
+                Collections.singletonList(new TestingLakeSplit(0, Collections.emptyList()));
+        DvBucketSplit logSplit =
+                DvBucketSplit.pinned(
+                        bucket, "p", 5L, 100L, 150L, null, DvBucketSplit.BUCKET_LOG, 107L, 100L);
+        DvBucketSplit group =
+                DvBucketSplit.pinned(bucket, "p", 5L, 100L, 150L, files, 0, 107L, 100L);
+        DvBucketSplit wholeBucket = new DvBucketSplit(bucket, "p", 5L, -1L, 150L, null);
+        DvBucketSplit unplannedFiles =
+                new DvBucketSplit(
+                        DvBucketPart.ofBucket(bucket, "p", 5L, 100L, 150L, files)
+                                .withLakeSplitsPlannedAtStart());
+
+        assertThat(FlinkSourceEnumerator.shouldRemoveForDroppedPartition(logSplit, removed))
+                .isFalse();
+        assertThat(FlinkSourceEnumerator.shouldRemoveForDroppedPartition(group, removed)).isFalse();
+        assertThat(FlinkSourceEnumerator.shouldRemoveForDroppedPartition(unplannedFiles, removed))
+                .isFalse();
+        assertThat(FlinkSourceEnumerator.shouldRemoveForDroppedPartition(wholeBucket, removed))
+                .isTrue();
+    }
+
+    /**
+     * Each split of a pinned bucket holds a hold of the bucket's cut. A reader's report that it
+     * finished splits releases their holds, once; closing the enumerator releases the holds of the
+     * splits left.
+     */
+    @Test
+    void testFinishedDvSplitsReleaseTheirHolds() throws Exception {
+        TableBucket bucket = new TableBucket(1L, 0);
+        List<LakeSplit> files =
+                Collections.singletonList(new TestingLakeSplit(0, Collections.emptyList()));
+        DvBucketSplit group0 =
+                DvBucketSplit.pinned(bucket, null, 5L, 100L, 150L, files, 0, 107L, 100L);
+        DvBucketSplit group1 =
+                DvBucketSplit.pinned(bucket, null, 5L, 100L, 150L, files, 1, 107L, 100L);
+        DvBucketSplit logSplit =
+                DvBucketSplit.pinned(
+                        bucket, null, 5L, 100L, 150L, null, DvBucketSplit.BUCKET_LOG, 107L, 100L);
+        DvBucketSplit unpinned =
+                new DvBucketSplit(new TableBucket(1L, 1), null, 5L, 100L, 150L, files);
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            DvCutsEnumerator enumerator = new DvCutsEnumerator(context);
+            enumerator.recordPinnedDvParts(Arrays.asList(group0, group1, logSplit, unpinned));
+
+            enumerator.handleSourceEvent(
+                    0,
+                    new DvSplitsFinishedEvent(
+                            new HashSet<>(Arrays.asList(group0.splitId(), unpinned.splitId()))));
+            enumerator.handleSourceEvent(
+                    0, new DvSplitsFinishedEvent(Collections.singleton(group0.splitId())));
+
+            assertThat(enumerator.released)
+                    .singleElement()
+                    .satisfies(parts -> assertThat(parts).containsExactly(group0.getPart()));
+            enumerator.released.clear();
+
+            enumerator.close();
+
+            assertThat(enumerator.released)
+                    .singleElement()
+                    .satisfies(
+                            parts ->
+                                    assertThat(parts)
+                                            .containsExactlyInAnyOrder(
+                                                    group1.getPart(), logSplit.getPart()));
+        }
+    }
+
+    /** Closing the enumerator releases the pinned cuts even if dropping its lease fails. */
+    @Test
+    void testCloseReleasesPinnedCutsWhenTheLeaseDropFails() throws Exception {
+        DvBucketSplit pinned =
+                DvBucketSplit.pinned(
+                        new TableBucket(1L, 0),
+                        null,
+                        5L,
+                        100L,
+                        150L,
+                        null,
+                        DvBucketSplit.WHOLE_BUCKET,
+                        107L,
+                        100L);
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            DvCutsEnumerator enumerator = new DvCutsEnumerator(context);
+            enumerator.leaseDropFails = true;
+            enumerator.recordPinnedDvParts(Collections.singletonList(pinned));
+
+            assertThatThrownBy(enumerator::close).hasRootCauseMessage("lease drop failed");
+
+            assertThat(enumerator.released)
+                    .singleElement()
+                    .satisfies(parts -> assertThat(parts).containsExactly(pinned.getPart()));
+        }
+    }
+
+    /** An enumerator that records the holds of mask cuts it releases instead of sending them. */
+    private class DvCutsEnumerator extends FlinkSourceEnumerator {
+        final List<List<DvBucketPart>> released = new ArrayList<>();
+        boolean leaseDropFails;
+
+        DvCutsEnumerator(MockSplitEnumeratorContext<SourceSplitBase> context) {
+            super(
+                    DEFAULT_TABLE_PATH,
+                    flussConf,
+                    true,
+                    false,
+                    context,
+                    OffsetsInitializer.full(),
+                    DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                    false,
+                    null,
+                    null,
+                    LeaseContext.DEFAULT,
+                    false);
+        }
+
+        @Override
+        void releaseDvHolds(Collection<DvBucketPart> parts, boolean wait) {
+            if (!parts.isEmpty()) {
+                released.add(new ArrayList<>(parts));
+            }
+        }
+
+        @Override
+        void maybeDropKvSnapshotLease() throws Exception {
+            if (leaseDropFails) {
+                throw new IllegalStateException("lease drop failed");
+            }
+        }
     }
 }

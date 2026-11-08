@@ -40,6 +40,7 @@ import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.kv.KvCloseMode;
 import org.apache.fluss.server.kv.KvManager;
+import org.apache.fluss.server.kv.dv.DvTestHooks;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.DefaultCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogManager;
@@ -153,6 +154,8 @@ public class TabletServer extends ServerBase {
 
     @GuardedBy("lock")
     private ReplicaManager replicaManager;
+
+    private DvTestHooks dvTestHooks = DvTestHooks.NONE;
 
     @GuardedBy("lock")
     private ScannerManager scannerManager;
@@ -315,6 +318,8 @@ public class TabletServer extends ServerBase {
                             ioExecutor,
                             localDiskManager,
                             pluginManager);
+            // before the server registers, so it leads no bucket yet
+            replicaManager.getKvSnapshotContext().getDvRebuildLimiter().setTestHooks(dvTestHooks);
             replicaManager.startup();
 
             this.groupManager = GroupManager.from(conf);
@@ -689,6 +694,14 @@ public class TabletServer extends ServerBase {
     @VisibleForTesting
     public ReplicaManager getReplicaManager() {
         return replicaManager;
+    }
+
+    /**
+     * Makes the deletion vector work of this server run {@code hooks}; set before {@link #start}.
+     */
+    @VisibleForTesting
+    public void setDvTestHooks(DvTestHooks hooks) {
+        this.dvTestHooks = hooks;
     }
 
     @VisibleForTesting

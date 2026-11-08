@@ -41,10 +41,13 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *   <li><b>Version 0:</b> Initial version.
  *   <li><b>Version 1:</b> Adds the log stopping offset and the batch flag to {@link
  *       HybridSnapshotLogSplit}.
- *   <li><b>Version 2 (Current):</b> Adds {@code recordsToSkip} to {@link
+ *   <li><b>Version 2:</b> Adds {@code recordsToSkip} to {@link
  *       org.apache.fluss.flink.lake.split.LakeSnapshotSplit}, so that a partially consumed lake
  *       snapshot split resumes from where it stopped instead of re-emitting already emitted
  *       records. Lake snapshot splits restored from older versions start from the beginning.
+ *   <li><b>Version 3 (Current):</b> Adds {@link org.apache.fluss.flink.lake.split.DvBucketSplit},
+ *       the split of a bucket of a table with deletion vectors. Its reader fetches the masks. Only
+ *       a started split keeps them in its state. The other splits keep the layout of version 2.
  * </ul>
  *
  * <p>This serializer can deserialize splits of all previous versions, but always produces the
@@ -55,6 +58,7 @@ public class SourceSplitSerializer implements SimpleVersionedSerializer<SourceSp
     private static final int VERSION_0 = 0;
     private static final int VERSION_1 = 1;
     private static final int VERSION_2 = 2;
+    private static final int VERSION_3 = 3;
 
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
@@ -63,7 +67,7 @@ public class SourceSplitSerializer implements SimpleVersionedSerializer<SourceSp
     private static final byte LOG_SPLIT_FLAG = 2;
     private static final byte KV_BATCH_SPLIT_FLAG = 3;
 
-    private static final int CURRENT_VERSION = VERSION_2;
+    private static final int CURRENT_VERSION = VERSION_3;
 
     @Nullable private final LakeSource<LakeSplit> lakeSource;
 

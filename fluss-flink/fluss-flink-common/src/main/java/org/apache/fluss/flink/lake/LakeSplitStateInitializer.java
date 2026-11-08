@@ -17,8 +17,10 @@
 
 package org.apache.fluss.flink.lake;
 
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
+import org.apache.fluss.flink.lake.state.DvBucketSplitState;
 import org.apache.fluss.flink.lake.state.LakeSnapshotAndFlussLogSplitState;
 import org.apache.fluss.flink.lake.state.LakeSnapshotSplitState;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
@@ -32,6 +34,8 @@ public class LakeSplitStateInitializer {
             return new LakeSnapshotSplitState((LakeSnapshotSplit) split);
         } else if (split instanceof LakeSnapshotAndFlussLogSplit) {
             return new LakeSnapshotAndFlussLogSplitState((LakeSnapshotAndFlussLogSplit) split);
+        } else if (split instanceof DvBucketSplit) {
+            return new DvBucketSplitState((DvBucketSplit) split);
         } else {
             throw new UnsupportedOperationException("Unsupported split type: " + split);
         }
