@@ -463,8 +463,8 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
   </thead>
   <tbody>
     <tr>
-      <th rowspan="39"><strong>tabletserver</strong></th>
-      <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="27">-</td>
+      <th rowspan="70"><strong>tabletserver</strong></th>
+      <td style={{textAlign: 'center', verticalAlign: 'middle' }} rowspan="56">-</td>
       <td>messagesInPerSecond</td>
       <td>The number of messages written per second to this server.</td>
       <td>Meter</td>
@@ -597,6 +597,162 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     <tr>
       <td>kvWalMemoryPoolCapacity</td>
       <td>Total capacity of the server-wide WAL memory pool for primary key tables in this server (in bytes).</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvSwitchPerSecond</td>
+      <td>Buckets with derived deletion vectors switching to a newer lake snapshot by applying the index changes after their own, per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvSwitchLatencyMs</td>
+      <td>The time of such a switch in ms.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvRebuildPerSecond</td>
+      <td>Buckets with derived deletion vectors rebuilding their state per second: from a checkpoint, the later index changes and the log, or from the log alone (a new leader of a bucket with nothing tiered, or again after a failed log replay).</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvRebuildLatencyMs</td>
+      <td>The time of a rebuild in ms.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvCheckpointPerSecond</td>
+      <td>Checkpoints of a bucket position index written per second.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvCheckpointLatencyMs</td>
+      <td>The time to write a checkpoint in ms.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvStaleSnapshotPerSecond</td>
+      <td>Requests for a lake snapshot a bucket no longer covers, per second. The client plans again on the newer snapshot.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvHandOffStallPerSecond</td>
+      <td>Writes per second that waited more than a second for their bucket to take the key changes of the batches handed to its deletion vectors: more than 100,000 changes were queued. Writes wait rather than the heap grow, at most 2 seconds, and never fail for it.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvHandOffOverflowPerSecond</td>
+      <td>Batches of key changes per second that a bucket's deletion vectors dropped, as the bucket fell behind its writes for longer than a write waits: the batches queued, and those written until the bucket's change list is replayed from the log. Union reads of the bucket read by key, or wait, until then. Should stay at 0.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvOwnerFaultPerSecond</td>
+      <td>Steps of a bucket's deletion vector state that failed unexpectedly, per second. The bucket replays its change list from the log before it serves masks again; the tablet server logs each at ERROR. Should stay at 0.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvOwnerStepMaxMs</td>
+      <td>The longest step of any bucket's deletion vector state since the metric was last reported, in ms. A bucket's steps run one at a time on a pool the buckets of the server share; applying changes and building masks are split into bounded steps. Swapping in a rebuilt or replayed change list and dropping the lake files a switch removed are the only steps whose time grows with the bucket's state.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvOwnerMailboxDelayMaxMs</td>
+      <td>The longest time a step of any bucket's deletion vector state waited for its turn since the metric was last reported, in ms. A union read that must wait for new masks waits at least this long.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvRebuildsInProgress</td>
+      <td>Rebuilds of derived deletion vectors running on this server. At most <code>kv.deletion-vectors.max-concurrent-rebuilds</code>; further rebuilds wait for a free slot.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvLastRebuildMs</td>
+      <td>The time of the last completed rebuild in ms.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvReplayBacklog</td>
+      <td>Log offsets the running rebuilds of this server still have to replay, summed over their buckets.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvHeapBytes</td>
+      <td>Estimated heap bytes the leaders of this server use to derive the masks of union reads: changes waiting for the high watermark, keys waiting for their lake positions (each with its bytes), the mask bitmaps and the masks kept for reads that do not wait. The change lists, the updates and deletes since the readable lake snapshots, are on local disk and do not count. Bounded by <code>kv.deletion-vectors.heap-memory</code>: beyond it the leaders drop the masks they keep across a switch, and rebuilds move their map of each key's last version to disk.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvChangeListBytes</td>
+      <td>Bytes of the change lists of this server's buckets on local disk, before compression: the updates and deletes not in a readable lake snapshot yet. They grow while tiering lags.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvPinnedCuts</td>
+      <td>Cuts the union reads of this server's buckets pinned: the masks of one log offset of a bucket, which the readers of one union read fetch their parts of.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvPinnedCutBytes</td>
+      <td>Estimated heap bytes of the pinned cuts of this server, with the pin requests each cut remembers so that a retried pin gets the same cut: the latest 1,024 per cut. They count towards <code>kv.deletion-vectors.heap-memory</code> and take at most half of it.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvPinnedCutEvictionPerSecond</td>
+      <td>Pinned cuts dropped per second because the pinned cuts of this server took more than half of <code>kv.deletion-vectors.heap-memory</code>; the least recently used go first. A split that shares a dropped cut with other splits of its bucket derives its masks from the keys; one that reads a whole bucket pins a new cut.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvPinnedCutExpirationPerSecond</td>
+      <td>Pinned cuts dropped per second because no request asked for them, or released some of their holds, for <code>kv.deletion-vectors.pinned-cut-idle-timeout</code>.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvMaskRequestMs</td>
+      <td>The time in ms a bucket leader of this server takes to answer a union read's request for masks: waiting for the bucket, applying the changes, looking up lake positions, building and pinning the masks.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskWaitSwitchMs</td>
+      <td>The time in ms such a request waits for its bucket to switch to the requested lake snapshot.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskWaitDeriveMs</td>
+      <td>The time in ms such a request waits for the masks a switch or a rebuild derives again, by looking up lake positions.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskWaitReplayMs</td>
+      <td>The time in ms such a request waits for a replay of the bucket's change list, after a rebuild or a failed replay.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskApplyMs</td>
+      <td>The time in ms such a request applies the changes below the high watermark that were still queued.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskResolveWaitMs</td>
+      <td>The time in ms such a request waits for the lake-position lookups of its changed keys: from when it finds lookups pending until none are.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskBuildMs</td>
+      <td>The time in ms such a request builds the masks.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvMaskFrontierPerSecond</td>
+      <td>Union reads that do not wait (<code>client.scanner.deletion-vectors.wait-for-catch-up</code> = false) served per second with masks other than those of the high watermark: masks below it while lake-position lookups are pending, the snapshot alone right after a switch, or the masks kept of the snapshot before. Such a read is exact as of the masks' offset, a moment older than the high watermark.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td rowspan="2">dvPool</td>
+      <td>queued</td>
+      <td>Tasks waiting in a thread pool of the server's deletion vectors, or in a share of one, labeled with <code>pool</code>: request, state (the buckets' state transitions), resolver (lake-position lookups of changed keys), advance (planning and switch loads) and rebuild, both on the index-load threads, checkpoint (on the server's IO pool), or scheduler.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>active</td>
+      <td>Tasks running in that pool or share, labeled with <code>pool</code>.</td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -976,7 +1132,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>Gauge</td>
     </tr>
     <tr>
-      <td rowspan="4">table_bucket_remoteLog</td>
+      <td rowspan="5">table_bucket_remoteLog</td>
       <td>numSegments</td>
       <td>The number of segments in remote storage for this table bucket.</td>
       <td>Gauge</td>
@@ -994,6 +1150,11 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
      <tr>
       <td>size</td>
       <td>The number of bytes written per second to this table.</td>
+      <td>Gauge</td>
+    </tr>
+    <tr>
+      <td>dvRetainedSize</td>
+      <td>For tables with deletion vectors enabled: the bytes of remote log segments of this table bucket that are past <code>table.log.ttl</code> and tiered to the lake, but kept because the bucket's deletion vectors still need them. They are at or after the readable offset of the lake snapshot the bucket's leader covers, from which a new leader rebuilds the deletion vectors. On Paimon, this is the log that is tiered into level 0 but not compacted yet. Reported by the bucket's leader.</td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -1290,6 +1451,101 @@ How to Use Flink Metrics, you can see [Flink Metrics](https://nightlies.apache.o
     </tbody>
 </table>
 
+#### Union Read Metrics of Tables with Deletion Vectors
+
+A Flink source reader of a bounded union read of a primary key table with deletion vectors counts where the time of its splits went, under the `dvUnionRead` group of its `SourceReaderMetricGroup`.
+
+<table class="table table-bordered">
+    <thead>
+    <tr>
+      <th class="text-left" style={{width: '225pt'}}>Metrics Name</th>
+      <th class="text-left" style={{width: '165pt'}}>Level</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '70pt'}}>Type</th>
+    </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>splits</td>
+            <td>Flink Source Operator</td>
+            <td>The splits of bounded union reads of tables with deletion vectors this source reader read.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>totalMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time those splits took, in ms, from the first poll to the last rows or close.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>resolveMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time spent planning the splits' parts and fetching their masks before the first rows, in ms.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>maskFetchMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time spent fetching masks and log mask pages from the bucket leaders, with retries and the leaders' waits, in ms.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>lakeOpenMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time spent opening lake splits, in ms. Reading the lake rows is not timed.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>lakeRowsRead</td>
+            <td>Flink Source Operator</td>
+            <td>The lake rows read.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>lakeRowsMasked</td>
+            <td>Flink Source Operator</td>
+            <td>The lake rows dropped by a mask.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>logReadMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time spent reading the log up to the masks' offset, in ms.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>logRecords</td>
+            <td>Flink Source Operator</td>
+            <td>The log records read.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>logRecordsMasked</td>
+            <td>Flink Source Operator</td>
+            <td>The log records dropped by a mask.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>replansBehind</td>
+            <td>Flink Source Operator</td>
+            <td>The splits planned again on the lake snapshot a leader that still switches covers, with <code>client.scanner.deletion-vectors.wait-for-catch-up</code> = false.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>foldedReads</td>
+            <td>Flink Source Operator</td>
+            <td>The splits read by key: their leader had no masks to serve yet, with <code>client.scanner.deletion-vectors.wait-for-catch-up</code> = false, or their masks stayed unavailable.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>deriveMs</td>
+            <td>Flink Source Operator</td>
+            <td>The time spent deriving masks from keys, for such splits and for splits whose pinned cut was dropped, in ms.</td>
+            <td>Counter</td>
+        </tr>
+    </tbody>
+</table>
+
 #### Sink Metrics
 
 <table class="table table-bordered">
@@ -1369,3 +1625,31 @@ All metrics are registered under the `fluss.tieringService` metric group, as a c
 A tiering round that fails to commit is retried in the next round without failing the tiering job, so a table whose commits keep failing stops advancing in the lake while the job looks healthy.
 To alert on it, use the `lakeTiering_table` metrics of the [Coordinator Server](#coordinator-server): `tierLag` keeps growing while a table cannot complete a round, for example beyond a multiple of its `freshness`, and `failuresTotal` counts its failed rounds.
 :::
+
+For tables with deletion vectors enabled, the tiering committer also reports the following metrics under the `derivedDeletionVectors` group of its Flink operator. Counters sum over all tables the operator commits; gauges show the last round of any table.
+
+<table class="table table-bordered">
+    <thead>
+    <tr>
+      <th class="text-left" style={{width: '225pt'}}>Metrics Name</th>
+      <th class="text-left" style={{width: '300pt'}}>Description</th>
+      <th class="text-left" style={{width: '70pt'}}>Type</th>
+    </tr>
+    </thead>
+    <tbody>
+        <tr><td>rounds</td><td>Tiering rounds with a successful lake commit, on both lakes. On Iceberg, a round counts once its commit of data and deletes is registered in Fluss. On Paimon, a round counts once its lake commit succeeds, also a commit without data that makes another engine's compaction readable, and also if the round is then held for a re-index before it is registered. Rounds that commit nothing to the lake, and Fluss's own compaction commits, are not counted.</td><td>Counter</td></tr>
+        <tr><td>changedKeys</td><td>On Iceberg: the primary keys changed in the counted rounds, deleted keys included. Each is looked up at most once per round.</td><td>Counter</td></tr>
+        <tr><td>reindexes</td><td>Index changes published from a read of the lake files (a re-index) instead of from positions the tiering writers handed over. On Iceberg: files rewritten by another engine, or by a Fluss compaction whose positions could not be handed over. On Paimon: a newly readable snapshot whose files the round's compactions did not hand over, e.g. after another engine's compaction or a failed hand-off. A re-index that only drops removed files counts too.</td><td>Counter</td></tr>
+        <tr><td>reindexMs</td><td>The sum of the times of the counted re-indexes, each from planning it to publishing its index change. Divide by <code>reindexes</code> for the mean.</td><td>Counter</td></tr>
+        <tr><td>compactionHandOffs</td><td>Index changes published from the positions the compactions in the tiering writers handed over, without a re-index: on Iceberg, a Fluss compaction (<code>table.datalake.auto-compaction</code>); on Paimon, a newly readable snapshot made by the round's compactions.</td><td>Counter</td></tr>
+        <tr><td>chainEntriesTrimmed</td><td>Index changes removed from the index history after all buckets have a checkpoint past them (see <code>lake.tiering.deletion-vectors.trim-interval</code>).</td><td>Counter</td></tr>
+        <tr><td>orphanChangesRemoved</td><td>Index changes that were never registered, e.g. of failed rounds, removed once older than <code>lake.tiering.deletion-vectors.orphan-min-age</code>.</td><td>Counter</td></tr>
+        <tr><td>indexChainLength</td><td>The longest index history of the committer's tables, in index changes, as of each table's last trim. It grows while something holds the history back: a bucket without a checkpoint, or one whose checkpoint could not be built.</td><td>Gauge</td></tr>
+        <tr><td>bucketsHoldingIndexChain</td><td>Buckets, summed over the committer's tables as of each table's last trim, whose checkpoint the trim had to build because no tablet server checkpoints them, but did not: the build failed, or the trim ran out of builds or time. They hold the index history back.</td><td>Gauge</td></tr>
+        <tr><td>checkpointBuildsFailed</td><td>Checkpoints the trim failed to build for buckets no tablet server checkpoints. A bucket whose build fails every time holds the index history back for good.</td><td>Counter</td></tr>
+        <tr><td>indexTrimsFailed</td><td>Trims of the index history that failed or were stopped, e.g. for a bucket whose rows trimmed changes hold and which has no checkpoint, or a tiering service that lost the table.</td><td>Counter</td></tr>
+        <tr><td>lastLookupMs</td><td>On Iceberg: the time to publish the index change of the last round, with the lookups of the positions of its changed keys.</td><td>Gauge</td></tr>
+        <tr><td>lastLakeCommitMs</td><td>The time of the lake commit in the last round (on Iceberg, data and deletes).</td><td>Gauge</td></tr>
+        <tr><td>lastReindexMs</td><td>The time from planning to publishing the last re-index.</td><td>Gauge</td></tr>
+    </tbody>
+</table>

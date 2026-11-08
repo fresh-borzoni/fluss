@@ -122,6 +122,26 @@ Keep these effects and restrictions in mind:
 Existing remote snapshot files have separate retention, controlled by
 [`kv.snapshot.num-retained`](../../maintenance/tiered-storage/remote-storage.md#remote-snapshot-of-primary-key-table).
 
+### Row TTL with Deletion Vectors
+
+A lakehouse table with deletion vectors (`table.deletion-vectors.enabled`) can use row TTL by
+processing time. Row TTL by event time (`table.kv.ttl.time-column`) is rejected for such a table:
+a late or backfilled row would expire at the next compaction, before it reaches the lake. Its KV
+values keep the log offset of their version and their TTL time in two fields of their own;
+Fluss picks this value layout when the table is created. Row TTL cleanup writes nothing to the
+changelog, while the lake can still hold a row of an expired key, so union reads behave as follows:
+
+- **An insert after expiry hides the old lake row.** A write that finds no value for its key may
+  follow an expired one, so its key is looked up in the lake. If the lake holds a row of the key,
+  union reads hide it and return the new row.
+- **A version that expires before it is tiered** cannot be named by a later write of its key. Until
+  the bucket covers a lake snapshot that holds that version, union reads can return it from the log
+  next to the new row. This happens only when `table.kv.ttl` is shorter than the time a change takes
+  to reach the lake. A leader that rebuilds its state from the log names the version exactly.
+- **Deleting a key whose row has expired is a no-op**, as for any table with row TTL: nothing is
+  written to the changelog, so a row of the key that was tiered stays in the lake and visible in
+  union reads.
+
 ## Partition Retention
 
 Use [auto partitioning](partitioning.md#auto-partitioning) when data should expire in whole time

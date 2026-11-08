@@ -72,6 +72,10 @@ SELECT * FROM orders;
 
 Flink first reads the latest lake snapshot, then switches to Fluss starting from the log offset aligned with that snapshot, ensuring exactly-once semantics.
 
+:::note
+A streaming read of a primary key table with deletion vectors (`table.deletion-vectors.enabled`) does not read the lake. A read with deletion vector masks stops at the log offset of its masks, so it cannot follow the log. Flink reads such a table as a primary key table without a lake: the latest Fluss KV snapshot, then its changelog. Batch reads of the table are union reads with masks.
+:::
+
 ## Data Deduplication
 
 For **primary key tables**, Union Read automatically deduplicates records with the same key, keeping the latest version from Fluss if it exists.
