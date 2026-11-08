@@ -133,6 +133,7 @@ import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
+import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.AutoPartitionStrategy;
@@ -522,7 +523,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 "Load tables success in {}ms when initializing coordinator context.",
                 System.currentTimeMillis() - start4loadTables);
 
-        lakeTableTieringManager.initWithLakeTables(lakeTables);
+        lakeTableTieringManager.initWithLakeTables(
+                lakeTables, coordinatorContext.getCoordinatorEpoch());
 
         // load all assignment
         long start4loadAssignment = System.currentTimeMillis();
@@ -2517,10 +2519,28 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                                     + tableId
                                                     + " not found or queued for deletion in coordinator context.");
                                 }
-                                lakeTableHelper.registerLakeTableSnapshotV2(
-                                        tableId,
-                                        snapshot.getLakeSnapshotMetadata(),
-                                        snapshot.getEarliestSnapshotIDToKeep());
+                                LakeTable.LakeSnapshotMetadata metadata =
+                                        snapshot.getLakeSnapshotMetadata();
+                                Long toKeep = snapshot.getEarliestSnapshotIDToKeep();
+                                Long tieringEpoch = snapshot.getTieringEpoch();
+                                if (tieringEpoch == null) {
+                                    // an older client, whose commits are not fenced
+                                    lakeTableHelper.registerLakeTableSnapshotV2(
+                                            tableId, metadata, toKeep);
+                                } else {
+                                    // Checked and written while the epoch cannot move on: a
+                                    // service the table was taken from cannot register, and the
+                                    // next one sees every snapshot registered before it.
+                                    LakeTableHelper.discard(
+                                            lakeTableTieringManager.inTieringEpoch(
+                                                    tableId,
+                                                    tieringEpoch,
+                                                    () ->
+                                                            lakeTableHelper
+                                                                    .upsertLakeTableSnapshotV2(
+                                                                            tableId, metadata,
+                                                                            toKeep)));
+                                }
                             } catch (Exception e) {
                                 failedTableIds.add(tableId);
                                 ApiError error = ApiError.fromThrowable(e);

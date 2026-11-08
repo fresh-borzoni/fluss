@@ -19,9 +19,11 @@ package org.apache.fluss.flink.tiering.source.split;
 
 import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
+import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.flink.core.memory.DataOutputSerializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -212,6 +214,132 @@ class TieringSplitSerializerTest {
         assertThat(deserializedLogSplit.getSplitIndex()).isEqualTo(2);
         assertThat(deserializedLogSplit.isFirstSplit()).isFalse();
         assertThat(deserializedLogSplit.getTieringRoundTimestamp()).isEqualTo(2000L);
+    }
+
+    @Test
+    void testTieringEpochSerde() throws Exception {
+        TieringSplit logSplit =
+                new TieringLogSplit(tablePath, tableBucket, null, 100, 200, 40, 2, 2000L)
+                        .copy(40, 2, 2000L, 7L);
+        TieringSplit deserialized =
+                serializer
+                        .deserialize(
+                                serializer.getVersion(),
+                                serializer.serialize(new FlinkTieringSplit(logSplit)))
+                        .unwrap();
+        assertThat(deserialized).isEqualTo(logSplit);
+        assertThat(deserialized.getTieringEpoch()).isEqualTo(7L);
+        // a split handed back to the enumerator stays in its round
+        assertThat(deserialized.copy(40).getTieringEpoch()).isEqualTo(7L);
+
+        TieringSplit unknown = new TieringSnapshotSplit(tablePath, tableBucket, null, 0L, 2L, 1);
+        assertThat(
+                        serializer
+                                .deserialize(
+                                        serializer.getVersion(),
+                                        serializer.serialize(new FlinkTieringSplit(unknown)))
+                                .unwrap()
+                                .getTieringEpoch())
+                .isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testRestoreVersion0Splits(boolean isPartitionedTable) throws Exception {
+        TableBucket bucket = isPartitionedTable ? partitionedTableBucket : tableBucket;
+        TablePath path = isPartitionedTable ? partitionedTablePath : tablePath;
+        String partitionName = isPartitionedTable ? "1024" : null;
+
+        TieringSplit snapshotSplit =
+                new TieringSnapshotSplit(path, bucket, partitionName, 3L, 200L, 10, true, 1, 1000L);
+        TieringSplit restoredSnapshotSplit =
+                serializer
+                        .deserialize(
+                                0,
+                                version0Bytes(
+                                        TieringSplit.TIERING_SNAPSHOT_SPLIT_FLAG,
+                                        path,
+                                        bucket,
+                                        partitionName,
+                                        10,
+                                        true,
+                                        1,
+                                        1000L,
+                                        3L,
+                                        200L))
+                        .unwrap();
+        assertThat(restoredSnapshotSplit).isEqualTo(snapshotSplit);
+        assertThat(restoredSnapshotSplit.getTieringEpoch())
+                .isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
+
+        TieringSplit logSplit =
+                new TieringLogSplit(path, bucket, partitionName, 100L, 200L, 40, 2, 2000L);
+        TieringSplit restoredLogSplit =
+                serializer
+                        .deserialize(
+                                0,
+                                version0Bytes(
+                                        TieringSplit.TIERING_LOG_SPLIT_FLAG,
+                                        path,
+                                        bucket,
+                                        partitionName,
+                                        40,
+                                        false,
+                                        2,
+                                        2000L,
+                                        100L,
+                                        200L))
+                        .unwrap();
+        assertThat(restoredLogSplit).isEqualTo(logSplit);
+        assertThat(restoredLogSplit.getTieringEpoch())
+                .isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
+    }
+
+    @Test
+    void testDeserializeUnknownVersion() throws Exception {
+        byte[] serialized =
+                serializer.serialize(
+                        new FlinkTieringSplit(
+                                new TieringLogSplit(tablePath, tableBucket, null, 0, 100, 3)));
+        assertThatThrownBy(() -> serializer.deserialize(2, serialized))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("Unknown version 2");
+    }
+
+    /** The layout of {@link TieringSplitSerializer} version 0, as released. */
+    private static byte[] version0Bytes(
+            byte splitKind,
+            TablePath path,
+            TableBucket bucket,
+            String partitionName,
+            int numberOfSplits,
+            boolean skipCurrentRound,
+            int splitIndex,
+            long tieringRoundTimestamp,
+            long first,
+            long second)
+            throws IOException {
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeByte(splitKind);
+        out.writeUTF(path.getDatabaseName());
+        out.writeUTF(path.getTableName());
+        out.writeLong(bucket.getTableId());
+        out.writeInt(bucket.getBucket());
+        if (bucket.getPartitionId() != null) {
+            out.writeBoolean(true);
+            out.writeLong(bucket.getPartitionId());
+            out.writeUTF(partitionName);
+        } else {
+            out.writeBoolean(false);
+        }
+        out.writeInt(numberOfSplits);
+        out.writeBoolean(skipCurrentRound);
+        out.writeInt(splitIndex);
+        out.writeLong(tieringRoundTimestamp);
+        // snapshot id and log offset of snapshot, or starting and stopping offset
+        out.writeLong(first);
+        out.writeLong(second);
+        return out.getCopyOfBuffer();
     }
 
     @Test

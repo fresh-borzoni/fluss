@@ -2034,7 +2034,10 @@ public class ServerRpcMessageUtils {
                     lakeTableInfoByTableId.get(tableId), // may be null for V2-only
                     tableBucketsMaxTimestamp.get(tableId), // may be null
                     lakeSnapshotMetadata,
-                    earliestSnapshotIDToKeep);
+                    earliestSnapshotIDToKeep,
+                    pbLakeTableSnapshotMetadata.hasTieringEpoch()
+                            ? pbLakeTableSnapshotMetadata.getTieringEpoch()
+                            : null);
         }
 
         return builder.build();

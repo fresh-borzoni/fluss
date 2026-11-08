@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.source;
 
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
+import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.metadata.TableBucket;
@@ -160,11 +161,128 @@ class TableBucketWriteResultSerializerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {0, 3})
+    @ValueSource(longs = {TieringSplit.UNKNOWN_TIERING_EPOCH, 0, 42})
+    void testTieringEpochRoundTrips(long tieringEpoch) throws Exception {
+        TableBucketWriteResult<TestingWriteResult> result =
+                new TableBucketWriteResult<>(
+                                TablePath.of("db1", "tb1"),
+                                new TableBucket(1, 2),
+                                null,
+                                new TestingWriteResult(3),
+                                7,
+                                30L,
+                                2)
+                        .withTieringEpoch(tieringEpoch);
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                tableBucketWriteResultSerializer.deserialize(
+                        tableBucketWriteResultSerializer.getVersion(),
+                        tableBucketWriteResultSerializer.serialize(result));
+        assertThat(deserialized.tieringEpoch()).isEqualTo(tieringEpoch);
+        assertThat(deserialized.logEndOffset()).isEqualTo(7);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 4})
     void testDeserializeUnknownVersion(int version) {
         assertThatThrownBy(() -> tableBucketWriteResultSerializer.deserialize(version, new byte[0]))
                 .isInstanceOf(IOException.class)
                 .hasMessage("Unknown version " + version);
+    }
+
+    @Test
+    void testDeserializeVersionTwo() throws Exception {
+        VersionRecordingWriteResultSerializer lakeSerializer =
+                new VersionRecordingWriteResultSerializer(7);
+        TableBucketWriteResultSerializer<TestingWriteResult> serializer =
+                new TableBucketWriteResultSerializer<>(lakeSerializer);
+
+        // the layout of VERSION_2
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeUTF("db1");
+        out.writeUTF("tb1");
+        out.writeLong(1L);
+        out.writeBoolean(false);
+        out.writeInt(2);
+        byte[] writeResultBytes = lakeSerializer.serialize(new TestingWriteResult(5));
+        out.writeInt(writeResultBytes.length);
+        out.writeInt(7);
+        out.write(writeResultBytes);
+        out.writeLong(10L);
+        out.writeLong(30L);
+        out.writeInt(3);
+
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                serializer.deserialize(2, out.getCopyOfBuffer());
+
+        assertThat(deserialized.tableBucket()).isEqualTo(new TableBucket(1L, 2));
+        assertThat(lakeSerializer.deserializedVersions).containsExactly(7);
+        assertThat(deserialized.writeResult().getWriteResult()).isEqualTo(5);
+        assertThat(deserialized.logEndOffset()).isEqualTo(10L);
+        assertThat(deserialized.maxTimestamp()).isEqualTo(30L);
+        assertThat(deserialized.numberOfWriteResults()).isEqualTo(3);
+    }
+
+    @Test
+    void testDeserializeVersionThree() throws Exception {
+        VersionRecordingWriteResultSerializer lakeSerializer =
+                new VersionRecordingWriteResultSerializer(7);
+        TableBucketWriteResultSerializer<TestingWriteResult> serializer =
+                new TableBucketWriteResultSerializer<>(lakeSerializer);
+
+        // the layout of VERSION_3: VERSION_2, then the tiering epoch
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeUTF("db1");
+        out.writeUTF("tb1");
+        out.writeLong(1L);
+        out.writeBoolean(true);
+        out.writeLong(1000L);
+        out.writeUTF("partition1");
+        out.writeInt(2);
+        byte[] writeResultBytes = lakeSerializer.serialize(new TestingWriteResult(5));
+        out.writeInt(writeResultBytes.length);
+        out.writeInt(7);
+        out.write(writeResultBytes);
+        out.writeLong(10L);
+        out.writeLong(30L);
+        out.writeInt(3);
+        // tiering epoch
+        out.writeLong(42L);
+
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                serializer.deserialize(3, out.getCopyOfBuffer());
+
+        assertThat(deserialized.tableBucket()).isEqualTo(new TableBucket(1L, 1000L, 2));
+        assertThat(deserialized.partitionName()).isEqualTo("partition1");
+        assertThat(lakeSerializer.deserializedVersions).containsExactly(7);
+        assertThat(deserialized.writeResult().getWriteResult()).isEqualTo(5);
+        assertThat(deserialized.logEndOffset()).isEqualTo(10L);
+        assertThat(deserialized.maxTimestamp()).isEqualTo(30L);
+        assertThat(deserialized.numberOfWriteResults()).isEqualTo(3);
+        assertThat(deserialized.tieringEpoch()).isEqualTo(42L);
+
+        // and the current version writes exactly that layout
+        assertThat(serializer.getVersion()).isEqualTo(3);
+        assertThat(serializer.serialize(deserialized)).isEqualTo(out.getCopyOfBuffer());
+    }
+
+    @Test
+    void testDeserializeVersionTwoHasNoRoundFields() throws Exception {
+        // VERSION_2 predates the tiering epoch: the round is not fenced
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeUTF("db1");
+        out.writeUTF("tb1");
+        out.writeLong(1L);
+        out.writeBoolean(false);
+        out.writeInt(2);
+        out.writeInt(-1);
+        out.writeLong(10L);
+        out.writeLong(30L);
+        out.writeInt(3);
+
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                tableBucketWriteResultSerializer.deserialize(2, out.getCopyOfBuffer());
+        assertThat(deserialized.writeResult()).isNull();
+        assertThat(deserialized.tieringEpoch()).isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
     }
 
     /** A lake write result serializer which records the versions passed for deserialization. */

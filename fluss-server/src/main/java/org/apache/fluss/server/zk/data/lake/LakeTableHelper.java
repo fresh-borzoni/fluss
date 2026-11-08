@@ -94,6 +94,19 @@ public class LakeTableHelper {
             LakeTable.LakeSnapshotMetadata lakeSnapshotMetadata,
             @Nullable Long earliestSnapshotIDToKeep)
             throws Exception {
+        discard(upsertLakeTableSnapshotV2(tableId, lakeSnapshotMetadata, earliestSnapshotIDToKeep));
+    }
+
+    /**
+     * The ZooKeeper part of {@link #registerLakeTableSnapshotV2(long,
+     * LakeTable.LakeSnapshotMetadata, Long)}. Registers the snapshot and returns the previous
+     * snapshots it drops from the table, which the caller {@link #discard discards}.
+     */
+    public List<LakeTable.LakeSnapshotMetadata> upsertLakeTableSnapshotV2(
+            long tableId,
+            LakeTable.LakeSnapshotMetadata lakeSnapshotMetadata,
+            @Nullable Long earliestSnapshotIDToKeep)
+            throws Exception {
         Optional<LakeTable> optPreviousTable = zkClient.getLakeTable(tableId);
         List<LakeTable.LakeSnapshotMetadata> previousMetadatas =
                 optPreviousTable
@@ -117,9 +130,12 @@ public class LakeTableHelper {
             LOG.warn("Failed to upsert lake table snapshot to zk.", e);
             throw e;
         }
+        return snapshotsToDiscard;
+    }
 
-        // After successful upsert, discard snapshots
-        for (LakeTable.LakeSnapshotMetadata metadata : snapshotsToDiscard) {
+    /** Discards the snapshots a registration dropped, once it is in ZooKeeper. */
+    public static void discard(List<LakeTable.LakeSnapshotMetadata> snapshots) {
+        for (LakeTable.LakeSnapshotMetadata metadata : snapshots) {
             metadata.discard();
         }
     }

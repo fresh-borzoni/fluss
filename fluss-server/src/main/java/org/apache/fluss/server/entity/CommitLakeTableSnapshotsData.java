@@ -65,6 +65,26 @@ public class CommitLakeTableSnapshotsData {
                 @Nullable Map<TableBucket, Long> tableMaxTieredTimestamps,
                 @Nullable LakeTable.LakeSnapshotMetadata lakeSnapshotMetadata,
                 @Nullable Long earliestSnapshotIDToKeep) {
+            addTableSnapshot(
+                    tableId,
+                    lakeTableSnapshot,
+                    tableMaxTieredTimestamps,
+                    lakeSnapshotMetadata,
+                    earliestSnapshotIDToKeep,
+                    null);
+        }
+
+        /**
+         * Add a table snapshot entry whose commit is fenced on the tiering epoch {@code
+         * tieringEpoch}, or not fenced if it is null.
+         */
+        public void addTableSnapshot(
+                long tableId,
+                @Nullable LakeTableSnapshot lakeTableSnapshot,
+                @Nullable Map<TableBucket, Long> tableMaxTieredTimestamps,
+                @Nullable LakeTable.LakeSnapshotMetadata lakeSnapshotMetadata,
+                @Nullable Long earliestSnapshotIDToKeep,
+                @Nullable Long tieringEpoch) {
             snapshotMap.put(
                     tableId,
                     new CommitLakeTableSnapshot(
@@ -73,7 +93,8 @@ public class CommitLakeTableSnapshotsData {
                                     ? tableMaxTieredTimestamps
                                     : Collections.emptyMap(),
                             lakeSnapshotMetadata,
-                            earliestSnapshotIDToKeep));
+                            earliestSnapshotIDToKeep,
+                            tieringEpoch));
         }
 
         /**
@@ -149,15 +170,20 @@ public class CommitLakeTableSnapshotsData {
         // The earliest snapshot ID to keep for Paimon DV tables. Null for non-Paimon-DV tables.
         @Nullable private final Long earliestSnapshotIDToKeep;
 
+        // The tiering epoch the commit is fenced on; null for clients that send none.
+        @Nullable private final Long tieringEpoch;
+
         public CommitLakeTableSnapshot(
                 @Nullable LakeTableSnapshot lakeTableSnapshot,
                 @Nullable Map<TableBucket, Long> tableMaxTieredTimestamps,
                 @Nullable LakeTable.LakeSnapshotMetadata lakeSnapshotMetadata,
-                @Nullable Long earliestSnapshotIDToKeep) {
+                @Nullable Long earliestSnapshotIDToKeep,
+                @Nullable Long tieringEpoch) {
             this.lakeTableSnapshot = lakeTableSnapshot;
             this.tableMaxTieredTimestamps = tableMaxTieredTimestamps;
             this.lakeSnapshotMetadata = lakeSnapshotMetadata;
             this.earliestSnapshotIDToKeep = earliestSnapshotIDToKeep;
+            this.tieringEpoch = tieringEpoch;
         }
 
         @Nullable
@@ -173,6 +199,11 @@ public class CommitLakeTableSnapshotsData {
         @Nullable
         public Long getEarliestSnapshotIDToKeep() {
             return earliestSnapshotIDToKeep;
+        }
+
+        @Nullable
+        public Long getTieringEpoch() {
+            return tieringEpoch;
         }
     }
 }

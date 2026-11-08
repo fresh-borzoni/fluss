@@ -830,6 +830,14 @@ message LakeTieringHeartbeatRequest {
   // These table IDs must also appear in finished_tables. The coordinator uses this field to
   // distinguish between normally finished tables and force finished tables.
   repeated int64 force_finished_tables = 5;
+  // Tables whose tiering epoch is only checked: their heartbeat is not renewed, nor are they
+  // finished or failed. A round checks its epoch before its lake commit, which Fluss cannot undo,
+  // so a round of a table handed to another tiering service meanwhile stops instead.
+  repeated PbTieringEpochForTable checked_tables = 6;
+  // Whether the tiering service tiers tables with 'table.deletion-vectors.enabled'. The
+  // coordinator hands such tables only to a service that sets it in its table requests; a service
+  // that predates deletion vectors never sets it, and would commit their rows without deletes.
+  optional bool supports_deletion_vectors = 7;
 }
 
 message LakeTieringHeartbeatResponse {
@@ -840,6 +848,8 @@ message LakeTieringHeartbeatResponse {
   repeated PbHeartbeatRespForTable tiering_table_resp = 3;
   repeated PbHeartbeatRespForTable finished_table_resp = 4;
   repeated PbHeartbeatRespForTable failed_table_resp = 5;
+  // one per checked table, with an error if the table is no longer tiered under the epoch
+  repeated PbHeartbeatRespForTable checked_table_resp = 6;
 }
 
 message ControlledShutdownRequest {
@@ -1404,6 +1414,12 @@ message PbLakeTieringStats {
   optional int64 record_count = 2;
 }
 
+message PbTieringEpochForTable {
+  optional int64 table_id = 1;
+  // the tiering epoch the table was assigned to the tiering service under
+  optional int64 tiering_epoch = 2;
+}
+
 message PbHeartbeatRespForTable {
   required int64 table_id = 1;
   optional ErrorResponse error = 2;
@@ -1479,6 +1495,10 @@ message PbLakeTableSnapshotMetadata {
   // 1. If set, the system will keep all snapshots in the range [earliest_snapshot_id_to_keep, current_snapshot_id].
   // 2. If not set, the system defaults to a "Single Snapshot Retention" policy, keeping only the snapshot specified in this request.
   optional int64 earliest_snapshot_id_to_keep = 5;
+  // The tiering epoch the table was assigned to the committing tiering service under. If set, the
+  // coordinator rejects the commit unless the table is still tiered under this epoch, so a tiering
+  // service the table was taken from cannot register its snapshot. Not set by older clients.
+  optional int64 tiering_epoch = 6;
 }
 
 message PbLakeTableSnapshotInfo {

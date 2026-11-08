@@ -24,6 +24,9 @@ import org.apache.fluss.metadata.TablePath;
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
+import java.util.List;
+
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
  * This class contains the {@link WriteResult} of {@link LakeWriter}, the table path and the bucket
@@ -57,6 +60,10 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     // for the round of tiering is finished
     private final int numberOfWriteResults;
 
+    // the tiering epoch the coordinator assigned the round's table under, which fences the round's
+    // commits; TieringSplit.UNKNOWN_TIERING_EPOCH if unknown
+    private final long tieringEpoch;
+
     public TableBucketWriteResult(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -65,6 +72,26 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             long logEndOffset,
             long maxTimestamp,
             int numberOfWriteResults) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                TieringSplit.UNKNOWN_TIERING_EPOCH);
+    }
+
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            long tieringEpoch) {
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partitionName = partitionName;
@@ -72,6 +99,22 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
         this.logEndOffset = logEndOffset;
         this.maxTimestamp = maxTimestamp;
         this.numberOfWriteResults = numberOfWriteResults;
+        this.tieringEpoch = tieringEpoch;
+    }
+
+    /** Returns this write result of a round the coordinator assigned under {@code tieringEpoch}. */
+    public TableBucketWriteResult<WriteResult> withTieringEpoch(long tieringEpoch) {
+        return tieringEpoch == this.tieringEpoch
+                ? this
+                : new TableBucketWriteResult<>(
+                        tablePath,
+                        tableBucket,
+                        partitionName,
+                        writeResult,
+                        logEndOffset,
+                        maxTimestamp,
+                        numberOfWriteResults,
+                        tieringEpoch);
     }
 
     public TablePath tablePath() {
@@ -102,5 +145,34 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
 
     public long maxTimestamp() {
         return maxTimestamp;
+    }
+
+    /**
+     * Returns the tiering epoch the coordinator assigned the round's table under, or {@link
+     * TieringSplit#UNKNOWN_TIERING_EPOCH}.
+     */
+    public long tieringEpoch() {
+        return tieringEpoch;
+    }
+
+    /**
+     * Returns the tiering epoch of a round from its write results, or {@link
+     * TieringSplit#UNKNOWN_TIERING_EPOCH} if none knows it.
+     */
+    public static long tieringEpochOf(List<? extends TableBucketWriteResult<?>> roundResults) {
+        long epoch = TieringSplit.UNKNOWN_TIERING_EPOCH;
+        for (TableBucketWriteResult<?> result : roundResults) {
+            if (result.tieringEpoch == TieringSplit.UNKNOWN_TIERING_EPOCH) {
+                continue;
+            }
+            checkState(
+                    epoch == TieringSplit.UNKNOWN_TIERING_EPOCH || epoch == result.tieringEpoch,
+                    "The write results of a round of table %s have tiering epochs %s and %s.",
+                    result.tablePath,
+                    epoch,
+                    result.tieringEpoch);
+            epoch = result.tieringEpoch;
+        }
+        return epoch;
     }
 }

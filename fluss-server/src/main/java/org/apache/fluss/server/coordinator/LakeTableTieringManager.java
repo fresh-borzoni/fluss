@@ -36,6 +36,7 @@ import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.ShutdownableThread;
+import org.apache.fluss.utils.function.SupplierWithException;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -153,6 +154,14 @@ public class LakeTableTieringManager implements AutoCloseable {
 
     private final ReadWriteLock lock = new ReentrantReadWriteLock(true);
 
+    private volatile long tieringServiceTimeoutMs = TIERING_SERVICE_TIMEOUT_MS;
+
+    // The first tiering epoch of a table under this coordinator. Epochs live in memory and
+    // restart with the coordinator. Starting above every epoch of earlier coordinators keeps a
+    // round assigned before a failover from matching, and committing as, one assigned after it.
+    @GuardedBy("lock")
+    private long tieringEpochBase;
+
     private final LakeTieringMetricGroup tieringMetricGroup;
 
     public LakeTableTieringManager(LakeTieringMetricGroup lakeTieringMetricGroup) {
@@ -203,10 +212,22 @@ public class LakeTableTieringManager implements AutoCloseable {
                 () -> inReadLock(lock, liveTieringTableIds::size));
     }
 
+    @VisibleForTesting
     public void initWithLakeTables(List<Tuple2<TableInfo, Long>> tableInfoWithTieredTime) {
+        initWithLakeTables(tableInfoWithTieredTime, 0);
+    }
+
+    /**
+     * Initializes the tables to tier under the coordinator of epoch {@code coordinatorEpoch}. The
+     * tiering epochs it hands out are greater than those of any coordinator with a smaller epoch.
+     */
+    public void initWithLakeTables(
+            List<Tuple2<TableInfo, Long>> tableInfoWithTieredTime, int coordinatorEpoch) {
         inWriteLock(
                 lock,
                 () -> {
+                    // a coordinator hands out far fewer than 2^32 epochs per table
+                    tieringEpochBase = ((long) coordinatorEpoch) << 32;
                     for (Tuple2<TableInfo, Long> tableInfoAndLastLakeTime :
                             tableInfoWithTieredTime) {
                         TableInfo tableInfo = tableInfoAndLastLakeTime.f0;
@@ -237,7 +258,7 @@ public class LakeTableTieringManager implements AutoCloseable {
         tableLakeFreshness.put(
                 tableId, tableInfo.getTableConfig().getDataLakeFreshness().toMillis());
         lastTieringResult.put(tableId, LastTieringResult.initial(lastTieredTime));
-        tableTierEpoch.put(tableId, 0L);
+        tableTierEpoch.put(tableId, tieringEpochBase);
 
         // register table-level metrics
         registerTableMetrics(tableId, tableInfo.getTablePath());
@@ -402,7 +423,7 @@ public class LakeTableTieringManager implements AutoCloseable {
                     Map<Long, TablePath> timeoutTables = new HashMap<>();
                     liveTieringTableIds.forEach(
                             (tableId, lastHeartbeat) -> {
-                                if (currentTime - lastHeartbeat >= TIERING_SERVICE_TIMEOUT_MS) {
+                                if (currentTime - lastHeartbeat >= tieringServiceTimeoutMs) {
                                     timeoutTables.put(tableId, tablePaths.get(tableId));
                                 }
                             });
@@ -418,6 +439,15 @@ public class LakeTableTieringManager implements AutoCloseable {
                                 doHandleStateChange(tableId, TieringState.Pending);
                             });
                 });
+    }
+
+    /**
+     * Sets how long a tiering service may go without a heartbeat for a table before the table is
+     * taken from it. A test can cut a service off with it without waiting two minutes.
+     */
+    @VisibleForTesting
+    public void setTieringServiceTimeoutMs(long tieringServiceTimeoutMs) {
+        this.tieringServiceTimeoutMs = tieringServiceTimeoutMs;
     }
 
     @Nullable
@@ -527,6 +557,44 @@ public class LakeTableTieringManager implements AutoCloseable {
                     }
                     liveTieringTableIds.put(tableId, clock.milliseconds());
                 });
+    }
+
+    /**
+     * Throws {@link FencedTieringEpochException} unless table {@code tableId} is tiered under
+     * {@code tieringEpoch}: the epoch is the table's current one and the round under it has not
+     * finished, failed or timed out.
+     */
+    public void validateTieringEpoch(long tableId, long tieringEpoch) {
+        inReadLock(lock, () -> validateTieringUnder(tableId, tieringEpoch));
+    }
+
+    /**
+     * Runs {@code action} if table {@code tableId} is tiered under {@code tieringEpoch}, see {@link
+     * #validateTieringEpoch}, and throws {@link FencedTieringEpochException} otherwise. The epoch
+     * cannot move on while the action runs, so the table goes to another tiering service only once
+     * the action is done, and that service sees what the action wrote, e.g. a lake snapshot.
+     */
+    public <T, E extends Exception> T inTieringEpoch(
+            long tableId, long tieringEpoch, SupplierWithException<T, E> action) throws E {
+        return inReadLock(
+                lock,
+                () -> {
+                    validateTieringUnder(tableId, tieringEpoch);
+                    return action.get();
+                });
+    }
+
+    @GuardedBy("lock")
+    private void validateTieringUnder(long tableId, long tieringEpoch) {
+        validateTieringServiceRequest(tableId, tieringEpoch);
+        // A finished round keeps its epoch until the table is pending again.
+        TieringState tieringState = tieringStates.get(tableId);
+        if (tieringState != TieringState.Tiering) {
+            throw new FencedTieringEpochException(
+                    String.format(
+                            "The table %d is no longer tiered under epoch %d, it is in %s state.",
+                            tableId, tieringEpoch, tieringState));
+        }
     }
 
     private void validateTieringServiceRequest(long tableId, long tieringEpoch) {

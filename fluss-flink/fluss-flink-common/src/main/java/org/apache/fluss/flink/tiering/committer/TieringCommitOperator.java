@@ -216,6 +216,10 @@ public class TieringCommitOperator<WriteResult, Committable>
                 () -> {
                     TieringCommitResult<Committable> result;
                     try {
+                        // the round's commits to Fluss carry its epoch, so a round of a table the
+                        // coordinator took from this service registers nothing
+                        flussTableLakeSnapshotCommitter.fenceOnTieringEpoch(
+                                tableId, TableBucketWriteResult.tieringEpochOf(results));
                         result = tieringCommitter.commitWriteResults(tableId, tablePath, results);
                     } catch (Exception e) {
                         postCompletion(tableId, () -> reportFailed(tableId, tablePath, e));

@@ -34,6 +34,7 @@ public abstract class TieringSplit implements Serializable {
     public static final byte TIERING_LOG_SPLIT_FLAG = 2;
     public static final int UNKNOWN_SPLIT_INDEX = -1;
     public static final long UNKNOWN_TIERING_ROUND_TIMESTAMP = -1L;
+    public static final long UNKNOWN_TIERING_EPOCH = -1L;
 
     protected static final int UNKNOWN_NUMBER_OF_SPLITS = -1;
 
@@ -47,6 +48,8 @@ public abstract class TieringSplit implements Serializable {
     protected final int splitIndex;
     // the timestamp when one round of tiering was generated
     protected final long tieringRoundTimestamp;
+    // the tiering epoch the coordinator assigned the round's table under, see copy()
+    protected long tieringEpoch = UNKNOWN_TIERING_EPOCH;
 
     /**
      * Indicates whether to skip tiering data for this split in the current round of tiering. When
@@ -158,6 +161,14 @@ public abstract class TieringSplit implements Serializable {
         return tieringRoundTimestamp;
     }
 
+    /**
+     * Returns the tiering epoch the coordinator assigned the round's table under, which fences the
+     * round's commits, or {@link #UNKNOWN_TIERING_EPOCH}.
+     */
+    public long getTieringEpoch() {
+        return tieringEpoch;
+    }
+
     protected static String toSplitId(String splitPrefix, TableBucket tableBucket) {
         if (tableBucket.getPartitionId() != null) {
             return splitPrefix
@@ -185,11 +196,23 @@ public abstract class TieringSplit implements Serializable {
     }
 
     public TieringSplit copy(int numberOfSplits) {
-        return copy(numberOfSplits, splitIndex, tieringRoundTimestamp);
+        return copy(numberOfSplits, splitIndex, tieringRoundTimestamp, tieringEpoch);
     }
 
+    /** Copies this split into a round whose tiering epoch is unknown. */
     public abstract TieringSplit copy(
             int numberOfSplits, int splitIndex, long tieringRoundTimestamp);
+
+    /**
+     * Copies this split into a round of the table the coordinator assigned under {@code
+     * tieringEpoch}.
+     */
+    public final TieringSplit copy(
+            int numberOfSplits, int splitIndex, long tieringRoundTimestamp, long tieringEpoch) {
+        TieringSplit copy = copy(numberOfSplits, splitIndex, tieringRoundTimestamp);
+        copy.tieringEpoch = tieringEpoch;
+        return copy;
+    }
 
     @Override
     public boolean equals(Object object) {
@@ -203,7 +226,8 @@ public abstract class TieringSplit implements Serializable {
                 && numberOfSplits == that.numberOfSplits
                 && skipCurrentRound == that.skipCurrentRound
                 && splitIndex == that.splitIndex
-                && tieringRoundTimestamp == that.tieringRoundTimestamp;
+                && tieringRoundTimestamp == that.tieringRoundTimestamp
+                && tieringEpoch == that.tieringEpoch;
     }
 
     @Override
@@ -215,6 +239,7 @@ public abstract class TieringSplit implements Serializable {
                 numberOfSplits,
                 skipCurrentRound,
                 splitIndex,
-                tieringRoundTimestamp);
+                tieringRoundTimestamp,
+                tieringEpoch);
     }
 }
