@@ -193,6 +193,9 @@ public class TieringCommitter<WriteResult, Committable> {
             Map<String, String> snapshotProperties =
                     Collections.singletonMap(
                             FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, lakeBucketTieredOffsetsFile);
+            // Fluss rejects the registration of a round whose table was handed to another tiering
+            // service, but not its lake commit. Checking right before it narrows the window.
+            flussTableLakeSnapshotCommitter.checkTieringEpoch(tableId);
             LakeCommitResult lakeCommitResult =
                     lakeCommitter.commit(
                             committable,

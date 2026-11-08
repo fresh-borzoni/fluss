@@ -919,6 +919,9 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                                 .collect(Collectors.toList()));
         long tieringRoundTimestamp = tieringSplits.get(0).unwrap().getTieringRoundTimestamp();
         assertThat(tieringRoundTimestamp).isPositive();
+        // the epoch the coordinator assigned the table under, which fences the round's commits
+        long tieringEpoch = tieringSplits.get(0).unwrap().getTieringEpoch();
+        assertThat(tieringEpoch).isPositive();
         assertThat(tieringSplits)
                 .allSatisfy(
                         split -> {
@@ -926,6 +929,7 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                                     .isEqualTo(tieringSplits.size());
                             assertThat(split.unwrap().getTieringRoundTimestamp())
                                     .isEqualTo(tieringRoundTimestamp);
+                            assertThat(split.unwrap().getTieringEpoch()).isEqualTo(tieringEpoch);
                         });
     }
 

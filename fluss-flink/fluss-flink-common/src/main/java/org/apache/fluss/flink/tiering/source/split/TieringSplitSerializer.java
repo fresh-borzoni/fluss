@@ -37,20 +37,29 @@ import static org.apache.fluss.client.tiering.TieringSplit.TIERING_SNAPSHOT_SPLI
 /**
  * A serializer for the {@link FlinkTieringSplit}.
  *
- * <p>This serializer is only used to serialize and deserialize splits sent from {@link
- * TieringSourceEnumerator} to {@link TieringSource} for network transmission. Therefore, it does
- * not need to consider compatibility.
+ * <p>This serializer is mainly used to send splits from {@link TieringSourceEnumerator} to {@link
+ * TieringSource}.
+ *
+ * <h3>Version Evolution:</h3>
+ *
+ * <ul>
+ *   <li><b>Version 0:</b> Initial version.
+ *   <li><b>Version 1 (Current):</b> Adds the tiering epoch of the split's round after the round's
+ *       timestamp, and the row position split of a re-index. A split of version 0 has no epoch, so
+ *       its round's commits are not fenced.
+ * </ul>
  */
 public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTieringSplit> {
 
     public static final TieringSplitSerializer INSTANCE = new TieringSplitSerializer();
 
     private static final int VERSION_0 = 0;
+    private static final int VERSION_1 = 1;
 
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
 
-    private static final int CURRENT_VERSION = VERSION_0;
+    private static final int CURRENT_VERSION = VERSION_1;
 
     @Override
     public int getVersion() {
@@ -93,6 +102,8 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
         // write split metadata for this tiering round
         out.writeInt(split.getSplitIndex());
         out.writeLong(split.getTieringRoundTimestamp());
+        // since VERSION_1
+        out.writeLong(split.getTieringEpoch());
         if (split.isTieringSnapshotSplit()) {
             // Snapshot split
             TieringSnapshotSplit tieringSnapshotSplit = split.asTieringSnapshotSplit();
@@ -116,7 +127,7 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
 
     @Override
     public FlinkTieringSplit deserialize(int version, byte[] serialized) throws IOException {
-        if (version != VERSION_0) {
+        if (version != VERSION_0 && version != VERSION_1) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -148,6 +159,8 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
         boolean skipCurrentRound = in.readBoolean();
         int splitIndex = in.readInt();
         long tieringRoundTimestamp = in.readLong();
+        long tieringEpoch =
+                version >= VERSION_1 ? in.readLong() : TieringSplit.UNKNOWN_TIERING_EPOCH;
 
         TieringSplit tieringSplit;
         if (splitKind == TIERING_SNAPSHOT_SPLIT_FLAG) {
@@ -184,6 +197,11 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
                             tieringRoundTimestamp);
         } else {
             throw new IOException("Unknown split kind " + splitKind);
+        }
+        if (tieringEpoch != TieringSplit.UNKNOWN_TIERING_EPOCH) {
+            tieringSplit =
+                    tieringSplit.copy(
+                            numberOfSplits, splitIndex, tieringRoundTimestamp, tieringEpoch);
         }
         return new FlinkTieringSplit(tieringSplit);
     }
