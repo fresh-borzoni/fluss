@@ -120,6 +120,7 @@ import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRequestExecutor;
+import org.apache.fluss.server.kv.dv.DvMaskRequest;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
 import org.apache.fluss.server.kv.scan.ScannerManager;
@@ -912,14 +913,22 @@ public final class TabletService extends RpcServiceBase
                                     request.getReadableSnapshotId(),
                                     keys));
         }
-        // The masks of a union read.
+        // The masks of a union read, or parts of a cut one pinned.
+        DvMaskRequest masks;
+        try {
+            masks = ServerRpcMessageUtils.toDvMaskRequest(request);
+        } catch (IllegalArgumentException e) {
+            CompletableFuture<GetDvSnapshotResponse> refused = new CompletableFuture<>();
+            refused.completeExceptionally(e);
+            return refused;
+        }
+        long tableId = request.getTableId();
+        int bucketId = request.getBucketId();
+        long snapshotId = request.getReadableSnapshotId();
         return dvRequests.submit(
                 () ->
                         replicaManager.getDvSnapshot(
-                                request.getTableId(),
-                                partitionId,
-                                request.getBucketId(),
-                                request.getReadableSnapshotId()));
+                                tableId, partitionId, bucketId, snapshotId, masks));
     }
 
     @Override

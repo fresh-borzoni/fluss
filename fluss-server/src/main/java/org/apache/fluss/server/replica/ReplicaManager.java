@@ -37,6 +37,7 @@ import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
@@ -96,6 +97,9 @@ import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
+import org.apache.fluss.server.kv.dv.DvMaskRequest;
+import org.apache.fluss.server.kv.dv.DvPinnedCut;
 import org.apache.fluss.server.kv.dv.DvSnapshot;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
@@ -1483,16 +1487,67 @@ public class ReplicaManager implements ServerReconfigurable {
      */
     public GetDvSnapshotResponse getDvSnapshot(
             long tableId, @Nullable Long partitionId, int bucketId, long readableSnapshotId) {
+        return getDvSnapshot(tableId, partitionId, bucketId, readableSnapshotId, DvMaskRequest.ALL);
+    }
+
+    /**
+     * Gets the masks of a union read of a bucket, or the requested parts of a cut the read pinned.
+     *
+     * @param tableId the table ID
+     * @param partitionId the partition ID, null for non-partitioned tables
+     * @param bucketId the bucket ID
+     * @param readableSnapshotId the lake snapshot the read is planned on
+     * @param masks which masks the read asks for
+     * @return a {@link GetDvSnapshotResponse} containing the masks
+     */
+    public GetDvSnapshotResponse getDvSnapshot(
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long readableSnapshotId,
+            DvMaskRequest masks) {
         TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
         try {
-            DvSnapshot snapshot =
-                    dvLeaderKvTablet(tb).getDvManager().getDvForUnionRead(readableSnapshotId);
-            return ServerRpcMessageUtils.buildGetDvSnapshotResponse(snapshot);
+            DerivedDvManager dvManager = dvLeaderKvTablet(tb).getDvManager();
+            if (!masks.usesCut()) {
+                DvSnapshot snapshot = dvManager.getDvForUnionRead(readableSnapshotId);
+                return ServerRpcMessageUtils.buildGetDvSnapshotResponse(snapshot);
+            }
+            DvPinnedCut cut =
+                    masks.cut() == null
+                            ? dvManager.pinCut(readableSnapshotId)
+                            : pinnedCut(tb, dvManager, readableSnapshotId, masks.cut());
+            if (!masks.paged()) {
+                return ServerRpcMessageUtils.buildGetDvSnapshotResponse(cut.toDvSnapshot());
+            }
+            return ServerRpcMessageUtils.buildPagedDvSnapshotResponse(cut, masks);
         } catch (ApiException e) {
             throw e;
         } catch (Exception e) {
             throw new FlussRuntimeException(
-                    "Failed to get DV snapshot for " + tb + " snapshot " + readableSnapshotId, e);
+                    "Failed to get DV snapshot for "
+                            + tb
+                            + " snapshot "
+                            + readableSnapshotId
+                            + (masks.cut() == null ? "" : " cut " + masks.cut()),
+                    e);
+        }
+    }
+
+    /**
+     * Returns a cut a union read pinned. A cut the bucket does not hold fails as stale. The message
+     * names the bucket and the cut after the snapshot ids, which clients read from it.
+     */
+    private static DvPinnedCut pinnedCut(
+            TableBucket tb, DerivedDvManager dvManager, long snapshotId, long cut)
+            throws IOException {
+        try {
+            return dvManager.pinnedCut(snapshotId, cut);
+        } catch (StaleSnapshotException e) {
+            throw new StaleSnapshotException(
+                    e.getCurrentSnapshotId(),
+                    e.getRequestedSnapshotId(),
+                    "bucket " + tb + ", cut " + cut);
         }
     }
 

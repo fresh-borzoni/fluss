@@ -76,6 +76,7 @@ import org.apache.fluss.rpc.messages.DescribeClusterResponse;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
@@ -193,6 +194,8 @@ import org.apache.fluss.server.entity.ProduceLogDataForBucket;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
+import org.apache.fluss.server.kv.dv.DvMaskRequest;
+import org.apache.fluss.server.kv.dv.DvPinnedCut;
 import org.apache.fluss.server.kv.dv.DvSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
@@ -219,6 +222,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -2535,6 +2539,55 @@ public class ServerRpcMessageUtils {
             pb.setRemoteLogEndOffset(entry.getManifestHandle().getRemoteLogEndOffset());
         }
         return response;
+    }
+
+    /**
+     * The masks a union read's {@link GetDvSnapshotRequest} asks for, read off the request before
+     * it is handed to another thread.
+     */
+    public static DvMaskRequest toDvMaskRequest(GetDvSnapshotRequest request) {
+        List<String> fileNames = new ArrayList<>(request.getLakeDvFileNamesCount());
+        for (int i = 0; i < request.getLakeDvFileNamesCount(); i++) {
+            fileNames.add(request.getLakeDvFileNameAt(i));
+        }
+        return new DvMaskRequest(
+                request.hasLogEndOffset() ? request.getLogEndOffset() : null,
+                request.hasPaged() && request.isPaged(),
+                fileNames,
+                request.hasLogDvFromOffset() ? request.getLogDvFromOffset() : null,
+                request.hasMaxLogDvBytes()
+                        ? request.getMaxLogDvBytes()
+                        : DvPinnedCut.DEFAULT_LOG_PAGE_BYTES);
+    }
+
+    /**
+     * Builds the {@link GetDvSnapshotResponse} of a paged union read: the cut, and the masks of the
+     * named lake files and of the log from the requested offset on, if any.
+     */
+    public static GetDvSnapshotResponse buildPagedDvSnapshotResponse(
+            DvPinnedCut cut, DvMaskRequest request) throws IOException {
+        GetDvSnapshotResponse resp =
+                new GetDvSnapshotResponse()
+                        .setLogEndOffset(cut.logEndOffset())
+                        .setSnapshotStartOffset(cut.snapshotStartOffset())
+                        .setPaged(true);
+        if (cut.lakeSnapshotIdentity() != null) {
+            resp.setLakeSnapshotIdentity(cut.lakeSnapshotIdentity());
+        }
+        for (Map.Entry<String, byte[]> entry :
+                cut.lakeMasksOf(request.lakeFileNames()).entrySet()) {
+            resp.addLakeDvEntry()
+                    .setFilePath(entry.getKey())
+                    .setDeletedPositionsBitmap(entry.getValue());
+        }
+        if (request.logFromOffset() != null) {
+            DvPinnedCut.LogPage page = cut.logPage(request.logFromOffset(), request.maxLogBytes());
+            resp.setLogDvToOffset(page.to());
+            if (page.bitmap() != null) {
+                resp.setLogDvBitmap(page.bitmap());
+            }
+        }
+        return resp;
     }
 
     /** Builds a {@link GetDvSnapshotResponse} carrying the masks of a union read. */

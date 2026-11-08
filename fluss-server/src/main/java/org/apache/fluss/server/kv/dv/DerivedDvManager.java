@@ -84,6 +84,11 @@ import java.util.function.Predicate;
  * When it is exceeded, the largest tails spill their changes to their bucket's RocksDB, so masks
  * are served however far tiering lags.
  *
+ * <p>A union read whose workers fetch a bucket's masks in parts first pins a cut ({@link #pinCut}):
+ * the masks up to the high watermark, frozen in the tablet server's {@link DerivedDvPinnedCuts}.
+ * Every worker then reads the lake and the log as of that one offset, while the bucket's own masks
+ * move on with writes and newer snapshots.
+ *
  * <p>A rebuild replays the log into a fresh tail without the manager lock, so the write path keeps
  * handing over its changes. It then replays the few changes written meanwhile and installs the tail
  * under the lock. Rebuilds of all buckets of a tablet server share a {@link
@@ -318,6 +323,7 @@ public class DerivedDvManager implements Closeable {
     public synchronized void useTailBudget(DerivedDvTailBudget budget) {
         if (budget != tailBudget) {
             tailBudget.remove(tailOwner);
+            tailBudget.pinnedCuts().dropAll(this);
             tailBudget = budget;
             reportTail(true);
         }
@@ -1421,6 +1427,8 @@ public class DerivedDvManager implements Closeable {
     public synchronized void close() {
         closed = true;
         reportTail(true);
+        // closed is set first: a pin racing the close fails instead of adding a cut nobody drops
+        tailBudget.pinnedCuts().dropAll(this);
         long deadline = System.currentTimeMillis() + CLOSE_WAIT_MS;
         boolean interrupted = false;
         // an interrupt does not cut the wait short: the RocksDB would outlive the close
@@ -2526,13 +2534,81 @@ public class DerivedDvManager implements Closeable {
      */
     public DvSnapshot getDvForUnionRead(long requestedSnapshotId)
             throws IOException, StaleSnapshotException {
+        return unionReadMasks(requestedSnapshotId, true);
+    }
+
+    /**
+     * Pins the cut of a union read of {@code requestedSnapshotId}: its masks up to the high
+     * watermark, frozen. The read's workers later fetch their parts of exactly these masks ({@link
+     * #pinnedCut}) while the bucket's own masks move on. Pins at the same high watermark share one
+     * cut.
+     *
+     * @throws StaleSnapshotException if the bucket does not cover {@code requestedSnapshotId} and
+     *     will not
+     * @throws DeletionVectorsNotReadyException while the bucket catches up to the snapshot or
+     *     replays its log tail
+     */
+    public DvPinnedCut pinCut(long requestedSnapshotId) throws IOException, StaleSnapshotException {
+        DvSnapshot masks = getDvForUnionRead(requestedSnapshotId);
+        return tailBudget.pinnedCuts().pin(this, requestedSnapshotId, masks, metrics);
+    }
+
+    /**
+     * Returns the cut of snapshot {@code snapshotId} at log offset {@code cut} that a union read
+     * pinned. A cut this bucket does not hold (dropped, or pinned on another leader) is built again
+     * only if {@code snapshotId} is the covered snapshot and {@code cut} the current high
+     * watermark, since that gives the same masks.
+     *
+     * @throws StaleSnapshotException if the cut is not held and cannot be built again
+     */
+    public DvPinnedCut pinnedCut(long snapshotId, long cut)
+            throws IOException, StaleSnapshotException {
+        DerivedDvPinnedCuts pinnedCuts = tailBudget.pinnedCuts();
+        DvPinnedCut held = pinnedCuts.get(this, snapshotId, cut);
+        if (held != null) {
+            return held;
+        }
+        synchronized (this) {
+            if (closed) {
+                throw new IOException("Derived DV manager is closed");
+            }
+            if (coveredSnapshotId != snapshotId || servableHighWatermark() != cut) {
+                LOG.debug(
+                        "Derived DV: the cut of snapshot {} at offset {} is not held; the bucket"
+                                + " covers snapshot {} up to offset {}.",
+                        snapshotId,
+                        cut,
+                        coveredSnapshotId,
+                        servableHighWatermark());
+                throw stale(snapshotId);
+            }
+        }
+        // the cached masks may be of an earlier high watermark
+        DvSnapshot masks = unionReadMasks(snapshotId, false);
+        if (masks.getLogEndOffset() != cut) {
+            // the high watermark moved meanwhile
+            synchronized (this) {
+                throw stale(snapshotId);
+            }
+        }
+        return pinnedCuts.pin(this, snapshotId, masks, metrics);
+    }
+
+    /** Whether the bucket's leader closed; read without the lock. */
+    boolean isClosed() {
+        return closed;
+    }
+
+    private DvSnapshot unionReadMasks(long requestedSnapshotId, boolean useCache)
+            throws IOException, StaleSnapshotException {
         long deadline = System.currentTimeMillis() + NOT_READY_WAIT_MS;
         while (true) {
             List<ByteBuffer> batch;
             long gen;
             synchronized (this) {
                 awaitServable(requestedSnapshotId, true);
-                if (cachedMasks != null
+                if (useCache
+                        && cachedMasks != null
                         && cachedMasksSnapshotId == coveredSnapshotId
                         && cachedMasksGeneration == generation
                         && System.nanoTime() - cachedMasksAtNanos < maskCacheNanos) {

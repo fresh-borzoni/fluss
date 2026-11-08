@@ -44,7 +44,11 @@ public final class DerivedDvMetrics {
                 new AtomicLong(),
                 new AtomicLong(),
                 new AtomicInteger(),
-                new AtomicLong());
+                new AtomicLong(),
+                new AtomicInteger(),
+                new AtomicLong(),
+                new SimpleCounter(),
+                new SimpleCounter());
     }
 
     public static DerivedDvMetrics of(TabletServerMetricGroup group) {
@@ -61,7 +65,11 @@ public final class DerivedDvMetrics {
                 group.dvReplayBacklog(),
                 group.dvTailMemoryBytes(),
                 group.dvSpilledTails(),
-                group.dvSpilledTailBytes());
+                group.dvSpilledTailBytes(),
+                group.dvPinnedCuts(),
+                group.dvPinnedCutBytes(),
+                group.dvPinnedCutEvictionCount(),
+                group.dvPinnedCutExpirationCount());
     }
 
     private final Counter catchUps;
@@ -80,6 +88,12 @@ public final class DerivedDvMetrics {
     // buckets whose log tail is spilled to disk, and the bytes they spilled
     private final AtomicInteger spilledTails;
     private final AtomicLong spilledTailBytes;
+    // pinned cuts of all buckets and their bytes; evictions count cuts dropped over the memory
+    // limit, expirations count cuts no request asked for within the idle timeout
+    private final AtomicInteger pinnedCuts;
+    private final AtomicLong pinnedCutBytes;
+    private final Counter pinnedCutEvictions;
+    private final Counter pinnedCutExpirations;
 
     private DerivedDvMetrics(
             Counter catchUps,
@@ -94,7 +108,11 @@ public final class DerivedDvMetrics {
             AtomicLong replayBacklog,
             AtomicLong tailMemoryBytes,
             AtomicInteger spilledTails,
-            AtomicLong spilledTailBytes) {
+            AtomicLong spilledTailBytes,
+            AtomicInteger pinnedCuts,
+            AtomicLong pinnedCutBytes,
+            Counter pinnedCutEvictions,
+            Counter pinnedCutExpirations) {
         this.catchUps = catchUps;
         this.catchUpMs = catchUpMs;
         this.rebuilds = rebuilds;
@@ -108,6 +126,10 @@ public final class DerivedDvMetrics {
         this.tailMemoryBytes = tailMemoryBytes;
         this.spilledTails = spilledTails;
         this.spilledTailBytes = spilledTailBytes;
+        this.pinnedCuts = pinnedCuts;
+        this.pinnedCutBytes = pinnedCutBytes;
+        this.pinnedCutEvictions = pinnedCutEvictions;
+        this.pinnedCutExpirations = pinnedCutExpirations;
     }
 
     /** Records a catch-up that applied the index changes after the covered snapshot. */
@@ -172,6 +194,40 @@ public final class DerivedDvMetrics {
 
     long spilledTailBytes() {
         return spilledTailBytes.get();
+    }
+
+    void pinnedCutAdded(long bytes) {
+        pinnedCuts.incrementAndGet();
+        pinnedCutBytes.addAndGet(bytes);
+    }
+
+    void pinnedCutRemoved(long bytes) {
+        pinnedCuts.decrementAndGet();
+        pinnedCutBytes.addAndGet(-bytes);
+    }
+
+    void pinnedCutEvicted() {
+        pinnedCutEvictions.inc();
+    }
+
+    void pinnedCutExpired() {
+        pinnedCutExpirations.inc();
+    }
+
+    int pinnedCuts() {
+        return pinnedCuts.get();
+    }
+
+    long pinnedCutBytes() {
+        return pinnedCutBytes.get();
+    }
+
+    long pinnedCutEvictions() {
+        return pinnedCutEvictions.getCount();
+    }
+
+    long pinnedCutExpirations() {
+        return pinnedCutExpirations.getCount();
     }
 
     long rebuildCount() {

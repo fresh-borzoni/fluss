@@ -19,6 +19,7 @@
 package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
@@ -26,6 +27,7 @@ import org.apache.fluss.config.MemorySize;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -35,6 +37,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
@@ -45,7 +48,8 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * <p>Each bucket reports the estimated bytes of its tail: changes waiting for the high watermark,
  * the updates and deletes since its covered snapshot, keys waiting for lake positions, and mask
  * bitmaps. A rebuild also reports its map of each key's last version. When the total exceeds the
- * budget, the largest tails and maps spill to RocksDB in the background until it fits.
+ * budget, the largest tails and maps spill to RocksDB in the background until it fits. Pinned cuts
+ * ({@link DerivedDvPinnedCuts}) count towards the budget too, up to a share of it.
  */
 @Internal
 public final class DerivedDvTailBudget {
@@ -76,6 +80,7 @@ public final class DerivedDvTailBudget {
     }
 
     private final long limitBytes;
+    private final DerivedDvPinnedCuts pinnedCuts;
     // Per tail: {heap bytes, bytes a spill moves to disk}.
     private final Map<Owner, long[]> bytes = new ConcurrentHashMap<>();
     private final AtomicLong total = new AtomicLong();
@@ -86,12 +91,22 @@ public final class DerivedDvTailBudget {
     private volatile long lastWarnMs;
 
     public DerivedDvTailBudget(long limitBytes) {
+        this(limitBytes, ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT.defaultValue());
+    }
+
+    public DerivedDvTailBudget(long limitBytes, Duration pinnedCutIdleTimeout) {
+        this(limitBytes, pinnedCutIdleTimeout, System::nanoTime);
+    }
+
+    @VisibleForTesting
+    DerivedDvTailBudget(long limitBytes, Duration pinnedCutIdleTimeout, LongSupplier nanoClock) {
         checkArgument(
                 limitBytes > 0,
                 "%s must be positive, but is %s",
                 ConfigOptions.KV_DELETION_VECTORS_TAIL_MEMORY.key(),
                 limitBytes);
         this.limitBytes = limitBytes;
+        this.pinnedCuts = new DerivedDvPinnedCuts(this, pinnedCutIdleTimeout, nanoClock);
     }
 
     /** The budget of {@code conf}: the option, or a share of the maximum heap. */
@@ -99,7 +114,8 @@ public final class DerivedDvTailBudget {
         return new DerivedDvTailBudget(
                 conf.getOptional(ConfigOptions.KV_DELETION_VECTORS_TAIL_MEMORY)
                         .map(MemorySize::getBytes)
-                        .orElseGet(DerivedDvTailBudget::defaultBytes));
+                        .orElseGet(DerivedDvTailBudget::defaultBytes),
+                conf.get(ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT));
     }
 
     static long defaultBytes() {
@@ -108,6 +124,11 @@ public final class DerivedDvTailBudget {
 
     public long limitBytes() {
         return limitBytes;
+    }
+
+    /** The cuts the union reads of the server's buckets pinned. */
+    public DerivedDvPinnedCuts pinnedCuts() {
+        return pinnedCuts;
     }
 
     /** The bytes all tails take now, as reported. */
@@ -187,9 +208,9 @@ public final class DerivedDvTailBudget {
             if (now - lastWarnMs > 60_000) {
                 lastWarnMs = now;
                 LOG.warn(
-                        "Derived DV: the log tails of this server take {} bytes after spilling"
-                                + " every tail, more than {} ({}): their mask bitmaps grow"
-                                + " while tiering lags.",
+                        "Derived DV: the log tails and pinned cuts of this server take {}"
+                                + " bytes after spilling every tail, more than {} ({}): their"
+                                + " mask bitmaps grow while tiering lags.",
                         total.get(),
                         limitBytes,
                         ConfigOptions.KV_DELETION_VECTORS_TAIL_MEMORY.key());

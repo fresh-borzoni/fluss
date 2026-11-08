@@ -87,6 +87,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final AtomicLong dvTailMemoryBytes = new AtomicLong();
     private final AtomicInteger dvSpilledTails = new AtomicInteger();
     private final AtomicLong dvSpilledTailBytes = new AtomicLong();
+    private final AtomicInteger dvPinnedCuts = new AtomicInteger();
+    private final AtomicLong dvPinnedCutBytes = new AtomicLong();
+    private final Counter dvPinnedCutEvictionCount;
+    private final Counter dvPinnedCutExpirationCount;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
 
@@ -175,6 +179,12 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         gauge(MetricNames.DV_TAIL_MEMORY_BYTES, dvTailMemoryBytes::get);
         gauge(MetricNames.DV_SPILLED_TAILS, dvSpilledTails::get);
         gauge(MetricNames.DV_SPILLED_TAIL_BYTES, dvSpilledTailBytes::get);
+        gauge(MetricNames.DV_PINNED_CUTS, dvPinnedCuts::get);
+        gauge(MetricNames.DV_PINNED_CUT_BYTES, dvPinnedCutBytes::get);
+        dvPinnedCutEvictionCount = new SimpleCounter();
+        meter(MetricNames.DV_PINNED_CUT_EVICTION_RATE, new MeterView(dvPinnedCutEvictionCount));
+        dvPinnedCutExpirationCount = new SimpleCounter();
+        meter(MetricNames.DV_PINNED_CUT_EXPIRATION_RATE, new MeterView(dvPinnedCutExpirationCount));
         kvTruncateAsDuplicatedCount = new SimpleCounter();
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
@@ -386,6 +396,22 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public AtomicLong dvSpilledTailBytes() {
         return dvSpilledTailBytes;
+    }
+
+    public AtomicInteger dvPinnedCuts() {
+        return dvPinnedCuts;
+    }
+
+    public AtomicLong dvPinnedCutBytes() {
+        return dvPinnedCutBytes;
+    }
+
+    public Counter dvPinnedCutEvictionCount() {
+        return dvPinnedCutEvictionCount;
+    }
+
+    public Counter dvPinnedCutExpirationCount() {
+        return dvPinnedCutExpirationCount;
     }
 
     public Counter kvTruncateAsDuplicatedCount() {
