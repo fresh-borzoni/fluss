@@ -20,6 +20,7 @@ package org.apache.fluss.lake.iceberg.tiering;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
+import org.apache.fluss.lake.iceberg.utils.IcebergSnapshotLineage;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
@@ -30,6 +31,8 @@ import org.apache.fluss.utils.IOUtils;
 
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 
@@ -56,10 +59,19 @@ public class IcebergLakeTieringFactory
 
     @Override
     public void validateTable(TableInfo tableInfo) throws IOException {
+        validateTable(tableInfo, null);
+    }
+
+    @Override
+    public void validateTable(TableInfo tableInfo, @Nullable Long registeredSnapshotId)
+            throws IOException {
         Catalog icebergCatalog = icebergCatalogProvider.get();
         try {
             Table icebergTable = icebergCatalog.loadTable(toIceberg(tableInfo.getLakeTablePath()));
             IcebergPartitionSpecValidator.validate(icebergTable, tableInfo);
+            if (registeredSnapshotId != null) {
+                IcebergSnapshotLineage.checkDescendsFrom(icebergTable, registeredSnapshotId);
+            }
         } finally {
             if (icebergCatalog instanceof AutoCloseable) {
                 IOUtils.closeQuietly(

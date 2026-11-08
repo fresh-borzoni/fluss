@@ -27,6 +27,8 @@ import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.LakeTableExternallyModifiedException;
+import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
@@ -72,6 +74,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
@@ -125,6 +128,9 @@ public class TieringSourceEnumerator
     private final Map<Long, Long> failedTableEpochs;
     private final Map<Long, TieringFinishInfo> finishedTables;
     private final Set<Long> tieringReachMaxDurationsTables;
+    // Tables whose lake table was rolled back or written by another engine. The error is logged
+    // once per table.
+    private final Set<Long> rolledBackTables = new HashSet<>();
 
     // lazily instantiated
     private RpcClient rpcClient;
@@ -539,8 +545,12 @@ public class TieringSourceEnumerator
             TablePath tablePath = tieringTable.f2;
             final TableInfo tableInfo = flussAdmin.getTableInfo(tablePath).get();
             if (lakeTieringFactory instanceof TieringTableValidator) {
-                ((TieringTableValidator) lakeTieringFactory).validateTable(tableInfo);
+                // A lake table with deletion vectors that was rolled back, or written by another
+                // engine outside Fluss, fails here before any of the round's data is written.
+                ((TieringTableValidator) lakeTieringFactory)
+                        .validateTable(tableInfo, registeredSnapshotOfDvTable(tableInfo));
             }
+            rolledBackTables.remove(tieringTable.f0);
             List<TieringSplit> tieringSplits = splitGenerator.generateTableSplits(tableInfo);
             if (tieringSplits.isEmpty()
                     && lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
@@ -593,9 +603,40 @@ public class TieringSourceEnumerator
                         TimeUnit.MILLISECONDS);
             }
         } catch (Exception e) {
-            LOG.warn("Fail to generate Tiering splits for table {}.", tieringTable.f2, e);
+            // a rollback, or rows another engine wrote
+            Optional<LakeTableExternallyModifiedException> rollback =
+                    ExceptionUtils.findThrowable(e, LakeTableExternallyModifiedException.class);
+            if (!rollback.isPresent()) {
+                LOG.warn("Fail to generate Tiering splits for table {}.", tieringTable.f2, e);
+            } else if (rolledBackTables.add(tieringTable.f0)) {
+                // Reported once; the table fails every round until the rollback is undone.
+                LOG.error(rollback.get().getMessage());
+            } else {
+                LOG.debug("The lake table of {} is still changed outside Fluss.", tieringTable.f2);
+            }
             failedTableEpochs.put(tieringTable.f0, tieringTable.f1);
             tieringTableEpochs.remove(tieringTable.f0);
+        }
+    }
+
+    /**
+     * Returns the latest lake snapshot registered for a primary key table with deletion vectors.
+     * The lake table must not be rolled back past it. Returns null for other tables, or if nothing
+     * is tiered yet.
+     */
+    @Nullable
+    private Long registeredSnapshotOfDvTable(TableInfo tableInfo) throws Exception {
+        if (!tableInfo.hasPrimaryKey() || !tableInfo.isDeletionVectorsEnabled()) {
+            return null;
+        }
+        try {
+            return flussAdmin.getLatestLakeSnapshot(tableInfo.getTablePath()).get().getSnapshotId();
+        } catch (Exception e) {
+            if (ExceptionUtils.findThrowable(e, LakeTableSnapshotNotExistException.class)
+                    .isPresent()) {
+                return null;
+            }
+            throw e;
         }
     }
 

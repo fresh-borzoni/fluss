@@ -33,6 +33,7 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -48,6 +49,7 @@ import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox.MailboxClose
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -57,9 +59,11 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static org.apache.flink.runtime.util.Runnables.withUncaughtExceptionHandler;
 import static org.apache.fluss.config.ConfigOptions.LAKE_TIERING_COMMIT_THREAD_NUM;
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getLakeTieringIoTmpDirs;
 import static org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.Uninterruptibles.awaitTerminationUninterruptibly;
 import static org.apache.fluss.utils.IOUtils.closeAll;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -79,6 +83,8 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  *
  * <p>Finally, it will also commit the committed lake snapshot to Fluss cluster to make Fluss aware
  * of the tiering progress.
+ *
+ * <p>Rounds of tables with deletion vectors are committed by a {@link DerivedDvTieringCommitter}.
  */
 public class TieringCommitOperator<WriteResult, Committable>
         extends AbstractStreamOperator<CommittableMessage<Committable>>
@@ -109,6 +115,7 @@ public class TieringCommitOperator<WriteResult, Committable>
     private ExecutorService commitExecutor;
     private boolean closed;
     private TieringCommitter<WriteResult, Committable> tieringCommitter;
+    private DerivedDvTieringCommitter<WriteResult, Committable> dvCommitter;
     private Connection connection;
     private Admin admin;
 
@@ -160,6 +167,30 @@ public class TieringCommitOperator<WriteResult, Committable>
                         lakeTieringConfig,
                         lakeTieringFactory,
                         flussTableLakeSnapshotCommitter);
+        // The index stores' temporary files, e.g. checkpoints the trim builds, go to the
+        // tiering service's local directories.
+        String[] ioTmpDirs =
+                getLakeTieringIoTmpDirs(
+                        lakeTieringConfig,
+                        getContainingTask()
+                                .getEnvironment()
+                                .getTaskManagerInfo()
+                                .getConfiguration());
+        dvCommitter =
+                new DerivedDvTieringCommitter<>(
+                        admin,
+                        flussConfig,
+                        lakeTieringConfig,
+                        lakeTieringFactory,
+                        flussTableLakeSnapshotCommitter,
+                        getMetricGroup(),
+                        ioTmpDirs.length == 0
+                                ? null
+                                : new File(
+                                        ioTmpDirs[
+                                                ThreadLocalRandom.current()
+                                                        .nextInt(ioTmpDirs.length)],
+                                        "dv-committer"));
         commitExecutor =
                 Executors.newFixedThreadPool(
                         commitThreads,
@@ -212,33 +243,55 @@ public class TieringCommitOperator<WriteResult, Committable>
 
     private void commitAsync(
             long tableId, TablePath tablePath, List<TableBucketWriteResult<WriteResult>> results) {
+        submit(
+                tableId,
+                tablePath,
+                results,
+                () -> {
+                    TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+                    if (tableInfo.isDeletionVectorsEnabled()) {
+                        return dvCommitter.commitRound(tableId, tablePath, tableInfo, results);
+                    }
+                    return DerivedDvTieringCommitter.Outcome.committed(
+                            tieringCommitter.commitWriteResults(tableId, tablePath, results));
+                });
+    }
+
+    private void submit(
+            long tableId,
+            TablePath tablePath,
+            List<TableBucketWriteResult<WriteResult>> results,
+            RoundCommit<Committable> roundCommit) {
         Runnable commit =
                 () -> {
-                    TieringCommitResult<Committable> result;
+                    DerivedDvTieringCommitter.Outcome<Committable> outcome;
                     try {
                         // the round's commits to Fluss carry its epoch, so a round of a table the
                         // coordinator took from this service registers nothing
                         flussTableLakeSnapshotCommitter.fenceOnTieringEpoch(
                                 tableId, TableBucketWriteResult.tieringEpochOf(results));
-                        result = tieringCommitter.commitWriteResults(tableId, tablePath, results);
+                        outcome = roundCommit.commit();
                     } catch (Exception e) {
                         postCompletion(tableId, () -> reportFailed(tableId, tablePath, e));
                         return;
                     }
-                    postCompletion(
-                            tableId,
-                            () ->
-                                    reportFinished(
-                                            tableId,
-                                            result,
-                                            results.stream()
-                                                    .anyMatch(TableBucketWriteResult::endedEarly)));
+                    postCompletion(tableId, () -> complete(tableId, results, outcome));
                 };
         commitExecutor.execute(
                 withUncaughtExceptionHandler(
                         commit,
                         (thread, error) ->
                                 getContainingTask().getEnvironment().failExternally(error)));
+    }
+
+    private void complete(
+            long tableId,
+            List<TableBucketWriteResult<WriteResult>> results,
+            DerivedDvTieringCommitter.Outcome<Committable> outcome) {
+        reportFinished(
+                tableId,
+                outcome.result(),
+                results.stream().anyMatch(TableBucketWriteResult::endedEarly));
     }
 
     @VisibleForTesting
@@ -304,6 +357,12 @@ public class TieringCommitOperator<WriteResult, Committable>
                     tableId,
                     cause);
         }
+    }
+
+    /** Commits a round on a commit thread. */
+    @FunctionalInterface
+    private interface RoundCommit<Committable> {
+        DerivedDvTieringCommitter.Outcome<Committable> commit() throws Exception;
     }
 
     /** Collects one table's tiering round with constant-time validation of each result. */

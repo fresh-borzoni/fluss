@@ -185,6 +185,17 @@ public class FlussTableLakeSnapshotCommitter implements AutoCloseable {
     }
 
     /**
+     * Prepares the offsets file of a snapshot from the offsets of all its buckets. It does not
+     * merge in the previous snapshot's offsets, so buckets left out, e.g. of dropped partitions,
+     * are not carried on.
+     */
+    public String prepareCompleteLakeSnapshot(
+            long tableId, TablePath tablePath, Map<TableBucket, Long> bucketOffsets)
+            throws IOException {
+        return prepareLakeSnapshot(tableId, tablePath, bucketOffsets, true);
+    }
+
+    /**
      * Prepares a complete offset map for the readable snapshot without inheriting newer offsets.
      */
     private String prepareReadableSnapshotOffsets(

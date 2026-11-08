@@ -46,6 +46,13 @@ public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable 
     String FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY = "fluss-offsets";
 
     /**
+     * The snapshot property key that stores the base of a tiering round of a table with deletion
+     * vectors: the id of the latest lake snapshot registered in Fluss when the round started, or -1
+     * if there was none. The round's commit descends from it.
+     */
+    String FLUSS_LAKE_SNAP_BASE_PROPERTY = "fluss-dv-base";
+
+    /**
      * Converts a list of write results to a committable object.
      *
      * @param writeResults the list of write results
@@ -116,4 +123,92 @@ public interface LakeCommitter<WriteResult, CommittableT> extends AutoCloseable 
     @Nullable
     CommittedLakeSnapshot getMissingLakeSnapshot(@Nullable Long latestLakeSnapshotIdOfFluss)
             throws IOException;
+
+    /**
+     * Returns the result {@link #commit} reported for lake snapshot {@code snapshotId}, which Fluss
+     * committed with the tiered offsets {@code tieredLogEndOffsets}. With it, a commit whose round
+     * was lost before registering it, e.g. on failover, is registered as the round would have, with
+     * its readable snapshot. Returns null if the lake cannot tell; the snapshot is then registered
+     * without a readable snapshot.
+     */
+    @Nullable
+    default LakeCommitResult getCommitResult(
+            long snapshotId, Map<TableBucket, Long> tieredLogEndOffsets) throws IOException {
+        return null;
+    }
+
+    /**
+     * Commits {@code committable} together with deletion vectors for the given row positions per
+     * data-file basename, atomically on top of {@code baseSnapshotId}. The committed snapshot's
+     * parent is the base, or a snapshot after it that changed no data file. Fails if a referenced
+     * file is gone or another commit happened since the base, because the deletes and the round's
+     * index change are relative to the base.
+     *
+     * <p>If the lake definitely did not take the commit, the delete files written for it are
+     * deleted. It then throws a {@link LakeCommitRejectedException}, so the caller can delete the
+     * committable's files too, or a {@link LakeBaseChangedException} if the table moved past the
+     * base, so the caller can plan the commit again on the new snapshot. Any other exception leaves
+     * the outcome unknown.
+     */
+    default LakeCommitResult commitWithDeletes(
+            CommittableT committable,
+            Map<String, String> snapshotProperties,
+            Map<String, long[]> deletedPositionsByFile,
+            long baseSnapshotId)
+            throws IOException {
+        throw new UnsupportedOperationException("commitWithDeletes is not supported");
+    }
+
+    /**
+     * Commits this round's compaction rewrite, if any, before the round's deletes, so that it
+     * validates against the files it read. It commits only on the snapshot the compaction read, or
+     * on snapshots after it that changed no data file, so the positions the compaction handed to
+     * the index are a change from that snapshot. Returns the rewrite's snapshot id, or null if
+     * there is none or it was rejected because the table changed. A rejected rewrite is safe to
+     * skip.
+     */
+    @Nullable
+    default Long commitPendingRewrite(CommittableT committable) throws IOException {
+        return null;
+    }
+
+    /**
+     * Checks that the lake table's current snapshot is {@code snapshotId} or descends from it.
+     *
+     * <p>Throws {@link org.apache.fluss.exception.LakeTableRolledBackException} if the table was
+     * rolled back past it outside Fluss. The check passes if the lake cannot tell or the snapshot
+     * is gone. Throws {@link org.apache.fluss.exception.LakeTableExternallyModifiedException} if
+     * another engine changed the table's rows after {@code snapshotId}; rewrites that keep the rows
+     * pass.
+     */
+    default void checkCurrentSnapshotDescendsFrom(long snapshotId) throws IOException {}
+
+    /**
+     * Returns whether the readable snapshot may have moved past {@code snapshotId}, the latest lake
+     * snapshot registered in Fluss, without new data. This applies to a lake whose commits are not
+     * readable at once (see {@link LakeCommitResult#getReadableSnapshot()}), e.g. when another
+     * engine compacted a Paimon table. A tiering round without data then commits the registered
+     * offsets again, so the newer readable snapshot is registered without waiting for a write.
+     */
+    default boolean readableSnapshotMayAdvanceSince(long snapshotId) throws IOException {
+        return false;
+    }
+
+    /**
+     * Keeps snapshot {@code snapshotId} from expiring while it is among the most recent readable
+     * snapshots, as the lake does for the readable snapshots it commits. Called before Fluss
+     * registers as readable a snapshot it did not commit, e.g. a rewrite by another engine. Best
+     * effort; a lake without such protection does nothing.
+     */
+    default void protectReadableSnapshot(long snapshotId) {}
+
+    /**
+     * Expires old snapshots of the lake table if its snapshots expire automatically ({@code
+     * table.datalake.auto-expire-snapshot} or {@code lake.tiering.auto-expire-snapshot}). Keeps
+     * {@code keepFromSnapshotId} and the snapshots after it, which Fluss still needs. If null,
+     * keeps only the snapshots the lake protects. Called after a round's commit of a table with
+     * deletion vectors. A lake that expires snapshots on commit, or not at all, does nothing. Best
+     * effort.
+     */
+    default void expireSnapshots(@Nullable Long keepFromSnapshotId) {}
 }

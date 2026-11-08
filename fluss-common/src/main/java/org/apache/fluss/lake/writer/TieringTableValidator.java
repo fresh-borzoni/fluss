@@ -20,6 +20,8 @@ package org.apache.fluss.lake.writer;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.TableInfo;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 
 /**
@@ -40,4 +42,24 @@ public interface TieringTableValidator {
      * @throws IOException if the validation fails or cannot be completed
      */
     void validateTable(TableInfo tableInfo) throws IOException;
+
+    /**
+     * Validates the table as {@link #validateTable(TableInfo)} does and, if {@code
+     * registeredSnapshotId} is not null, checks that the lake table's current snapshot is the
+     * latest lake snapshot registered in Fluss or descends from it. Tables with deletion vectors
+     * need this check, since a rollback of the lake table outside Fluss breaks their deletion
+     * vectors. Such a table fails with {@link
+     * org.apache.fluss.exception.LakeTableRolledBackException} before any of its data is written. A
+     * table whose rows another engine changed since fails the same way, with {@link
+     * org.apache.fluss.exception.LakeTableExternallyModifiedException}.
+     *
+     * @param tableInfo the Fluss table metadata
+     * @param registeredSnapshotId the latest lake snapshot registered in Fluss, or null to skip the
+     *     check
+     * @throws IOException if the validation fails or cannot be completed
+     */
+    default void validateTable(TableInfo tableInfo, @Nullable Long registeredSnapshotId)
+            throws IOException {
+        validateTable(tableInfo);
+    }
 }
