@@ -19,7 +19,12 @@ package org.apache.fluss.lake.writer;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.SupportsDataFiles;
+import org.apache.fluss.lake.source.SupportsRewritePlanning;
+import org.apache.fluss.lake.source.SupportsRowPositions;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePath;
 
 import javax.annotation.Nullable;
 
@@ -34,6 +39,9 @@ import java.io.IOException;
  *
  * <ul>
  *   <li>its lake committers implement {@link SupportsPositionDeleteCommit};
+ *   <li>the lake source of {@link #createLakeSource} implements {@link SupportsRewritePlanning};
+ *       its record readers implement {@link SupportsRowPositions} and its splits {@link
+ *       SupportsDataFiles};
  *   <li>its lake writers take the table's position index directory from the {@link
  *       DeletionVectorWriterInitContext} Fluss gives them.
  * </ul>
@@ -42,6 +50,15 @@ import java.io.IOException;
  */
 @PublicEvolving
 public interface SupportsDeletionVectorTiering {
+
+    /**
+     * Creates a {@link LakeSource} of the lake table using the factory's configuration. Tiering
+     * uses it to plan the re-index of rewritten data files and to read the positions of their rows.
+     *
+     * @param lakeTablePath the path of the lake table
+     * @return the lake source, which implements {@link SupportsRewritePlanning}
+     */
+    LakeSource<?> createLakeSource(TablePath lakeTablePath);
 
     /**
      * Validates a table with deletion vectors before a tiering round writes any of its data. Fluss

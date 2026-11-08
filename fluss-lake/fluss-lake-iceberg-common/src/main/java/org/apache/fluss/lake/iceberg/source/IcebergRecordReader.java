@@ -20,6 +20,8 @@ package org.apache.fluss.lake.iceberg.source;
 
 import org.apache.fluss.lake.iceberg.utils.IcebergUtils;
 import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.RowWithPosResult;
+import org.apache.fluss.lake.source.SupportsRowPositions;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.GenericRecord;
 import org.apache.fluss.record.LogRecord;
@@ -27,9 +29,11 @@ import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.utils.CloseableIterator;
 
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
+import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.data.IcebergGenericReader;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.CloseableIterable;
@@ -51,7 +55,7 @@ import static org.apache.fluss.lake.iceberg.IcebergSchemaUtils.LEGACY_SYSTEM_COL
  * <p>Refer to {@link org.apache.iceberg.data.GenericReader#open(FileScanTask)} and {@link
  * org.apache.iceberg.Scan#ignoreResiduals()} for details.
  */
-public class IcebergRecordReader implements RecordReader {
+public class IcebergRecordReader implements RecordReader, SupportsRowPositions {
 
     /** Sentinel value emitted when the lake table has no per-record offset/timestamp. */
     private static final long NO_SYSTEM_COLUMN_VALUE = -1L;
@@ -60,19 +64,105 @@ public class IcebergRecordReader implements RecordReader {
     protected @Nullable int[][] project;
     protected Types.StructType struct;
 
+    private final FileScanTask fileScanTask;
+    private final Table table;
+    // The catalog that owns this reader's FileIO (S3 connection pool). It is closed once, when the
+    // reader or its row iterator closes; otherwise each split leaks an S3FileIO and exhausts the
+    // connection pool.
+    private final @Nullable Catalog catalog;
+    private boolean catalogClosed;
+
     public IcebergRecordReader(FileScanTask fileScanTask, Table table, @Nullable int[][] project) {
+        this(fileScanTask, table, project, null);
+    }
+
+    public IcebergRecordReader(
+            FileScanTask fileScanTask,
+            Table table,
+            @Nullable int[][] project,
+            @Nullable Catalog catalog) {
+        this.fileScanTask = fileScanTask;
+        this.table = table;
+        this.project = project;
+        this.catalog = catalog;
         TableScan tableScan = table.newScan();
         if (project != null) {
             tableScan = applyProject(tableScan, project);
         }
-        IcebergGenericReader reader = new IcebergGenericReader(tableScan, true);
         struct = tableScan.schema().asStruct();
-        this.iterator = new IcebergRecordAsFlussRecordIterator(reader.open(fileScanTask), struct);
+        // The iterator opens lazily in read(), so a reader only read with positions opens no
+        // connection for it.
+        this.readScan = tableScan;
     }
+
+    private final TableScan readScan;
 
     @Override
     public CloseableIterator<LogRecord> read() throws IOException {
+        if (iterator == null) {
+            try {
+                IcebergGenericReader reader = new IcebergGenericReader(readScan, true);
+                iterator =
+                        new IcebergRecordAsFlussRecordIterator(
+                                reader.open(fileScanTask), struct, this::closeCatalog);
+            } catch (RuntimeException e) {
+                // no iterator owns the catalog yet
+                closeCatalog();
+                throw e;
+            }
+        }
         return iterator;
+    }
+
+    @Override
+    public CloseableIterator<RowWithPosResult> readWithPos() throws IOException {
+        try {
+            return openWithPos();
+        } catch (IOException | RuntimeException e) {
+            // no iterator owns the catalog yet
+            closeCatalog();
+            throw e;
+        }
+    }
+
+    private CloseableIterator<RowWithPosResult> openWithPos() throws IOException {
+        // Project the caller's columns plus Iceberg's _pos metadata column. _pos is the row's
+        // position in its file; rows hidden by deletion vectors leave gaps.
+        Types.StructType tableStruct = table.schema().asStruct();
+        List<Types.NestedField> cols = new ArrayList<>();
+        if (project != null && project.length > 0) {
+            for (int[] p : project) {
+                cols.add(tableStruct.fields().get(p[0]));
+            }
+        } else {
+            // No projection pushed down (e.g. SELECT *): all columns of the table.
+            cols.addAll(tableStruct.fields());
+        }
+        cols.add(MetadataColumns.ROW_POSITION);
+        TableScan tableScan = table.newScan().project(new Schema(cols));
+        Types.StructType posStruct = tableScan.schema().asStruct();
+        int posIndex =
+                posStruct.fields().indexOf(posStruct.field(MetadataColumns.ROW_POSITION.name()));
+        IcebergGenericReader reader = new IcebergGenericReader(tableScan, true);
+        return new IcebergRowWithPosIterator(
+                reader.open(fileScanTask),
+                posStruct,
+                posIndex,
+                IcebergSplit.fileNameOf(fileScanTask),
+                this::closeCatalog);
+    }
+
+    /** Closes the reader's catalog, unless its row iterator closed it already. */
+    @Override
+    public void close() {
+        closeCatalog();
+    }
+
+    private synchronized void closeCatalog() {
+        if (!catalogClosed) {
+            catalogClosed = true;
+            closeCatalogQuietly(catalog);
+        }
     }
 
     private TableScan applyProject(TableScan tableScan, int[][] projects) {
@@ -96,9 +186,20 @@ public class IcebergRecordReader implements RecordReader {
         private final ProjectedRow projectedRow;
         private final IcebergRecordAsFlussRow icebergRecordAsFlussRow;
 
+        // releases what the reader holds, e.g. its catalog, once the iterator closes
+        private final @Nullable Runnable onClose;
+
         public IcebergRecordAsFlussRecordIterator(
                 CloseableIterable<Record> icebergRecordIterator, Types.StructType struct) {
+            this(icebergRecordIterator, struct, null);
+        }
+
+        public IcebergRecordAsFlussRecordIterator(
+                CloseableIterable<Record> icebergRecordIterator,
+                Types.StructType struct,
+                @Nullable Runnable onClose) {
             this.icebergRecordIterator = icebergRecordIterator.iterator();
+            this.onClose = onClose;
 
             // A legacy table read without projection still exposes its three trailing system
             // columns; trim them so only the business columns are emitted. A clean table (or any
@@ -117,6 +218,10 @@ public class IcebergRecordReader implements RecordReader {
                 icebergRecordIterator.close();
             } catch (Exception e) {
                 throw new RuntimeException("Fail to close iterator.", e);
+            } finally {
+                if (onClose != null) {
+                    onClose.run();
+                }
             }
         }
 
@@ -138,6 +243,76 @@ public class IcebergRecordReader implements RecordReader {
                     ChangeType.INSERT,
                     projectedRow.replaceRow(
                             icebergRecordAsFlussRow.replaceIcebergRecord(icebergRecord)));
+        }
+    }
+
+    /** Iterator yielding each row with its physical {@code _pos} and the data file name. */
+    public static class IcebergRowWithPosIterator implements CloseableIterator<RowWithPosResult> {
+
+        private final org.apache.iceberg.io.CloseableIterator<Record> icebergRecordIterator;
+        private final IcebergRecordAsFlussRow icebergRecordAsFlussRow =
+                new IcebergRecordAsFlussRow();
+        private final ProjectedRow projectedRow;
+        private final RowWithPosResult reusable = new RowWithPosResult();
+        private final int posIndex;
+        private final String fileName;
+        // releases what the reader holds, e.g. its catalog, once the iterator closes
+        private final @Nullable Runnable onClose;
+
+        public IcebergRowWithPosIterator(
+                CloseableIterable<Record> records,
+                Types.StructType struct,
+                int posIndex,
+                String fileName,
+                @Nullable Runnable onClose) {
+            this.icebergRecordIterator = records.iterator();
+            this.posIndex = posIndex;
+            this.fileName = fileName;
+            this.onClose = onClose;
+            // Project away the trailing _pos column so the caller sees only its own columns.
+            int[] project =
+                    IntStream.range(0, struct.fields().size()).filter(i -> i != posIndex).toArray();
+            this.projectedRow = ProjectedRow.from(project);
+        }
+
+        @Override
+        public boolean hasNext() {
+            return icebergRecordIterator.hasNext();
+        }
+
+        @Override
+        public RowWithPosResult next() {
+            Record icebergRecord = icebergRecordIterator.next();
+            long pos = icebergRecord.get(posIndex, Long.class);
+            return reusable.set(
+                    projectedRow.replaceRow(
+                            icebergRecordAsFlussRow.replaceIcebergRecord(icebergRecord)),
+                    pos,
+                    fileName);
+        }
+
+        @Override
+        public void close() {
+            try {
+                icebergRecordIterator.close();
+            } catch (Exception e) {
+                throw new RuntimeException("Fail to close iterator.", e);
+            } finally {
+                if (onClose != null) {
+                    onClose.run();
+                }
+            }
+        }
+    }
+
+    /** Closes the catalog and its FileIO (S3 connection pool). Never throws. */
+    private static void closeCatalogQuietly(@Nullable Catalog catalog) {
+        if (catalog instanceof AutoCloseable) {
+            try {
+                ((AutoCloseable) catalog).close();
+            } catch (Exception ignored) {
+                // best-effort; a failed catalog close must not fail the read
+            }
         }
     }
 }

@@ -21,6 +21,7 @@ import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringCommitResult;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.lake.committer.LakeBaseChangedException;
 import org.apache.fluss.lake.committer.LakeCommitRejectedException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.LakeCommitter;
@@ -37,6 +38,7 @@ import org.slf4j.Logger;
 import javax.annotation.Nullable;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -67,7 +69,10 @@ import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCK
  *       are left out, the lake still descends from B, and a commit an earlier attempt left
  *       unregistered is registered first ({@link
  *       DerivedDvRecovery#checkFlussNotMissingLakeSnapshot}), after which the round fails and runs
- *       again.
+ *       again. A round without rows re-indexes only ({@link DerivedDvReindexer#reindexIdleTable}).
+ *   <li>Still {@code STARTED}: files rewritten since B are re-indexed ({@link
+ *       DerivedDvReindexer#triggerReindex}). The round is held until the tiering readers report, or
+ *       runs again at once if the re-index is already published.
  *   <li>{@link Phase#OFFSETS_WRITTEN}: the offsets file of the snapshot.
  *   <li>{@link Phase#INDEX_PUBLISHED}: the writers' staged parts are published as index change I,
  *       committed in the store and not registered, with the base positions of the changed keys
@@ -88,13 +93,16 @@ import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCK
  *       attempt's data files, offsets file and index change ({@link
  *       DerivedDvRecovery#cleanUpFailedRound}); a crash leaves them as orphans, and the round is
  *       tiered again from B's offsets.
+ *   <li>{@code LAKE_REJECTED} because the lake moved past B: the attempt's offsets file and change
+ *       are deleted, and the round runs again from {@code STARTED} on the lake's current snapshot,
+ *       at most {@link #MAX_BASE_CHANGES} times.
  *   <li>A failure or crash at {@code LAKE_COMMITTING} or later keeps every file, as S may exist,
  *       also when the lake does not show S yet: a commit with an unknown outcome may still land
  *       after the call failed, e.g. on a REST catalog. This is Iceberg's own rule; the files of a
  *       commit that never lands are left to orphan-file removal. The next round finds S by its
  *       properties and registers it ({@link DerivedDvRecovery#checkFlussNotMissingLakeSnapshot});
  *       registering I again is a no-op.
- *   <li>The writers' staged parts are deleted when the round ends.
+ *   <li>The writers' staged parts are deleted when the round ends, unless it is held.
  * </ul>
  */
 final class DerivedDvRound<WriteResult, Committable> {
@@ -102,6 +110,10 @@ final class DerivedDvRound<WriteResult, Committable> {
     private static final Logger LOG = DerivedDvContext.LOG;
 
     private final DerivedDvContext<WriteResult, Committable> context;
+
+    // A round runs again at once when another engine commits during it. On a table that keeps
+    // moving, the round fails after this many attempts and the next round tries again.
+    private static final int MAX_BASE_CHANGES = 5;
 
     /**
      * The phases of an attempt of a round, in order. Each names the last durable step the attempt
@@ -149,31 +161,77 @@ final class DerivedDvRound<WriteResult, Committable> {
     }
 
     private final DerivedDvRecovery<WriteResult, Committable> recovery;
+    private final DerivedDvReindexer<WriteResult, Committable> reindexer;
     private final DerivedDvRegistrations<WriteResult, Committable> registrations;
 
     DerivedDvRound(
             DerivedDvContext<WriteResult, Committable> context,
             DerivedDvRecovery<WriteResult, Committable> recovery,
+            DerivedDvReindexer<WriteResult, Committable> reindexer,
             DerivedDvRegistrations<WriteResult, Committable> registrations) {
         this.context = context;
         this.recovery = recovery;
+        this.reindexer = reindexer;
         this.registrations = registrations;
     }
 
     /**
-     * Runs a round until it commits or fails. The writers' staged index parts are deleted when it
-     * ends either way. The change the round published holds what it needs of them.
+     * Runs a round until it commits, fails or is held. The writers' staged index parts stay while
+     * the round is held and are deleted when it ends either way. The change the round published
+     * holds what it needs of them.
      */
     RoundOutcome<Committable> commitRound(
             long tableId,
             TablePath tablePath,
             TableInfo tableInfo,
-            List<TableBucketWriteResult<WriteResult>> writeResults)
+            List<TableBucketWriteResult<WriteResult>> writeResults,
+            boolean resumed)
             throws Exception {
+        boolean held = false;
         try {
-            return RoundOutcome.committed(commitOnce(tableId, tablePath, tableInfo, writeResults));
+            RoundOutcome<Committable> outcome =
+                    commitUntilDone(tableId, tablePath, tableInfo, writeResults, resumed);
+            held = outcome.reindex() != null;
+            return outcome;
         } finally {
-            deleteStagedParts(tableId, tablePath, writeResults);
+            if (!held) {
+                deleteStagedParts(tableId, tablePath, writeResults);
+            }
+        }
+    }
+
+    private RoundOutcome<Committable> commitUntilDone(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            List<TableBucketWriteResult<WriteResult>> writeResults,
+            boolean resumed)
+            throws Exception {
+        boolean resuming = resumed;
+        int baseChanges = 0;
+        while (true) {
+            try {
+                return RoundOutcome.committed(
+                        commitOnce(
+                                tableId,
+                                tablePath,
+                                tableInfo,
+                                writeResults,
+                                resuming,
+                                baseChanges < MAX_BASE_CHANGES));
+            } catch (ReindexPending pending) {
+                if (pending.reindex != null) {
+                    return RoundOutcome.held(pending.reindex);
+                }
+                // Run the round again at once in two cases. Files were only removed: the
+                // re-index is published, and the lookups must not see the removed files. Or the
+                // lake table moved past the base during the round: the next attempt re-indexes
+                // the rewrite on the new snapshot.
+                if (pending.baseChanged) {
+                    baseChanges++;
+                }
+                resuming = true;
+            }
         }
     }
 
@@ -181,7 +239,9 @@ final class DerivedDvRound<WriteResult, Committable> {
             long tableId,
             TablePath tablePath,
             TableInfo tableInfo,
-            List<TableBucketWriteResult<WriteResult>> committableWriteResults)
+            List<TableBucketWriteResult<WriteResult>> committableWriteResults,
+            boolean resuming,
+            boolean rerunOnBaseChange)
             throws Exception {
         checkSameTable(tableId, tablePath, tableInfo);
 
@@ -197,10 +257,12 @@ final class DerivedDvRound<WriteResult, Committable> {
         List<TableBucketWriteResult<WriteResult>> nonEmptyResults =
                 results.stream().filter(r -> r.writeResult() != null).collect(Collectors.toList());
 
-        // All buckets were empty, so nothing is committed.
-        if (nonEmptyResults.isEmpty()) {
-            LOG.info(
-                    "Commit tiering write results is empty for table {} ({}).", tablePath, tableId);
+        // No bucket wrote a row or advanced its offset, so nothing is committed. Rewrites since the
+        // latest snapshot are still re-indexed, else an idle table keeps reading the snapshot
+        // before the rewrite. A round whose buckets advanced without a row, e.g. over records
+        // that fold away, commits like any other, so the next round does not read them again.
+        if (nonEmptyResults.isEmpty() && !advancesOffsets(results, flussCurrentLakeSnapshot)) {
+            reindexer.reindexIdleTable(tableId, tablePath, tableInfo);
             return new TieringCommitResult<>(null, null);
         }
 
@@ -260,7 +322,12 @@ final class DerivedDvRound<WriteResult, Committable> {
                         flussCurrentLakeSnapshot,
                         logEndOffsets,
                         logMaxTieredTimestamps,
+                        resuming,
+                        rerunOnBaseChange,
                         round);
+            } catch (ReindexPending pending) {
+                // The round is held or runs again, and keeps the files it wrote.
+                throw pending;
             } catch (Exception e) {
                 recovery.cleanUpFailedRound(tableId, tablePath, lakeCommitter, committable, round);
                 throw e;
@@ -282,11 +349,19 @@ final class DerivedDvRound<WriteResult, Committable> {
             @Nullable LakeSnapshot flussCurrentLakeSnapshot,
             Map<TableBucket, Long> logEndOffsets,
             Map<TableBucket, Long> logMaxTieredTimestamps,
+            boolean resuming,
+            boolean rerunOnBaseChange,
             RoundFiles round)
             throws Exception {
         long base =
                 flussCurrentLakeSnapshot == null ? -1L : flussCurrentLakeSnapshot.getSnapshotId();
         long t0 = System.currentTimeMillis();
+        // A rewrite since the base by another engine is re-indexed and made readable before the
+        // round resolves its keys.
+        if (base > 0) {
+            // Holds the round while the tiering readers re-index the rewritten files.
+            reindexer.triggerReindex(tableId, tablePath, tableInfo, flussCurrentLakeSnapshot);
+        }
         // 1. The writers' parts of the index change, staged in the store when they completed.
         PositionIndexStore store = context.indexStore(tableId, tablePath);
         Map<TableBucket, StagedIndexPart> parts = stagedParts(tablePath, nonEmptyResults);
@@ -356,6 +431,21 @@ final class DerivedDvRound<WriteResult, Committable> {
                                     committable, snapshotProperties, published.deleted, base);
         } catch (LakeCommitRejectedException e) {
             round.advance(Phase.LAKE_REJECTED);
+            if (e instanceof LakeBaseChangedException && rerunOnBaseChange) {
+                // Another engine committed during the round, e.g. a rewrite of files this round
+                // does not touch. The deletes and the index change are relative to the base, so
+                // the round runs again on the new snapshot and re-indexes the rewrite first. If
+                // the new owner of a table taken from this service committed, the round stops.
+                context.flussTableLakeSnapshotCommitter.checkTieringEpoch(tableId);
+                LOG.info(
+                        "{} moved past base snapshot {} during the round ({}); the round runs"
+                                + " again on its current snapshot.",
+                        tablePath,
+                        base,
+                        e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
+                recovery.discardAttempt(tableId, tablePath, round);
+                throw ReindexPending.baseChanged();
+            }
             throw e;
         }
         round.advance(Phase.LAKE_COMMITTED);
@@ -455,5 +545,25 @@ final class DerivedDvRound<WriteResult, Committable> {
                         e);
             }
         }
+    }
+
+    /**
+     * Whether a round moves the tiered offset of a bucket past the registered snapshot's, or tiers
+     * a bucket the snapshot does not have.
+     */
+    static <WriteResult> boolean advancesOffsets(
+            List<TableBucketWriteResult<WriteResult>> results, @Nullable LakeSnapshot registered) {
+        Map<TableBucket, Long> registeredOffsets =
+                registered == null ? Collections.emptyMap() : registered.getTableBucketsOffset();
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            if (r.logEndOffset() < 0) {
+                continue;
+            }
+            Long offset = registeredOffsets.get(r.tableBucket());
+            if (offset == null || r.logEndOffset() > offset) {
+                return true;
+            }
+        }
+        return false;
     }
 }

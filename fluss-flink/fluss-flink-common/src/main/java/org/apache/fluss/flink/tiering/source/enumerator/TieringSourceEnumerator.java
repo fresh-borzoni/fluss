@@ -21,9 +21,11 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.tiering.TieringCommitterInitContext;
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
 import org.apache.fluss.config.ConfigOptions;
@@ -33,6 +35,7 @@ import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
+import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
@@ -44,6 +47,7 @@ import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.lake.writer.TieringTableValidator;
+import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -344,11 +348,32 @@ public class TieringSourceEnumerator
 
     @Override
     public void handleSourceEvent(int subtaskId, SourceEvent sourceEvent) {
+        try {
+            handleTableEvent(sourceEvent);
+        } catch (RuntimeException e) {
+            Long tableId = tableIdOf(sourceEvent);
+            if (tableId == null) {
+                throw e;
+            }
+            failRound(tableId, e);
+        }
+
+        if (!finishedTables.isEmpty() || !failedTableEpochs.isEmpty()) {
+            // call one round of heartbeat to notify table has been finished or failed
+            LOG.info("Finished tiering table {}.", finishedTables);
+            requestTableAndAssign(0);
+        }
+    }
+
+    private void handleTableEvent(SourceEvent sourceEvent) {
         if (sourceEvent instanceof FinishedTieringEvent) {
             FinishedTieringEvent finishedTieringEvent = (FinishedTieringEvent) sourceEvent;
             long finishedTableId = finishedTieringEvent.getTableId();
-            Long tieringEpoch = tieringTableEpochs.remove(finishedTableId);
             LOG.info("Got FinishedTieringEvent for tiering table {}. ", finishedTableId);
+            if (isStale(finishedTableId, finishedTieringEvent.getTieringEpoch(), "end")) {
+                return;
+            }
+            Long tieringEpoch = tieringTableEpochs.remove(finishedTableId);
             if (tieringEpoch == null) {
                 // shouldn't happen, warn it
                 LOG.warn(
@@ -367,14 +392,21 @@ public class TieringSourceEnumerator
             }
         }
 
+        if (sourceEvent instanceof RowPosRequestEvent) {
+            handleRowPosRequest((RowPosRequestEvent) sourceEvent);
+        }
+
         if (sourceEvent instanceof FailedTieringEvent) {
             FailedTieringEvent failedEvent = (FailedTieringEvent) sourceEvent;
             long failedTableId = failedEvent.getTableId();
-            Long tieringEpoch = tieringTableEpochs.remove(failedTableId);
             LOG.info(
                     "Tiering table {} is failed, fail reason is {}.",
                     failedTableId,
                     failedEvent.failReason());
+            if (isStale(failedTableId, failedEvent.getTieringEpoch(), "failure")) {
+                return;
+            }
+            Long tieringEpoch = tieringTableEpochs.remove(failedTableId);
             if (tieringEpoch == null) {
                 // shouldn't happen, warn it
                 LOG.warn(
@@ -384,12 +416,103 @@ public class TieringSourceEnumerator
                 failedTableEpochs.put(failedTableId, tieringEpoch);
             }
         }
+    }
 
-        if (!finishedTables.isEmpty() || !failedTableEpochs.isEmpty()) {
-            // call one round of heartbeat to notify table has been finished or failed
-            LOG.info("Finished tiering table {}.", finishedTables);
-            requestTableAndAssign(0);
+    /**
+     * Whether the end or failure of a round of a table under {@code tieringEpoch} is stale: the
+     * coordinator handed the table out again, under a newer epoch, while the round ran. The newer
+     * round goes on. An event without an epoch ends the table's current round.
+     */
+    private boolean isStale(long tableId, long tieringEpoch, String what) {
+        if (tieringEpoch == TieringSplit.UNKNOWN_TIERING_EPOCH) {
+            return false;
         }
+        Long current = tieringTableEpochs.get(tableId);
+        if (current == null || current == tieringEpoch) {
+            return false;
+        }
+        LOG.info(
+                "Ignoring the {} of the round of tiering table {} under epoch {}; the table is"
+                        + " tiered under epoch {} now.",
+                what,
+                tableId,
+                tieringEpoch,
+                current);
+        return true;
+    }
+
+    @Nullable
+    private static Long tableIdOf(SourceEvent sourceEvent) {
+        if (sourceEvent instanceof FinishedTieringEvent) {
+            return ((FinishedTieringEvent) sourceEvent).getTableId();
+        }
+        if (sourceEvent instanceof FailedTieringEvent) {
+            return ((FailedTieringEvent) sourceEvent).getTableId();
+        }
+        if (sourceEvent instanceof RowPosRequestEvent) {
+            return ((RowPosRequestEvent) sourceEvent).getTableId();
+        }
+        return null;
+    }
+
+    /**
+     * Fails the round of a table whose event cannot be handled, for example a re-index request
+     * whose splits cannot be built. The coordinator schedules the table again. The other tables'
+     * rounds go on: a job failover would lose them too, including the rounds held for a re-index
+     * after their lake commit.
+     */
+    private void failRound(long tableId, RuntimeException cause) {
+        LOG.error(
+                "Failed to handle an event of tiering table {}; its round fails, the rounds of"
+                        + " other tables go on.",
+                tableId,
+                cause);
+        pendingSplits.removeIf(split -> split.getTableBucket().getTableId() == tableId);
+        tieringReachMaxDurationsTables.remove(tableId);
+        Long tieringEpoch = tieringTableEpochs.remove(tableId);
+        if (tieringEpoch != null) {
+            failedTableEpochs.put(tableId, tieringEpoch);
+        }
+    }
+
+    /**
+     * Handles a {@link RowPosRequestEvent} from the committer by queueing one {@link
+     * TieringRowPosSplit} per split of the request for assignment. Each split covers a bounded
+     * number of files of one bucket.
+     */
+    private void handleRowPosRequest(RowPosRequestEvent event) {
+        long tableId = event.getTableId();
+        if (isStale(tableId, event.getTieringEpoch(), "re-index request")) {
+            return;
+        }
+        TablePath tablePath = event.getTablePath();
+        List<TieringRowPosSplit> rowPosSplits = new ArrayList<>();
+        int files = 0;
+        for (RowPosRequestEvent.Split split : event.getSplits()) {
+            rowPosSplits.add(
+                    new TieringRowPosSplit(
+                            tablePath,
+                            new TableBucket(tableId, split.getPartitionId(), split.getBucket()),
+                            split.getPartitionName(),
+                            split.getFileIds(),
+                            split.getPlanReference(),
+                            split.getSplit(),
+                            event.getTotalSplits(),
+                            event.getChangeId(),
+                            event.getRemoteUploadBasePath()));
+            files += split.getFileIds().length;
+        }
+
+        LOG.info(
+                "Received RowPosRequestEvent for table {} ({}): {} of {} splits, {} files.",
+                tablePath,
+                tableId,
+                rowPosSplits.size(),
+                event.getTotalSplits(),
+                files);
+
+        pendingSplits.addAll(rowPosSplits);
+        assignSplits();
     }
 
     private void handleSourceReaderFailOver() {
@@ -569,6 +692,9 @@ public class TieringSourceEnumerator
             }
             rolledBackTables.remove(tieringTable.f0);
             List<TieringSplit> tieringSplits = splitGenerator.generateTableSplits(tableInfo);
+            if (tieringSplits.isEmpty()) {
+                tieringSplits = new ArrayList<>(dvIdleRoundSplits(tableInfo));
+            }
             if (tieringSplits.isEmpty()
                     && lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_PARTITION_MARK_DONE_ENABLED)
                     && lakeTieringFactory.supportsPartitionMarkDone()
@@ -726,6 +852,71 @@ public class TieringSourceEnumerator
                 TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * The round of an idle table with deletion vectors: one empty split, so that the committer
+     * finds lake files another engine rewrote since the latest snapshot and re-indexes them. Such a
+     * rewrite does not change Fluss's latest lake snapshot, so every idle round gets the split.
+     * When nothing was rewritten, the committer's check is one lake metadata load.
+     */
+    private List<TieringSplit> dvIdleRoundSplits(TableInfo tableInfo) throws Exception {
+        if (!tableInfo.getTableConfig().isDeletionVectorsEnabled()) {
+            return Collections.emptyList();
+        }
+        TablePath tablePath = tableInfo.getTablePath();
+        LakeSnapshot latest;
+        try {
+            latest = flussAdmin.getLatestLakeSnapshot(tablePath).get();
+        } catch (Exception e) {
+            return Collections.emptyList(); // nothing tiered yet
+        }
+        Map<Long, String> partitionNames = new HashMap<>();
+        if (tableInfo.isPartitioned()) {
+            // with system partitions, e.g. the historical partition, which are tiered as well
+            for (PartitionInfo info : flussAdmin.listPartitionInfos(tablePath, true).get()) {
+                partitionNames.put(info.getPartitionId(), info.getPartitionName());
+            }
+        }
+        Map.Entry<TableBucket, Long> idle =
+                idleRoundBucket(latest.getTableBucketsOffset(), partitionNames);
+        if (idle == null) {
+            return Collections.emptyList();
+        }
+        TableBucket tb = idle.getKey();
+        LOG.info(
+                "DV idle round for table {} (checks for rewrites since snapshot {}).",
+                tablePath,
+                latest.getSnapshotId());
+        return Collections.singletonList(
+                new TieringLogSplit(
+                        tablePath,
+                        tb,
+                        tb.getPartitionId() == null
+                                ? null
+                                : partitionNames.get(tb.getPartitionId()),
+                        idle.getValue(),
+                        idle.getValue()));
+    }
+
+    /**
+     * The bucket an idle round's split names, with its tiered offset: a bucket of the latest
+     * snapshot in a partition the table still has, or null if there is none. The snapshot keeps the
+     * offsets of a dropped partition until a round registers again, and on an idle table that is
+     * the idle round. Naming the dropped partition, whose split cannot be built, would fail the
+     * idle round every time.
+     */
+    @VisibleForTesting
+    @Nullable
+    static Map.Entry<TableBucket, Long> idleRoundBucket(
+            Map<TableBucket, Long> tieredOffsets, Map<Long, String> partitionNames) {
+        for (Map.Entry<TableBucket, Long> e : tieredOffsets.entrySet()) {
+            Long partitionId = e.getKey().getPartitionId();
+            if (partitionId == null || partitionNames.containsKey(partitionId)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
     private List<TieringSplit> populateTieringRoundMetadata(
             List<TieringSplit> tieringSplits, long tieringEpoch) {
         int numberOfSplits = tieringSplits.size();
@@ -794,7 +985,9 @@ public class TieringSourceEnumerator
     static class HeartBeatHelper {
 
         static LakeTieringHeartbeatRequest basicHeartBeat() {
-            return new LakeTieringHeartbeatRequest();
+            // This service tiers tables with deletion vectors (DerivedDvTieringCommitter), so the
+            // coordinator may hand it those as well.
+            return new LakeTieringHeartbeatRequest().setSupportsDeletionVectors(true);
         }
 
         static LakeTieringHeartbeatRequest heartBeatWithRequestNewTieringTable(

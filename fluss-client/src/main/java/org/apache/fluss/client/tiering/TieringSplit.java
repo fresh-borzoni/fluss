@@ -135,11 +135,23 @@ public abstract class TieringSplit implements Serializable {
         return (TieringLogSplit) this;
     }
 
+    /** Checks whether this split is a re-index split. */
+    public final boolean isTieringRowPosSplit() {
+        return getClass() == TieringRowPosSplit.class;
+    }
+
+    /** Casts this split into a {@link TieringRowPosSplit}. */
+    public TieringRowPosSplit asTieringRowPosSplit() {
+        return (TieringRowPosSplit) this;
+    }
+
     public byte splitKind() {
         if (isTieringSnapshotSplit()) {
             return TIERING_SNAPSHOT_SPLIT_FLAG;
         } else if (isTieringLogSplit()) {
             return TIERING_LOG_SPLIT_FLAG;
+        } else if (isTieringRowPosSplit()) {
+            return TieringRowPosSplit.TIERING_ROW_POS_SPLIT_FLAG;
         } else {
             throw new IllegalArgumentException("Unsupported split kind for " + getClass());
         }

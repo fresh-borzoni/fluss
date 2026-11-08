@@ -18,14 +18,19 @@
 
 package org.apache.fluss.lake.iceberg.source;
 
+import org.apache.fluss.lake.iceberg.utils.IcebergConversions;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.SupportsDataFiles;
 
 import org.apache.iceberg.FileScanTask;
 
+import javax.annotation.Nullable;
+
+import java.util.Collections;
 import java.util.List;
 
 /** Split for Iceberg table. */
-public class IcebergSplit implements LakeSplit {
+public class IcebergSplit implements LakeSplit, SupportsDataFiles {
 
     private static final long serialVersionUID = 1L;
 
@@ -51,6 +56,33 @@ public class IcebergSplit implements LakeSplit {
 
     public FileScanTask fileScanTask() {
         return fileScanTask;
+    }
+
+    @Override
+    public long rowCount() {
+        return fileScanTask.file().recordCount();
+    }
+
+    /** The name of the split's one data file, the one {@link #fileNames()} names. */
+    @Nullable
+    public String fileName() {
+        return fileNameOf(fileScanTask);
+    }
+
+    @Nullable
+    @Override
+    public List<String> fileNames() {
+        String fileName = fileName();
+        return fileName == null ? null : Collections.singletonList(fileName);
+    }
+
+    /** Returns the basename of the split's single data file, used as the DV FileDict key. */
+    static String fileNameOf(FileScanTask fileScanTask) {
+        String location = fileScanTask.file().location();
+        if (location == null) {
+            return null;
+        }
+        return IcebergConversions.fileName(location);
     }
 
     @Override

@@ -19,21 +19,40 @@ package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.client.tiering.TieringCommitResult;
 
-/** The outcome of a round of a table with deletion vectors: committed. */
-final class RoundOutcome<Committable> {
-    private final TieringCommitResult<Committable> result;
+import javax.annotation.Nullable;
 
-    private RoundOutcome(TieringCommitResult<Committable> result) {
+/**
+ * The outcome of a round of a table with deletion vectors: committed, or held until a re-index is
+ * done.
+ */
+final class RoundOutcome<Committable> {
+    @Nullable private final TieringCommitResult<Committable> result;
+    @Nullable private final Reindex reindex;
+
+    private RoundOutcome(
+            @Nullable TieringCommitResult<Committable> result, @Nullable Reindex reindex) {
         this.result = result;
+        this.reindex = reindex;
     }
 
     static <Committable> RoundOutcome<Committable> committed(
             TieringCommitResult<Committable> result) {
-        return new RoundOutcome<>(result);
+        return new RoundOutcome<>(result, null);
     }
 
-    /** The committed round's result. */
+    static <Committable> RoundOutcome<Committable> held(Reindex reindex) {
+        return new RoundOutcome<>(null, reindex);
+    }
+
+    /** The committed round's result, or null if the round is held. */
+    @Nullable
     TieringCommitResult<Committable> result() {
         return result;
+    }
+
+    /** The re-index a held round waits for, or null if the round is committed. */
+    @Nullable
+    Reindex reindex() {
+        return reindex;
     }
 }

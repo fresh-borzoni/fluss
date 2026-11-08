@@ -24,24 +24,33 @@ import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
+import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderContext;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderOutput;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
 import static org.apache.fluss.testutils.DataTestUtils.row;
@@ -51,6 +60,70 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link TieringSourceReader}. */
 class TieringSourceReaderTest extends FlinkTestBase {
+
+    /**
+     * The deletion vector options of the tiering service, such as {@code
+     * --lake.tiering.deletion-vectors.write-buffer-size}, are options of the tiering job: its
+     * readers take them from the job's lake tiering config, not from the Fluss client config.
+     */
+    @Test
+    void testDeletionVectorOptionsComeFromTheLakeTieringConfig() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_tiering_dv_options");
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder()
+                                .schema(DEFAULT_PK_TABLE_SCHEMA)
+                                .distributedBy(1, "id")
+                                .build());
+        Configuration flussConf = new Configuration(FLUSS_CLUSTER_EXTENSION.getClientConfig());
+        try (Connection connection = ConnectionFactory.createConnection(flussConf)) {
+            writeRows(
+                    connection,
+                    tablePath,
+                    Arrays.asList(row(0, "v0"), row(1, "v1"), row(2, "v2")),
+                    false);
+        }
+        Configuration lakeTieringConfig = new Configuration();
+        lakeTieringConfig.setString(
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE.key(), "32kb");
+        List<WriterInitContext> contexts = new CopyOnWriteArrayList<>();
+        TestingLakeTieringFactory factory =
+                new TestingLakeTieringFactory() {
+                    @Override
+                    public LakeWriter<TestingWriteResult> createLakeWriter(
+                            WriterInitContext writerInitContext) throws IOException {
+                        contexts.add(writerInitContext);
+                        return super.createLakeWriter(writerInitContext);
+                    }
+                };
+        TieringSource<TestingWriteResult> source =
+                new TieringSource.Builder<>(flussConf, lakeTieringConfig, factory).build();
+        try (SourceReader<TableBucketWriteResult<TestingWriteResult>, FlinkTieringSplit> reader =
+                source.createReader(new TestingReaderContext())) {
+            reader.start();
+            reader.addSplits(
+                    Collections.singletonList(
+                            new FlinkTieringSplit(
+                                    new TieringLogSplit(
+                                            tablePath,
+                                            new TableBucket(tableId, 0),
+                                            null,
+                                            EARLIEST_OFFSET,
+                                            3))));
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
+                        reader.pollNext(new TestingReaderOutput<>());
+                        assertThat(contexts).isNotEmpty();
+                    });
+            assertThat(
+                            ((DeletionVectorWriterInitContext) contexts.get(0))
+                                    .writerMemoryPool()
+                                    .capacity())
+                    .isEqualTo(MemorySize.parse("32kb").getBytes());
+        }
+    }
 
     @Test
     void testHandleTieringReachMaxDurationEvent() throws Exception {
