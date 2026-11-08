@@ -22,8 +22,10 @@ import org.apache.fluss.fs.local.LocalDataOutputStream;
 import org.apache.fluss.fs.local.LocalFileStatus;
 import org.apache.fluss.fs.local.LocalFileSystem;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.FileAlreadyExistsException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,6 +49,12 @@ public class TestFileSystem extends LocalFileSystem {
 
     // number of upcoming create() calls that throw an IOException
     private static final AtomicInteger createFailuresRemaining = new AtomicInteger(0);
+
+    // whether files are written as on an object store: see simulateObjectStoreWrites
+    private static volatile boolean objectStoreWrites = false;
+
+    // number of creates refused because another stream was writing the file
+    private static final AtomicInteger racingCreatesRefused = new AtomicInteger(0);
 
     private final Configuration configuration;
 
@@ -81,21 +89,52 @@ public class TestFileSystem extends LocalFileSystem {
         createFailuresRemaining.set(failures);
     }
 
+    /**
+     * Turns on or off writing files as an object store such as S3 does. A file is visible only once
+     * the stream writing it is closed. A create of a file another stream is writing fails, as S3A's
+     * does with "is a directory".
+     */
+    public static void simulateObjectStoreWrites(boolean enabled) {
+        objectStoreWrites = enabled;
+        racingCreatesRefused.set(0);
+    }
+
+    /** The creates refused since {@link #simulateObjectStoreWrites} as another stream wrote. */
+    public static int getRacingCreatesRefused() {
+        return racingCreatesRefused.get();
+    }
+
     @Override
     public FSDataOutputStream create(final FsPath filePath, final WriteMode overwrite)
             throws IOException {
         if (createFailuresRemaining.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
             throw new IOException("Injected create failure for " + filePath);
         }
-        currentUnclosedOutputStream.compute(filePath, (k, v) -> v == null ? 1 : v + 1);
+        if (isBeingWritten(filePath)) {
+            racingCreatesRefused.incrementAndGet();
+            throw new FileAlreadyExistsException(filePath + " is a directory");
+        }
         LocalDataOutputStream stream = (LocalDataOutputStream) super.create(filePath, overwrite);
+        currentUnclosedOutputStream.compute(filePath, (k, v) -> v == null ? 1 : v + 1);
         return new TestOutputStream(stream, filePath);
     }
 
     @Override
+    public boolean exists(FsPath f) throws IOException {
+        return !isBeingWritten(f) && super.exists(f);
+    }
+
+    @Override
     public FileStatus getFileStatus(FsPath f) throws IOException {
+        if (isBeingWritten(f)) {
+            throw new FileNotFoundException(f + " is being written.");
+        }
         LocalFileStatus status = (LocalFileStatus) super.getFileStatus(f);
         return new LocalFileStatus(status.getFile(), this);
+    }
+
+    private static boolean isBeingWritten(FsPath f) {
+        return objectStoreWrites && currentUnclosedOutputStream.getOrDefault(f, 0) > 0;
     }
 
     @Override
