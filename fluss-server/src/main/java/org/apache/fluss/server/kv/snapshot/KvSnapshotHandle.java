@@ -22,6 +22,8 @@ import org.apache.fluss.server.utils.SnapshotUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -45,6 +47,9 @@ public class KvSnapshotHandle {
     /** The size of the incremental snapshot. */
     private final long incrementalSize;
 
+    /** With row TTL and deletion vectors, what the snapshot saved of the TTL filter, or null. */
+    @Nullable private final RowTtlFilterState rowTtl;
+
     /**
      * Whether {@link #discard()} should directly delete the shared files. This is true for newly
      * created handles until registration and false for restored handles.
@@ -61,10 +66,20 @@ public class KvSnapshotHandle {
             List<KvFileHandleAndLocalPath> privateFileHandles,
             long incrementalSize,
             boolean ownsSharedFiles) {
+        this(sharedFileHandles, privateFileHandles, incrementalSize, ownsSharedFiles, null);
+    }
+
+    private KvSnapshotHandle(
+            List<KvFileHandleAndLocalPath> sharedFileHandles,
+            List<KvFileHandleAndLocalPath> privateFileHandles,
+            long incrementalSize,
+            boolean ownsSharedFiles,
+            @Nullable RowTtlFilterState rowTtl) {
         this.sharedFileHandles = sharedFileHandles;
         this.privateFileHandles = privateFileHandles;
         this.incrementalSize = incrementalSize;
         this.ownsSharedFiles = ownsSharedFiles;
+        this.rowTtl = rowTtl;
     }
 
     /** Creates a handle that directly discards its shared files until they are registered. */
@@ -87,7 +102,35 @@ public class KvSnapshotHandle {
             List<KvFileHandleAndLocalPath> sharedFileHandles,
             List<KvFileHandleAndLocalPath> privateFileHandles,
             long incrementalSize) {
-        return new KvSnapshotHandle(sharedFileHandles, privateFileHandles, incrementalSize, false);
+        return restore(sharedFileHandles, privateFileHandles, incrementalSize, null);
+    }
+
+    /**
+     * Restores a handle, with what it was saved with of row TTL on a table with deletion vectors.
+     */
+    static KvSnapshotHandle restore(
+            List<KvFileHandleAndLocalPath> sharedFileHandles,
+            List<KvFileHandleAndLocalPath> privateFileHandles,
+            long incrementalSize,
+            @Nullable RowTtlFilterState rowTtl) {
+        return new KvSnapshotHandle(
+                sharedFileHandles, privateFileHandles, incrementalSize, false, rowTtl);
+    }
+
+    /** This handle with what the snapshot saved of the row TTL filter, before it is registered. */
+    public KvSnapshotHandle withRowTtl(@Nullable RowTtlFilterState rowTtl) {
+        checkState(
+                sharedKvFileRegistry == null,
+                "The row TTL filter's state is attached before the snapshot's files are"
+                        + " registered.");
+        return new KvSnapshotHandle(
+                sharedFileHandles, privateFileHandles, incrementalSize, ownsSharedFiles, rowTtl);
+    }
+
+    /** What the snapshot saved of the row TTL filter, or null. */
+    @Nullable
+    public RowTtlFilterState getRowTtl() {
+        return rowTtl;
     }
 
     public List<KvFileHandleAndLocalPath> getSharedKvFileHandles() {
@@ -172,11 +215,12 @@ public class KvSnapshotHandle {
         KvSnapshotHandle that = (KvSnapshotHandle) o;
         return incrementalSize == that.incrementalSize
                 && Objects.equals(sharedFileHandles, that.sharedFileHandles)
-                && Objects.equals(privateFileHandles, that.privateFileHandles);
+                && Objects.equals(privateFileHandles, that.privateFileHandles)
+                && Objects.equals(rowTtl, that.rowTtl);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(sharedFileHandles, privateFileHandles, incrementalSize);
+        return Objects.hash(sharedFileHandles, privateFileHandles, incrementalSize, rowTtl);
     }
 }

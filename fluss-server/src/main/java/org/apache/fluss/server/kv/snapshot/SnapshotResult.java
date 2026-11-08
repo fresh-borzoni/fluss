@@ -47,6 +47,11 @@ public class SnapshotResult implements Serializable {
         return kvSnapshotHandle;
     }
 
+    /** This result with what the snapshot saved of the row TTL filter. */
+    public SnapshotResult withRowTtl(RowTtlFilterState rowTtl) {
+        return new SnapshotResult(kvSnapshotHandle.withRowTtl(rowTtl), snapshotPath, tabletState);
+    }
+
     public FsPath getSnapshotPath() {
         return snapshotPath;
     }

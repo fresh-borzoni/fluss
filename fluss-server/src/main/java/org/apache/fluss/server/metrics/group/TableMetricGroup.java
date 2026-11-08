@@ -506,6 +506,13 @@ public class TableMetricGroup extends AbstractMetricGroup {
                                         .mapToDouble(BucketMetricGroup::getKvBackpressureLevel)
                                         .max()
                                         .orElse(0d));
+        gauge(
+                MetricNames.DV_ROW_TTL_CAP_LAG_MS_MAX,
+                () ->
+                        buckets.values().stream()
+                                .mapToLong(BucketMetricGroup::getRowTtlCapLagMs)
+                                .max()
+                                .orElse(0L));
     }
 
     /** Metric group for specific kind of tablet of a table. */

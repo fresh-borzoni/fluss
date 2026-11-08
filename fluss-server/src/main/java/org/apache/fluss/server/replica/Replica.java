@@ -66,7 +66,9 @@ import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvStateLookupResult;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
+import org.apache.fluss.server.kv.RowTtlFilterClock;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
@@ -865,6 +867,7 @@ public final class Replica {
         }
         if (kvTablet != null) {
             bucketMetricGroup.unregisterRocksDBStatistics();
+            bucketMetricGroup.setRowTtlCapLag(null);
 
             checkNotNull(kvManager);
             kvManager.dropKv(tableBucket);
@@ -951,6 +954,13 @@ public final class Replica {
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
+                if (kvTablet.getDvManager() != null) {
+                    // the TTL filter of the snapshot's leader compacted its files
+                    kvTablet.getDvManager()
+                            .restoredRowTtlFilter(
+                                    restoreStartOffset,
+                                    completedSnapshot.getKvSnapshotHandle().getRowTtl());
+                }
                 if (recovery.initializeLocalLog) {
                     logManager.initializeEmptyLocalTail(tableBucket, restoreStartOffset);
                 }
@@ -1000,8 +1010,8 @@ public final class Replica {
                         .advanceHistoricalCleanupOffset(restoreStartOffset);
             }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
-            // Rebuild the position index in the background, so the leader takes writes
-            // meanwhile. Lookups of the bucket are answered as not ready.
+            // Rebuild the position index and the log tail in the background, so the leader
+            // takes writes meanwhile. Union reads of the bucket are answered as not ready.
             if (kvTablet.getDvManager() != null) {
                 kvTablet.getDvManager()
                         .recoverInBackground(
@@ -1009,8 +1019,13 @@ public final class Replica {
                                         dvRemoteDataDir(),
                                         tableInfo,
                                         tableBucket,
+                                        logTablet,
+                                        remoteLogManager,
                                         snapshotContext.getZooKeeperClient(),
+                                        schemaGetter,
                                         new File(logTablet.getLogDir(), "derived-dv-recovery"),
+                                        snapshotContext.remoteLogPrefetchNumInRecoverKv(),
+                                        snapshotContext.remoteLogDownloadThreadsInRecoverKv(),
                                         snapshotContext.getDvMetadataCache()),
                                 snapshotContext.getDvRebuildLimiter());
             }
@@ -1032,6 +1047,13 @@ public final class Replica {
             // Register RocksDB statistics now that the kv tablet is fully initialized.
             if (kvTablet.getRocksDBStatistics() != null) {
                 bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+            }
+            RowTtlFilterClock rowTtlFilter =
+                    kvTablet.getDvManager() == null
+                            ? null
+                            : kvTablet.getDvManager().rowTtlFilterClock();
+            if (rowTtlFilter != null) {
+                bucketMetricGroup.setRowTtlCapLag(rowTtlFilter::capLagMs);
             }
         }
 
@@ -1283,6 +1305,13 @@ public final class Replica {
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
                             snapshotSize);
+            DerivedDvManager dvManager = kvTablet.getDvManager();
+            RowTtlFilterClock rowTtlFilter =
+                    dvManager == null ? null : dvManager.rowTtlFilterClock();
+            if (rowTtlFilter != null) {
+                // the row TTL filter's state is saved with each KV snapshot
+                kvTabletSnapshotTarget.setRowTtlFilterState(rowTtlFilter::saved);
+            }
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,

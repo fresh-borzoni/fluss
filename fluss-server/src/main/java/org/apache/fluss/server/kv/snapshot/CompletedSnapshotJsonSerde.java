@@ -27,6 +27,8 @@ import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.JsonSerializer;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -82,7 +84,8 @@ public class CompletedSnapshotJsonSerde
                 snapshotHandle.getIncrementalSize(),
                 completedSnapshot.getLogOffset(),
                 completedSnapshot.getRowCount(),
-                ranges);
+                ranges,
+                toFileMetadata(snapshotHandle.getRowTtl()));
     }
 
     /** Converts already-parsed standard metadata into a completed server snapshot. */
@@ -103,7 +106,8 @@ public class CompletedSnapshotJsonSerde
                 KvSnapshotHandle.restore(
                         toServerFileHandles(metadata.getSharedFiles()),
                         toServerFileHandles(metadata.getPrivateFiles()),
-                        metadata.getIncrementalSize()),
+                        metadata.getIncrementalSize(),
+                        toServerState(metadata.getRowTtl())),
                 metadata.getLogOffset(),
                 metadata.getRowCount(),
                 ranges);
@@ -136,5 +140,32 @@ public class CompletedSnapshotJsonSerde
                             metadataHandle.getLocalPath()));
         }
         return handles;
+    }
+
+    @Nullable
+    private static KvSnapshotFileMetadata.RowTtl toFileMetadata(
+            @Nullable RowTtlFilterState rowTtl) {
+        if (rowTtl == null) {
+            return null;
+        }
+        List<Long> ends = new ArrayList<>();
+        List<Long> mins = new ArrayList<>();
+        for (long[] s : rowTtl.slices()) {
+            ends.add(s[0]);
+            mins.add(s[1]);
+        }
+        return new KvSnapshotFileMetadata.RowTtl(rowTtl.cappedFrom(), rowTtl.from(), ends, mins);
+    }
+
+    @Nullable
+    private static RowTtlFilterState toServerState(@Nullable KvSnapshotFileMetadata.RowTtl rowTtl) {
+        if (rowTtl == null) {
+            return null;
+        }
+        List<long[]> slices = new ArrayList<>();
+        for (int i = 0; i < rowTtl.getSliceEnds().size(); i++) {
+            slices.add(new long[] {rowTtl.getSliceEnds().get(i), rowTtl.getSliceMins().get(i)});
+        }
+        return new RowTtlFilterState(rowTtl.getCappedFrom(), rowTtl.getSlicesFrom(), slices);
     }
 }

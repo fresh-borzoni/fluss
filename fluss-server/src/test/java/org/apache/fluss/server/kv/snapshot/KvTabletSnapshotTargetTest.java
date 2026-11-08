@@ -63,16 +63,19 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
@@ -351,6 +354,55 @@ class KvTabletSnapshotTargetTest {
         assertThat(remoteKvCopyBytes.getCount())
                 .isEqualTo(uploadedBytes.get())
                 .isGreaterThan(bytesAfterFailedCommit);
+    }
+
+    /**
+     * With row TTL, the state of the bucket's TTL filter is saved with each snapshot. It is taken
+     * when the snapshot starts, as its files are fixed, below the snapshot's offset: what the
+     * filter does afterwards does not reach the snapshot.
+     */
+    @Test
+    void testRowTtlFilterStateIsSavedAsOfTheSnapshotStart(@TempDir Path kvTabletDir)
+            throws Exception {
+        AtomicReference<CompletedSnapshotHandle> added = new AtomicReference<>();
+        CompletedSnapshotHandleStore completedSnapshotHandleStore =
+                TestCompletedSnapshotHandleStore.newBuilder()
+                        .setAddFunction(
+                                (snapshot) -> {
+                                    added.set(snapshot);
+                                    return null;
+                                })
+                        .build();
+        KvTabletSnapshotTarget kvTabletSnapshotTarget =
+                createSnapshotTarget(
+                        FsPath.fromLocalFile(kvTabletDir.toFile()), completedSnapshotHandleStore);
+        AtomicLong cappedFrom = new AtomicLong(3);
+        List<Long> takenAt = new CopyOnWriteArrayList<>();
+        kvTabletSnapshotTarget.setRowTtlFilterState(
+                offset -> {
+                    takenAt.add(offset);
+                    return new RowTtlFilterState(
+                            cappedFrom.get(),
+                            0,
+                            Collections.singletonList(new long[] {offset, 77}));
+                });
+        periodicSnapshotManager = createSnapshotManager(kvTabletSnapshotTarget);
+        periodicSnapshotManager.start();
+        TestRocksIncrementalSnapshot rocksIncrementalSnapshot =
+                (TestRocksIncrementalSnapshot) kvTabletSnapshotTarget.getRocksIncrementalSnapshot();
+        rocksDBExtension.getRocksDb().put("key".getBytes(), "val".getBytes());
+        logOffsetGenerator.set(5);
+
+        periodicSnapshotManager.triggerSnapshot();
+        retry(Duration.ofMinutes(1), () -> assertThat(takenAt).containsExactly(5L));
+        cappedFrom.set(9);
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(rocksIncrementalSnapshot.completedSnapshots).contains(1L));
+
+        assertThat(added.get().retrieveCompleteSnapshot().getKvSnapshotHandle().getRowTtl())
+                .isEqualTo(
+                        new RowTtlFilterState(3, 0, Collections.singletonList(new long[] {5, 77})));
     }
 
     @Test

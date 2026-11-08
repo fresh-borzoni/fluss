@@ -22,6 +22,7 @@ import org.apache.fluss.utils.json.JsonSerdeTestBase;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -43,6 +44,55 @@ class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFi
 
     KvSnapshotFileMetadataJsonSerdeTest() {
         super(KvSnapshotFileMetadataJsonSerde.INSTANCE);
+    }
+
+    /**
+     * With row TTL the bucket's leader saves its TTL filter's state at the top level: P and the
+     * slices below the snapshot's offset. A state that is not whole reads as none.
+     */
+    @Test
+    void testRowTtlRoundTrip() {
+        KvSnapshotFileMetadata.RowTtl rowTtl =
+                new KvSnapshotFileMetadata.RowTtl(
+                        7L, 5L, Arrays.asList(8L, 10L), Arrays.asList(-3L, 400L));
+        KvSnapshotFileMetadata m = createObjects()[0];
+        KvSnapshotFileMetadata metadata =
+                new KvSnapshotFileMetadata(
+                        m.getTableBucket(),
+                        m.getSnapshotId(),
+                        m.getSnapshotLocation(),
+                        m.getSharedFiles(),
+                        m.getPrivateFiles(),
+                        m.getIncrementalSize(),
+                        m.getLogOffset(),
+                        m.getRowCount(),
+                        m.getAutoIncrementRanges(),
+                        rowTtl);
+
+        String json =
+                new String(
+                        KvSnapshotFileMetadataJsonSerde.toJson(metadata), StandardCharsets.UTF_8);
+
+        assertThat(json)
+                .endsWith(
+                        "\"ttl_capped_from\":7,\"ttl_slices\":{\"from\":5,\"ends\":[8,10],"
+                                + "\"mins\":[-3,400]}}");
+        KvSnapshotFileMetadata read =
+                KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
+        assertThat(read).isEqualTo(metadata);
+        assertThat(read.getRowTtl()).isEqualTo(rowTtl);
+
+        String partial = json.replace("\"mins\":[-3,400]", "\"mins\":[-3]");
+        assertThat(
+                        KvSnapshotFileMetadataJsonSerde.fromJson(
+                                        partial.getBytes(StandardCharsets.UTF_8))
+                                .getRowTtl())
+                .isNull();
+        assertThat(
+                        KvSnapshotFileMetadataJsonSerde.fromJson(
+                                        GOLDEN_JSON.getBytes(StandardCharsets.UTF_8))
+                                .getRowTtl())
+                .isNull();
     }
 
     @Test

@@ -26,6 +26,7 @@ import io.github.fluss_contrib.rocksdb.MutableColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.Options;
 import io.github.fluss_contrib.rocksdb.RocksDB;
 import io.github.fluss_contrib.rocksdb.SstFileWriter;
+import io.github.fluss_contrib.rocksdb.WriteOptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -197,6 +198,36 @@ class DvMergeOnLoadTest {
                 assertThat(index.compact(later)).isTrue();
             }
             assertMovedEveryThirdKey(index, keys);
+        }
+    }
+
+    /**
+     * A full load's one call puts each change SST in level 0. However many there are, the other
+     * column families of the bucket's RocksDB keep taking writes: a write of the change list
+     * neither slows down nor stops while the compaction catches up.
+     */
+    @Test
+    void testOneCallOfManyChangesDoesNotStallTheChangeList() throws Exception {
+        List<String> ssts = overlappingSsts("stall", OVERLAPPING_SSTS);
+        try (DvRocksDB db = DvRocksDB.open(tempDir.resolve("db").toString())) {
+            RowPosIndex index = db.rowPosIndex();
+            RocksDB rocksDb = field(index, "db");
+            index.ingestExternalFile(ssts);
+            // more level-0 files than RocksDB's default trigger to stop writes
+            assertThat(
+                            Long.parseLong(
+                                    rocksDb.getProperty(
+                                            field(index, "cfHandle"),
+                                            "rocksdb.num-files-at-level0")))
+                    .isGreaterThanOrEqualTo(36L);
+            assertThat(rocksDb.getLongProperty("rocksdb.is-write-stopped")).isZero();
+            assertThat(rocksDb.getLongProperty("rocksdb.actual-delayed-write-rate")).isZero();
+            List<ColumnFamilyHandle> handles = field(db, "cfHandles");
+            try (WriteOptions noStall =
+                    new WriteOptions().setDisableWAL(true).setNoSlowdown(true)) {
+                // fails rather than wait if the write would stall
+                rocksDb.put(handles.get(3), noStall, intKey(1), intKey(1));
+            }
         }
     }
 

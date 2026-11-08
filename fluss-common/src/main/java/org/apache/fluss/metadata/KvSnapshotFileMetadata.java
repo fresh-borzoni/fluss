@@ -42,6 +42,7 @@ public final class KvSnapshotFileMetadata {
     private final long logOffset;
     private final @Nullable Long rowCount;
     private final @Nullable List<AutoIncrementRange> autoIncrementRanges;
+    private final @Nullable RowTtl rowTtl;
 
     /** Creates immutable standard KV snapshot file metadata. */
     public KvSnapshotFileMetadata(
@@ -54,6 +55,34 @@ public final class KvSnapshotFileMetadata {
             long logOffset,
             @Nullable Long rowCount,
             @Nullable List<AutoIncrementRange> autoIncrementRanges) {
+        this(
+                tableBucket,
+                snapshotId,
+                snapshotLocation,
+                sharedFiles,
+                privateFiles,
+                incrementalSize,
+                logOffset,
+                rowCount,
+                autoIncrementRanges,
+                null);
+    }
+
+    /**
+     * Creates immutable standard KV snapshot file metadata, with row TTL on a table with deletion
+     * vectors what the bucket's leader saved of its TTL filter.
+     */
+    public KvSnapshotFileMetadata(
+            TableBucket tableBucket,
+            long snapshotId,
+            String snapshotLocation,
+            List<FileHandle> sharedFiles,
+            List<FileHandle> privateFiles,
+            long incrementalSize,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncrementRange> autoIncrementRanges,
+            @Nullable RowTtl rowTtl) {
         this.tableBucket = checkNotNull(tableBucket, "Table bucket must not be null.");
         this.snapshotId = snapshotId;
         this.snapshotLocation =
@@ -69,6 +98,7 @@ public final class KvSnapshotFileMetadata {
                         : immutableCopy(
                                 autoIncrementRanges,
                                 "Auto-increment ranges must not contain null entries.");
+        this.rowTtl = rowTtl;
     }
 
     /** Returns the table bucket described by this metadata. */
@@ -118,6 +148,15 @@ public final class KvSnapshotFileMetadata {
         return autoIncrementRanges;
     }
 
+    /**
+     * Returns what the bucket's leader saved of its row TTL filter on a table with deletion
+     * vectors, or null. Readers that do not use it ignore it.
+     */
+    @Nullable
+    public RowTtl getRowTtl() {
+        return rowTtl;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -135,7 +174,8 @@ public final class KvSnapshotFileMetadata {
                 && Objects.equals(sharedFiles, that.sharedFiles)
                 && Objects.equals(privateFiles, that.privateFiles)
                 && Objects.equals(rowCount, that.rowCount)
-                && Objects.equals(autoIncrementRanges, that.autoIncrementRanges);
+                && Objects.equals(autoIncrementRanges, that.autoIncrementRanges)
+                && Objects.equals(rowTtl, that.rowTtl);
     }
 
     @Override
@@ -149,7 +189,68 @@ public final class KvSnapshotFileMetadata {
                 incrementalSize,
                 logOffset,
                 rowCount,
-                autoIncrementRanges);
+                autoIncrementRanges,
+                rowTtl);
+    }
+
+    /**
+     * What the leader of a bucket with deletion vectors saved of its row TTL filter: P, the highest
+     * readable offset the filter was capped for, and the tracked TTL times below the snapshot's
+     * offset, as slices from {@code slicesFrom}, each ending at its entry of {@code sliceEnds},
+     * exclusive, with the oldest time in {@code sliceMins}.
+     */
+    @Internal
+    public static final class RowTtl {
+        private final long cappedFrom;
+        private final long slicesFrom;
+        private final List<Long> sliceEnds;
+        private final List<Long> sliceMins;
+
+        public RowTtl(
+                long cappedFrom, long slicesFrom, List<Long> sliceEnds, List<Long> sliceMins) {
+            checkArgument(
+                    sliceEnds.size() == sliceMins.size(), "Each slice has an end and a minimum.");
+            this.cappedFrom = cappedFrom;
+            this.slicesFrom = slicesFrom;
+            this.sliceEnds = immutableCopy(sliceEnds, "Slice ends must not be null.");
+            this.sliceMins = immutableCopy(sliceMins, "Slice minimums must not be null.");
+        }
+
+        public long getCappedFrom() {
+            return cappedFrom;
+        }
+
+        public long getSlicesFrom() {
+            return slicesFrom;
+        }
+
+        public List<Long> getSliceEnds() {
+            return sliceEnds;
+        }
+
+        public List<Long> getSliceMins() {
+            return sliceMins;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            RowTtl that = (RowTtl) o;
+            return cappedFrom == that.cappedFrom
+                    && slicesFrom == that.slicesFrom
+                    && sliceEnds.equals(that.sliceEnds)
+                    && sliceMins.equals(that.sliceMins);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(cappedFrom, slicesFrom, sliceEnds, sliceMins);
+        }
     }
 
     private static <T> List<T> immutableCopy(List<T> values, String message) {

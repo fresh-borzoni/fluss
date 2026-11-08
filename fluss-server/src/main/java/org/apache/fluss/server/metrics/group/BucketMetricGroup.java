@@ -18,6 +18,7 @@
 package org.apache.fluss.server.metrics.group;
 
 import org.apache.fluss.metrics.CharacterFilter;
+import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.AbstractMetricGroup;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
@@ -29,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.util.Map;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
 
@@ -57,6 +59,10 @@ public class BucketMetricGroup extends AbstractMetricGroup {
     // and for KV buckets that haven't seen a write yet, so the table-level aggregation is
     // well-defined in both cases.
     private volatile float kvBackpressureLevel = 0f;
+
+    // the cap lag of the bucket's row TTL filter with deletion vectors, while this server leads it
+    private volatile @Nullable LongSupplier rowTtlCapLag;
+    private boolean rowTtlCapLagRegistered;
 
     public BucketMetricGroup(
             MetricRegistry registry,
@@ -149,6 +155,24 @@ public class BucketMetricGroup extends AbstractMetricGroup {
      */
     public float getKvBackpressureLevel() {
         return kvBackpressureLevel;
+    }
+
+    /**
+     * Reads the cap lag of the bucket's row TTL filter from {@code capLag} while this server leads
+     * the bucket, or stops reading it with null.
+     */
+    public synchronized void setRowTtlCapLag(@Nullable LongSupplier capLag) {
+        this.rowTtlCapLag = capLag;
+        if (capLag != null && !rowTtlCapLagRegistered) {
+            rowTtlCapLagRegistered = true;
+            gauge(MetricNames.DV_ROW_TTL_CAP_LAG_MS, this::getRowTtlCapLagMs);
+        }
+    }
+
+    /** The cap lag of the bucket's row TTL filter, or 0 if this server does not lead it. */
+    public long getRowTtlCapLagMs() {
+        LongSupplier capLag = rowTtlCapLag;
+        return capLag == null ? 0 : capLag.getAsLong();
     }
 
     @Override

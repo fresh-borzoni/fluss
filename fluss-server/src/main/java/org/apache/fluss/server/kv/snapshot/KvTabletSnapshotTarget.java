@@ -34,12 +34,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RunnableFuture;
 import java.util.function.Consumer;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
 
 /**
@@ -83,6 +87,9 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     private volatile long logOffsetOfLatestSnapshot;
 
     private volatile long snapshotSize;
+
+    // the row TTL filter's state below an offset, or null without row TTL and deletion vectors
+    @Nullable private volatile LongFunction<RowTtlFilterState> rowTtl;
 
     @VisibleForTesting
     KvTabletSnapshotTarget(
@@ -156,6 +163,14 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.snapshotsCleaner = new SnapshotsCleaner();
     }
 
+    /**
+     * Saves the bucket's row TTL filter state below each snapshot's log offset with the snapshot
+     * from now on, taken once the snapshot's files are fixed.
+     */
+    public void setRowTtlFilterState(@Nullable LongFunction<RowTtlFilterState> rowTtl) {
+        this.rowTtl = rowTtl;
+    }
+
     @Override
     public long currentSnapshotId() {
         try {
@@ -185,13 +200,36 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         int bucketLeaderEpoch = bucketLeaderEpochSupplier.get();
         int coordinatorEpoch = coordinatorEpochSupplier.get();
         SnapshotLocation snapshotLocation = initSnapshotLocation(currentSnapshotId);
+        RunnableFuture<SnapshotResult> snapshot =
+                snapshotRunner.snapshot(currentSnapshotId, tabletState, snapshotLocation);
+        LongFunction<RowTtlFilterState> rowTtlState = rowTtl;
+        if (rowTtlState != null) {
+            // The files are fixed: every compaction that wrote one took its time from the filter
+            // by now, under the state taken here.
+            snapshot = withRowTtl(snapshot, rowTtlState.apply(logOffset));
+        }
         return Optional.of(
                 new PeriodicSnapshotManager.SnapshotRunnable(
-                        snapshotRunner.snapshot(currentSnapshotId, tabletState, snapshotLocation),
+                        snapshot,
                         currentSnapshotId,
                         coordinatorEpoch,
                         bucketLeaderEpoch,
                         snapshotLocation));
+    }
+
+    private static RunnableFuture<SnapshotResult> withRowTtl(
+            RunnableFuture<SnapshotResult> kvSnapshot, RowTtlFilterState rowTtl) {
+        return new FutureTask<SnapshotResult>(
+                () -> {
+                    kvSnapshot.run();
+                    return kvSnapshot.get().withRowTtl(rowTtl);
+                }) {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                kvSnapshot.cancel(mayInterruptIfRunning);
+                return super.cancel(mayInterruptIfRunning);
+            }
+        };
     }
 
     private SnapshotLocation initSnapshotLocation(long snapshotId) {

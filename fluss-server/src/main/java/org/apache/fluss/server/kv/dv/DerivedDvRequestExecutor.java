@@ -28,10 +28,10 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 
 /**
- * Runs a tablet server's deletion vector requests (tiering's position lookups) on their own
- * threads. A request may wait briefly for background work or read many keys, so it must not hold
- * the RPC threads that serve writes and fetches. At most {@code threads} requests run at once and
- * {@code queued} wait. A request beyond that is answered as not ready; clients retry it.
+ * Runs a tablet server's deletion vector requests (union read masks, tiering's position lookups) on
+ * their own threads. A request may wait briefly for background work or read many keys, so it must
+ * not hold the RPC threads that serve writes and fetches. At most {@code threads} requests run at
+ * once and {@code queued} wait. A request beyond that is answered as not ready; clients retry it.
  */
 @Internal
 public final class DerivedDvRequestExecutor implements AutoCloseable {

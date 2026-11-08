@@ -63,6 +63,28 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                 .isEqualTo(snapshot);
     }
 
+    /** What the leader saved of its row TTL filter survives the snapshot metadata. */
+    @Test
+    void testRowTtlRoundTrip() {
+        RowTtlFilterState rowTtl =
+                new RowTtlFilterState(7, 4, Arrays.asList(new long[] {6, 100}, new long[] {9, 50}));
+        CompletedSnapshot snapshot =
+                new CompletedSnapshot(
+                        new TableBucket(1, 1),
+                        1,
+                        new FsPath("oss://bucket/snapshot"),
+                        KvSnapshotHandle.restore(
+                                Collections.emptyList(), Collections.emptyList(), 0, rowTtl),
+                        10,
+                        null,
+                        null);
+
+        CompletedSnapshot read =
+                CompletedSnapshotJsonSerde.fromJson(CompletedSnapshotJsonSerde.toJson(snapshot));
+        assertThat(read).isEqualTo(snapshot);
+        assertThat(read.getKvSnapshotHandle().getRowTtl()).isEqualTo(rowTtl);
+    }
+
     @Override
     protected CompletedSnapshot[] createObjects() {
         List<KvFileHandleAndLocalPath> sharedFileHandles =

@@ -44,6 +44,7 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.dv.DerivedDvHeapBudget;
 import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvMetrics;
 import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
@@ -244,7 +245,8 @@ public final class KvTablet {
             Clock clock,
             boolean rowTtlEnabled,
             boolean skipUnchangedUpsert,
-            @Nullable DerivedDvManager dvManager) {
+            @Nullable DerivedDvManager dvManager,
+            @Nullable RowTtlFilterClock rowTtlFilterClock) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
         this.historicalPartition =
@@ -261,10 +263,23 @@ public final class KvTablet {
                 new KvStateAccessor(kvPreWriteBuffer, rocksDBKv, historicalPartition);
         this.kvValueLayout = kvValueLayout;
         // historical state and deletion vectors tag values with their offset
-        this.stateValueEncoder =
+        KvStateValueEncoder encoder =
                 historicalPartition || valueEncoder.takesExplicitTags()
                         ? valueEncoder::encodeValue
                         : (value, logOffset) -> valueEncoder.encodeValue(value);
+        if (rowTtlFilterClock != null) {
+            // the cap's bound sees each TTL time before its value reaches the KV, on writes and in
+            // replay, as the filter will read it from the value's TTL slot
+            int ttlSlot = kvValueLayout.ttlTimestampSlot();
+            KvStateValueEncoder untracked = encoder;
+            encoder =
+                    (value, logOffset) -> {
+                        byte[] bytes = untracked.encodeValue(value, logOffset);
+                        rowTtlFilterClock.track(logOffset, readLongBigEndian(bytes, ttlSlot));
+                        return bytes;
+                    };
+        }
+        this.stateValueEncoder = encoder;
         this.historicalCleanupOffset = historicalCleanupOffset;
         this.rowTtlTimestampProvider = rowTtlTimestampProvider;
         this.rowTtlEnabled = rowTtlEnabled;
@@ -285,7 +300,9 @@ public final class KvTablet {
                         valueDecoder,
                         rowTtlTimestampProvider,
                         clock,
-                        skipUnchangedUpsert);
+                        skipUnchangedUpsert,
+                        rowTtlEnabled,
+                        dvManager);
         this.rocksDBStatistics = rocksDBStatistics;
         this.dvManager = dvManager;
         this.autoIncrementManager = autoIncrementManager;
@@ -349,6 +366,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 SystemClock.getInstance(),
                 new TableConfig(new Configuration()),
+                null,
                 null);
     }
 
@@ -375,6 +393,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            DerivedDvHeapBudget dvHeapBudget,
             DerivedDvRuntime dvRuntime)
             throws IOException {
         return create(
@@ -401,6 +420,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                dvHeapBudget,
                 dvRuntime);
     }
 
@@ -450,6 +470,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                null,
                 null);
     }
 
@@ -477,6 +498,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            @Nullable DerivedDvHeapBudget dvHeapBudget,
             @Nullable DerivedDvRuntime dvRuntime)
             throws IOException {
         checkNotNull(tableConfig, "tableConfig must not be null.");
@@ -526,6 +548,12 @@ public final class KvTablet {
                         : ValueEncoder.forLayout(kvValueLayout, rowTtlTimestampProvider);
         ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvValueLayout);
         AtomicLong historicalCleanupOffset = new AtomicLong(0L);
+        // with deletion vectors, the bucket caps the filter's time until versions are tiered
+        @Nullable
+        RowTtlFilterClock rowTtlFilterClock =
+                deletionVectors && rowTtl.isPresent()
+                        ? new RowTtlFilterClock(clock, rowTtl.get().toMillis())
+                        : null;
         @Nullable
         AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
                 compactionFilterFactory =
@@ -534,10 +562,13 @@ public final class KvTablet {
                                         kvValueLayout,
                                         HISTORICAL_KV_RETENTION_OFFSET_DISTANCE,
                                         () -> historicalCleanupOffset.get() - 1L)
-                                : rowTtl.isPresent()
+                                : rowTtlFilterClock != null
                                         ? RowTtlCompactionFilterFactory.create(
-                                                kvValueLayout, rowTtl.get(), clock)
-                                        : null;
+                                                kvValueLayout, rowTtl.get(), rowTtlFilterClock)
+                                        : rowTtl.isPresent()
+                                                ? RowTtlCompactionFilterFactory.create(
+                                                        kvValueLayout, rowTtl.get(), clock)
+                                                : null;
         RocksDBKv kv =
                 buildRocksDBKv(
                         serverConf,
@@ -563,6 +594,7 @@ public final class KvTablet {
 
         DerivedDvManager dvManager = null;
         if (tableConfig.isDeletionVectorsEnabled()) {
+            checkNotNull(dvHeapBudget, "Deletion vectors need the tablet server's budget.");
             checkNotNull(dvRuntime, "Deletion vectors need the tablet server's executors.");
             // the manager owns and closes it
             DvRocksDB dvRocksDB;
@@ -581,11 +613,18 @@ public final class KvTablet {
             dvManager =
                     new DerivedDvManager(
                             dvRocksDB,
+                            logTablet::getHighWatermark,
                             serverConf.get(ConfigOptions.KV_DELETION_VECTORS_CHECKPOINT_INTERVAL),
                             DerivedDvMetrics.of(serverMetricGroup),
+                            dvHeapBudget,
                             dvRuntime);
-            // names the bucket in the lines that log moves and rebuilds
+            // names the bucket in the lines that log mask requests, moves and rebuilds
             dvManager.setLogContext(tablePath.getTablePath(), tableBucket);
+            if (rowTtlFilterClock != null) {
+                // row TTL removes values without a change in the log, so a replayed insert may
+                // supersede an expired version; the bucket caps the filter's time
+                dvManager.useRowTtl(rowTtl.get(), rowTtlFilterClock);
+            }
         }
 
         return new KvTablet(
@@ -617,7 +656,8 @@ public final class KvTablet {
                 clock,
                 rowTtl.isPresent(),
                 tableConfig.isUpsertSkipUnchanged(),
-                dvManager);
+                dvManager,
+                rowTtlFilterClock);
     }
 
     public static KvTablet create(
@@ -657,6 +697,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                null,
                 null);
     }
 
@@ -686,6 +727,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            @Nullable DerivedDvHeapBudget dvHeapBudget,
             @Nullable DerivedDvRuntime dvRuntime)
             throws IOException {
         return create(
@@ -712,6 +754,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                dvHeapBudget,
                 dvRuntime);
     }
 
@@ -1692,6 +1735,15 @@ public final class KvTablet {
         return dvManager;
     }
 
+    /**
+     * Makes the write path hand its key changes to {@code manager} instead of the tablet's own
+     * manager, which the tablet still closes, as a test of the hand-off needs.
+     */
+    @VisibleForTesting
+    void handChangesTo(DerivedDvManager manager) {
+        kvWriteProcessor.setDvManager(manager);
+    }
+
     /** Returns whether deletion vectors are enabled for this tablet. */
     public boolean isDvEnabled() {
         return dvManager != null;
@@ -1777,5 +1829,13 @@ public final class KvTablet {
         QUEUED,
         RUNNING,
         STORAGE_BLOCKED
+    }
+
+    private static long readLongBigEndian(byte[] bytes, int offset) {
+        long value = 0;
+        for (int i = 0; i < 8; i++) {
+            value = (value << 8) | (bytes[offset + i] & 0xFFL);
+        }
+        return value;
     }
 }

@@ -24,6 +24,8 @@ import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.JsonSerializer;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -61,6 +63,14 @@ public final class KvSnapshotFileMetadataJsonSerde
     private static final String AUTO_INC_COLUMN_ID = "column_id";
     private static final String AUTO_INC_ID_START = "start";
     private static final String AUTO_INC_ID_END = "end";
+    // With deletion vectors and row TTL, what the leader saved of its TTL filter: optional. Readers
+    // that do not know it ignore it, as they read named fields only, so the metadata stays at
+    // version 1.
+    private static final String TTL_CAPPED_FROM = "ttl_capped_from";
+    private static final String TTL_SLICES = "ttl_slices";
+    private static final String TTL_SLICES_FROM = "from";
+    private static final String TTL_SLICES_ENDS = "ends";
+    private static final String TTL_SLICES_MINS = "mins";
 
     private KvSnapshotFileMetadataJsonSerde() {}
 
@@ -106,6 +116,23 @@ public final class KvSnapshotFileMetadataJsonSerde
             }
             generator.writeEndArray();
         }
+        KvSnapshotFileMetadata.RowTtl rowTtl = metadata.getRowTtl();
+        if (rowTtl != null) {
+            generator.writeNumberField(TTL_CAPPED_FROM, rowTtl.getCappedFrom());
+            generator.writeObjectFieldStart(TTL_SLICES);
+            generator.writeNumberField(TTL_SLICES_FROM, rowTtl.getSlicesFrom());
+            generator.writeArrayFieldStart(TTL_SLICES_ENDS);
+            for (long end : rowTtl.getSliceEnds()) {
+                generator.writeNumber(end);
+            }
+            generator.writeEndArray();
+            generator.writeArrayFieldStart(TTL_SLICES_MINS);
+            for (long min : rowTtl.getSliceMins()) {
+                generator.writeNumber(min);
+            }
+            generator.writeEndArray();
+            generator.writeEndObject();
+        }
         generator.writeEndObject();
     }
 
@@ -148,7 +175,34 @@ public final class KvSnapshotFileMetadataJsonSerde
                 snapshotHandle.get(SNAPSHOT_INCREMENTAL_SIZE).asLong(),
                 node.get(LOG_OFFSET).asLong(),
                 rowCount,
-                ranges);
+                ranges,
+                deserializeRowTtl(node));
+    }
+
+    /** The row TTL filter's state, or null if missing or not whole: a restore then saves none. */
+    @Nullable
+    private static KvSnapshotFileMetadata.RowTtl deserializeRowTtl(JsonNode node) {
+        JsonNode cappedFrom = node.get(TTL_CAPPED_FROM);
+        JsonNode slices = node.get(TTL_SLICES);
+        if (cappedFrom == null
+                || !cappedFrom.isIntegralNumber()
+                || slices == null
+                || !slices.has(TTL_SLICES_FROM)
+                || !slices.has(TTL_SLICES_ENDS)
+                || !slices.has(TTL_SLICES_MINS)
+                || slices.get(TTL_SLICES_ENDS).size() != slices.get(TTL_SLICES_MINS).size()) {
+            return null;
+        }
+        List<Long> ends = new ArrayList<>();
+        for (JsonNode end : slices.get(TTL_SLICES_ENDS)) {
+            ends.add(end.asLong());
+        }
+        List<Long> mins = new ArrayList<>();
+        for (JsonNode min : slices.get(TTL_SLICES_MINS)) {
+            mins.add(min.asLong());
+        }
+        return new KvSnapshotFileMetadata.RowTtl(
+                cappedFrom.asLong(), slices.get(TTL_SLICES_FROM).asLong(), ends, mins);
     }
 
     /** Serializes standard KV snapshot file metadata to JSON bytes. */

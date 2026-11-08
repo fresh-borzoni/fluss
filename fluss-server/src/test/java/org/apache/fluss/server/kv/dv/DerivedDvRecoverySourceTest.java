@@ -58,7 +58,12 @@ class DerivedDvRecoverySourceTest {
                 DATA1_TABLE_INFO_PK,
                 new TableBucket(DATA1_TABLE_INFO_PK.getTableId(), 0),
                 null,
+                null,
+                null,
+                null,
                 localTmp,
+                1,
+                1,
                 new DerivedDvMetadataCache());
 
         assertThat(leftover).doesNotExist();
@@ -101,7 +106,12 @@ class DerivedDvRecoverySourceTest {
                         DATA1_TABLE_INFO_PK,
                         bucket,
                         null,
+                        null,
+                        null,
+                        null,
                         localTmp,
+                        1,
+                        1,
                         new DerivedDvMetadataCache());
         List<PositionIndexStore.ChainEntry> chain = source.chain();
 
@@ -158,7 +168,12 @@ class DerivedDvRecoverySourceTest {
                         DATA1_TABLE_INFO_PK,
                         bucket,
                         null,
+                        null,
+                        null,
+                        null,
                         tempDir.resolve("log").resolve("derived-dv-recovery").toFile(),
+                        1,
+                        1,
                         cache);
         // the registration of snapshot 300 was read, so the listing is cached under it
         source.useRegistration("offsets-300");

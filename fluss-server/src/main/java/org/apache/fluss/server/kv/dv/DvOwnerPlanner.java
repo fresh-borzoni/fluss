@@ -67,23 +67,45 @@ final class DvOwnerPlanner {
         FULL
     }
 
-    /** A plan of the owner's: what reaches a target, with the load that does. */
+    /**
+     * A plan of the owner's: what reaches a target, with the load that does, and the registrations
+     * the chain listed.
+     */
     static final class Plan {
-        static final Plan COVERED = new Plan(PlanKind.COVERED, null);
-        static final Plan NOT_COVERED = new Plan(PlanKind.NOT_COVERED, null);
-        static final Plan HELD = new Plan(PlanKind.HELD, null);
+        static final Plan COVERED = new Plan(PlanKind.COVERED, null, null);
+        static final Plan NOT_COVERED = new Plan(PlanKind.NOT_COVERED, null, null);
+        static final Plan HELD = new Plan(PlanKind.HELD, null, null);
 
         final PlanKind kind;
         @Nullable final DvLoad load;
+        @Nullable final Registrations registrations;
 
-        private Plan(PlanKind kind, @Nullable DvLoad load) {
+        private Plan(PlanKind kind, @Nullable DvLoad load, @Nullable Registrations registrations) {
             this.kind = kind;
             this.load = load;
+            this.registrations = registrations;
         }
 
         static Plan of(DvLoad load) {
             return new Plan(
-                    load.kind == DvLoad.Kind.SWITCH ? PlanKind.SWITCH : PlanKind.FULL, load);
+                    load.kind == DvLoad.Kind.SWITCH ? PlanKind.SWITCH : PlanKind.FULL, load, null);
+        }
+
+        Plan with(Registrations registrations) {
+            return new Plan(kind, load, registrations);
+        }
+
+        /** What the chain listed: the registration after {@code covered}, and the newest. */
+        static final class Registrations {
+            final long covered;
+            final long next;
+            final long newest;
+
+            Registrations(long covered, long next, long newest) {
+                this.covered = covered;
+                this.next = next;
+                this.newest = newest;
+            }
         }
     }
 
@@ -164,40 +186,68 @@ final class DvOwnerPlanner {
             return Plan.NOT_COVERED; // chain marker not visible yet
         }
         int start = in.from < 0 ? -1 : chainIndex(chain, in.from);
+        Plan.Registrations registrations =
+                new Plan.Registrations(
+                        in.from,
+                        start >= 0 && start + 1 < chain.size()
+                                ? chain.get(start + 1).snapshotId
+                                : Long.MIN_VALUE,
+                        chain.get(chain.size() - 1).snapshotId);
         int dirtyThrough =
                 in.dirtyThrough == Long.MIN_VALUE ? -1 : chainIndex(chain, in.dirtyThrough);
         if (target < dirtyThrough) {
             // A failed ingest left changes of a later snapshot in the index, which a switch or
             // rebuild to this one would keep. Readers plan again on a later snapshot.
-            return Plan.NOT_COVERED;
+            return Plan.NOT_COVERED.with(registrations);
         }
-        // A readable offset below the covered snapshot's (a lake whose readable offsets lag its
-        // commits) is rebuilt in full, as is a full rebuild that failed after it cleared the index.
+        // The change list holds changes from the covered snapshot's offset only; a readable
+        // offset below it (a lake whose readable offsets lag its commits) needs the log replayed.
+        // A full rebuild that failed after it cleared the index needs another full rebuild.
         if (start < 0 || in.reset || (target > start && offset < in.fromOffset)) {
             // Full rebuild. It waits for a rebuild slot, so the owner hands it to the rebuild
             // limiter.
-            return Plan.of(new DvLoad.FullLoad(o, src, snapshotId, offset, chain));
+            return Plan.of(new DvLoad.FullLoad(o, src, snapshotId, offset, chain))
+                    .with(registrations);
         }
         if (target < start) {
-            return Plan.NOT_COVERED; // older than the covered snapshot
+            return Plan.NOT_COVERED.with(registrations); // older than the covered snapshot
         }
         if (o.rebuild.limiter.switchesHeld()) {
             // a test reads while the bucket covers the snapshot before: tried again later
-            return Plan.HELD;
+            return Plan.HELD.with(registrations);
         }
         return Plan.of(
-                new DvLoad.SwitchLoad(
-                        o,
-                        src,
-                        chain,
-                        start,
-                        target,
-                        snapshotId,
-                        offset,
-                        in.from,
-                        in.fromOffset,
-                        in.dirty,
-                        in.plannedAtNanos));
+                        new DvLoad.SwitchLoad(
+                                o,
+                                src,
+                                chain,
+                                start,
+                                target,
+                                snapshotId,
+                                offset,
+                                in.from,
+                                in.fromOffset,
+                                in.dirty,
+                                in.plannedAtNanos))
+                .with(registrations);
+    }
+
+    /**
+     * Records what a catch-up listed in the chain: the snapshot registered right after {@code
+     * covered}, or {@link Long#MIN_VALUE} for none, and the newest registered one. Wakes the
+     * requests that wait for the catch-up: one that does not wait reads {@code covered} if it asks
+     * for the snapshot right after it, and that one is the newest.
+     */
+    void noteRegistrations(long covered, long next, long newest) {
+        if (o.coveredSnapshotId != covered) {
+            return;
+        }
+        o.newestRegistration = newest;
+        if (next != Long.MIN_VALUE
+                && (o.nextRegistrationOf != covered || o.nextRegistration != next)) {
+            o.nextRegistration = next;
+            o.nextRegistrationOf = covered;
+        }
     }
 
     /** The retriable answer to a request whose catch-up failed. */

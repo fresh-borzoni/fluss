@@ -45,6 +45,15 @@ public final class RowTtlCompactionFilterFactory {
         return create(kvValueLayout, ttlMillis, clock::milliseconds);
     }
 
+    /**
+     * Creates a configured native compaction filter factory for row TTL cleanup that compares
+     * values with the time {@code now} supplies.
+     */
+    public static FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory create(
+            KvValueLayout kvValueLayout, Duration ttl, LongSupplier now) {
+        return create(kvValueLayout, RowTtlUtils.validateAndConvertTtlDurationToMillis(ttl), now);
+    }
+
     /** Removes values using the default interval for refreshing the supplied current value. */
     static FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory create(
             KvValueLayout kvValueLayout,
