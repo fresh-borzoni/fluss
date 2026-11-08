@@ -17,6 +17,7 @@
 
 package org.apache.fluss.spark.read.lake
 
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart
 import org.apache.fluss.lake.source.LakeSplit
 import org.apache.fluss.metadata.TableBucket
 import org.apache.fluss.spark.read.FlussInputPartition
@@ -63,5 +64,21 @@ case class FlussLakeUpsertInputPartition(
       s" partitionId=${tableBucket.getPartitionId}," +
       s" lakeSplits=${if (lakeSplits != null) lakeSplits.size() else 0}," +
       s" logStartOffset=$logStartingOffset, logStopOffset=$logStoppingOffset}"
+  }
+}
+
+/**
+ * Represents an input partition reading one part of a union read of a primary key table with
+ * deletion vectors. A part is all of a bucket or, when the bucket's cut was pinned at planning and
+ * several partitions share it, a group of its lake files or its log.
+ *
+ * @param part
+ *   the part to read, as planned; a retried task reads it again from the start
+ */
+case class FlussLakeDvInputPartition(part: DvBucketPart) extends FlussInputPartition {
+  override def toString: String = {
+    s"FlussLakeDvInputPartition{${part.describe()}, snapshotId=${part.getSnapshotId}," +
+      s" lakeSplits=${part.lakeSplitCount()}, pinned=${part.isPinned}," +
+      s" cut=${part.getMaskLogEndOffset}}"
   }
 }

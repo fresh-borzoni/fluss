@@ -20,14 +20,15 @@ package org.apache.fluss.spark.read
 import org.apache.fluss.client.admin.Admin
 import org.apache.fluss.client.initializer.{BucketOffsetsRetrieverImpl, OffsetsInitializer}
 import org.apache.fluss.client.metadata.{KvSnapshots, LakeSnapshot}
+import org.apache.fluss.client.table.scanner.batch.dv.{DvBucketPart, DvBucketPlanner}
 import org.apache.fluss.client.table.scanner.log.LogScanner
-import org.apache.fluss.config.Configuration
+import org.apache.fluss.config.{ConfigOptions, Configuration}
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException
 import org.apache.fluss.lake.source.{LakeSource, LakeSplit}
 import org.apache.fluss.metadata.{LogFormat, PartitionInfo, ResolvedPartitionSpec, TableBucket, TableBucketSnapshot, TableInfo, TablePath}
 import org.apache.fluss.predicate.{Predicate => FlussPredicate}
 import org.apache.fluss.spark.SparkFlussConf
-import org.apache.fluss.spark.read.lake.{FlussLakeInputPartition, FlussLakeUpsertInputPartition, FlussLakeUtils}
+import org.apache.fluss.spark.read.lake.{FlussLakeDvInputPartition, FlussLakeInputPartition, FlussLakeUpsertInputPartition, FlussLakeUtils}
 import org.apache.fluss.spark.utils.{FlussConnectionCache, SparkPartitionPredicate}
 import org.apache.fluss.utils.{ExceptionUtils, Preconditions}
 
@@ -617,6 +618,8 @@ class AppendPlanner(
  * Single upsert (primary-key table) planner. Probes a readable lake snapshot at construction; if
  * present, the plan is a union of lake splits and per-bucket Fluss (kv-snapshot + log-tail)
  * partitions. If absent, the plan is a pure Fluss upsert scan derived from kv snapshots + log tail.
+ * A table with deletion vectors unions its lake splits with the log tail through masks instead of a
+ * merge by key, see `planDvUnion`.
  *
  * Startup-mode gating has been removed: a batch upsert scan is always full-table regardless of the
  * user-facing SCAN_START_UP_MODE setting — same rationale as [[AppendPlanner]]. Setting
@@ -826,6 +829,10 @@ class UpsertPlanner(
       })
       .plan()
 
+    if (tableInfo.getTableConfig.isDeletionVectorsEnabled) {
+      return planDvUnion(snap, lakeSource, lakeSplits.asScala.toSeq)
+    }
+
     val tableBucketsOffset = snap.getTableBucketsOffset
     val bucketOffsetsRetriever = new BucketOffsetsRetrieverImpl(admin, tablePath)
 
@@ -1006,5 +1013,139 @@ class UpsertPlanner(
         logStartingOffset,
         stoppingOffset
       ))
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Tables with deletion vectors: lake rows minus the masks of the rows the log changed, plus the
+  // log after the snapshot's readable offset. Nothing is merged by key, so the lake need not read
+  // rows in key order.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Plans one part per bucket on the readable snapshot, then has the tablet servers pin a cut of
+   * each bucket's masks. A pinned bucket whose lake files hold more rows than
+   * `client.scanner.deletion-vectors.file-group-rows` is read by several partitions sharing the
+   * cut: groups of its files and its log. A bucket that could not be pinned keeps one partition,
+   * which fetches the masks when its task starts. Partitions only the lake still has are read from
+   * their files.
+   */
+  private def planDvUnion(
+      snap: LakeSnapshot,
+      lakeSource: LakeSource[LakeSplit],
+      lakeSplits: Seq[LakeSplit]): Array[InputPartition] = {
+    val tableId = tableInfo.getTableId
+    val snapshotId = snap.getSnapshotId
+    val tableBucketsOffset = snap.getTableBucketsOffset
+    val buckets = (0 until tableInfo.getNumBuckets).toSeq
+    val bucketOffsetsRetriever = new BucketOffsetsRetrieverImpl(admin, tablePath)
+    val lakeSplitsByPartition = groupLakeSplitsByPartition(lakeSplits)
+
+    def bucketParts(
+        partitionId: Option[Long],
+        partitionName: String,
+        splitsByBucket: collection.Map[Int, Seq[LakeSplit]]): Seq[DvBucketPart] = {
+      val stoppingOffsets =
+        getBucketOffsets(stoppingOffsetsInitializer, partitionName, buckets, bucketOffsetsRetriever)
+      buckets.flatMap {
+        bucketId =>
+          val tableBucket = partitionId match {
+            case Some(pid) => new TableBucket(tableId, pid, bucketId)
+            case None => new TableBucket(tableId, bucketId)
+          }
+          dvBucketPart(
+            tableBucket,
+            partitionName,
+            snapshotId,
+            tableBucketsOffset.get(tableBucket),
+            stoppingOffsets(bucketId),
+            splitsByBucket.get(bucketId))
+      }
+    }
+
+    val (parts, lakeOnlyPartitions) = if (tableInfo.isPartitioned) {
+      val flussPartitions = SparkPartitionPredicate.filterPartitions(
+        tableInfo,
+        partitionInfos.asScala.toSeq,
+        partitionPredicate)
+      val flussPartitionNames = flussPartitions.map(_.getPartitionName).toSet
+      // A partition without lake splits may still have tiered offsets when a filter pruned its
+      // files. Its log is read from the readable offset all the same.
+      val parts = flussPartitions.flatMap {
+        partitionInfo =>
+          bucketParts(
+            Some(partitionInfo.getPartitionId),
+            partitionInfo.getPartitionName,
+            lakeSplitsByPartition
+              .get(partitionInfo.getPartitionName)
+              .map(_._2)
+              .getOrElse(Map.empty[Int, Seq[LakeSplit]])
+          )
+      }
+      // Dropped from Fluss: no log changes its tiered rows any more, so its lake files are read
+      // without masks.
+      val lakeOnly = lakeSplitsByPartition.toSeq.flatMap {
+        case (partitionName, (partitionValues, splitsByBucket))
+            if !flussPartitionNames.contains(partitionName) &&
+              SparkPartitionPredicate.matchesPartition(
+                tableInfo,
+                partitionValues,
+                partitionPredicate) =>
+          splitsByBucket.toSeq.flatMap {
+            case (bucketId, splits) =>
+              val tableBucket = new TableBucket(tableId, -1L, bucketId)
+              splits.map(split => FlussLakeInputPartition(tableBucket, split): InputPartition)
+          }
+        case _ => Seq.empty[InputPartition]
+      }
+      (parts, lakeOnly)
+    } else {
+      val splitsByBucket = lakeSplitsByPartition.values.headOption
+        .map(_._2)
+        .getOrElse(Map.empty[Int, Seq[LakeSplit]])
+      (bucketParts(None, null, splitsByBucket), Seq.empty[InputPartition])
+    }
+
+    val pinned = new DvBucketPlanner(admin, tablePath, lakeSource)
+      .withFileGroupRows(
+        flussConfig.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS))
+      .pin(snapshotId, parts.asJava)
+    val dvPartitions = parts.flatMap {
+      part =>
+        Option(pinned.get(part.getTableBucket))
+          .map(_.asScala.toSeq)
+          .getOrElse(Seq(part))
+          .map(p => FlussLakeDvInputPartition(p): InputPartition)
+    }
+    (dvPartitions ++ lakeOnlyPartitions).toArray
+  }
+
+  /**
+   * The part reading all of a bucket, or none for a bucket empty at planning (no lake files and no
+   * log after the readable offset). The lake files of a bucket with nothing tiered in the snapshot
+   * are not read: all its rows are still in the log.
+   */
+  private def dvBucketPart(
+      tableBucket: TableBucket,
+      partitionName: String,
+      snapshotId: Long,
+      snapshotLogOffset: java.lang.Long,
+      stoppingOffset: Long,
+      lakeSplits: Option[Seq[LakeSplit]]): Option[DvBucketPart] = {
+    val tieredUpTo =
+      if (snapshotLogOffset == null || snapshotLogOffset < 0) -1L
+      else snapshotLogOffset.longValue()
+    val splits = if (tieredUpTo >= 0) lakeSplits.filter(_.nonEmpty) else None
+    if (splits.isEmpty && stoppingOffset <= math.max(tieredUpTo, 0L)) {
+      None
+    } else {
+      Some(
+        DvBucketPart.ofBucket(
+          tableBucket,
+          partitionName,
+          snapshotId,
+          tieredUpTo,
+          stoppingOffset,
+          splits.map(s => new util.ArrayList[LakeSplit](s.asJava)).orNull))
+    }
   }
 }

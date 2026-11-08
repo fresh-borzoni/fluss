@@ -17,6 +17,7 @@
 
 package org.apache.fluss.spark.read
 
+import org.apache.fluss.client.Connection
 import org.apache.fluss.client.table.Table
 import org.apache.fluss.client.table.scanner.ScanRecord
 import org.apache.fluss.config.Configuration
@@ -57,6 +58,13 @@ abstract class FlussPartitionReader(
     openedTable = acquiredTable
     openedTable
   }
+
+  /** The connection the table was opened with. */
+  protected def connection: Connection = {
+    table
+    connectionLease.connection
+  }
+
   protected lazy val tableInfo: TableInfo = table.getTableInfo
   protected lazy val rowType: RowType = tableInfo.getRowType
 
