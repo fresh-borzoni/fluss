@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.tiering.event;
 
+import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.lake.committer.TieringStats;
 
 import org.apache.flink.api.connector.source.SourceEvent;
@@ -30,12 +31,35 @@ public class FinishedTieringEvent implements SourceEvent {
 
     private final long tableId;
 
+    /**
+     * The tiering epoch of the finished round, or {@link TieringSplit#UNKNOWN_TIERING_EPOCH}. The
+     * end of a round whose table was handed out again under a newer epoch is stale.
+     */
+    private final long tieringEpoch;
+
     /** Statistics collected during this tiering round. */
     @Nullable private final TieringStats stats;
 
+    /**
+     * Whether a bucket's round ended before the end of its split, so the table has more to tier at
+     * once instead of after its freshness interval.
+     */
+    private final boolean moreToTier;
+
     public FinishedTieringEvent(long tableId, @Nullable TieringStats stats) {
+        this(tableId, stats, false);
+    }
+
+    public FinishedTieringEvent(long tableId, @Nullable TieringStats stats, boolean moreToTier) {
+        this(tableId, TieringSplit.UNKNOWN_TIERING_EPOCH, stats, moreToTier);
+    }
+
+    public FinishedTieringEvent(
+            long tableId, long tieringEpoch, @Nullable TieringStats stats, boolean moreToTier) {
         this.tableId = tableId;
+        this.tieringEpoch = tieringEpoch;
         this.stats = stats;
+        this.moreToTier = moreToTier;
     }
 
     public FinishedTieringEvent(long tableId) {
@@ -46,8 +70,16 @@ public class FinishedTieringEvent implements SourceEvent {
         return tableId;
     }
 
+    public long getTieringEpoch() {
+        return tieringEpoch;
+    }
+
     @Nullable
     public TieringStats getStats() {
         return stats;
+    }
+
+    public boolean hasMoreToTier() {
+        return moreToTier;
     }
 }

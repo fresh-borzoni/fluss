@@ -160,6 +160,9 @@ public class TestingLakeTieringFactory
 
         @Nullable private IOException commitFailure;
 
+        private final List<Integer> abortedWriteResults =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+
         public TestingLakeCommitter() {
             this(null);
         }
@@ -201,7 +204,12 @@ public class TestingLakeTieringFactory
 
         @Override
         public void abort(TestingCommittable committable) throws IOException {
-            // do nothing
+            abortedWriteResults.addAll(committable.writeResults());
+        }
+
+        /** The write results of the committables aborted, whose files would be deleted. */
+        public List<Integer> abortedWriteResults() {
+            return abortedWriteResults;
         }
 
         @Override

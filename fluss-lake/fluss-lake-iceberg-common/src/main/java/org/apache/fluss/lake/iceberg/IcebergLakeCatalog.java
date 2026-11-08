@@ -18,6 +18,7 @@
 package org.apache.fluss.lake.iceberg;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidTableException;
@@ -41,12 +42,14 @@ import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.UpdateProperties;
 import org.apache.iceberg.UpdateSchema;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.deletes.DeleteGranularity;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
@@ -116,6 +119,20 @@ public class IcebergLakeCatalog implements LakeCatalog {
         // sort order. (Legacy tables keep ASC(__offset), but those are never created here.)
         SortOrder sortOrder = SortOrder.unsorted();
         Map<String, String> expectedProperties = buildTableProperties(tableDescriptor, isPkTable);
+        if (isDeletionVectorsEnabled(tableDescriptor)) {
+            String formatVersion = expectedProperties.get(TableProperties.FORMAT_VERSION);
+            if (formatVersion != null && Integer.parseInt(formatVersion.trim()) < 2) {
+                throw new InvalidTableException(
+                        String.format(
+                                "Table %s with '%s' needs Iceberg format version 2 or 3, which"
+                                        + " have deletes by position, but '%s%s' is %s.",
+                                tablePath,
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                ICEBERG_CONF_PREFIX,
+                                TableProperties.FORMAT_VERSION,
+                                formatVersion));
+            }
+        }
         tableBuilder.withProperties(expectedProperties);
         tableBuilder.withPartitionSpec(partitionSpec);
         tableBuilder.withSortOrder(sortOrder);
@@ -381,6 +398,30 @@ public class IcebergLakeCatalog implements LakeCatalog {
             // has; otherwise the compatibility checks below would spuriously reject the legacy
             // table.
             boolean existingIsLegacy = IcebergUtils.isLegacyTable(existingSchema);
+            if (existingIsLegacy && isDeletionVectorsEnabled(tableDescriptor)) {
+                throw new TableAlreadyExistException(
+                        String.format(
+                                "The table %s already exists in Iceberg catalog with the legacy "
+                                        + "layout (Fluss system columns), which does not support "
+                                        + "'%s'. Please first drop the table in Iceberg catalog, "
+                                        + "use a new table name, or disable deletion vectors.",
+                                tablePath, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()),
+                        e);
+            }
+            if (isDeletionVectorsEnabled(tableDescriptor)
+                    && TableUtil.formatVersion(existingTable) < 2) {
+                throw new TableAlreadyExistException(
+                        String.format(
+                                "The table %s already exists in Iceberg catalog with format version"
+                                        + " %d, which has no deletes by position and does not"
+                                        + " support '%s'. Please first drop the table in Iceberg"
+                                        + " catalog, use a new table name, or disable deletion"
+                                        + " vectors.",
+                                tablePath,
+                                TableUtil.formatVersion(existingTable),
+                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()),
+                        e);
+            }
             if (existingIsLegacy) {
                 newIcebergSchema =
                         IcebergSchemaUtils.createLegacyIcebergSchema(tableDescriptor, isPkTable);
@@ -568,7 +609,10 @@ public class IcebergLakeCatalog implements LakeCatalog {
     boolean isIcebergPropertiesCompatible(
             Map<String, String> existingProperties, Map<String, String> expectedProperties) {
         for (Map.Entry<String, String> entry : expectedProperties.entrySet()) {
-            if (entry.getKey().startsWith(FLUSS_CONF_PREFIX)) {
+            // Iceberg moves format-version into the table metadata, and it never appears in the
+            // table properties, so it cannot be compared here.
+            if (entry.getKey().startsWith(FLUSS_CONF_PREFIX)
+                    || TableProperties.FORMAT_VERSION.equals(entry.getKey())) {
                 continue;
             }
             String actual = existingProperties.get(entry.getKey());
@@ -622,6 +666,14 @@ public class IcebergLakeCatalog implements LakeCatalog {
                     TableProperties.UPDATE_MODE, RowLevelOperationMode.MERGE_ON_READ.modeName());
             icebergProperties.put(
                     TableProperties.MERGE_MODE, RowLevelOperationMode.MERGE_ON_READ.modeName());
+
+            // Tables with deletion vectors get deletes by position, never equality deletes: v3
+            // deletion vectors, or position delete files if the format version is set to 2.
+            if (isDeletionVectorsEnabled(tableDescriptor)) {
+                icebergProperties.put(TableProperties.FORMAT_VERSION, "3");
+                icebergProperties.put(
+                        TableProperties.DELETE_GRANULARITY, DeleteGranularity.FILE.toString());
+            }
         }
 
         tableDescriptor
@@ -632,6 +684,12 @@ public class IcebergLakeCatalog implements LakeCatalog {
                 .forEach((k, v) -> setFlussPropertyToIceberg(k, v, icebergProperties));
 
         return icebergProperties;
+    }
+
+    /** Returns whether the Fluss table has deletion vectors enabled. */
+    static boolean isDeletionVectorsEnabled(TableDescriptor tableDescriptor) {
+        return Configuration.fromMap(tableDescriptor.getProperties())
+                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
     }
 
     @Override

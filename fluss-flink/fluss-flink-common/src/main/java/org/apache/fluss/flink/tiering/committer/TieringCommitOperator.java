@@ -225,7 +225,14 @@ public class TieringCommitOperator<WriteResult, Committable>
                         postCompletion(tableId, () -> reportFailed(tableId, tablePath, e));
                         return;
                     }
-                    postCompletion(tableId, () -> reportFinished(tableId, result));
+                    postCompletion(
+                            tableId,
+                            () ->
+                                    reportFinished(
+                                            tableId,
+                                            result,
+                                            results.stream()
+                                                    .anyMatch(TableBucketWriteResult::endedEarly)));
                 };
         commitExecutor.execute(
                 withUncaughtExceptionHandler(
@@ -258,13 +265,19 @@ public class TieringCommitOperator<WriteResult, Committable>
         return consecutiveCommitFailures.getFailures(tableId);
     }
 
-    private void reportFinished(long tableId, TieringCommitResult<Committable> result) {
+    /**
+     * Reports a committed round. {@code moreToTier} is set if a bucket's round ended early, so the
+     * table is tiered again at once.
+     */
+    private void reportFinished(
+            long tableId, TieringCommitResult<Committable> result, boolean moreToTier) {
         consecutiveCommitFailures.recordSuccess(tableId);
         if (result.getCommittable() != null) {
             output.collect(new StreamRecord<>(new CommittableMessage<>(result.getCommittable())));
         }
         operatorEventGateway.sendEventToCoordinator(
-                new SourceEventWrapper(new FinishedTieringEvent(tableId, result.getStats())));
+                new SourceEventWrapper(
+                        new FinishedTieringEvent(tableId, result.getStats(), moreToTier)));
     }
 
     private void reportFailed(long tableId, TablePath tablePath, Exception cause) {

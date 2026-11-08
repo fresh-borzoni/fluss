@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.tiering.event;
 
+import org.apache.fluss.client.tiering.TieringSplit;
+
 import org.apache.flink.api.connector.source.SourceEvent;
 
 /** SourceEvent used to represent a Fluss table is failed during tiering. */
@@ -26,15 +28,30 @@ public class FailedTieringEvent implements SourceEvent {
 
     private final long tableId;
 
+    /**
+     * The tiering epoch of the failed round, or {@link TieringSplit#UNKNOWN_TIERING_EPOCH}. The
+     * failure of a round whose table was handed out again under a newer epoch is stale.
+     */
+    private final long tieringEpoch;
+
     private final String failReason;
 
     public FailedTieringEvent(long tableId, String failReason) {
+        this(tableId, TieringSplit.UNKNOWN_TIERING_EPOCH, failReason);
+    }
+
+    public FailedTieringEvent(long tableId, long tieringEpoch, String failReason) {
         this.tableId = tableId;
+        this.tieringEpoch = tieringEpoch;
         this.failReason = failReason;
     }
 
     public long getTableId() {
         return tableId;
+    }
+
+    public long getTieringEpoch() {
+        return tieringEpoch;
     }
 
     public String failReason() {

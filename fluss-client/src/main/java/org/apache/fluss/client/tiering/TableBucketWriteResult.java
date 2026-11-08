@@ -60,6 +60,10 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     // for the round of tiering is finished
     private final int numberOfWriteResults;
 
+    // whether the bucket's round ended before the end of its split, because its lake writer held
+    // as much as one round may; the next round tiers the rest
+    private final boolean endedEarly;
+
     // the tiering epoch the coordinator assigned the round's table under, which fences the round's
     // commits; TieringSplit.UNKNOWN_TIERING_EPOCH if unknown
     private final long tieringEpoch;
@@ -80,6 +84,27 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
+                false);
+    }
+
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            boolean endedEarly) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                endedEarly,
                 TieringSplit.UNKNOWN_TIERING_EPOCH);
     }
 
@@ -91,6 +116,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             long logEndOffset,
             long maxTimestamp,
             int numberOfWriteResults,
+            boolean endedEarly,
             long tieringEpoch) {
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
@@ -99,6 +125,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
         this.logEndOffset = logEndOffset;
         this.maxTimestamp = maxTimestamp;
         this.numberOfWriteResults = numberOfWriteResults;
+        this.endedEarly = endedEarly;
         this.tieringEpoch = tieringEpoch;
     }
 
@@ -114,6 +141,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                         logEndOffset,
                         maxTimestamp,
                         numberOfWriteResults,
+                        endedEarly,
                         tieringEpoch);
     }
 
@@ -145,6 +173,14 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
 
     public long maxTimestamp() {
         return maxTimestamp;
+    }
+
+    /**
+     * Returns whether the bucket's round ended at {@link #logEndOffset()} before the end of its
+     * split, because its lake writer held as much as one round may. The next round tiers the rest.
+     */
+    public boolean endedEarly() {
+        return endedEarly;
     }
 
     /**

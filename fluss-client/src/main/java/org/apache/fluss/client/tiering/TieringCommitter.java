@@ -228,6 +228,16 @@ public class TieringCommitter<WriteResult, Committable> {
                                     + "Aborting commit to prevent dirty commit.",
                             currentTableInfo.getTableId(), tablePath, tableId));
         }
+        // Committing a round of such a table would add its rows without deleting the old versions
+        // of their keys. Only the Flink tiering service tiers it, with deletes.
+        if (currentTableInfo.getTableConfig().isDeletionVectorsEnabled()) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Table %s has '%s' enabled; this tiering committer does not tier"
+                                    + " tables with deletion vectors. Tier it with the Flink"
+                                    + " tiering service.",
+                            tablePath, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+        }
         return currentTableInfo;
     }
 

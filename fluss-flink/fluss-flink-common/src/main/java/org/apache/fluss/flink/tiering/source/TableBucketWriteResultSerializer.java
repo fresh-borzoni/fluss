@@ -39,8 +39,10 @@ import java.io.IOException;
  *   <li><b>Version 2:</b> Persists the version of the lake write result serializer before the write
  *       result bytes and passes it to the lake serializer on deserialization, so that lake formats
  *       can evolve their write result format independently.
- *   <li><b>Version 3 (Current):</b> Appends, after the number of write results, the tiering epoch
- *       of the round ({@link TableBucketWriteResult#tieringEpoch()}).
+ *   <li><b>Version 3 (Current):</b> Appends, after the number of write results, whether the
+ *       bucket's round ended before the end of its split ({@link
+ *       TableBucketWriteResult#endedEarly()}) and the tiering epoch of the round ({@link
+ *       TableBucketWriteResult#tieringEpoch()}).
  * </ul>
  */
 public class TableBucketWriteResultSerializer<WriteResult>
@@ -114,6 +116,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
         out.writeInt(tableBucketWriteResult.numberOfWriteResults());
 
         // since VERSION_3
+        out.writeBoolean(tableBucketWriteResult.endedEarly());
         out.writeLong(tableBucketWriteResult.tieringEpoch());
 
         final byte[] result = out.getCopyOfBuffer();
@@ -165,6 +168,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
         // deserialize number of write results
         int numberOfWriteResults = in.readInt();
 
+        boolean endedEarly = version >= VERSION_3 && in.readBoolean();
         long tieringEpoch =
                 version >= VERSION_3 ? in.readLong() : TieringSplit.UNKNOWN_TIERING_EPOCH;
 
@@ -176,6 +180,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
+                endedEarly,
                 tieringEpoch);
     }
 }
