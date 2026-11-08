@@ -20,7 +20,10 @@ package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.lake.dv.FilePos;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.remote.RemoteLogSegment;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,11 +35,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.AbstractMap;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
+import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_INFO_PK;
+import static org.apache.fluss.testutils.DataTestUtils.genLogRecordsWithBaseOffsetAndTimestamp;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -58,7 +65,12 @@ class DerivedDvRecoverySourceTest {
                 DATA1_TABLE_INFO_PK,
                 new TableBucket(DATA1_TABLE_INFO_PK.getTableId(), 0),
                 null,
+                null,
+                null,
+                null,
                 localTmp,
+                1,
+                1,
                 new DerivedDvMetadataCache());
 
         assertThat(leftover).doesNotExist();
@@ -101,7 +113,12 @@ class DerivedDvRecoverySourceTest {
                         DATA1_TABLE_INFO_PK,
                         bucket,
                         null,
+                        null,
+                        null,
+                        null,
                         localTmp,
+                        1,
+                        1,
                         new DerivedDvMetadataCache());
         List<PositionIndexStore.ChainEntry> chain = source.chain();
 
@@ -158,7 +175,12 @@ class DerivedDvRecoverySourceTest {
                         DATA1_TABLE_INFO_PK,
                         bucket,
                         null,
+                        null,
+                        null,
+                        null,
                         tempDir.resolve("log").resolve("derived-dv-recovery").toFile(),
+                        1,
+                        1,
                         cache);
         // the registration of snapshot 300 was read, so the listing is cached under it
         source.useRegistration("offsets-300");
@@ -174,5 +196,74 @@ class DerivedDvRecoverySourceTest {
 
         // the next plan lists the chain as it is now
         assertThat(source.chain()).isEqualTo(trimmed);
+    }
+
+    /**
+     * Below the local log, the write time is bounded from remote log metadata: the max timestamp of
+     * the latest segment that ends at or before the offset, by its physical end, as a clipped
+     * suffix may hold later batches. With no such segment, no bound is known and the read fails.
+     */
+    @Test
+    void testTheRemoteWriteTimeBoundIsTheLastSegmentEndingBeforeTheOffset() {
+        TableBucket bucket = new TableBucket(DATA1_TABLE_INFO_PK.getTableId(), 0);
+        List<RemoteLogSegment> segments =
+                Arrays.asList(
+                        segment(bucket, 0, 100, 1_000),
+                        segment(bucket, 100, 200, 2_000),
+                        // overlaps the next one: physically up to 300, logically up to 250
+                        segment(bucket, 200, 300, 3_000).withLogicalRange(200, 250),
+                        segment(bucket, 250, 400, 4_000));
+
+        assertThat(DerivedDvRecoverySource.remoteWriteTimeBound(segments, bucket, 100))
+                .isEqualTo(1_000L);
+        assertThat(DerivedDvRecoverySource.remoteWriteTimeBound(segments, bucket, 199))
+                .isEqualTo(1_000L);
+        assertThat(DerivedDvRecoverySource.remoteWriteTimeBound(segments, bucket, 260))
+                .isEqualTo(2_000L);
+        assertThat(DerivedDvRecoverySource.remoteWriteTimeBound(segments, bucket, 300))
+                .isEqualTo(3_000L);
+        assertThatThrownBy(() -> DerivedDvRecoverySource.remoteWriteTimeBound(segments, bucket, 50))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    /**
+     * In the local log, the write time is the commit time of the batch holding the offset. No batch
+     * holding it, or a negative time, fails rather than read as "nothing written yet".
+     */
+    @Test
+    void testTheLocalWriteTimeIsTheCommitTimeOfTheBatchHoldingTheOffset() throws Exception {
+        TableBucket bucket = new TableBucket(DATA1_TABLE_INFO_PK.getTableId(), 0);
+        int n = DATA1.size();
+        List<LogRecordBatch> batches = Arrays.asList(batch(0, 1_000), batch(n, 2_000));
+
+        assertThat(DerivedDvRecoverySource.writeTimeOf(batches, bucket, 0)).isEqualTo(1_000L);
+        assertThat(DerivedDvRecoverySource.writeTimeOf(batches, bucket, n - 1)).isEqualTo(1_000L);
+        assertThat(DerivedDvRecoverySource.writeTimeOf(batches, bucket, n)).isEqualTo(2_000L);
+        assertThatThrownBy(() -> DerivedDvRecoverySource.writeTimeOf(batches, bucket, 2L * n))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(
+                        () ->
+                                DerivedDvRecoverySource.writeTimeOf(
+                                        Collections.singletonList(batch(0, -5)), bucket, 0))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    private static RemoteLogSegment segment(TableBucket bucket, long start, long end, long time) {
+        return RemoteLogSegment.Builder.builder()
+                .remoteLogSegmentId(UUID.randomUUID())
+                .physicalTablePath(PhysicalTablePath.of(DATA1_TABLE_INFO_PK.getTablePath()))
+                .tableBucket(bucket)
+                .remoteLogStartOffset(start)
+                .remoteLogEndOffset(end)
+                .maxTimestamp(time)
+                .segmentSizeInBytes(1)
+                .build();
+    }
+
+    private static LogRecordBatch batch(long baseOffset, long commitTime) throws Exception {
+        return genLogRecordsWithBaseOffsetAndTimestamp(baseOffset, commitTime, DATA1)
+                .batches()
+                .iterator()
+                .next();
     }
 }

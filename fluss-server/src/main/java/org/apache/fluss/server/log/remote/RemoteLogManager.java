@@ -295,6 +295,11 @@ public class RemoteLogManager implements Closeable {
         return remoteLogTablet(tableBucket).relevantRemoteLogSegments(offset);
     }
 
+    /** All remote log segments of the bucket, as its manifest lists them; nothing is downloaded. */
+    public List<RemoteLogSegment> allRemoteLogSegments(TableBucket tableBucket) {
+        return remoteLogTablet(tableBucket).allRemoteLogSegments();
+    }
+
     /** Returns the maximal physically contiguous remote segment prefix for FetchLog v0. */
     public List<RemoteLogSegment> relevantRemoteLogSegmentsForFetchV0(
             TableBucket tableBucket, long offset) {

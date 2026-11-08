@@ -37,6 +37,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -57,20 +58,28 @@ import java.util.function.IntSupplier;
  *       step</td></tr>
  *   <tr><td>{@code kv-deletion-vectors-request}</td><td>{@link
  *       DerivedDvRequestExecutor#DEFAULT_THREADS} (half the cores, 2 to 16), 1,024
- *       queued</td><td>tiering's position lookups</td><td>yes: a lookup reads RocksDB; kept off the
- *       RPC threads</td></tr>
+ *       queued</td><td>union read masks, pins, tiering's position lookups</td><td>yes: a read waits
+ *       at most 500 ms for its bucket's owner, a lookup reads RocksDB; kept off the RPC
+ *       threads</td></tr>
+ *   <tr><td>{@code kv-deletion-vectors-key-lookup}</td><td>4</td><td>lookups of the lake
+ *       positions of changed keys, 10,000 keys per task, and full-resolve chunks</td><td>briefly:
+ *       one RocksDB multi-get per task</td></tr>
  *   <tr><td>{@code kv-deletion-vectors-index-load}</td><td>2 + {@code
  *       kv.deletion-vectors.max-concurrent-rebuilds}</td><td>planning and switch loads, at most 2
- *       at a time; full rebuilds, at most one per rebuild slot</td><td>yes: index downloads and
- *       RocksDB ingest, for seconds to minutes</td></tr>
- *   <tr><td>{@code kv-deletion-vectors-scheduler}</td><td>1</td><td>timers: retry backoffs and
- *       checkpoint delays</td><td>no: it only posts work to owners and pools</td></tr>
+ *       at a time; full rebuilds and change list replays, at most one per rebuild slot</td><td>yes:
+ *       index downloads, RocksDB ingest and log replays, for seconds to minutes</td></tr>
+ *   <tr><td>{@code kv-deletion-vectors-scheduler}</td><td>1</td><td>timers: resolve delays,
+ *       retry backoffs, checkpoint delays, idle pinned cuts; asking the buckets over the heap budget
+ *       to free</td><td>no: it only posts work to owners and pools</td></tr>
  * </table>
  *
  * <p>Planning and switch loads, and rebuilds, share the index-load pool, but each kind runs on its
  * own share of its threads ({@link BoundedConcurrencyExecutor}): work beyond the share waits
  * without a thread, so a long rebuild never holds up a switch. Exports and uploads of index
- * checkpoints run on the server's IO pool ({@code server.io-pool.size}), at most 2 at a time.
+ * checkpoints run on the server's IO pool ({@code server.io-pool.size}), at most 2 at a time. Under
+ * row TTL, the reads of a covered snapshot's write time ({@link DvRowTtlGuard}), a batch header or
+ * remote log metadata each, run on the IO pool outside the checkpoint share, as a registration
+ * switches every bucket at once.
  *
  * <p>Errors follow Fluss's other server pools: the threads hand a {@link VirtualMachineError} to
  * {@code FatalExitExceptionHandler}, which stops the tablet server, after the job, step or request
@@ -80,7 +89,7 @@ import java.util.function.IntSupplier;
  * <p>Each pool's or share's queued and active tasks are gauges in the server's {@code dvPool}
  * group, by {@code pool} ({@link #registerMetrics}). {@link #shutdown} stops the pools in a fixed
  * order: requests first, so no new work comes in, then the pools that start work for others (index
- * loads, checkpoints), then the owners' steps and the scheduler.
+ * loads, checkpoints, key lookups), then the owners' steps and the scheduler.
  */
 @Internal
 public final class DerivedDvRuntime {
@@ -88,17 +97,21 @@ public final class DerivedDvRuntime {
     private static final Logger LOG = LoggerFactory.getLogger(DerivedDvRuntime.class);
 
     static final int STATE_THREADS = 2;
+    static final int KEY_LOOKUP_THREADS = 4;
     static final int SWITCH_THREADS = 2;
     static final int CHECKPOINT_THREADS = 2;
     static final int IO_THREADS = 2;
 
     private final DerivedDvRequestExecutor requests;
     private final ThreadPoolExecutor bucketState;
+    private final ThreadPoolExecutor keyLookup;
     private final ThreadPoolExecutor indexLoad;
     private final BoundedConcurrencyExecutor switches;
     private final DerivedDvRebuildLimiter rebuilds;
     private final ScheduledThreadPoolExecutor scheduler;
     private final BoundedConcurrencyExecutor checkpoints;
+    // the server's IO pool, or the runtime's own
+    private final Executor io;
     // the IO pool the runtime created as the server gave it none, which it then shuts down
     @Nullable private final ExecutorService ownIo;
 
@@ -108,6 +121,7 @@ public final class DerivedDvRuntime {
      */
     public DerivedDvRuntime(Configuration conf, ExecutorService ioExecutor) {
         this(
+                KEY_LOOKUP_THREADS,
                 conf.get(ConfigOptions.KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS),
                 DerivedDvRequestExecutor.DEFAULT_THREADS,
                 DerivedDvRequestExecutor.DEFAULT_QUEUED,
@@ -118,6 +132,7 @@ public final class DerivedDvRuntime {
     /** As above, with an IO pool of the runtime's own, for a server that gives it none. */
     public DerivedDvRuntime(Configuration conf) {
         this(
+                KEY_LOOKUP_THREADS,
                 conf.get(ConfigOptions.KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS),
                 DerivedDvRequestExecutor.DEFAULT_THREADS,
                 DerivedDvRequestExecutor.DEFAULT_QUEUED,
@@ -128,7 +143,13 @@ public final class DerivedDvRuntime {
     /** A runtime with the default sizes. */
     @VisibleForTesting
     DerivedDvRuntime() {
-        this(FatalExitExceptionHandler.INSTANCE);
+        this(KEY_LOOKUP_THREADS);
+    }
+
+    /** A runtime with {@code keyLookupThreads} key-lookup threads. */
+    @VisibleForTesting
+    DerivedDvRuntime(int keyLookupThreads) {
+        this(keyLookupThreads, FatalExitExceptionHandler.INSTANCE);
     }
 
     /**
@@ -136,8 +157,9 @@ public final class DerivedDvRuntime {
      * instead of stopping the process.
      */
     @VisibleForTesting
-    DerivedDvRuntime(Thread.UncaughtExceptionHandler fatalErrorHandler) {
+    DerivedDvRuntime(int keyLookupThreads, Thread.UncaughtExceptionHandler fatalErrorHandler) {
         this(
+                keyLookupThreads,
                 ConfigOptions.KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS.defaultValue(),
                 DerivedDvRequestExecutor.DEFAULT_THREADS,
                 DerivedDvRequestExecutor.DEFAULT_QUEUED,
@@ -146,6 +168,7 @@ public final class DerivedDvRuntime {
     }
 
     private DerivedDvRuntime(
+            int keyLookupThreads,
             int maxConcurrentRebuilds,
             int requestThreads,
             int queued,
@@ -156,6 +179,8 @@ public final class DerivedDvRuntime {
                         requestPool(requestThreads, queued, fatalErrorHandler));
         this.bucketState =
                 fixed(STATE_THREADS, "kv-deletion-vectors-bucket-state", fatalErrorHandler);
+        this.keyLookup =
+                fixed(keyLookupThreads, "kv-deletion-vectors-key-lookup", fatalErrorHandler);
         this.indexLoad =
                 idleEnding(
                         SWITCH_THREADS + maxConcurrentRebuilds,
@@ -171,9 +196,8 @@ public final class DerivedDvRuntime {
                 ioExecutor == null
                         ? fixed(IO_THREADS, "kv-deletion-vectors-io", fatalErrorHandler)
                         : null;
-        this.checkpoints =
-                new BoundedConcurrencyExecutor(
-                        ioExecutor == null ? ownIo : ioExecutor, CHECKPOINT_THREADS);
+        this.io = ioExecutor == null ? ownIo : ioExecutor;
+        this.checkpoints = new BoundedConcurrencyExecutor(io, CHECKPOINT_THREADS);
     }
 
     /** The executor of the server's deletion vector requests. */
@@ -191,6 +215,11 @@ public final class DerivedDvRuntime {
         return bucketState;
     }
 
+    /** Looks up the lake positions of changed keys. */
+    Executor keyLookup() {
+        return keyLookup;
+    }
+
     /** Plans catch-ups and runs switch loads, on their share of the index-load threads. */
     Executor switches() {
         return switches;
@@ -201,15 +230,47 @@ public final class DerivedDvRuntime {
         return checkpoints;
     }
 
+    /**
+     * Runs brief IO of the buckets on the server's IO pool, outside the checkpoint share: the reads
+     * of a covered snapshot's write time under row TTL.
+     */
+    Executor io() {
+        return io;
+    }
+
     /** Runs timers, which only post work to owners and pools. */
     ScheduledExecutorService scheduler() {
         return scheduler;
     }
 
     /**
+     * Runs {@code task} on {@code executor} after {@code delayMs}, posted by the scheduler; at once
+     * if there is no delay. If {@code executor} rejects the task once its delay passed, {@code
+     * onRejected} runs on the scheduler. Throws {@link RejectedExecutionException} if the delay
+     * cannot be scheduled.
+     */
+    void executeAfter(long delayMs, Executor executor, Runnable task, Runnable onRejected) {
+        if (delayMs <= 0) {
+            executor.execute(task);
+            return;
+        }
+        scheduler.schedule(
+                () -> {
+                    try {
+                        executor.execute(task);
+                    } catch (RejectedExecutionException e) {
+                        onRejected.run();
+                    }
+                },
+                delayMs,
+                TimeUnit.MILLISECONDS);
+    }
+
+    /**
      * Registers each pool's or share's queued and active tasks as gauges {@code queued} and {@code
      * active}, in the group {@code dvPool} of {@code group} with the variable {@code pool}:
-     * request, state, advance (planning and switch loads), rebuild, checkpoint, and scheduler.
+     * request, state, resolver (the key lookups), advance (planning and switch loads), rebuild,
+     * checkpoint, and scheduler.
      */
     public void registerMetrics(MetricGroup group) {
         MetricGroup pools = group.addGroup("dvPool");
@@ -217,6 +278,7 @@ public final class DerivedDvRuntime {
         register(
                 pools, "request", () -> requestPool.getQueue().size(), requestPool::getActiveCount);
         register(pools, "state", () -> bucketState.getQueue().size(), bucketState::getActiveCount);
+        register(pools, "resolver", () -> keyLookup.getQueue().size(), keyLookup::getActiveCount);
         register(pools, "advance", switches::queued, switches::active);
         register(pools, "rebuild", rebuilds.lane()::queued, rebuilds.lane()::active);
         register(pools, "checkpoint", checkpoints::queued, checkpoints::active);
@@ -232,10 +294,10 @@ public final class DerivedDvRuntime {
 
     /**
      * Stops accepting work, in order: requests, then the pools that start work for others (index
-     * loads, checkpoints), then the owners' steps and the scheduler. Tasks that run finish, and so
-     * do the owners' queued steps; delayed timers and waiting shares are dropped, as every bucket
-     * is closed by then. The threads end once idle. The server's IO pool is the server's to shut
-     * down.
+     * loads, checkpoints, key lookups), then the owners' steps and the scheduler. Tasks that run
+     * finish, and so do the owners' queued steps; delayed timers and waiting shares are dropped, as
+     * every bucket is closed by then. The threads end once idle. The server's IO pool is the
+     * server's to shut down.
      */
     public void shutdown() {
         requests.close();
@@ -246,6 +308,7 @@ public final class DerivedDvRuntime {
         if (ownIo != null) {
             ownIo.shutdown();
         }
+        keyLookup.shutdown();
         bucketState.shutdown();
         scheduler.shutdown();
     }

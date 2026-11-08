@@ -210,7 +210,7 @@ final class DvOwnerIndex {
     /**
      * Removes files that left the lake snapshot from the dictionary in one write, so either all or
      * none are gone, and returns their ids. File ids are never reused; checkpoints leave out their
-     * stale index entries.
+     * stale index entries. The caller drops their masks once its switch commits.
      */
     Set<Integer> dropFiles(List<String> fileNames) throws IOException {
         for (String name : fileNames) {

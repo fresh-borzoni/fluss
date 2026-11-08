@@ -28,6 +28,8 @@ import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ColumnPositionType;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.exception.InvalidConfigException;
+import org.apache.fluss.exception.InvalidRequestException;
+import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 import org.apache.fluss.lake.committer.LakeCommitResult;
@@ -76,6 +78,8 @@ import org.apache.fluss.rpc.messages.DescribeClusterResponse;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
 import org.apache.fluss.rpc.messages.GetLakeSnapshotResponse;
@@ -192,6 +196,8 @@ import org.apache.fluss.server.entity.ProduceLogDataForBucket;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
+import org.apache.fluss.server.kv.dv.DvMaskRequest;
+import org.apache.fluss.server.kv.dv.DvPinnedCut;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
@@ -217,6 +223,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -2533,5 +2540,109 @@ public class ServerRpcMessageUtils {
             pb.setRemoteLogEndOffset(entry.getManifestHandle().getRemoteLogEndOffset());
         }
         return response;
+    }
+
+    /**
+     * The masks a union read's {@link GetDvSnapshotRequest} asks for, read off the request before
+     * it is handed to another thread.
+     */
+    public static DvMaskRequest toDvMaskRequest(GetDvSnapshotRequest request) {
+        if (request.hasReleaseCut() && request.isReleaseCut()) {
+            if (!request.hasLogEndOffset()) {
+                throw new InvalidRequestException(
+                        "A release of a pinned cut names no cut (log_end_offset).");
+            }
+            return DvMaskRequest.release(request.getLogEndOffset(), holdsOf(request));
+        }
+        if (request.hasMaxLogDvBytes() && request.getMaxLogDvBytes() <= 0) {
+            throw new InvalidRequestException(
+                    String.format(
+                            "A log mask page of %d bytes is requested.",
+                            request.getMaxLogDvBytes()));
+        }
+        List<String> fileNames = new ArrayList<>(request.getLakeDvFileNamesCount());
+        for (int i = 0; i < request.getLakeDvFileNamesCount(); i++) {
+            fileNames.add(request.getLakeDvFileNameAt(i));
+        }
+        return new DvMaskRequest(
+                request.hasLogEndOffset() ? request.getLogEndOffset() : null,
+                fileNames,
+                request.hasLogDvFromOffset() ? request.getLogDvFromOffset() : null,
+                request.hasMaxLogDvBytes()
+                        ? request.getMaxLogDvBytes()
+                        : DvPinnedCut.DEFAULT_LOG_PAGE_BYTES,
+                !request.hasWaitForCatchUp() || request.isWaitForCatchUp(),
+                request.hasPinRequestId() ? request.getPinRequestId() : null,
+                holdsOf(request));
+    }
+
+    private static int holdsOf(GetDvSnapshotRequest request) {
+        int holds = request.hasHolds() ? request.getHolds() : 1;
+        if (holds <= 0 || holds > DvMaskRequest.MAX_HOLDS) {
+            throw new InvalidRequestException(
+                    String.format(
+                            "A pin or release of %d holds is requested, outside [1, %d].",
+                            holds, DvMaskRequest.MAX_HOLDS));
+        }
+        return holds;
+    }
+
+    /**
+     * Builds the {@link GetDvSnapshotResponse} of a union read: the cut, and the masks of the named
+     * lake files and of the log from the requested offset on, if any.
+     */
+    public static GetDvSnapshotResponse buildDvCutResponse(DvPinnedCut cut, DvMaskRequest request)
+            throws IOException {
+        GetDvSnapshotResponse resp =
+                new GetDvSnapshotResponse()
+                        .setLogEndOffset(cut.logEndOffset())
+                        .setSnapshotStartOffset(cut.snapshotStartOffset());
+        if (cut.lakeSnapshotIdentity() != null) {
+            resp.setLakeSnapshotIdentity(cut.lakeSnapshotIdentity());
+        }
+        for (Map.Entry<String, byte[]> entry :
+                cut.lakeMasksOf(request.lakeFileNames()).entrySet()) {
+            resp.addLakeDvEntry()
+                    .setFilePath(entry.getKey())
+                    .setDeletedPositionsBitmap(entry.getValue());
+        }
+        if (request.logFromOffset() != null) {
+            long from = request.logFromOffset();
+            if (from < 0 || from > cut.logEndOffset()) {
+                throw new InvalidRequestException(
+                        String.format(
+                                "The log mask is requested from offset %d, outside [0, %d].",
+                                from, cut.logEndOffset()));
+            }
+            DvPinnedCut.LogPage page = cut.logPage(from, request.maxLogBytes());
+            resp.setLogDvToOffset(page.to());
+            if (page.bitmap() != null) {
+                resp.setLogDvBitmap(page.bitmap());
+            }
+        }
+        return resp;
+    }
+
+    /**
+     * Builds the answer to a read that does not wait for catch-ups whose bucket's leader covers
+     * another snapshot than the requested one.
+     */
+    public static GetDvSnapshotResponse buildDvCoveredSnapshotResponse(StaleSnapshotException e) {
+        GetDvSnapshotResponse response =
+                new GetDvSnapshotResponse()
+                        .setCoveredSnapshotId(e.getCurrentSnapshotId())
+                        .setBehind(e.isBehind());
+        if (e.getCurrentStartOffset() >= 0) {
+            response.setSnapshotStartOffset(e.getCurrentStartOffset());
+        }
+        return response;
+    }
+
+    /**
+     * Builds the answer to a read that does not wait for catch-ups whose bucket's leader has no
+     * masks to serve yet: the reader reads the bucket by key up to {@code cut}.
+     */
+    public static GetDvSnapshotResponse buildDvFoldResponse(long cut) {
+        return new GetDvSnapshotResponse().setFoldCut(cut);
     }
 }

@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A version of a bucket's index: the index and file dictionary of one lake snapshot, as a RocksDB
- * snapshot taken when the version was published. Lookups are read through it, so a load that
- * ingests the next snapshot's changes into the latest index never shows through: an answer read
- * from a version is exact for that version.
+ * snapshot taken when the version was published. Lookups and the lake positions of masks are read
+ * through it, so a load that ingests the next snapshot's changes into the latest index never shows
+ * through: an answer read from a version is exact for that version.
  *
  * <p>The empty lake is a version too, snapshot -1, readable from offset 0, with an empty index.
  *
@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class DvVersion {
 
     final long snapshotId;
-    // the bucket's readable offset in the snapshot
+    // the bucket's readable offset in the snapshot: its change list starts here
     final long readableOffset;
     // the identity of the lake snapshot the version covers, or null
     @Nullable final String identity;
