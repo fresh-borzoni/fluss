@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.SortMergeReader;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -35,7 +36,11 @@ import org.apache.fluss.row.KeyValueRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.IOUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -46,6 +51,7 @@ import java.util.Comparator;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.TreeMap;
+import java.util.function.BooleanSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
@@ -54,6 +60,8 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  */
 @Internal
 public class KvSnapshotAndLogBatchScanner implements BatchScanner {
+
+    private static final Logger LOG = LoggerFactory.getLogger(KvSnapshotAndLogBatchScanner.class);
 
     private final TableBucket tableBucket;
     private final long logStoppingOffset;
@@ -66,6 +74,8 @@ public class KvSnapshotAndLogBatchScanner implements BatchScanner {
     @Nullable private final LogScanner logScanner;
 
     private boolean logScanFinished;
+    // whether the bucket's partition was dropped from Fluss, null to wait for the log regardless
+    @Nullable private final BooleanSupplier partitionDropped;
     private boolean finished;
     private boolean closed;
 
@@ -80,6 +90,30 @@ public class KvSnapshotAndLogBatchScanner implements BatchScanner {
             long logStartingOffset,
             long logStoppingOffset,
             @Nullable int[] projectedFields) {
+        this(
+                table,
+                tableBucket,
+                snapshotId,
+                logStartingOffset,
+                logStoppingOffset,
+                projectedFields,
+                null);
+    }
+
+    /**
+     * Creates a scanner that ends the log read early if {@code partitionDropped} says the bucket's
+     * partition was dropped from Fluss, because its log is gone. The merge then holds the bucket's
+     * rows as of the last log offset read, which is a state the bucket had.
+     */
+    public KvSnapshotAndLogBatchScanner(
+            Table table,
+            TableBucket tableBucket,
+            long snapshotId,
+            long logStartingOffset,
+            long logStoppingOffset,
+            @Nullable int[] projectedFields,
+            @Nullable BooleanSupplier partitionDropped) {
+        this.partitionDropped = partitionDropped;
         checkArgument(
                 table.getTableInfo().hasPrimaryKey(),
                 "KvSnapshotAndLogBatchScanner only supports primary-key tables.");
@@ -100,19 +134,34 @@ public class KvSnapshotAndLogBatchScanner implements BatchScanner {
                         : null;
 
         boolean emptyLogRange = logStartingOffset >= logStoppingOffset || logStoppingOffset <= 0;
-        this.logScanFinished = emptyLogRange;
+        boolean logScanFinished = emptyLogRange;
         if (emptyLogRange) {
             this.logScanner = null;
         } else {
             this.logScanner =
                     table.newScan().project(projectionPlan.scanProjectedFields).createLogScanner();
             Long partitionId = tableBucket.getPartitionId();
-            if (partitionId == null) {
-                this.logScanner.subscribe(tableBucket.getBucket(), logStartingOffset);
-            } else {
-                this.logScanner.subscribe(partitionId, tableBucket.getBucket(), logStartingOffset);
+            try {
+                if (partitionId == null) {
+                    this.logScanner.subscribe(tableBucket.getBucket(), logStartingOffset);
+                } else {
+                    this.logScanner.subscribe(
+                            partitionId, tableBucket.getBucket(), logStartingOffset);
+                }
+            } catch (RuntimeException e) {
+                if (partitionDropped == null
+                        || !ExceptionUtils.findThrowable(e, PartitionNotExistException.class)
+                                .isPresent()) {
+                    throw e;
+                }
+                LOG.warn(
+                        "The partition of bucket {} was dropped before its log was read; reading"
+                                + " its snapshot only.",
+                        tableBucket);
+                logScanFinished = true;
             }
         }
+        this.logScanFinished = logScanFinished;
     }
 
     @Nullable
@@ -156,6 +205,18 @@ public class KvSnapshotAndLogBatchScanner implements BatchScanner {
 
     private void pollLogRecords(Duration timeout) {
         ScanRecords scanRecords = logScanner.poll(timeout);
+        if (scanRecords.records(tableBucket).isEmpty()
+                && scanRecords.consumedUpToOffset(tableBucket) == null
+                && partitionDropped != null
+                && partitionDropped.getAsBoolean()) {
+            // A log scanner keeps polling the buckets of a dropped partition without an error.
+            LOG.warn(
+                    "The partition of bucket {} was dropped while its log was read; merging its"
+                            + " snapshot with the log read so far.",
+                    tableBucket);
+            logScanFinished = true;
+            return;
+        }
         for (ScanRecord scanRecord : scanRecords.records(tableBucket)) {
             long logOffset = scanRecord.logOffset();
             if (logOffset >= logStoppingOffset) {

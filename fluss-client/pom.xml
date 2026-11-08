@@ -49,6 +49,13 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- deletion vector masks of union reads -->
+        <dependency>
+            <groupId>org.roaringbitmap</groupId>
+            <artifactId>RoaringBitmap</artifactId>
+            <version>${roaringbitmap.version}</version>
+        </dependency>
+
         <!-- Unshaded Arrow dependencies for the Arrow scan batch API (ArrowBatchData).
              Marked as "provided" to avoid Arrow class conflicts with consumers that
              bring their own Arrow version. Currently only the internal tiering service

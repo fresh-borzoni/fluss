@@ -23,6 +23,7 @@ import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.SortMergeReader;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.RecordReader;
@@ -33,6 +34,10 @@ import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.KeyValueRow;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.ExceptionUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -45,9 +50,12 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.function.BooleanSupplier;
 
 /** A scanner to merge the lakehouse's snapshot and change log. */
 public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
+
+    private static final Logger LOG = LoggerFactory.getLogger(LakeSnapshotAndLogSplitScanner.class);
 
     private final @Nullable List<LakeSplit> lakeSplits;
     private Comparator<InternalRow> rowComparator;
@@ -65,8 +73,11 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
     private Map<InternalRow, KeyValueRow> logRows;
 
     private final LogScanner logScanner;
+    private final TableBucket tableBucket;
     private final long stoppingOffset;
     private boolean logScanFinished;
+    // whether the bucket's partition was dropped from Fluss, null to wait for the log regardless
+    @Nullable private final BooleanSupplier partitionDropped;
 
     private SortMergeReader currentSortMergeReader;
 
@@ -78,6 +89,33 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
             long startingOffset,
             long stoppingOffset,
             @Nullable int[] projectedFields) {
+        this(
+                table,
+                lakeSource,
+                lakeSplits,
+                tableBucket,
+                startingOffset,
+                stoppingOffset,
+                projectedFields,
+                null);
+    }
+
+    /**
+     * Creates a scanner that ends the log read early if {@code partitionDropped} says the bucket's
+     * partition was dropped from Fluss, because its log is gone. The merge then holds the bucket's
+     * rows as of the last log offset read, which is a state the bucket had.
+     */
+    public LakeSnapshotAndLogSplitScanner(
+            Table table,
+            LakeSource<LakeSplit> lakeSource,
+            @Nullable List<LakeSplit> lakeSplits,
+            TableBucket tableBucket,
+            long startingOffset,
+            long stoppingOffset,
+            @Nullable int[] projectedFields,
+            @Nullable BooleanSupplier partitionDropped) {
+        this.tableBucket = tableBucket;
+        this.partitionDropped = partitionDropped;
         this.pkIndexes = table.getTableInfo().getSchema().getPrimaryKeyIndexes();
         this.lakeSplits = lakeSplits;
         this.lakeSource = lakeSource;
@@ -97,14 +135,28 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
                         .mapToObj(field -> new int[] {field})
                         .toArray(int[][]::new));
 
-        if (tableBucket.getPartitionId() != null) {
-            this.logScanner.subscribe(
-                    tableBucket.getPartitionId(), tableBucket.getBucket(), startingOffset);
-        } else {
-            this.logScanner.subscribe(tableBucket.getBucket(), startingOffset);
-        }
-
         this.logScanFinished = startingOffset >= stoppingOffset || stoppingOffset <= 0;
+        if (!logScanFinished) {
+            try {
+                if (tableBucket.getPartitionId() != null) {
+                    this.logScanner.subscribe(
+                            tableBucket.getPartitionId(), tableBucket.getBucket(), startingOffset);
+                } else {
+                    this.logScanner.subscribe(tableBucket.getBucket(), startingOffset);
+                }
+            } catch (RuntimeException e) {
+                if (partitionDropped == null
+                        || !ExceptionUtils.findThrowable(e, PartitionNotExistException.class)
+                                .isPresent()) {
+                    throw e;
+                }
+                LOG.warn(
+                        "The partition of bucket {} was dropped before its log was read; merging"
+                                + " its lake snapshot only.",
+                        tableBucket);
+                this.logScanFinished = true;
+            }
+        }
     }
 
     @Nullable
@@ -178,6 +230,18 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
 
     private void pollLogRecords(Duration timeout) {
         ScanRecords scanRecords = logScanner.poll(timeout);
+        if (scanRecords.records(tableBucket).isEmpty()
+                && scanRecords.consumedUpToOffset(tableBucket) == null
+                && partitionDropped != null
+                && partitionDropped.getAsBoolean()) {
+            // A log scanner keeps polling the buckets of a dropped partition without an error.
+            LOG.warn(
+                    "The partition of bucket {} was dropped while its log was read; merging its"
+                            + " lake snapshot with the log read so far.",
+                    tableBucket);
+            logScanFinished = true;
+            return;
+        }
         for (ScanRecord scanRecord : scanRecords) {
             boolean isDelete =
                     scanRecord.getChangeType() == ChangeType.DELETE
