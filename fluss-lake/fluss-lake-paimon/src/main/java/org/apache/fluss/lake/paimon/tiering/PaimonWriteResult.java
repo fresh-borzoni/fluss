@@ -17,7 +17,12 @@
 
 package org.apache.fluss.lake.paimon.tiering;
 
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
+
 import org.apache.paimon.table.sink.CommitMessage;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -28,17 +33,44 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** The write result of Paimon lake writer to pass to committer to commit. */
-public final class PaimonWriteResult implements Serializable {
+public final class PaimonWriteResult implements Serializable, CompactionIndexPartProvider {
 
     private static final long serialVersionUID = 1L;
 
     private final List<CommitMessage> commitMessages;
+    // whether the writer compacted the bucket, and the positions it handed to the index if so
+    private final boolean compacted;
+    @Nullable private final CompactionIndexPart compactionIndexPart;
 
     /** Creates a write result containing all commit messages produced by one lake writer. */
     public PaimonWriteResult(List<CommitMessage> commitMessages) {
+        this(commitMessages, false, null);
+    }
+
+    /**
+     * Creates a write result of a writer that may have compacted the bucket of a table with
+     * deletion vectors, with the index part of its compaction if it handed the positions over.
+     */
+    public PaimonWriteResult(
+            List<CommitMessage> commitMessages,
+            boolean compacted,
+            @Nullable CompactionIndexPart compactionIndexPart) {
         checkNotNull(commitMessages, "commitMessages must not be null");
         checkArgument(!commitMessages.isEmpty(), "commitMessages must not be empty");
         this.commitMessages = Collections.unmodifiableList(new ArrayList<>(commitMessages));
+        this.compacted = compacted;
+        this.compactionIndexPart = compactionIndexPart;
+    }
+
+    @Override
+    public boolean compacted() {
+        return compacted;
+    }
+
+    @Nullable
+    @Override
+    public CompactionIndexPart compactionIndexPart() {
+        return compactionIndexPart;
     }
 
     /** Returns all commit messages produced by the lake writer. */

@@ -1255,6 +1255,70 @@ class TableManagerITCase {
         }
     }
 
+    /**
+     * Deletion vectors do not cover the historical partition, so neither option can be turned on by
+     * ALTER while the other is on.
+     */
+    @Test
+    void testAlterRejectsHistoricalPartitionWithDeletionVectors() throws Exception {
+        FlussClusterExtension cluster =
+                historicalPartitionCluster(ConfigOptions.MAX_PARTITION_NUM.defaultValue());
+        try {
+            cluster.start();
+            AdminGateway gateway = cluster.newCoordinatorClient();
+
+            TablePath dvTable = TablePath.of("fluss", "historical_partition_dv_alter");
+            gateway.createTable(
+                            newCreateTableRequest(
+                                    dvTable,
+                                    newPartitionedTableBuilder(null)
+                                            .property(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "dt")
+                                            .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                                            .property(
+                                                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED,
+                                                    true)
+                                            .build(),
+                                    false))
+                    .get();
+            assertThatThrownBy(() -> setHistoricalPartitionEnabled(gateway, dvTable, true))
+                    .cause()
+                    .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                    .hasMessageContaining(
+                            ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key());
+            assertThat(isHistoricalPartitionEnabled(gateway, dvTable)).isFalse();
+
+            TablePath historicalTable = TablePath.of("fluss", "historical_partition_alter_dv");
+            createHistoricalPartitionTable(gateway, historicalTable, true);
+            assertThatThrownBy(
+                            () ->
+                                    gateway.alterTable(
+                                                    newAlterTableRequest(
+                                                            historicalTable,
+                                                            Collections.singletonMap(
+                                                                    ConfigOptions
+                                                                            .TABLE_DELETION_VECTORS_ENABLED
+                                                                            .key(),
+                                                                    "true"),
+                                                            Collections.emptyList(),
+                                                            Collections.emptyList(),
+                                                            false))
+                                            .get())
+                    .cause()
+                    .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+            TableDescriptor descriptor =
+                    TableDescriptor.fromJsonBytes(
+                            gateway.getTableInfo(newGetTableInfoRequest(historicalTable))
+                                    .get()
+                                    .getTableJson());
+            assertThat(
+                            Configuration.fromMap(descriptor.getProperties())
+                                    .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED))
+                    .isFalse();
+        } finally {
+            cluster.close();
+        }
+    }
+
     @Test
     void testKvLeaderReplicaCapacityRecomputedOnTabletServerReRegistration() throws Exception {
         Configuration conf = initConf();

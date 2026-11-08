@@ -30,6 +30,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.flink.tiering.LakeTieringJobBuilder;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -56,6 +57,8 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.CloseableIterator;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
+
+import javax.annotation.Nullable;
 
 import java.nio.file.Files;
 import java.time.Duration;
@@ -127,17 +130,40 @@ public abstract class FlinkPaimonTieringTestBase {
         return buildTieringJob(execEnv, new Configuration());
     }
 
+    /**
+     * Builds the tiering job with {@code lakeTieringConfig} on top of the {@link
+     * #defaultLakeTieringConfig}, as the {@code --lake.tiering.*} arguments of the tiering service
+     * set them.
+     */
     protected JobClient buildTieringJob(
             StreamExecutionEnvironment execEnv, Configuration lakeTieringConfig) throws Exception {
         Configuration flussConfig = new Configuration(clientConf);
         flussConfig.set(POLL_TIERING_TABLE_INTERVAL, Duration.ofMillis(500L));
-        return LakeTieringJobBuilder.newBuilder(
+        Configuration tieringConfig = defaultLakeTieringConfig();
+        tieringConfig.addAll(lakeTieringConfig);
+        LakeTieringJobBuilder builder =
+                LakeTieringJobBuilder.newBuilder(
                         execEnv,
                         flussConfig,
                         Configuration.fromMap(getPaimonCatalogConf()),
-                        lakeTieringConfig,
-                        DataLakeFormat.PAIMON.toString())
-                .build();
+                        tieringConfig,
+                        DataLakeFormat.PAIMON.toString());
+        LakeTieringFactory<?, ?> lakeTieringFactory = lakeTieringFactory();
+        if (lakeTieringFactory != null) {
+            builder.withLakeTieringFactory(lakeTieringFactory);
+        }
+        return builder.build();
+    }
+
+    /** The lake tiering configuration of every tiering job of the test class. */
+    protected Configuration defaultLakeTieringConfig() {
+        return new Configuration();
+    }
+
+    /** The factory the tiering jobs tier with, or null for the one of the Paimon plugin. */
+    @Nullable
+    protected LakeTieringFactory<?, ?> lakeTieringFactory() {
+        return null;
     }
 
     protected static Map<String, String> getPaimonCatalogConf() {

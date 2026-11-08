@@ -232,7 +232,8 @@ class DerivedDvReindexRequestTest {
                         firstFileId,
                         new FsPath(tempDir.toUri().toString()),
                         41L,
-                        99L);
+                        99L,
+                        null);
     }
 
     /**

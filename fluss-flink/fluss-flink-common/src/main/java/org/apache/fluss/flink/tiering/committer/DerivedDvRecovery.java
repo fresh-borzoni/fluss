@@ -17,16 +17,24 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
+import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.dv.FormatVersions;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.utils.IOUtils;
+import org.apache.fluss.utils.json.TableBucketOffsets;
 
 import org.slf4j.Logger;
 
 import javax.annotation.Nullable;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.Map;
 
@@ -34,6 +42,7 @@ import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.DERIVED_
 import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.DERIVED_INDEX_ID_PROPERTY;
 import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.DERIVED_OFFSETS_PROPERTY;
 import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.dvCommit;
+import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.keyMerging;
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
@@ -44,8 +53,10 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * lake commit, or when the lake surely rejected it ({@link #cleanUpFailedRound}). Otherwise its
  * files stay, and the next round finds the commit if it landed. A round that takes deletes records
  * its index change, base and offsets in its snapshot, so {@link #checkFlussNotMissingLakeSnapshot}
- * registers a crashed round's snapshot from them before anything else is committed. The round that
- * recovered fails and runs again on top of the recovered snapshot.
+ * registers a crashed round's snapshot from them before anything else is committed. A merging round
+ * publishes its change after its commit, so {@link #registerLostCommit} indexes and registers the
+ * lost commit as its round would have. Either way the round that recovered fails and runs again on
+ * top of the recovered snapshot.
  */
 final class DerivedDvRecovery<WriteResult, Committable> {
 
@@ -54,12 +65,15 @@ final class DerivedDvRecovery<WriteResult, Committable> {
     private final DerivedDvContext<WriteResult, Committable> context;
 
     private final DerivedDvRegistrations<WriteResult, Committable> registrations;
+    private final DerivedDvReindexer<WriteResult, Committable> reindexer;
 
     DerivedDvRecovery(
             DerivedDvContext<WriteResult, Committable> context,
-            DerivedDvRegistrations<WriteResult, Committable> registrations) {
+            DerivedDvRegistrations<WriteResult, Committable> registrations,
+            DerivedDvReindexer<WriteResult, Committable> reindexer) {
         this.context = context;
         this.registrations = registrations;
+        this.reindexer = reindexer;
     }
 
     /**
@@ -126,7 +140,8 @@ final class DerivedDvRecovery<WriteResult, Committable> {
 
     /**
      * Registers a lake snapshot a previous attempt committed but did not register, and fails the
-     * round so it runs again on top of it. The caller deletes the round's files.
+     * round so it runs again on top of it. The caller deletes the round's files. Used for lakes
+     * that take deletes; a merging round registers a lost commit with {@link #registerLostCommit}.
      */
     void checkFlussNotMissingLakeSnapshot(
             TablePath tablePath,
@@ -248,5 +263,74 @@ final class DerivedDvRecovery<WriteResult, Committable> {
             return null;
         }
         return missingCommittedSnapshot;
+    }
+
+    /**
+     * Registers the lake commit of an earlier merging round that was lost before it registered it,
+     * e.g. because the job failed over while the round was held. It registers the commit as that
+     * round would have: with its readable snapshot, once the chain has that snapshot. Registering
+     * it without one would leave the readable snapshot behind until a later round's compaction, and
+     * for good if the table stays idle. Fails this round once the commit is registered, so the
+     * round runs again on top of it. Returns the re-index the registration waits for, which this
+     * round is held for instead, or null if no commit is unregistered.
+     */
+    @Nullable
+    Reindex registerLostCommit(
+            long tableId,
+            TablePath tablePath,
+            TableInfo tableInfo,
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            @Nullable Long flussCurrentLakeSnapshot)
+            throws Exception {
+        CommittedLakeSnapshot lost =
+                unregisteredCommit(tablePath, tableId, lakeCommitter, flussCurrentLakeSnapshot);
+        if (lost == null) {
+            return null;
+        }
+        // Not registered if the lake table was rolled back past it.
+        dvCommit(lakeCommitter).checkCurrentSnapshotDescendsFrom(lost.getLakeSnapshotId());
+        String offsetsFile =
+                lost.getSnapshotProperties().get(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY);
+        LakeCommitResult result =
+                keyMerging(lakeCommitter)
+                        .getCommitResult(
+                                lost.getLakeSnapshotId(), readOffsets(new FsPath(offsetsFile)));
+        if (result == null) {
+            result = LakeCommitResult.unknownReadableSnapshot(lost.getLakeSnapshotId(), null);
+        }
+        Registration<Committable> registration =
+                new Registration<>(
+                        result, offsetsFile, Collections.emptyMap(), Collections.emptyMap(), null);
+        Reindex reindex =
+                reindexer.indexReadableSnapshot(
+                        tableId, tablePath, tableInfo, registration, Collections.emptyList());
+        if (reindex != null) {
+            LOG.warn(
+                    "Lake snapshot {} of {} was committed by a round lost before it"
+                            + " registered it; this round registers it once its readable snapshot {}"
+                            + " is indexed, and runs again after.",
+                    lost.getLakeSnapshotId(),
+                    tablePath,
+                    reindex.compactSnapshotId);
+            return reindex;
+        }
+        registrations.register(tableId, tablePath, registration);
+        throw lostCommitRegistered(tablePath, lost.getLakeSnapshotId());
+    }
+
+    static IllegalStateException lostCommitRegistered(TablePath tablePath, long snapshotId) {
+        return new IllegalStateException(
+                String.format(
+                        "Registered lake snapshot %d of %s, which a round lost before"
+                                + " registering it had committed; this round runs again on top of it.",
+                        snapshotId, tablePath));
+    }
+
+    private static Map<TableBucket, Long> readOffsets(FsPath offsetsFile) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (FSDataInputStream in = offsetsFile.getFileSystem().open(offsetsFile)) {
+            IOUtils.copyBytes(in, bytes, false);
+        }
+        return TableBucketOffsets.fromJsonBytes(bytes.toByteArray()).getOffsets();
     }
 }

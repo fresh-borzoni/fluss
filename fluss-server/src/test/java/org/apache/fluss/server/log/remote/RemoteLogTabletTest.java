@@ -176,6 +176,59 @@ class RemoteLogTabletTest extends RemoteLogTestBase {
         assertThat(remoteLogTablet.expiredRemoteLogSegments(oneHourMs, null, -1L)).isEmpty();
     }
 
+    /**
+     * The deletion vectors of a Paimon table need the log from the readable offset of their lake
+     * snapshot, which lags its tiered offset. Expired segments that end after it are kept although
+     * they are tiered, and counted as kept for the deletion vectors.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testExpireSegmentsKeepsWhatDeletionVectorsNeed(boolean partitionTable) throws Exception {
+        LogTablet logTablet = makeLogTabletAndAddSegments(partitionTable);
+        RemoteLogTablet remoteLogTablet = buildRemoteLogTablet(logTablet);
+        RemoteLogSegment s0 = createLogSegmentWithMaxTimestamp(logTablet, 10, 0, 10);
+        RemoteLogSegment s1 = createLogSegmentWithMaxTimestamp(logTablet, 20, 10, 20);
+        RemoteLogSegment s2 = createLogSegmentWithMaxTimestamp(logTablet, 30, 20, 30);
+        RemoteLogSegment s3 = createLogSegmentWithMaxTimestamp(logTablet, 40, 30, 40);
+        loadRemoteLogSegments(remoteLogTablet, logTablet, Arrays.asList(s0, s1, s2, s3));
+        // all four are expired, and tiered up to offset 40
+        long now = 1000L;
+        long ttlMs = 1L;
+
+        // no readable snapshot yet: the deletion vectors need all of the log
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 0L, ttlMs)).isEmpty();
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isEqualTo(4);
+        assertThat(remoteLogTablet.getDvRetainedSizeInBytes()).isEqualTo(4000L);
+
+        // readable from offset 15: [10, 20) still holds offsets 15 to 19
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 15L, ttlMs))
+                .containsExactly(s0);
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isEqualTo(3);
+        assertThat(remoteLogTablet.getDvRetainedSizeInBytes()).isEqualTo(3000L);
+
+        // readable from offset 20: the segments at or above it are kept
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 20L, ttlMs))
+                .containsExactlyInAnyOrder(s0, s1);
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isEqualTo(2);
+
+        // a readable offset beyond the tiered one keeps nothing but what is not tiered
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 30L, 40L, ttlMs))
+                .containsExactlyInAnyOrder(s0, s1, s2);
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isZero();
+        assertThat(remoteLogTablet.getDvRetainedSizeInBytes()).isZero();
+
+        // readable up to the end: everything expired and tiered goes
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 40L, ttlMs))
+                .containsExactlyInAnyOrder(s0, s1, s2, s3);
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isZero();
+
+        // segments that have not expired are not counted as kept for the deletion vectors
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 0L, now)).isEmpty();
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isZero();
+        assertThat(remoteLogTablet.expiredRemoteLogSegments(now, 40L, 0L, -1L)).isEmpty();
+        assertThat(remoteLogTablet.getDvRetainedSegments()).isZero();
+    }
+
     RemoteLogSegment createLogSegmentWithMaxTimestamp(
             LogTablet logTablet,
             long timestamp,

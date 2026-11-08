@@ -25,6 +25,7 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
+import org.apache.fluss.lake.paimon.utils.PaimonConversions;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -35,6 +36,7 @@ import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.CatalogUtils;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.Options;
@@ -52,10 +54,14 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toFlussTableDescriptor;
@@ -140,6 +146,10 @@ public class PaimonLakeCatalog implements LakeCatalog {
         validateLakeTablePath(tablePath, context);
         // then, create the table
         Schema paimonSchema = toPaimonSchema(tableDescriptor);
+        if (Configuration.fromMap(tableDescriptor.getProperties())
+                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+            validateDeletionVectorsOptions(tablePath, paimonSchema);
+        }
         try {
             createTable(tablePath, paimonSchema, context);
         } catch (Catalog.DatabaseNotExistException e) {
@@ -318,6 +328,20 @@ public class PaimonLakeCatalog implements LakeCatalog {
         return new InvalidAlterTableException(
                 String.format(
                         "'%s' can only be altered before the Paimon table is created.", optionKey));
+    }
+
+    /**
+     * Checks the options a table with deletion vectors gets in Paimon: those Fluss sets, and the
+     * catalog's {@code table-default.*} options, which Paimon adds where the table sets none.
+     */
+    private void validateDeletionVectorsOptions(TablePath tablePath, Schema schema) {
+        Map<String, String> defaults = CatalogUtils.tableDefaultOptions(paimonCatalog.options());
+        Map<String, String> effective = new HashMap<>(defaults);
+        effective.putAll(schema.options());
+        Set<String> fromDefaults = new HashSet<>(defaults.keySet());
+        fromDefaults.removeAll(schema.options().keySet());
+        PaimonConversions.validateDeletionVectorsOptions(
+                toPaimon(tablePath).getFullName(), effective, fromDefaults);
     }
 
     private void createTable(TablePath tablePath, Schema schema, Context context)

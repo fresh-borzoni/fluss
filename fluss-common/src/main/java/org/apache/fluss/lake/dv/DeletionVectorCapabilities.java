@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.committer.SupportsPrimaryKeyMergeCommit;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.RecordReader;
@@ -60,18 +61,30 @@ public final class DeletionVectorCapabilities {
         return require(committer, SupportsPositionDeleteCommit.class, "lake committer", tablePath);
     }
 
+    /** The lake committer as one of a lake that merges rows by primary key itself. */
+    public static SupportsPrimaryKeyMergeCommit primaryKeyMergeCommit(
+            LakeCommitter<?, ?> committer, TablePath tablePath) {
+        return require(committer, SupportsPrimaryKeyMergeCommit.class, "lake committer", tablePath);
+    }
+
     /**
      * Checks that the lake committer commits the rounds of a table with deletion vectors the way
-     * its lake does: it takes deletes ({@link SupportsPositionDeleteCommit}).
+     * its lake does ({@link SupportsDeletionVectorTiering#mergesByPrimaryKey()}): it takes deletes
+     * ({@link SupportsPositionDeleteCommit}), or the lake merges by primary key ({@link
+     * SupportsPrimaryKeyMergeCommit}).
      */
     public static void checkCommitter(
             SupportsDeletionVectorTiering tiering,
             LakeCommitter<?, ?> committer,
             TablePath tablePath) {
-        positionDeleteCommit(committer, tablePath);
+        if (tiering.mergesByPrimaryKey()) {
+            primaryKeyMergeCommit(committer, tablePath);
+        } else {
+            positionDeleteCommit(committer, tablePath);
+        }
     }
 
-    /** The lake source as one that plans rewrites. */
+    /** The lake source as one that plans rewrites and names the commits of snapshot ids. */
     @SuppressWarnings("unchecked")
     public static <Split extends LakeSplit> SupportsRewritePlanning<Split> rewritePlanning(
             LakeSource<Split> source, TablePath tablePath) {

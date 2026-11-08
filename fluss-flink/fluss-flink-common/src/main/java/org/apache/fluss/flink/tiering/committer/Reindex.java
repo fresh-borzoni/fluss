@@ -38,6 +38,9 @@ final class Reindex {
     // one result per split
     final int expectedResults;
     final long startedAtMs;
+    // The registration of a round that committed to the lake before it was held, or null if
+    // the round commits once the re-index is published.
+    @Nullable final Registration<?> registration;
 
     @VisibleForTesting
     Reindex(
@@ -48,7 +51,8 @@ final class Reindex {
             @Nullable Map<String, Map<Integer, List<String>>> removedFiles,
             List<RowPosRequestEvent> requests,
             int expectedResults,
-            long startedAtMs) {
+            long startedAtMs,
+            @Nullable Registration<?> registration) {
         this.tablePath = tablePath;
         this.baseSnapshotId = baseSnapshotId;
         this.compactSnapshotId = compactSnapshotId;
@@ -57,5 +61,6 @@ final class Reindex {
         this.requests = requests;
         this.expectedResults = expectedResults;
         this.startedAtMs = startedAtMs;
+        this.registration = registration;
     }
 }

@@ -531,13 +531,12 @@ class TableDescriptorValidationTest {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(lake);
 
-        assertThatThrownBy(
+        assertThatCode(
                         () ->
                                 validate(
                                         pkTableWithProperties(dv, "true", lake, "true"),
                                         DataLakeFormat.PAIMON))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("not supported yet for the paimon lake format");
+                .doesNotThrowAnyException();
         assertThatThrownBy(
                         () ->
                                 validate(
@@ -555,6 +554,8 @@ class TableDescriptorValidationTest {
         walImage.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
         walImage.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
         assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.PAIMON))
                 .doesNotThrowAnyException();
     }
 
@@ -628,6 +629,8 @@ class TableDescriptorValidationTest {
         versionedTtl.put(ttl, "1 h");
         assertThatCode(() -> validate(pkTableWithProperties(versionedTtl), DataLakeFormat.ICEBERG))
                 .doesNotThrowAnyException();
+        assertThatCode(() -> validate(pkTableWithProperties(versionedTtl), DataLakeFormat.PAIMON))
+                .doesNotThrowAnyException();
         for (KvValueLayout other : Arrays.asList(KvValueLayout.PLAIN, KvValueLayout.TAGGED)) {
             Map<String, String> wrong = new HashMap<>(versionedTtl);
             wrong.put(layout, String.valueOf(other.version()));
@@ -654,6 +657,8 @@ class TableDescriptorValidationTest {
                         .withReplicationFactor(3);
         // by event time too: the leader caps the filter until a late row is tiered
         assertThatCode(() -> validate(eventTimeTable, DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(eventTimeTable, DataLakeFormat.PAIMON))
                 .doesNotThrowAnyException();
         TableInfo dvTable =
                 TableInfo.of(
