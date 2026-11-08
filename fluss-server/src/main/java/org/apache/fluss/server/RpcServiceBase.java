@@ -588,14 +588,20 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
         }
     }
 
+    /**
+     * Refuses a client that cannot read the KV value layout of the table's snapshots: version 1 of
+     * the API reads the tagged layout, version 2 the versioned one too.
+     */
     static void validateKvSnapshotMetadataVersion(short apiVersion, TableInfo tableInfo) {
-        if (apiVersion < 1
-                && KvValueLayout.fromTableConfig(tableInfo.getTableConfig()).hasValueTag()) {
+        KvValueLayout layout = KvValueLayout.fromTableConfig(tableInfo.getTableConfig());
+        int required = layout == KvValueLayout.PLAIN ? 0 : layout == KvValueLayout.TAGGED ? 1 : 2;
+        if (apiVersion < required) {
             throw new UnsupportedVersionException(
                     String.format(
-                            "Client API version %d cannot read tagged KV snapshots for table '%s'. "
-                                    + "Please upgrade your Fluss client to a newer version.",
-                            apiVersion, tableInfo.getTablePath()));
+                            "Client API version %d cannot read the KV snapshots of table '%s',"
+                                    + " whose KV value layout is version %d. Please upgrade your"
+                                    + " Fluss client to a newer version.",
+                            apiVersion, tableInfo.getTablePath(), layout.version()));
         }
     }
 

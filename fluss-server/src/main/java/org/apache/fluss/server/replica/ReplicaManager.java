@@ -22,14 +22,17 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
+import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.HistoricalPartitionThrottledException;
 import org.apache.fluss.exception.InvalidBucketRoutingException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
@@ -69,6 +72,7 @@ import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.entity.TableStatsResultForBucket;
 import org.apache.fluss.rpc.entity.WriteResultForBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
@@ -92,6 +96,8 @@ import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
+import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
@@ -365,7 +371,11 @@ public class ReplicaManager implements ServerReconfigurable {
         this.kvSnapshotResource = KvSnapshotResource.create(serverId, conf, ioExecutor);
         this.kvSnapshotContext =
                 DefaultSnapshotContext.create(
-                        zkClient, completedKvSnapshotCommitter, kvSnapshotResource, conf);
+                        zkClient,
+                        completedKvSnapshotCommitter,
+                        kvSnapshotResource,
+                        conf,
+                        kvManager.getDvRuntime().rebuilds());
         this.remoteLogManager = remoteLogManager;
         this.serverMetricGroup = serverMetricGroup;
         this.userMetrics = userMetrics;
@@ -416,6 +426,11 @@ public class ReplicaManager implements ServerReconfigurable {
 
     public RemoteLogManager getRemoteLogManager() {
         return remoteLogManager;
+    }
+
+    /** The threads of this server's derived deletion vectors. */
+    public DerivedDvRuntime getDvRuntime() {
+        return kvManager.getDvRuntime();
     }
 
     public DefaultSnapshotContext getKvSnapshotContext() {
@@ -1432,6 +1447,13 @@ public class ReplicaManager implements ServerReconfigurable {
                         Replica replica = getReplicaOrException(tb);
                         LogTablet logTablet = replica.getLogTablet();
                         logTablet.updateLakeTableSnapshotId(lakeBucketOffset.getSnapshotId());
+                        // Catch up in the background; only the leader holds DV state.
+                        KvTablet notifiedKv = replica.isLeader() ? replica.getKvTablet() : null;
+                        if (notifiedKv != null && notifiedKv.isDvEnabled()) {
+                            notifiedKv
+                                    .getDvManager()
+                                    .advanceAsync(lakeBucketOffset.getSnapshotId());
+                        }
 
                         lakeBucketOffset
                                 .getLogStartOffset()
@@ -1457,6 +1479,49 @@ public class ReplicaManager implements ServerReconfigurable {
                         responseCallback.accept(new NotifyLakeTableOffsetResponse());
                     }
                 });
+    }
+
+    /**
+     * Returns the leader's KvTablet, or throws NotLeaderOrFollower so the client refreshes its
+     * cached leader instead of retrying this server.
+     */
+    private KvTablet dvLeaderKvTablet(TableBucket tb) {
+        Replica replica = getReplicaOrException(tb);
+        KvTablet kvTablet = replica.getKvTablet();
+        if (!replica.isLeader() || kvTablet == null) {
+            throw new NotLeaderOrFollowerException(
+                    String.format(
+                            "Server %s is not the leader of %s for a deletion-vector request.",
+                            serverId, tb));
+        }
+        if (!kvTablet.isDvEnabled()) {
+            throw new InvalidTableException(
+                    String.format("Deletion vectors are not enabled for the table of %s.", tb));
+        }
+        return kvTablet;
+    }
+
+    /** Returns the positions of the given primary keys in snapshot {@code snapshotId}. */
+    public GetDvSnapshotResponse lookupDvPositions(
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long snapshotId,
+            List<byte[]> keys) {
+        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+        try {
+            List<Object[]> found = dvLeaderKvTablet(tb).getDvManager().lookup(snapshotId, keys);
+            GetDvSnapshotResponse resp = new GetDvSnapshotResponse();
+            for (Object[] f : found) {
+                resp.addKeyPosition().setFilePath((String) f[1]).setPos((Long) f[2]);
+            }
+            return resp;
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to get DV snapshot for " + tb + " snapshot " + snapshotId, e);
+        }
     }
 
     /**

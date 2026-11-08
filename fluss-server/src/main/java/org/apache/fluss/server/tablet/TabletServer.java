@@ -256,6 +256,11 @@ public class TabletServer extends ServerBase {
                             localDiskManager);
             logManager.startup();
 
+            this.ioExecutor =
+                    Executors.newFixedThreadPool(
+                            conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
+                            new ExecutorThreadFactory("tablet-server-io"));
+
             this.kvManager =
                     KvManager.create(
                             conf,
@@ -263,7 +268,8 @@ public class TabletServer extends ServerBase {
                             logManager,
                             tabletServerMetricGroup,
                             localDiskManager,
-                            clock);
+                            clock,
+                            ioExecutor);
             kvManager.startup();
 
             this.authorizer = AuthorizerLoader.createAuthorizer(conf, zkClient, pluginManager);
@@ -282,10 +288,6 @@ public class TabletServer extends ServerBase {
                             rpcClient,
                             CoordinatorGateway.class);
 
-            this.ioExecutor =
-                    Executors.newFixedThreadPool(
-                            conf.get(ConfigOptions.SERVER_IO_POOL_SIZE),
-                            new ExecutorThreadFactory("tablet-server-io"));
             this.replicaStateChangeExecutor =
                     Executors.newSingleThreadExecutor(
                             new ExecutorThreadFactory("tablet-server-replica-state-change"));

@@ -36,34 +36,67 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * The tag is an opaque signed 64-bit value whose semantics are defined by the producer and consumer
  * of the selected layout. Its byte order follows FRocksDB's native {@code DeserializeTimestamp}
  * contract, which reads the eight-byte value most-significant byte first.
+ *
+ * <p>VERSIONED (version 3): {@code [big-endian long version offset][big-endian long TTL
+ * timestamp][little-endian schema id][BinaryRow payload]}. Two fixed slots with fixed meanings, for
+ * a table with deletion vectors and row TTL: the version offset is the log offset of the change
+ * that wrote the value, and the TTL timestamp is the time row TTL expires the value by, or {@link
+ * #NEVER_EXPIRE_TIMESTAMP} for a value that never expires. So row TTL and the version offsets do
+ * not share a field, and one read of the value returns both. The TTL timestamp follows the byte
+ * order of the tag, so the native TTL compaction filter reads it at its slot as it reads the tag of
+ * TAGGED at 0.
+ *
+ * <pre>
+ *   byte  0                8                16      18
+ *         +----------------+----------------+-------+------------------+
+ *         | version offset | TTL timestamp  | schema| BinaryRow payload |
+ *         | (BE long)      | (BE long)      | id(LE)|                   |
+ *         +----------------+----------------+-------+------------------+
+ * </pre>
  */
 @Internal
 public final class KvValueLayout {
 
     private static final int SCHEMA_ID_LENGTH = 2;
     private static final int VALUE_TAG_LENGTH = 8;
+    private static final int SLOT_LENGTH = 8;
     private static final int NO_OFFSET = -1;
 
-    public static final KvValueLayout PLAIN = new KvValueLayout(1, 0, 0, 2, NO_OFFSET);
-    public static final KvValueLayout TAGGED = new KvValueLayout(2, 8, 8, 10, 0);
+    /**
+     * The TTL timestamp of a value row TTL never expires: of a table without row TTL, or of a row
+     * whose TTL time column is null. Adding a TTL to it cannot overflow.
+     */
+    public static final long NEVER_EXPIRE_TIMESTAMP = Long.MAX_VALUE / 2;
+
+    public static final KvValueLayout PLAIN =
+            new KvValueLayout(1, 0, 0, 2, NO_OFFSET, NO_OFFSET, NO_OFFSET);
+    public static final KvValueLayout TAGGED =
+            new KvValueLayout(2, 8, 8, 10, 0, NO_OFFSET, NO_OFFSET);
+    public static final KvValueLayout VERSIONED = new KvValueLayout(3, 16, 16, 18, NO_OFFSET, 0, 8);
 
     private final int version;
     private final int valueBodyOffset;
     private final int schemaIdOffset;
     private final int rowPayloadOffset;
     private final int valueTagOffset;
+    private final int versionOffsetSlot;
+    private final int ttlTimestampSlot;
 
     private KvValueLayout(
             int version,
             int valueBodyOffset,
             int schemaIdOffset,
             int rowPayloadOffset,
-            int valueTagOffset) {
+            int valueTagOffset,
+            int versionOffsetSlot,
+            int ttlTimestampSlot) {
         this.version = version;
         this.valueBodyOffset = valueBodyOffset;
         this.schemaIdOffset = schemaIdOffset;
         this.rowPayloadOffset = rowPayloadOffset;
         this.valueTagOffset = valueTagOffset;
+        this.versionOffsetSlot = versionOffsetSlot;
+        this.ttlTimestampSlot = ttlTimestampSlot;
     }
 
     /** Returns the layout for the persisted version. */
@@ -73,6 +106,8 @@ public final class KvValueLayout {
                 return PLAIN;
             case 2:
                 return TAGGED;
+            case 3:
+                return VERSIONED;
             default:
                 throw new IllegalArgumentException(
                         "Unsupported KV value layout version " + version + ".");
@@ -81,7 +116,15 @@ public final class KvValueLayout {
 
     /** Returns the layout persisted in the table config, defaulting to the plain layout. */
     public static KvValueLayout fromTableConfig(TableConfig tableConfig) {
-        return fromVersion(tableConfig.getKvValueLayoutVersion().orElse(PLAIN.version()));
+        if (tableConfig.getKvValueLayoutVersion().isPresent()) {
+            return fromVersion(tableConfig.getKvValueLayoutVersion().get());
+        }
+        if (!tableConfig.isDeletionVectorsEnabled()) {
+            return PLAIN;
+        }
+        // Deletion vectors keep the log offset of each value's version in the tag. Row TTL needs a
+        // field of its own then, which only the versioned layout has.
+        return tableConfig.getKvTTL().isPresent() ? VERSIONED : TAGGED;
     }
 
     /** Returns the persisted version of this layout. */
@@ -117,7 +160,10 @@ public final class KvValueLayout {
         return SCHEMA_ID_LENGTH;
     }
 
-    /** Returns whether the raw KV value has an internal value tag. */
+    /**
+     * Returns whether the raw KV value has an internal value tag, the opaque field of TAGGED. The
+     * slots of VERSIONED have fixed meanings and are read and written by their own methods.
+     */
     public boolean hasValueTag() {
         return valueTagOffset != NO_OFFSET;
     }
@@ -149,6 +195,48 @@ public final class KvValueLayout {
                             + ".");
         }
         return valueLength - rowPayloadOffset;
+    }
+
+    /** Returns whether the raw KV value has a version offset slot. */
+    public boolean hasVersionOffsetSlot() {
+        return versionOffsetSlot != NO_OFFSET;
+    }
+
+    /** Returns the byte offset of the version offset slot. */
+    public int versionOffsetSlot() {
+        checkState(hasVersionOffsetSlot(), "KV value layout does not have a version offset slot.");
+        return versionOffsetSlot;
+    }
+
+    /** Returns whether the raw KV value has a TTL timestamp slot. */
+    public boolean hasTtlTimestampSlot() {
+        return ttlTimestampSlot != NO_OFFSET;
+    }
+
+    /** Returns the byte offset of the TTL timestamp slot. */
+    public int ttlTimestampSlot() {
+        checkState(hasTtlTimestampSlot(), "KV value layout does not have a TTL timestamp slot.");
+        return ttlTimestampSlot;
+    }
+
+    /** Reads the version offset from a raw KV value embedded at the given offset. */
+    public long readVersionOffset(MemorySegment value, int valueOffset) {
+        return value.getLongBigEndian(valueOffset + versionOffsetSlot());
+    }
+
+    /** Writes the version offset to a raw KV value embedded at the given offset. */
+    public void writeVersionOffset(byte[] value, int valueOffset, long versionOffset) {
+        writeLongBigEndian(value, valueOffset + versionOffsetSlot(), versionOffset);
+    }
+
+    /** Reads the TTL timestamp from a raw KV value embedded at the given offset. */
+    public long readTtlTimestamp(MemorySegment value, int valueOffset) {
+        return value.getLongBigEndian(valueOffset + ttlTimestampSlot());
+    }
+
+    /** Writes the TTL timestamp to a raw KV value embedded at the given offset. */
+    public void writeTtlTimestamp(byte[] value, int valueOffset, long ttlTimestamp) {
+        writeLongBigEndian(value, valueOffset + ttlTimestampSlot(), ttlTimestamp);
     }
 
     /** Reads the schema id from a raw KV value. */
@@ -202,18 +290,19 @@ public final class KvValueLayout {
      * producer defines the tag's semantics.
      */
     public void writeValueTag(byte[] value, int valueOffset, long valueTag) {
-        int absoluteValueTagOffset = valueOffset + valueTagOffset();
-        if (absoluteValueTagOffset < 0
-                || absoluteValueTagOffset > value.length - VALUE_TAG_LENGTH) {
+        writeLongBigEndian(value, valueOffset + valueTagOffset(), valueTag);
+    }
+
+    private static void writeLongBigEndian(byte[] value, int offset, long field) {
+        if (offset < 0 || offset > value.length - SLOT_LENGTH) {
             throw new IndexOutOfBoundsException(
-                    "Cannot write value tag at offset "
-                            + absoluteValueTagOffset
+                    "Cannot write an 8-byte field at offset "
+                            + offset
                             + " to value of length "
                             + value.length
                             + ".");
         }
-        long bigEndianValueTag =
-                MemorySegment.LITTLE_ENDIAN ? Long.reverseBytes(valueTag) : valueTag;
-        UnsafeUtils.putLong(value, absoluteValueTagOffset, bigEndianValueTag);
+        UnsafeUtils.putLong(
+                value, offset, MemorySegment.LITTLE_ENDIAN ? Long.reverseBytes(field) : field);
     }
 }

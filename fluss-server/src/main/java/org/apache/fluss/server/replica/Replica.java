@@ -23,6 +23,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
+import org.apache.fluss.exception.IllegalConfigurationException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidTableException;
@@ -35,6 +36,7 @@ import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -65,6 +67,7 @@ import org.apache.fluss.server.kv.KvStateLookupResult;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
+import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
@@ -476,6 +479,27 @@ public final class Replica {
     /** The actual bucket count of the owning table/partition, or null if not yet notified. */
     public @Nullable Integer getRoutingBucketCount() {
         return routingBucketCount;
+    }
+
+    /**
+     * The remote data directory the position index of a table with deletion vectors lives under.
+     * Only such a table needs it, so only its buckets fail if the server has none.
+     */
+    @Nullable
+    private String dvRemoteDataDir() {
+        try {
+            return PositionIndexStore.remoteDataDirOf(tableInfo, snapshotContext::getRemoteDataDir);
+        } catch (IllegalConfigurationException e) {
+            throw new IllegalConfigurationException(
+                    String.format(
+                            "Table %s has deletion vectors, whose position index is kept under the"
+                                    + " remote data directory, but neither '%s' nor '%s' is set on"
+                                    + " this tablet server.",
+                            tableInfo.getTablePath(),
+                            ConfigOptions.REMOTE_DATA_DIR.key(),
+                            ConfigOptions.REMOTE_DATA_DIRS.key()),
+                    e);
+        }
     }
 
     /** The bucket layout epoch of the owning table, or null if not yet notified. */
@@ -976,6 +1000,20 @@ public final class Replica {
                         .advanceHistoricalCleanupOffset(restoreStartOffset);
             }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
+            // Rebuild the position index in the background, so the leader takes writes
+            // meanwhile. Lookups of the bucket are answered as not ready.
+            if (kvTablet.getDvManager() != null) {
+                kvTablet.getDvManager()
+                        .recoverInBackground(
+                                new DerivedDvRecoverySource(
+                                        dvRemoteDataDir(),
+                                        tableInfo,
+                                        tableBucket,
+                                        snapshotContext.getZooKeeperClient(),
+                                        new File(logTablet.getLogDir(), "derived-dv-recovery"),
+                                        snapshotContext.getDvMetadataCache()),
+                                snapshotContext.getDvRebuildLimiter());
+            }
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(

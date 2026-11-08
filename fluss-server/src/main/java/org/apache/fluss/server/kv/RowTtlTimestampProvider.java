@@ -21,6 +21,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 
@@ -30,10 +31,13 @@ import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.types.DataTypeChecks.getPrecision;
 
-/** Provides the timestamp used as the internal KV value tag for row TTL. */
+/**
+ * Provides the timestamp row TTL expires a KV value by: the value tag of the tagged layout, or the
+ * TTL timestamp slot of the versioned layout.
+ */
 final class RowTtlTimestampProvider implements ToLongFunction<BinaryRow> {
 
-    static final long NEVER_EXPIRE_TIMESTAMP_MS = Long.MAX_VALUE / 2;
+    static final long NEVER_EXPIRE_TIMESTAMP_MS = KvValueLayout.NEVER_EXPIRE_TIMESTAMP;
 
     private final TimestampExtractor timestampExtractor;
     private long timestampMs;

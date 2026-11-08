@@ -28,18 +28,23 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.AbstractMetricGroup;
 import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
+import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvFlushScheduler;
@@ -56,6 +61,7 @@ import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.RowType;
@@ -67,6 +73,8 @@ import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -76,8 +84,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -92,6 +102,7 @@ import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
@@ -99,6 +110,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA2;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
+import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
 import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
@@ -111,6 +123,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
+import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -323,6 +336,67 @@ final class ReplicaTest extends ReplicaTestBase {
         // 3. try to append an out of ordered batch as follower
         logReplica.appendRecordsToFollower(genMemoryLogRecordsWithWriterId(DATA1, writerId, 2, 10));
         assertThat(logReplica.getLocalLogEndOffset()).isEqualTo(20);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testDvReplicaWriteAdvancesHighWatermark(boolean rowTtl) throws Exception {
+        TablePath dvTablePath = TablePath.of("test_db_1", "dv_pk_table_" + rowTtl);
+        long dvTableId = rowTtl ? 100011L : 100001L;
+        TableDescriptor dvDescriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(1, "a")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .properties(dvRowTtl(rowTtl))
+                        .build();
+        TableInfo dvTableInfo =
+                TableInfo.of(
+                        dvTablePath, dvTableId, 1, dvDescriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+        // KV recovery loads the table and its schema from ZooKeeper.
+        zkClient.registerTable(
+                dvTablePath,
+                TableRegistration.newTable(
+                        dvTableId, conf.get(ConfigOptions.REMOTE_DATA_DIR), dvDescriptor));
+        zkClient.registerFirstSchema(dvTablePath, DATA1_SCHEMA_PK);
+        TableBucket dvBucket = new TableBucket(dvTableId, 0);
+        Replica dvReplica = makeKvReplica(PhysicalTablePath.of(dvTablePath), dvBucket, dvTableInfo);
+        makeLeaderReplica(dvReplica, dvTablePath, dvBucket, INITIAL_LEADER_EPOCH);
+
+        // The replica must be DV-enabled, otherwise the test proves nothing.
+        assertThat(dvReplica.getTableInfo().isDeletionVectorsEnabled()).isTrue();
+        assertThat(dvReplica.getKvTablet().getDvManager()).isNotNull();
+        assertThat(dvReplica.getKvTablet().getKvValueLayout())
+                .isEqualTo(rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED);
+
+        KvRecordTestUtils.KvRecordFactory kvRecordFactory =
+                KvRecordTestUtils.KvRecordFactory.of(DATA1_ROW_TYPE);
+        KvRecordTestUtils.KvRecordBatchFactory kvRecordBatchFactory =
+                KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+        KvRecordBatch kvRecords =
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1", new Object[] {1, "v1"}));
+
+        LogAppendInfo info = putRecordsToLeader(dvReplica, kvRecords);
+        long leo = dvReplica.getLocalLogEndOffset();
+        long hwm = dvReplica.getLogTablet().getHighWatermark();
+        // The produce ack waits for the high watermark to reach the appended offset. On a
+        // single-replica DV leader it must advance to the log end, or the client write hangs.
+        assertThat(hwm)
+                .as(
+                        "HWM must advance to LEO for a DV write (leo=%s lastOffset=%s)",
+                        leo, info.lastOffset())
+                .isEqualTo(leo);
+
+        // The client's acks=-1 write completes on this gate. If it is not satisfied, the client
+        // retries forever and flush() hangs.
+        org.apache.fluss.utils.types.Tuple2<Boolean, org.apache.fluss.rpc.protocol.Errors> gate =
+                dvReplica.checkEnoughReplicasReachOffset(leo);
+        assertThat(gate.f1)
+                .as("delayed-write gate error must be NONE (was %s)", gate.f1)
+                .isEqualTo(org.apache.fluss.rpc.protocol.Errors.NONE);
+        assertThat(gate.f0).as("delayed-write gate must be satisfied").isTrue();
     }
 
     @Test
@@ -591,6 +665,152 @@ final class ReplicaTest extends ReplicaTestBase {
                 .withSchema(DATA2_ROW_TYPE)
                 .withSchemaGetter(schemaGetter)
                 .isEqualTo(expected);
+    }
+
+    /**
+     * A table with deletion vectors keeps the log offset of each KV value's version, in the value's
+     * tag, or in its version offset slot with row TTL, which names the version a later change
+     * supersedes. A new leader restores the KV from a snapshot and replays the log after it; the
+     * restored values carry the same version offsets, from the snapshot's files and from the
+     * replayed log alike, and later changes name them.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testDvVersionTagsSurviveKvRecovery(boolean rowTtl, @TempDir File snapshotKvTabletDir)
+            throws Exception {
+        TablePath dvTablePath = TablePath.of("test_db_1", "dv_tagged_table_" + rowTtl);
+        long dvTableId = rowTtl ? 100012L : 100002L;
+        TableDescriptor dvDescriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA_PK)
+                        .distributedBy(1, "a")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .properties(dvRowTtl(rowTtl))
+                        .build();
+        TableInfo dvTableInfo =
+                TableInfo.of(
+                        dvTablePath, dvTableId, 1, dvDescriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
+        zkClient.registerTable(
+                dvTablePath,
+                TableRegistration.newTable(
+                        dvTableId, conf.get(ConfigOptions.REMOTE_DATA_DIR), dvDescriptor));
+        zkClient.registerFirstSchema(dvTablePath, DATA1_SCHEMA_PK);
+        TableBucket dvBucket = new TableBucket(dvTableId, 0);
+        PhysicalTablePath dvPath = PhysicalTablePath.of(dvTablePath);
+        TestSnapshotContext context = new TestSnapshotContext(snapshotKvTabletDir.getPath());
+        Replica leader = makeKvReplica(dvPath, dvBucket, context, dvTableInfo);
+        makeLeaderReplica(leader, dvTablePath, dvBucket, INITIAL_LEADER_EPOCH);
+
+        // keys encoded from the rows' primary key, as the KV recovery encodes them from the log
+        KeyEncoder keyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        dvTableInfo.getRowType(),
+                        dvTableInfo.getPhysicalPrimaryKeys(),
+                        dvTableInfo.getTableConfig(),
+                        dvTableInfo.isDefaultBucketKey());
+        // a=1 inserted at 0 and updated (-U at 1, +U at 2), a=2 inserted at 3
+        putRecordsToLeader(
+                leader,
+                dvBatch(
+                        keyEncoder,
+                        new Object[] {1, "a"},
+                        new Object[] {1, "b"},
+                        new Object[] {2, "c"}));
+        context.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        context.testKvSnapshotStore.waitUntilSnapshotComplete(dvBucket, 0);
+        // only in the log after the snapshot: a=2 updated (-U at 4, +U at 5), a=3 inserted at 6
+        putRecordsToLeader(
+                leader, dvBatch(keyEncoder, new Object[] {2, "d"}, new Object[] {3, "e"}));
+        assertThat(versionTags(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
+
+        // as a follower the replica drops its KV; as the leader again it restores the snapshot and
+        // replays its local log after it
+        KvTablet before = leader.getKvTablet();
+        leader.makeFollower(dvLeaderAndIsr(dvPath, dvBucket, 1));
+        assertThat(leader.getKvTablet()).isNull();
+        makeLeaderReplica(leader, dvTablePath, dvBucket, 2);
+        assertThat(leader.getKvTablet()).isNotSameAs(before);
+        assertThat(leader.getLocalLogEndOffset()).isEqualTo(7L);
+        assertThat(leader.getKvTablet().getKvValueLayout())
+                .isEqualTo(rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED);
+        assertThat(versionTags(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
+
+        // after the restore: a=1 updated (-U at 7, +U at 8), a=4 inserted at 9, a=3 deleted at
+        // 10; a second snapshot holds them, then a=4 is updated (-U at 11, +U at 12) in the log
+        putRecordsToLeader(
+                leader, dvBatch(keyEncoder, new Object[] {1, "f"}, new Object[] {4, "g"}));
+        putRecordsToLeader(leader, dvDeleteBatch(keyEncoder, 3));
+        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 9L);
+        context.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        context.testKvSnapshotStore.waitUntilSnapshotComplete(dvBucket, 1);
+        putRecordsToLeader(leader, dvBatch(keyEncoder, new Object[] {4, "h"}));
+        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 12L);
+
+        leader.makeFollower(dvLeaderAndIsr(dvPath, dvBucket, 3));
+        makeLeaderReplica(leader, dvTablePath, dvBucket, 4);
+        assertThat(leader.getLocalLogEndOffset()).isEqualTo(13L);
+        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 12L);
+    }
+
+    /** The table properties of row TTL, long enough that no value expires during a test. */
+    private static Map<String, String> dvRowTtl(boolean rowTtl) {
+        Map<String, String> properties = new HashMap<>();
+        if (rowTtl) {
+            properties.put(ConfigOptions.TABLE_KV_TTL.key(), "1 d");
+            properties.put(
+                    ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                    String.valueOf(KvValueLayout.VERSIONED.version()));
+        }
+        return properties;
+    }
+
+    private static KvRecordBatch dvDeleteBatch(KeyEncoder keyEncoder, int... keys)
+            throws Exception {
+        KvRecordTestUtils.KvRecordFactory factory =
+                KvRecordTestUtils.KvRecordFactory.of(DATA1_ROW_TYPE);
+        List<KvRecord> records = new ArrayList<>();
+        for (int a : keys) {
+            records.add(factory.ofRecord(keyEncoder.encodeKey(row(a, "")), null));
+        }
+        return KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID).ofRecords(records);
+    }
+
+    private static KvRecordBatch dvBatch(KeyEncoder keyEncoder, Object[]... rows) throws Exception {
+        KvRecordTestUtils.KvRecordFactory factory =
+                KvRecordTestUtils.KvRecordFactory.of(DATA1_ROW_TYPE);
+        List<KvRecord> records = new ArrayList<>();
+        for (Object[] r : rows) {
+            records.add(factory.ofRecord(keyEncoder.encodeKey(row(r)), r));
+        }
+        return KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID).ofRecords(records);
+    }
+
+    private static List<Long> versionTags(Replica replica, KeyEncoder keyEncoder, int... keys)
+            throws IOException {
+        KvTablet kv = checkNotNull(replica.getKvTablet());
+        List<Long> tags = new ArrayList<>();
+        for (int a : keys) {
+            tags.add(kv.versionOffset(keyEncoder.encodeKey(row(a, ""))));
+        }
+        return tags;
+    }
+
+    private static NotifyLeaderAndIsrData dvLeaderAndIsr(
+            PhysicalTablePath path, TableBucket bucket, int leaderEpoch) {
+        return new NotifyLeaderAndIsrData(
+                path,
+                bucket,
+                Collections.singletonList(TABLET_SERVER_ID),
+                new LeaderAndIsr(
+                        TABLET_SERVER_ID,
+                        leaderEpoch,
+                        Collections.singletonList(TABLET_SERVER_ID),
+                        Collections.emptyList(),
+                        INITIAL_COORDINATOR_EPOCH,
+                        leaderEpoch),
+                3,
+                0L);
     }
 
     @Test

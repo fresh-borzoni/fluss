@@ -1087,10 +1087,17 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         String.valueOf(CURRENT_KV_FORMAT_VERSION));
             }
 
+            // Row TTL tags a value with its time; deletion vectors tag it with the log offset of
+            // its version. Both together take the versioned layout, which has a slot for each.
+            boolean rowTtl = newTableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent();
+            boolean deletionVectors =
+                    newTableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
             int layoutVersion =
-                    newTableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent()
-                            ? KvValueLayout.TAGGED.version()
-                            : KvValueLayout.PLAIN.version();
+                    rowTtl && deletionVectors
+                            ? KvValueLayout.VERSIONED.version()
+                            : rowTtl || deletionVectors
+                                    ? KvValueLayout.TAGGED.version()
+                                    : KvValueLayout.PLAIN.version();
             newProperties.put(
                     ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
                     String.valueOf(layoutVersion));
@@ -1598,7 +1605,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         }
 
         if (request.hasRequestTable() && request.isRequestTable()) {
-            LakeTieringTableInfo lakeTieringTableInfo = lakeTableTieringManager.requestTable();
+            // A tiering service that does not declare it supports deletion vectors predates
+            // them, and gets no table with deletion vectors.
+            LakeTieringTableInfo lakeTieringTableInfo =
+                    lakeTableTieringManager.requestTable(
+                            request.hasSupportsDeletionVectors()
+                                    && request.isSupportsDeletionVectors());
             if (lakeTieringTableInfo != null) {
                 heartbeatResponse
                         .setTieringTable()

@@ -50,7 +50,7 @@ class ApiKeysTest {
 
     @Test
     void testSnapshotMetadataSupportsLayoutAwareClient() {
-        assertThat(ApiKeys.GET_KV_SNAPSHOT_METADATA.highestSupportedVersion).isEqualTo((short) 1);
+        assertThat(ApiKeys.GET_KV_SNAPSHOT_METADATA.highestSupportedVersion).isEqualTo((short) 2);
     }
 
     @Test

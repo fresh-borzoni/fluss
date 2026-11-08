@@ -540,12 +540,105 @@ class LakeTableTieringManagerTest {
         assertThat(tableTieringManager.requestTable()).isNull();
     }
 
+    /**
+     * A tiering service that does not declare it tiers tables with deletion vectors never gets one:
+     * it would commit their rows without deletes. Such a table stays pending for a service that
+     * does, while other tables are handed out.
+     */
+    @Test
+    void testTablesWithDeletionVectorsAreHandedOnlyToServicesThatTierThem() {
+        long dvTableId = 1L;
+        TablePath dvTablePath = TablePath.of("db", "dv_table");
+        tableTieringManager.addNewLakeTable(
+                createTableInfo(dvTableId, dvTablePath, Duration.ofSeconds(10), true));
+        long tableId = 2L;
+        TablePath tablePath = TablePath.of("db", "table");
+        tableTieringManager.addNewLakeTable(
+                createTableInfo(tableId, tablePath, Duration.ofSeconds(10), false));
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        waitUntilPending(dvTableId);
+        waitUntilPending(tableId);
+
+        // a service without the capability gets the other table only
+        assertThat(tableTieringManager.requestTable())
+                .isEqualTo(new LakeTieringTableInfo(tableId, tablePath, 1));
+        assertThat(tableTieringManager.requestTable()).isNull();
+        assertThat(tableTieringManager.getTableState(dvTableId))
+                .isEqualTo(LakeTableTieringManager.TieringState.Pending);
+
+        // a service that supports them gets it
+        assertThat(tableTieringManager.requestTable(true))
+                .isEqualTo(new LakeTieringTableInfo(dvTableId, dvTablePath, 1));
+        assertThat(tableTieringManager.requestTable(true)).isNull();
+    }
+
+    /**
+     * A round assigned before a table's datalake was disabled and enabled again is fenced: the
+     * table's epochs go on from where they were, instead of starting over.
+     */
+    @Test
+    void testTieringEpochGrowsAcrossDisableAndEnable() {
+        long tableId = 1L;
+        TablePath tablePath = TablePath.of("db", "table");
+        TableInfo tableInfo = createTableInfo(tableId, tablePath, Duration.ofSeconds(10));
+        tableTieringManager.addNewLakeTable(tableInfo);
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        assertRequestTable(tableId, tablePath, 1);
+
+        tableTieringManager.disableLakeTable(tableId);
+        tableTieringManager.addNewLakeTable(tableInfo);
+        // the round of epoch 1 is fenced, also while the table waits for its next round
+        assertThatThrownBy(() -> tableTieringManager.validateTieringEpoch(tableId, 1))
+                .isInstanceOf(FencedTieringEpochException.class);
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        assertRequestTable(tableId, tablePath, 3);
+        assertThatThrownBy(
+                        () ->
+                                tableTieringManager.finishTableTiering(
+                                        tableId, 1, false, TieringStats.UNKNOWN))
+                .isInstanceOf(FencedTieringEpochException.class);
+
+        // a dropped table's epochs are forgotten; its id is not used again
+        tableTieringManager.removeLakeTable(tableId);
+        tableTieringManager.addNewLakeTable(tableInfo);
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        assertRequestTable(tableId, tablePath, 1);
+    }
+
+    /**
+     * A table whose datalake is disabled while it is pending and enabled again is handed out once,
+     * under its new epoch, though its old entry is still queued.
+     */
+    @Test
+    void testTableReEnabledWhilePendingIsHandedOutOnce() {
+        long tableId = 1L;
+        TablePath tablePath = TablePath.of("db", "table");
+        TableInfo tableInfo = createTableInfo(tableId, tablePath, Duration.ofSeconds(10));
+        tableTieringManager.addNewLakeTable(tableInfo);
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        waitUntilPending(tableId);
+
+        tableTieringManager.disableLakeTable(tableId);
+        tableTieringManager.addNewLakeTable(tableInfo);
+        // the old entry is not handed out while the table waits for its freshness
+        assertThat(tableTieringManager.requestTable()).isNull();
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        assertRequestTable(tableId, tablePath, 3);
+        assertThat(tableTieringManager.requestTable()).isNull();
+    }
+
     private TableInfo createTableInfo(long tableId, TablePath tablePath, Duration freshness) {
+        return createTableInfo(tableId, tablePath, freshness, false);
+    }
+
+    private TableInfo createTableInfo(
+            long tableId, TablePath tablePath, Duration freshness, boolean deletionVectors) {
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
                         .schema(Schema.newBuilder().column("c1", DataTypes.INT()).build())
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, freshness)
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, deletionVectors)
                         .distributedBy(1)
                         .build();
 
@@ -557,6 +650,17 @@ class LakeTableTieringManagerTest {
                 remoteDataDir,
                 System.currentTimeMillis(),
                 System.currentTimeMillis());
+    }
+
+    private void waitUntilPending(long tableId) {
+        waitValue(
+                () ->
+                        tableTieringManager.getTableState(tableId)
+                                        == LakeTableTieringManager.TieringState.Pending
+                                ? Optional.of(true)
+                                : Optional.empty(),
+                Duration.ofSeconds(10),
+                "Table " + tableId + " is not pending");
     }
 
     private void assertRequestTable(long tableId, TablePath tablePath, long tieredEpoch) {

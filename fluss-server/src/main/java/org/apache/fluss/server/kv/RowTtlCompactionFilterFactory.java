@@ -57,7 +57,21 @@ public final class RowTtlCompactionFilterFactory {
                 currentValueSupplier);
     }
 
-    /** Removes a value when {@code valueTag + expirationDistance <= currentValue}. */
+    /**
+     * The byte offset of the 8-byte big-endian field the filter expires values by: the TTL
+     * timestamp slot of the versioned layout, which keeps the log offset of the value's version in
+     * a slot of its own, else the tag of the tagged layout.
+     */
+    static int expiryFieldOffset(KvValueLayout kvValueLayout) {
+        return kvValueLayout.hasTtlTimestampSlot()
+                ? kvValueLayout.ttlTimestampSlot()
+                : kvValueLayout.valueTagOffset();
+    }
+
+    /**
+     * Removes a value when {@code field + expirationDistance <= currentValue}, where the field is
+     * the value's tag, or its TTL timestamp slot in the versioned layout.
+     */
     static FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory create(
             KvValueLayout kvValueLayout,
             long expirationDistance,
@@ -65,7 +79,9 @@ public final class RowTtlCompactionFilterFactory {
             LongSupplier currentValueSupplier) {
         checkNotNull(kvValueLayout, "kvValueLayout must not be null.");
         checkNotNull(currentValueSupplier, "currentValueSupplier must not be null.");
-        checkArgument(kvValueLayout.hasValueTag(), "Compaction filter requires a tagged layout.");
+        checkArgument(
+                kvValueLayout.hasValueTag() || kvValueLayout.hasTtlTimestampSlot(),
+                "Compaction filter requires a tagged or versioned layout.");
         checkArgument(expirationDistance >= 0L, "Expiration distance must be non-negative.");
         checkArgument(
                 queryCurrentValueAfterNumEntries > 0L,
@@ -78,7 +94,7 @@ public final class RowTtlCompactionFilterFactory {
         factory.configure(
                 FlussTtlCompactionFilter.Config.createNotList(
                         FlussTtlCompactionFilter.StateType.Value,
-                        kvValueLayout.valueTagOffset(),
+                        expiryFieldOffset(kvValueLayout),
                         expirationDistance,
                         queryCurrentValueAfterNumEntries));
         return factory;

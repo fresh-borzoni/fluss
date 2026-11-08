@@ -542,6 +542,9 @@ class TableDescriptorValidationTest {
                 Arguments.of(KvValueLayout.PLAIN.version(), true, false),
                 Arguments.of(KvValueLayout.TAGGED.version(), true, true),
                 Arguments.of(KvValueLayout.TAGGED.version(), false, false),
+                // the versioned layout is for tables with deletion vectors and row TTL only
+                Arguments.of(KvValueLayout.VERSIONED.version(), true, false),
+                Arguments.of(KvValueLayout.VERSIONED.version(), false, false),
                 Arguments.of(999, true, false));
     }
 

@@ -75,6 +75,62 @@ class RowTtlCompactionFilterTest {
         }
     }
 
+    /**
+     * In the versioned layout the filter reads the TTL timestamp slot, not the version offset slot
+     * before it: a value with a small version offset and a fresh timestamp stays, and one with a
+     * large version offset and an old timestamp goes. A value without row TTL never expires.
+     */
+    @Test
+    void testFlussTtlCompactionFilterReadsTheTtlSlotOfVersionedValue() throws Exception {
+        byte[] expiredKey = "expired-key".getBytes(StandardCharsets.UTF_8);
+        byte[] freshKey = "fresh-key".getBytes(StandardCharsets.UTF_8);
+        byte[] neverKey = "never-key".getBytes(StandardCharsets.UTF_8);
+        BinaryRow row = compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        long now = 123456789L;
+        assertThat(RowTtlCompactionFilterFactory.expiryFieldOffset(KvValueLayout.VERSIONED))
+                .isEqualTo(8);
+        assertThat(RowTtlCompactionFilterFactory.expiryFieldOffset(KvValueLayout.TAGGED))
+                .isEqualTo(0);
+
+        try (FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory filterFactory =
+                        RowTtlCompactionFilterFactory.create(
+                                KvValueLayout.VERSIONED,
+                                Duration.ofHours(1L),
+                                new ManualClock(now));
+                DBOptions dbOptions = new DBOptions().setCreateIfMissing(true);
+                ColumnFamilyOptions cfOptions =
+                        new ColumnFamilyOptions().setCompactionFilterFactory(filterFactory);
+                RocksDBHandle handle = new RocksDBHandle(tempDir.toFile(), dbOptions, cfOptions);
+                FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            handle.openDB();
+            // an old timestamp behind a large version offset, a fresh one behind offset 0
+            handle.getDb()
+                    .put(
+                            expiredKey,
+                            ValueEncoder.forLayout(
+                                            KvValueLayout.VERSIONED,
+                                            ignored -> now - Duration.ofHours(2L).toMillis())
+                                    .encodeValue(new BinaryValue(DEFAULT_SCHEMA_ID, row), now));
+            handle.getDb()
+                    .put(
+                            freshKey,
+                            ValueEncoder.forLayout(KvValueLayout.VERSIONED, ignored -> now)
+                                    .encodeValue(new BinaryValue(DEFAULT_SCHEMA_ID, row), 0L));
+            handle.getDb()
+                    .put(
+                            neverKey,
+                            ValueEncoder.forLayout(KvValueLayout.VERSIONED)
+                                    .encodeValue(new BinaryValue(DEFAULT_SCHEMA_ID, row), 0L));
+            handle.getDb().flush(flushOptions);
+
+            handle.getDb().compactRange();
+
+            assertThat(handle.getDb().get(expiredKey)).isNull();
+            assertThat(handle.getDb().get(freshKey)).isNotNull();
+            assertThat(handle.getDb().get(neverKey)).isNotNull();
+        }
+    }
+
     @Test
     void testCreateRejectsInvalidTtlDuration() {
         assertThatThrownBy(
