@@ -137,7 +137,8 @@ public class TieringSource<WriteResult>
                 sourceReaderContext,
                 connection,
                 lakeTieringFactory,
-                getLakeTieringIoTmpDirs(lakeTieringConfig, sourceReaderContext.getConfiguration()));
+                getLakeTieringIoTmpDirs(lakeTieringConfig, sourceReaderContext.getConfiguration()),
+                lakeTieringConfig);
     }
 
     /** This follows the operator uid hash generation logic of flink {@link StreamGraphHasherV2}. */

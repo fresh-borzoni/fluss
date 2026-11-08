@@ -25,6 +25,7 @@ import org.apache.fluss.lake.iceberg.utils.IcebergPartitionSpecUtils;
 import org.apache.fluss.lake.source.Planner;
 import org.apache.fluss.metadata.TablePath;
 
+import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.Table;
@@ -141,10 +142,17 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         return result;
     }
 
-    private Function<FileScanTask, Integer> createBucketExtractor(Table table) {
+    /** Returns the Fluss bucket of a task's data file, or -1 if the table has none. */
+    public static Function<FileScanTask, Integer> createBucketExtractor(Table table) {
+        Function<ContentFile<?>, Integer> ofFile = createFileBucketExtractor(table);
+        return task -> ofFile.apply(task.file());
+    }
+
+    /** Returns the Fluss bucket of a data file, or -1 if the table has none. */
+    public static Function<ContentFile<?>, Integer> createFileBucketExtractor(Table table) {
         List<PartitionField> partitionFields = table.spec().fields();
         if (partitionFields.isEmpty()) {
-            return task -> -1;
+            return file -> -1;
         }
 
         // Only a bucket(bucketKey) transform carries a physical bucket value in the partition
@@ -152,15 +160,22 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
         // A legacy identity(__bucket) partition or a bucket-unaware user partition has none.
         int bucketFieldIndex = partitionFields.size() - 1;
         if (!IcebergPartitionSpecUtils.isBucketTransform(partitionFields.get(bucketFieldIndex))) {
-            return task -> -1;
+            return file -> -1;
         }
-        return task -> task.file().partition().get(bucketFieldIndex, Integer.class);
+        return file -> file.partition().get(bucketFieldIndex, Integer.class);
     }
 
-    private Function<FileScanTask, List<String>> createPartitionExtractor(Table table) {
+    /** Returns the Fluss partition values of a task's data file. */
+    public static Function<FileScanTask, List<String>> createPartitionExtractor(Table table) {
+        Function<ContentFile<?>, List<String>> ofFile = createFilePartitionExtractor(table);
+        return task -> ofFile.apply(task.file());
+    }
+
+    /** Returns the Fluss partition values of a data file. */
+    public static Function<ContentFile<?>, List<String>> createFilePartitionExtractor(Table table) {
         List<PartitionField> partitionFields = table.spec().fields();
         if (partitionFields.isEmpty()) {
-            return task -> Collections.emptyList();
+            return file -> Collections.emptyList();
         }
 
         // The trailing field is the Fluss bucket (legacy identity(__bucket) or a bucket(bucketKey)
@@ -172,14 +187,14 @@ public class IcebergSplitPlanner implements Planner<IcebergSplit> {
                         : partitionFields.size();
 
         if (partitionColCount == 0) {
-            return task -> Collections.emptyList();
+            return file -> Collections.emptyList();
         }
         List<Integer> partitionFieldIndices =
                 IntStream.range(0, partitionColCount).boxed().collect(Collectors.toList());
-        return task ->
+        return file ->
                 partitionFieldIndices.stream()
                         // since currently, only string partition is supported
-                        .map(index -> task.partition().get(index, String.class))
+                        .map(index -> file.partition().get(index, String.class))
                         .collect(Collectors.toList());
     }
 }

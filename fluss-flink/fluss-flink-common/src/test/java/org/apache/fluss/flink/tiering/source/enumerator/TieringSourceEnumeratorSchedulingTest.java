@@ -108,6 +108,27 @@ class TieringSourceEnumeratorSchedulingTest {
         }
     }
 
+    /**
+     * The coordinator hands tables with deletion vectors only to tiering services that declare they
+     * tier them; this one does, in every request for a table.
+     */
+    @Test
+    void testTableRequestsDeclareDeletionVectorSupport() throws Throwable {
+        try (Fixture fixture = new Fixture()) {
+            fixture.addTable(1, false);
+            fixture.requestTable();
+            fixture.requestTable();
+
+            assertThat(fixture.claims())
+                    .isNotEmpty()
+                    .allSatisfy(
+                            claim -> {
+                                assertThat(claim.hasSupportsDeletionVectors()).isTrue();
+                                assertThat(claim.isSupportsDeletionVectors()).isTrue();
+                            });
+        }
+    }
+
     @Test
     void testEmptyTablesShareContinuationAndAdvance() throws Throwable {
         try (Fixture fixture = new Fixture()) {

@@ -22,6 +22,8 @@ import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.utils.CloseableIterator;
 
+import javax.annotation.Nullable;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -31,8 +33,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-/** A testing implementation of {@link LakeSource}. */
-public class TestingLakeSource implements LakeSource<LakeSplit> {
+/**
+ * A testing implementation of {@link LakeSource}. As a lake with deletion vectors, it plans no
+ * rewrites.
+ */
+public class TestingLakeSource
+        implements LakeSource<LakeSplit>, SupportsRewritePlanning<LakeSplit> {
 
     private static final long serialVersionUID = 1L;
 
@@ -175,5 +181,12 @@ public class TestingLakeSource implements LakeSource<LakeSplit> {
                 }
             }
         };
+    }
+
+    @Nullable
+    @Override
+    public DataDeltaPlan<LakeSplit> planRewrite(
+            long baseSnapshotId, @Nullable Long targetSnapshotId) {
+        return null;
     }
 }

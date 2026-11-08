@@ -26,6 +26,7 @@ import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.RecordReaders;
 import org.apache.fluss.lake.source.SortedRecordReader;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
@@ -33,6 +34,8 @@ import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.KeyValueRow;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.ExceptionUtils;
+import org.apache.fluss.utils.IOUtils;
 
 import javax.annotation.Nullable;
 
@@ -140,23 +143,22 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
             return;
         }
 
-        List<RecordReader> recordReaders = new ArrayList<>();
-        if (lakeSplits == null || lakeSplits.isEmpty()) {
-            // pass null split to get rowComparator
-            recordReaders.add(lakeSource.createRecordReader(sortedReaderContext(null)));
-        } else {
-            for (LakeSplit lakeSplit : lakeSplits) {
-                recordReaders.add(lakeSource.createRecordReader(sortedReaderContext(lakeSplit)));
-            }
-        }
-        for (RecordReader reader : recordReaders) {
-            if (reader instanceof SortedRecordReader) {
-                rowComparator = ((SortedRecordReader) reader).order();
-            } else {
+        // pass null split to get rowComparator
+        List<LakeSplit> splits =
+                lakeSplits == null || lakeSplits.isEmpty()
+                        ? Collections.singletonList(null)
+                        : lakeSplits;
+        // Each reader is read once created; its records' iterator owns it, and close() closes the
+        // iterators.
+        for (LakeSplit lakeSplit : splits) {
+            RecordReader reader = lakeSource.createRecordReader(sortedReaderContext(lakeSplit));
+            if (!(reader instanceof SortedRecordReader)) {
+                IOUtils.closeQuietly(reader);
                 throw new UnsupportedOperationException(
                         "lake records must instance of sorted view.");
             }
-            lakeRecordIterators.add(reader.read());
+            rowComparator = ((SortedRecordReader) reader).order();
+            lakeRecordIterators.add(RecordReaders.read(reader));
         }
         lakeRecordIteratorsInitialized = true;
     }
@@ -197,17 +199,26 @@ public class LakeSnapshotAndLogSplitScanner implements BatchScanner {
 
     @Override
     public void close() throws IOException {
+        Exception failure = null;
         try {
             if (logScanner != null) {
                 logScanner.close();
             }
-            if (lakeRecordIterators != null) {
-                for (CloseableIterator<LogRecord> iterator : lakeRecordIterators) {
+        } catch (Exception e) {
+            failure = e;
+        }
+        if (lakeRecordIterators != null) {
+            // each closes its lake reader; all are closed even if one fails
+            for (CloseableIterator<LogRecord> iterator : lakeRecordIterators) {
+                try {
                     iterator.close();
+                } catch (Exception e) {
+                    failure = ExceptionUtils.firstOrSuppressed(e, failure);
                 }
             }
-        } catch (Exception e) {
-            throw new IOException("Failed to close resources", e);
+        }
+        if (failure != null) {
+            throw new IOException("Failed to close resources", failure);
         }
     }
 }

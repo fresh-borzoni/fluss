@@ -19,6 +19,7 @@ package org.apache.fluss.flink.tiering.source;
 
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringSplit;
+import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
@@ -27,6 +28,10 @@ import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * The serializer for {@link TableBucketWriteResult}.
@@ -39,10 +44,12 @@ import java.io.IOException;
  *   <li><b>Version 2:</b> Persists the version of the lake write result serializer before the write
  *       result bytes and passes it to the lake serializer on deserialization, so that lake formats
  *       can evolve their write result format independently.
- *   <li><b>Version 3 (Current):</b> Appends, after the number of write results, whether the
- *       bucket's round ended before the end of its split ({@link
- *       TableBucketWriteResult#endedEarly()}) and the tiering epoch of the round ({@link
- *       TableBucketWriteResult#tieringEpoch()}).
+ *   <li><b>Version 3 (Current):</b> Appends, after the number of write results and in the order
+ *       they were added, the tiering epoch of the round ({@link
+ *       TableBucketWriteResult#tieringEpoch()}), whether the bucket's round ended before the end of
+ *       its split ({@link TableBucketWriteResult#endedEarly()}) and the optional deletion-vector
+ *       {@link RowPosResult} (index change id, re-index split, new file dictionary entries, SST
+ *       metas and the failure of the split, if any).
  * </ul>
  */
 public class TableBucketWriteResultSerializer<WriteResult>
@@ -56,6 +63,9 @@ public class TableBucketWriteResultSerializer<WriteResult>
     private static final int VERSION_3 = 3;
 
     private static final int CURRENT_VERSION = VERSION_3;
+
+    // a failure message is cut to fit a UTF string of at most 64 KB
+    private static final int MAX_FAILURE_CHARS = 16_000;
 
     private final org.apache.fluss.lake.serializer.SimpleVersionedSerializer<WriteResult>
             writeResultSerializer;
@@ -116,8 +126,40 @@ public class TableBucketWriteResultSerializer<WriteResult>
         out.writeInt(tableBucketWriteResult.numberOfWriteResults());
 
         // since VERSION_3
-        out.writeBoolean(tableBucketWriteResult.endedEarly());
         out.writeLong(tableBucketWriteResult.tieringEpoch());
+        out.writeBoolean(tableBucketWriteResult.endedEarly());
+
+        // serialize the optional RowPosResult, since VERSION_3
+        RowPosResult rowPosResult = tableBucketWriteResult.getRowPosResult();
+        if (rowPosResult != null) {
+            out.writeBoolean(true);
+            out.writeLong(rowPosResult.getChangeId());
+            out.writeInt(rowPosResult.getSplit());
+            // serialize newFileDictEntries
+            Map<Integer, String> newFileDictEntries = rowPosResult.getNewFileDictEntries();
+            out.writeInt(newFileDictEntries.size());
+            for (Map.Entry<Integer, String> entry : newFileDictEntries.entrySet()) {
+                out.writeInt(entry.getKey());
+                out.writeUTF(entry.getValue());
+            }
+            // serialize sstMetas
+            List<RowPosResult.SstMeta> sstMetas = rowPosResult.getSstMetas();
+            out.writeInt(sstMetas.size());
+            for (RowPosResult.SstMeta meta : sstMetas) {
+                out.writeUTF(meta.getFileName());
+                out.writeLong(meta.getFileSize());
+            }
+            String failure = rowPosResult.getFailure();
+            out.writeBoolean(failure != null);
+            if (failure != null) {
+                out.writeUTF(
+                        failure.length() > MAX_FAILURE_CHARS
+                                ? failure.substring(0, MAX_FAILURE_CHARS)
+                                : failure);
+            }
+        } else {
+            out.writeBoolean(false);
+        }
 
         final byte[] result = out.getCopyOfBuffer();
         out.clear();
@@ -168,9 +210,34 @@ public class TableBucketWriteResultSerializer<WriteResult>
         // deserialize number of write results
         int numberOfWriteResults = in.readInt();
 
-        boolean endedEarly = version >= VERSION_3 && in.readBoolean();
         long tieringEpoch =
                 version >= VERSION_3 ? in.readLong() : TieringSplit.UNKNOWN_TIERING_EPOCH;
+        boolean endedEarly = version >= VERSION_3 && in.readBoolean();
+
+        // deserialize the optional RowPosResult, present since VERSION_3
+        RowPosResult rowPosResult = null;
+        if (version >= VERSION_3 && in.readBoolean()) {
+            long changeId = in.readLong();
+            int split = in.readInt();
+            // deserialize newFileDictEntries
+            int dictSize = in.readInt();
+            Map<Integer, String> newFileDictEntries = new HashMap<>(dictSize);
+            for (int d = 0; d < dictSize; d++) {
+                int fileId = in.readInt();
+                String fileName = in.readUTF();
+                newFileDictEntries.put(fileId, fileName);
+            }
+            // deserialize sstMetas
+            int sstMetaCount = in.readInt();
+            List<RowPosResult.SstMeta> sstMetas = new ArrayList<>(sstMetaCount);
+            for (int s = 0; s < sstMetaCount; s++) {
+                String sstFileName = in.readUTF();
+                long sstFileSize = in.readLong();
+                sstMetas.add(new RowPosResult.SstMeta(sstFileName, sstFileSize));
+            }
+            String failure = in.readBoolean() ? in.readUTF() : null;
+            rowPosResult = new RowPosResult(changeId, split, newFileDictEntries, sstMetas, failure);
+        }
 
         return new TableBucketWriteResult<>(
                 tablePath,
@@ -180,6 +247,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
+                rowPosResult,
                 endedEarly,
                 tieringEpoch);
     }

@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client.tiering;
 
+import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -60,6 +61,10 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     // for the round of tiering is finished
     private final int numberOfWriteResults;
 
+    // the re-index result this record carries from the reader to the committer, null for a
+    // normal write result
+    @Nullable private final RowPosResult rowPosResult;
+
     // whether the bucket's round ended before the end of its split, because its lake writer held
     // as much as one round may; the next round tiers the rest
     private final boolean endedEarly;
@@ -84,6 +89,27 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
+                null);
+    }
+
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            @Nullable RowPosResult rowPosResult) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                rowPosResult,
                 false);
     }
 
@@ -95,6 +121,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             long logEndOffset,
             long maxTimestamp,
             int numberOfWriteResults,
+            @Nullable RowPosResult rowPosResult,
             boolean endedEarly) {
         this(
                 tablePath,
@@ -104,6 +131,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
+                rowPosResult,
                 endedEarly,
                 TieringSplit.UNKNOWN_TIERING_EPOCH);
     }
@@ -116,6 +144,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             long logEndOffset,
             long maxTimestamp,
             int numberOfWriteResults,
+            @Nullable RowPosResult rowPosResult,
             boolean endedEarly,
             long tieringEpoch) {
         this.tablePath = tablePath;
@@ -125,6 +154,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
         this.logEndOffset = logEndOffset;
         this.maxTimestamp = maxTimestamp;
         this.numberOfWriteResults = numberOfWriteResults;
+        this.rowPosResult = rowPosResult;
         this.endedEarly = endedEarly;
         this.tieringEpoch = tieringEpoch;
     }
@@ -141,6 +171,7 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                         logEndOffset,
                         maxTimestamp,
                         numberOfWriteResults,
+                        rowPosResult,
                         endedEarly,
                         tieringEpoch);
     }
@@ -173,6 +204,17 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
 
     public long maxTimestamp() {
         return maxTimestamp;
+    }
+
+    /** Returns whether this write result carries a re-index result. */
+    public boolean isRowPosResult() {
+        return rowPosResult != null;
+    }
+
+    /** Returns the re-index result, or null for a normal write result. */
+    @Nullable
+    public RowPosResult getRowPosResult() {
+        return rowPosResult;
     }
 
     /**

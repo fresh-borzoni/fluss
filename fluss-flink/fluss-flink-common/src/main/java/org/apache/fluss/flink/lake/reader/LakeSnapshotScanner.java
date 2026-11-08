@@ -21,6 +21,7 @@ import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.RecordReaders;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.utils.CloseableIterator;
@@ -48,13 +49,13 @@ public class LakeSnapshotScanner implements BatchScanner {
     @Override
     public CloseableIterator<InternalRow> pollBatch(Duration timeout) throws IOException {
         if (rowsIterator == null) {
+            // the iterator owns the reader and closes it with itself
             rowsIterator =
                     InternalRowIterator.wrap(
-                            lakeSource
-                                    .createRecordReader(
+                            RecordReaders.read(
+                                    lakeSource.createRecordReader(
                                             (LakeSource.ReaderContext<LakeSplit>)
-                                                    lakeSnapshotSplit::getLakeSplit)
-                                    .read());
+                                                    lakeSnapshotSplit::getLakeSplit)));
         }
         return rowsIterator.hasNext() ? rowsIterator : null;
     }

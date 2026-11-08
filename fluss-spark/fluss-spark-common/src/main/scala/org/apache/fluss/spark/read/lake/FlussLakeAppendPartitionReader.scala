@@ -18,7 +18,7 @@
 package org.apache.fluss.spark.read.lake
 
 import org.apache.fluss.config.Configuration
-import org.apache.fluss.lake.source.{LakeSource, LakeSplit}
+import org.apache.fluss.lake.source.{LakeSource, LakeSplit, RecordReaders}
 import org.apache.fluss.metadata.TablePath
 import org.apache.fluss.record.LogRecord
 import org.apache.fluss.spark.read.FlussPartitionReader
@@ -45,9 +45,8 @@ class FlussLakeAppendPartitionReader(
   private def initialize(): Unit = {
     logInfo(s"Reading lake split for table $tablePath $partition")
 
-    recordIterator = lakeSource
-      .createRecordReader(() => partition.lakeSplit)
-      .read()
+    // the iterator owns the reader and closes it with itself
+    recordIterator = RecordReaders.read(lakeSource.createRecordReader(() => partition.lakeSplit))
   }
 
   override lazy val projectedRowType: RowType = rowType.project(projection)
