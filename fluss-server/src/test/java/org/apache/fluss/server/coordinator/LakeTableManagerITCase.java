@@ -42,6 +42,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateDatabaseRequest;
@@ -50,6 +51,7 @@ import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropDatab
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newGetTableInfoRequest;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -371,6 +373,65 @@ class LakeTableManagerITCase {
         // cleanup
         adminGateway.dropTable(newDropTableRequest(db1, tb1, false)).get();
         adminGateway.dropDatabase(newDropDatabaseRequest(db1, false, true)).get();
+    }
+
+    /**
+     * A round of a table assigned before its datalake was disabled and enabled again must not match
+     * the epoch of a round after it, so the coordinator fences the older round's commits.
+     */
+    @Test
+    void testTieringEpochGrowsAcrossDatalakeReEnabling() throws Exception {
+        AdminGateway adminGateway = getAdminGateway();
+        String db = "test_tiering_epoch_reenable_db";
+        TablePath tablePath = TablePath.of(db, "tb1");
+        adminGateway.createDatabase(newCreateDatabaseRequest(db, false)).get();
+        Map<String, String> properties = new HashMap<>();
+        properties.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
+        properties.put(ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(), "100ms");
+        adminGateway
+                .createTable(
+                        newCreateTableRequest(
+                                tablePath, newPkTable().withProperties(properties), false))
+                .get();
+        long tableId =
+                adminGateway.getTableInfo(newGetTableInfoRequest(tablePath)).get().getTableId();
+        LakeTableTieringManager tieringManager =
+                FLUSS_CLUSTER_EXTENSION
+                        .getCoordinatorServer()
+                        .getCoordinatorService()
+                        .getLakeTableTieringManager();
+        long firstEpoch = takeTable(tieringManager, tableId);
+
+        for (String enabled : new String[] {"false", "true"}) {
+            adminGateway
+                    .alterTable(
+                            newAlterTableRequest(
+                                    tablePath,
+                                    Collections.singletonMap(
+                                            ConfigOptions.TABLE_DATALAKE_ENABLED.key(), enabled),
+                                    Collections.emptyList(),
+                                    Collections.emptyList(),
+                                    false))
+                    .get();
+        }
+
+        assertThat(takeTable(tieringManager, tableId)).isGreaterThan(firstEpoch);
+        adminGateway.dropTable(newDropTableRequest(db, "tb1", false)).get();
+        adminGateway.dropDatabase(newDropDatabaseRequest(db, false, true)).get();
+    }
+
+    /** Requests tables to tier until the coordinator hands out the given one; its epoch. */
+    private static long takeTable(LakeTableTieringManager tieringManager, long tableId) {
+        return waitValue(
+                () -> {
+                    LakeTieringTableInfo table = tieringManager.requestTable();
+                    // tables of other tests are left assigned
+                    return table != null && table.tableId() == tableId
+                            ? Optional.of(table.tieringEpoch())
+                            : Optional.empty();
+                },
+                Duration.ofMinutes(1),
+                "The coordinator did not hand out table " + tableId);
     }
 
     private AdminReadOnlyGateway getAdminOnlyGateway(boolean isCoordinatorServer) {

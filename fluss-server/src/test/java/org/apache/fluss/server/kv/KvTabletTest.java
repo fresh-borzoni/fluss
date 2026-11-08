@@ -59,6 +59,7 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.dv.DvTestManagers;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.PreparedFlush;
@@ -110,6 +111,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -131,6 +133,7 @@ import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
+import static org.apache.fluss.utils.function.ThrowingRunnable.unchecked;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -334,7 +337,8 @@ class KvTabletTest {
                     KvManager.getDefaultRateLimiter(),
                     autoIncrementManager,
                     clock,
-                    tableConf);
+                    tableConf,
+                    DvTestManagers.executors());
         }
         return KvTablet.create(
                 tablePath,
@@ -613,6 +617,32 @@ class KvTabletTest {
 
         assertThatCode(kvTablet::drop).doesNotThrowAnyException();
         assertThat(kvTablet.getKvTabletDir()).doesNotExist();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testDvEnabledInsertFlushAndClose(boolean rowTtl) throws Exception {
+        PhysicalTablePath path = PhysicalTablePath.of(TablePath.of("db", "dv_kv"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, path);
+        Map<String, String> conf = new HashMap<>();
+        conf.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        if (rowTtl) {
+            conf.put(ConfigOptions.TABLE_KV_TTL.key(), "1 d");
+        }
+        TableBucket bucket = logTablet.getTableBucket();
+        kvTablet = createKvTablet(path, bucket, logTablet, tmpKvDir, schemaGetter, conf);
+        assertThat(kvTablet.isDvEnabled()).isTrue();
+        // an insert is appended and flushed, then closing also closes the DV RocksDB
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        KvRecordTestUtils.KvRecordFactory.of(DATA1_SCHEMA_PK.getRowType())
+                                .ofRecord("k1".getBytes(), new Object[] {1, "v1"})),
+                null);
+        assertThat(logTablet.localLogEndOffset()).isGreaterThan(0L);
+        flushAndWait(kvTablet, logTablet.localLogEndOffset());
+        assertThat(CompletableFuture.runAsync(unchecked(kvTablet::close), executor))
+                .succeedsWithin(Duration.ofSeconds(15));
     }
 
     @Test

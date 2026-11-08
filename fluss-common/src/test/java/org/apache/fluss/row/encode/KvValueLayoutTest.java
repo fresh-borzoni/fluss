@@ -17,6 +17,9 @@
 
 package org.apache.fluss.row.encode;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.record.BinaryValue;
@@ -25,6 +28,8 @@ import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.utils.ByteArraySlice;
 
 import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
 
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
@@ -40,9 +45,121 @@ class KvValueLayoutTest {
     void testLayoutVersionMapping() {
         assertThat(KvValueLayout.fromVersion(1)).isSameAs(KvValueLayout.PLAIN);
         assertThat(KvValueLayout.fromVersion(2)).isSameAs(KvValueLayout.TAGGED);
-        assertThatThrownBy(() -> KvValueLayout.fromVersion(3))
+        assertThat(KvValueLayout.fromVersion(3)).isSameAs(KvValueLayout.VERSIONED);
+        assertThatThrownBy(() -> KvValueLayout.fromVersion(4))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Unsupported KV value layout version 3");
+                .hasMessageContaining("Unsupported KV value layout version 4");
+    }
+
+    /**
+     * A table with deletion vectors that does not persist a layout version takes the tagged layout,
+     * or the versioned one with row TTL; a persisted version wins.
+     */
+    @Test
+    void testLayoutOfTablesWithDeletionVectors() {
+        assertThat(KvValueLayout.fromTableConfig(dvTableConfig(false, null)))
+                .isSameAs(KvValueLayout.TAGGED);
+        assertThat(KvValueLayout.fromTableConfig(dvTableConfig(true, null)))
+                .isSameAs(KvValueLayout.VERSIONED);
+        assertThat(KvValueLayout.fromTableConfig(dvTableConfig(true, 3)))
+                .isSameAs(KvValueLayout.VERSIONED);
+        assertThat(KvValueLayout.fromTableConfig(dvTableConfig(false, 2)))
+                .isSameAs(KvValueLayout.TAGGED);
+        assertThat(KvValueLayout.fromTableConfig(new TableConfig(new Configuration())))
+                .isSameAs(KvValueLayout.PLAIN);
+    }
+
+    private static TableConfig dvTableConfig(boolean rowTtl, Integer layoutVersion) {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        if (rowTtl) {
+            conf.set(ConfigOptions.TABLE_KV_TTL, Duration.ofHours(1));
+        }
+        if (layoutVersion != null) {
+            conf.set(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION, layoutVersion);
+        }
+        return new TableConfig(conf);
+    }
+
+    /**
+     * The versioned layout keeps the version offset and the TTL timestamp in two fixed slots before
+     * the schema id, both big-endian. One value carries both; the RPC value body is the plain
+     * value.
+     */
+    @Test
+    void testVersionedLayoutKeepsVersionOffsetAndTtlTimestamp() {
+        BinaryRow row = compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
+        BinaryValue binaryValue = new BinaryValue(DEFAULT_SCHEMA_ID, row);
+        KvValueLayout layout = KvValueLayout.VERSIONED;
+        assertThat(layout.version()).isEqualTo(3);
+        assertThat(layout.versionOffsetSlot()).isEqualTo(0);
+        assertThat(layout.ttlTimestampSlot()).isEqualTo(8);
+        assertThat(layout.valueBodyOffset()).isEqualTo(16);
+        assertThat(layout.schemaIdOffset()).isEqualTo(16);
+        assertThat(layout.rowPayloadOffset()).isEqualTo(18);
+        assertThat(layout.hasValueTag()).isFalse();
+        assertThat(KvValueLayout.TAGGED.hasVersionOffsetSlot()).isFalse();
+        assertThat(KvValueLayout.TAGGED.hasTtlTimestampSlot()).isFalse();
+
+        // with row TTL: the caller's version offset and the provider's TTL timestamp
+        ValueEncoder withTtl = ValueEncoder.forLayout(layout, ignored -> 1234L);
+        assertThat(withTtl.takesExplicitTags()).isTrue();
+        byte[] value = withTtl.encodeValue(binaryValue, 42L);
+        assertThat(layout.readVersionOffset(MemorySegment.wrap(value), 0)).isEqualTo(42L);
+        assertThat(layout.readTtlTimestamp(MemorySegment.wrap(value), 0)).isEqualTo(1234L);
+        assertThat(layout.readSchemaId(MemorySegment.wrap(value))).isEqualTo(DEFAULT_SCHEMA_ID);
+        assertThat(layout.toValueBodySlice(value).toByteArray())
+                .containsExactly(ValueEncoder.encodeValue(DEFAULT_SCHEMA_ID, row));
+
+        TestingSchemaGetter schemaGetter = new TestingSchemaGetter(DEFAULT_SCHEMA_ID, DATA1_SCHEMA);
+        ValueDecoder decoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED, layout);
+        assertThat(decoder.decodeValue(value)).isEqualTo(binaryValue);
+        assertThat(decoder.decodeVersionOffset(value)).isEqualTo(42L);
+        byte[] tagged = ValueEncoder.forLayout(KvValueLayout.TAGGED).encodeValue(binaryValue, 7L);
+        assertThat(
+                        new ValueDecoder(schemaGetter, KvFormat.COMPACTED, KvValueLayout.TAGGED)
+                                .decodeVersionOffset(tagged))
+                .isEqualTo(7L);
+
+        // without row TTL the value never expires
+        byte[] noTtl = ValueEncoder.forLayout(layout).encodeValue(binaryValue, 43L);
+        assertThat(layout.readVersionOffset(MemorySegment.wrap(noTtl), 0)).isEqualTo(43L);
+        assertThat(layout.readTtlTimestamp(MemorySegment.wrap(noTtl), 0))
+                .isEqualTo(KvValueLayout.NEVER_EXPIRE_TIMESTAMP);
+
+        // a versioned value needs its version offset
+        assertThatThrownBy(() -> ValueEncoder.forLayout(layout).encodeValue(binaryValue))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("explicit version offset");
+        assertThatThrownBy(() -> ValueEncoder.forLayout(KvValueLayout.PLAIN, ignored -> 1L))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        byte[] header = new byte[layout.rowPayloadOffset()];
+        layout.writeVersionOffset(header, 0, 0x0102030405060708L);
+        layout.writeTtlTimestamp(header, 0, 0x1112131415161718L);
+        layout.writeSchemaId(header, (short) 0x1234);
+        assertThat(header)
+                .containsExactly(
+                        (byte) 0x01,
+                        (byte) 0x02,
+                        (byte) 0x03,
+                        (byte) 0x04,
+                        (byte) 0x05,
+                        (byte) 0x06,
+                        (byte) 0x07,
+                        (byte) 0x08,
+                        (byte) 0x11,
+                        (byte) 0x12,
+                        (byte) 0x13,
+                        (byte) 0x14,
+                        (byte) 0x15,
+                        (byte) 0x16,
+                        (byte) 0x17,
+                        (byte) 0x18,
+                        (byte) 0x34,
+                        (byte) 0x12);
+        assertThatThrownBy(() -> layout.writeTtlTimestamp(new byte[12], 0, 1L))
+                .isInstanceOf(IndexOutOfBoundsException.class);
     }
 
     @Test

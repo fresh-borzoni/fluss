@@ -19,15 +19,21 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
+import org.apache.fluss.exception.IllegalConfigurationException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.KvSnapshotResource;
+import org.apache.fluss.server.kv.dv.DerivedDvMetadataCache;
+import org.apache.fluss.server.kv.dv.DerivedDvRebuildLimiter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.utils.function.FunctionWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -59,6 +65,16 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
 
     private final int remoteLogDownloadThreadsInRecoverKv;
 
+    // where the remote data directory is resolved from, once a bucket with deletion vectors asks:
+    // a server without one serves every other table
+    private final Configuration conf;
+    @Nullable private volatile String remoteDataDir;
+
+    private final DerivedDvRebuildLimiter dvRebuildLimiter;
+
+    // one per tablet server: its buckets read a round's remote metadata once
+    private final DerivedDvMetadataCache dvMetadataCache = new DerivedDvMetadataCache();
+
     private DefaultSnapshotContext(
             ZooKeeperClient zooKeeperClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
@@ -68,10 +84,14 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
             KvSnapshotDataDownloader kvSnapshotDataDownloader,
             long kvSnapshotIntervalMs,
             int writeBufferSizeInBytes,
+            Configuration conf,
             CompletedSnapshotHandleStore completedSnapshotHandleStore,
             int maxFetchLogSizeInRecoverKv,
             int remoteLogPrefetchNumInRecoverKv,
-            int remoteLogDownloadThreadsInRecoverKv) {
+            int remoteLogDownloadThreadsInRecoverKv,
+            DerivedDvRebuildLimiter dvRebuildLimiter) {
+        this.conf = conf;
+        this.dvRebuildLimiter = dvRebuildLimiter;
         this.zooKeeperClient = zooKeeperClient;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.snapshotScheduler = snapshotScheduler;
@@ -87,11 +107,28 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
         this.remoteLogDownloadThreadsInRecoverKv = remoteLogDownloadThreadsInRecoverKv;
     }
 
+    /** A context whose deletion vector rebuilds run on the limiter of no server, for tests. */
     public static DefaultSnapshotContext create(
             ZooKeeperClient zkClient,
             CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
             KvSnapshotResource kvSnapshotResource,
             Configuration conf) {
+        return create(
+                zkClient,
+                completedKvSnapshotCommitter,
+                kvSnapshotResource,
+                conf,
+                new DerivedDvRebuildLimiter(
+                        conf.get(ConfigOptions.KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS)));
+    }
+
+    /** A context whose deletion vector rebuilds run on {@code dvRebuildLimiter}, the server's. */
+    public static DefaultSnapshotContext create(
+            ZooKeeperClient zkClient,
+            CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            KvSnapshotResource kvSnapshotResource,
+            Configuration conf,
+            DerivedDvRebuildLimiter dvRebuildLimiter) {
         return new DefaultSnapshotContext(
                 zkClient,
                 completedKvSnapshotCommitter,
@@ -101,10 +138,37 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
                 kvSnapshotResource.getKvSnapshotDataDownloader(),
                 conf.get(ConfigOptions.KV_SNAPSHOT_INTERVAL).toMillis(),
                 (int) conf.get(ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE).getBytes(),
+                conf,
                 new ZooKeeperCompletedSnapshotHandleStore(zkClient),
                 (int) conf.get(ConfigOptions.KV_RECOVER_LOG_RECORD_BATCH_MAX_SIZE).getBytes(),
                 conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_PREFETCH_NUM),
-                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS));
+                conf.get(ConfigOptions.KV_RECOVERY_REMOTE_LOG_DOWNLOAD_THREADS),
+                dvRebuildLimiter);
+    }
+
+    /**
+     * Returns the default remote data directory, resolved on first use.
+     *
+     * @throws IllegalConfigurationException if neither remote data dir option is set
+     */
+    @Override
+    public String getRemoteDataDir() {
+        String dir = remoteDataDir;
+        if (dir == null) {
+            dir = FlussConfigUtils.getDefaultRemoteDataDir(conf);
+            remoteDataDir = dir;
+        }
+        return dir;
+    }
+
+    @Override
+    public DerivedDvRebuildLimiter getDvRebuildLimiter() {
+        return dvRebuildLimiter;
+    }
+
+    @Override
+    public DerivedDvMetadataCache getDvMetadataCache() {
+        return dvMetadataCache;
     }
 
     @Override

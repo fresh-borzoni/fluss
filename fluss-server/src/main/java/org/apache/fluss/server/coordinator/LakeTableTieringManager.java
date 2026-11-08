@@ -49,6 +49,8 @@ import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -133,6 +135,18 @@ public class LakeTableTieringManager implements AutoCloseable {
     // cache table_id -> table tiering epoch
     private final Map<Long, Long> tableTierEpoch;
 
+    // table_id -> the last tiering epoch of a table whose datalake was disabled. Its epochs go on
+    // from there if the datalake is enabled again, so a round assigned before never matches one
+    // assigned after.
+    private final Map<Long, Long> retiredTierEpochs;
+
+    // the tables with deletion vectors, which only tiering services that support them may tier
+    private final Set<Long> deletionVectorTables;
+
+    // pending tables with deletion vectors whose wait for a tiering service that supports them is
+    // logged, so it is logged once while they are pending
+    private final Set<Long> loggedDeletionVectorWaits;
+
     // table_id -> result snapshot of the last completed tiering round
     private final Map<Long, LastTieringResult> lastTieringResult;
 
@@ -194,6 +208,9 @@ public class LakeTableTieringManager implements AutoCloseable {
         this.lakeTieringServiceTimeoutChecker.scheduleWithFixedDelay(
                 this::checkTieringServiceTimeout, 0, 15, TimeUnit.SECONDS);
         this.tableTierEpoch = new HashMap<>();
+        this.retiredTierEpochs = new HashMap<>();
+        this.deletionVectorTables = new HashSet<>();
+        this.loggedDeletionVectorWaits = new HashSet<>();
         this.lastTieringResult = new HashMap<>();
         this.delayedTieringByTableId = new HashMap<>();
         this.tableFailureCounters = new HashMap<>();
@@ -258,7 +275,15 @@ public class LakeTableTieringManager implements AutoCloseable {
         tableLakeFreshness.put(
                 tableId, tableInfo.getTableConfig().getDataLakeFreshness().toMillis());
         lastTieringResult.put(tableId, LastTieringResult.initial(lastTieredTime));
-        tableTierEpoch.put(tableId, tieringEpochBase);
+        Long retiredEpoch = retiredTierEpochs.remove(tableId);
+        tableTierEpoch.put(
+                tableId,
+                retiredEpoch == null
+                        ? tieringEpochBase
+                        : Math.max(tieringEpochBase, retiredEpoch + 1));
+        if (tableInfo.getTableConfig().isDeletionVectorsEnabled()) {
+            deletionVectorTables.add(tableId);
+        }
 
         // register table-level metrics
         registerTableMetrics(tableId, tableInfo.getTablePath());
@@ -349,27 +374,55 @@ public class LakeTableTieringManager implements AutoCloseable {
         return r != null ? fieldExtractor.applyAsLong(r) : -1L;
     }
 
+    /**
+     * Stops tiering a dropped table. Also forgets the tiering epoch {@link #disableLakeTable} kept
+     * for it, as the id of a dropped table is not used again.
+     */
     public void removeLakeTable(long tableId) {
         inWriteLock(
                 lock,
                 () -> {
-                    tablePaths.remove(tableId);
-                    tableLakeFreshness.remove(tableId);
-                    lastTieringResult.remove(tableId);
-                    currentTieringStartTime.remove(tableId);
-                    pendingEnterTime.remove(tableId);
-                    tableFailureCounters.remove(tableId);
-                    // close and remove the metric group to unregister metrics
-                    tieringMetricGroup.removeTableLakeTieringMetricGroup(tableId);
-                    tieringStates.remove(tableId);
-                    liveTieringTableIds.remove(tableId);
-                    tableTierEpoch.remove(tableId);
-                    // Remove and cancel the delayed tiering task if present
-                    DelayedTiering delayedTiering = delayedTieringByTableId.remove(tableId);
-                    if (delayedTiering != null) {
-                        delayedTiering.cancel();
+                    unregisterLakeTable(tableId);
+                    retiredTierEpochs.remove(tableId);
+                });
+    }
+
+    /**
+     * Stops tiering a table whose datalake was disabled. Its tiering epochs go on from the current
+     * one if its datalake is enabled again, so the coordinator fences a round assigned before.
+     */
+    public void disableLakeTable(long tableId) {
+        inWriteLock(
+                lock,
+                () -> {
+                    Long epoch = tableTierEpoch.get(tableId);
+                    unregisterLakeTable(tableId);
+                    if (epoch != null) {
+                        retiredTierEpochs.put(tableId, epoch);
                     }
                 });
+    }
+
+    @GuardedBy("lock")
+    private void unregisterLakeTable(long tableId) {
+        tablePaths.remove(tableId);
+        tableLakeFreshness.remove(tableId);
+        lastTieringResult.remove(tableId);
+        currentTieringStartTime.remove(tableId);
+        pendingEnterTime.remove(tableId);
+        tableFailureCounters.remove(tableId);
+        // close and remove the metric group to unregister metrics
+        tieringMetricGroup.removeTableLakeTieringMetricGroup(tableId);
+        tieringStates.remove(tableId);
+        liveTieringTableIds.remove(tableId);
+        tableTierEpoch.remove(tableId);
+        deletionVectorTables.remove(tableId);
+        loggedDeletionVectorWaits.remove(tableId);
+        // Remove and cancel the delayed tiering task if present
+        DelayedTiering delayedTiering = delayedTieringByTableId.remove(tableId);
+        if (delayedTiering != null) {
+            delayedTiering.cancel();
+        }
     }
 
     /**
@@ -450,24 +503,52 @@ public class LakeTableTieringManager implements AutoCloseable {
         this.tieringServiceTimeoutMs = tieringServiceTimeoutMs;
     }
 
+    /** Requests a table to tier for a tiering service that does not support deletion vectors. */
+    @VisibleForTesting
     @Nullable
     public LakeTieringTableInfo requestTable() {
+        return requestTable(false);
+    }
+
+    /**
+     * Hands the longest pending table to a tiering service, or returns null if none is pending.
+     * Tables with deletion vectors go only to a service that {@code supportsDeletionVectors}: one
+     * that does not would commit their rows without deleting the old versions. They stay pending
+     * for such a service meanwhile, while other tables are handed out.
+     */
+    @Nullable
+    public LakeTieringTableInfo requestTable(boolean supportsDeletionVectors) {
         return inWriteLock(
                 lock,
                 () -> {
-                    Long tableId = pendingTieringTables.poll();
-                    // now no any pending table, return directly
-                    if (tableId == null) {
-                        return null;
+                    for (Iterator<Long> it = pendingTieringTables.iterator(); it.hasNext(); ) {
+                        long tableId = it.next();
+                        TablePath tablePath = tablePaths.get(tableId);
+                        // The table has been dropped, or the entry is left from before its
+                        // datalake was disabled and enabled again.
+                        if (tablePath == null
+                                || tieringStates.get(tableId) != TieringState.Pending) {
+                            it.remove();
+                            continue;
+                        }
+                        if (!supportsDeletionVectors && deletionVectorTables.contains(tableId)) {
+                            if (loggedDeletionVectorWaits.add(tableId)) {
+                                LOG.info(
+                                        "Table {} ({}) has deletion vectors and waits for a"
+                                                + " tiering service that supports them; the"
+                                                + " requesting tiering service does not.",
+                                        tablePath,
+                                        tableId);
+                            }
+                            continue;
+                        }
+                        it.remove();
+                        loggedDeletionVectorWaits.remove(tableId);
+                        doHandleStateChange(tableId, TieringState.Tiering);
+                        long tieringEpoch = tableTierEpoch.get(tableId);
+                        return new LakeTieringTableInfo(tableId, tablePath, tieringEpoch);
                     }
-                    TablePath tablePath = tablePaths.get(tableId);
-                    // the table has been dropped, request again
-                    if (tablePath == null) {
-                        return requestTable();
-                    }
-                    doHandleStateChange(tableId, TieringState.Tiering);
-                    long tieringEpoch = tableTierEpoch.get(tableId);
-                    return new LakeTieringTableInfo(tableId, tablePath, tieringEpoch);
+                    return null;
                 });
     }
 

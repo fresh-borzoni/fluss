@@ -45,11 +45,20 @@ class RpcServiceBaseTest {
     @Test
     void testValidateKvSnapshotMetadataVersion() {
         TableInfo taggedTableInfo = tableInfo(KvValueLayout.TAGGED);
+        TableInfo versionedTableInfo = tableInfo(KvValueLayout.VERSIONED);
         TableInfo plainTableInfo = tableInfo(KvValueLayout.PLAIN);
 
         assertThatThrownBy(() -> validateKvSnapshotMetadataVersion((short) 0, taggedTableInfo))
                 .isInstanceOf(UnsupportedVersionException.class);
+        assertThatThrownBy(() -> validateKvSnapshotMetadataVersion((short) 0, versionedTableInfo))
+                .isInstanceOf(UnsupportedVersionException.class);
         validateKvSnapshotMetadataVersion((short) 1, taggedTableInfo);
+        // a client of version 1 reads only the tagged layout
+        assertThatThrownBy(() -> validateKvSnapshotMetadataVersion((short) 1, versionedTableInfo))
+                .isInstanceOf(UnsupportedVersionException.class)
+                .hasMessageContaining("layout is version 3");
+        validateKvSnapshotMetadataVersion((short) 2, versionedTableInfo);
+        validateKvSnapshotMetadataVersion((short) 2, taggedTableInfo);
         validateKvSnapshotMetadataVersion((short) 0, plainTableInfo);
     }
 
