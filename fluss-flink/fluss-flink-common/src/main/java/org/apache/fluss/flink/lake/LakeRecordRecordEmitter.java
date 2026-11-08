@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.lake;
 
 import org.apache.fluss.client.table.scanner.ScanRecord;
+import org.apache.fluss.flink.lake.reader.DvBucketSplitResolution;
+import org.apache.fluss.flink.lake.state.DvBucketSplitState;
 import org.apache.fluss.flink.lake.state.LakeSnapshotAndFlussLogSplitState;
 import org.apache.fluss.flink.lake.state.LakeSnapshotSplitState;
 import org.apache.fluss.flink.source.reader.RecordAndPos;
@@ -66,6 +68,21 @@ public class LakeRecordRecordEmitter<OUT> {
                 lakeSnapshotAndFlussLogSplitState.setNextLogOffset(scanRecord.logOffset() + 1);
             }
             sourceOutputFunc.accept(recordAndPos.record(), sourceOutput);
+        } else if (splitState instanceof DvBucketSplitState) {
+            DvBucketSplitState dvBucketSplitState = (DvBucketSplitState) splitState;
+            if (recordAndPos instanceof DvBucketSplitResolution) {
+                // how the split is read, which precedes its rows
+                dvBucketSplitState.resolve(((DvBucketSplitResolution) recordAndPos).getResolved());
+                return;
+            }
+            ScanRecord scanRecord = recordAndPos.record();
+            if (scanRecord.logOffset() >= 0) {
+                dvBucketSplitState.setNextLogOffset(scanRecord.logOffset() + 1);
+            } else if (recordAndPos.readRecordsCount() > 0) {
+                dvBucketSplitState.setLakePosition(
+                        recordAndPos.getCurrentSplitIndex(), recordAndPos.readRecordsCount());
+            }
+            sourceOutputFunc.accept(scanRecord, sourceOutput);
         } else {
             throw new UnsupportedOperationException(
                     "Unknown split state type: " + splitState.getClass());

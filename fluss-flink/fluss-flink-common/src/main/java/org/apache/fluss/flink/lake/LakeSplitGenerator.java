@@ -18,9 +18,15 @@
 package org.apache.fluss.flink.lake;
 
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.admin.DvAdmin;
+import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart;
+import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPlanner;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
+import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
@@ -32,9 +38,13 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.utils.ExceptionUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -51,14 +61,25 @@ import static org.apache.fluss.metadata.ResolvedPartitionSpec.PARTITION_SPEC_SEP
 /** A generator for lake splits. */
 public class LakeSplitGenerator {
 
+    private static final Logger LOG = LoggerFactory.getLogger(LakeSplitGenerator.class);
+
     private final TableInfo tableInfo;
     private final Admin flussAdmin;
     private final OffsetsInitializer.BucketOffsetsRetriever bucketOffsetsRetriever;
     private final OffsetsInitializer stoppingOffsetInitializer;
     private final int bucketCount;
     private final Supplier<Set<PartitionInfo>> listPartitionSupplier;
+    private final boolean dvEnabled;
 
     private final LakeSource<LakeSplit> lakeSource;
+
+    // The most rows of a bucket's lake files one split reads when a pinned cut lets several splits
+    // read the bucket.
+    private long fileGroupRows =
+            ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS.defaultValue();
+    // whether pinning waits for a leader that still switches to the planned snapshot
+    private boolean waitForCatchUp =
+            ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.defaultValue();
 
     public LakeSplitGenerator(
             TableInfo tableInfo,
@@ -75,48 +96,178 @@ public class LakeSplitGenerator {
         this.stoppingOffsetInitializer = stoppingOffsetInitializer;
         this.bucketCount = bucketCount;
         this.listPartitionSupplier = listPartitionSupplier;
+        this.dvEnabled = tableInfo.getTableConfig().isDeletionVectorsEnabled();
     }
 
     /**
      * Return A list of hybrid lake snapshot {@link LakeSnapshotSplit}, {@link
      * LakeSnapshotAndFlussLogSplit} and the corresponding Fluss {@link LogSplit} based on the lake
      * snapshot. Return null if no lake snapshot exists.
+     *
+     * <p>A bounded read of a primary key table with deletion vectors gets {@link DvBucketSplit}s,
+     * planned on the coordinator's readable snapshot, or on the empty lake if nothing is tiered
+     * yet. Planning pins one cut per bucket on its leader, without masks; each split's reader
+     * fetches the masks of its part of the cut when the split starts.
      */
     @Nullable
     public List<SourceSplitBase> generateHybridLakeFlussSplits() throws Exception {
+        if (dvEnabled
+                && tableInfo.hasPrimaryKey()
+                && stoppingOffsetInitializer instanceof NoStoppingOffsetsInitializer) {
+            // Masked reads stop at the masks' cut, so only bounded reads can use them. A
+            // streaming read needs the ordered changelog of the KV snapshot and log splits.
+            LOG.info(
+                    "Streaming read of deletion-vector table {}: reading Fluss KV snapshot and"
+                            + " changelog instead of lake splits with masks.",
+                    tableInfo.getTablePath());
+            return null;
+        }
+        boolean dvBatchRead = isBatchReadWithDeletionVectors();
         LakeSnapshot lakeSnapshotInfo;
         try {
             lakeSnapshotInfo = flussAdmin.getReadableLakeSnapshot(tableInfo.getTablePath()).get();
         } catch (Exception exception) {
-            if (ExceptionUtils.stripExecutionException(exception)
-                    instanceof LakeTableSnapshotNotExistException) {
+            if (!(ExceptionUtils.stripExecutionException(exception)
+                    instanceof LakeTableSnapshotNotExistException)) {
+                throw exception;
+            }
+            if (!dvBatchRead) {
                 return null;
             }
-            throw exception;
+            // Nothing tiered yet reads as an empty lake at offset 0, with the whole log masked.
+            lakeSnapshotInfo = null;
         }
+        boolean emptyLake = lakeSnapshotInfo == null;
+        long snapshotId = emptyLake ? -1L : lakeSnapshotInfo.getSnapshotId();
 
         boolean isLogTable = !tableInfo.hasPrimaryKey();
         boolean isPartitioned = tableInfo.isPartitioned();
 
         Map<String, Map<Integer, List<LakeSplit>>> lakeSplits =
-                groupLakeSplits(
-                        lakeSource
-                                .createPlanner(
-                                        (LakeSource.PlannerContext) lakeSnapshotInfo::getSnapshotId)
-                                .plan());
+                emptyLake
+                        ? Collections.emptyMap()
+                        : groupLakeSplits(
+                                lakeSource
+                                        .createPlanner((LakeSource.PlannerContext) () -> snapshotId)
+                                        .plan());
 
-        Map<TableBucket, Long> tableBucketsOffset = lakeSnapshotInfo.getTableBucketsOffset();
+        Map<TableBucket, Long> tableBucketsOffset =
+                emptyLake ? Collections.emptyMap() : lakeSnapshotInfo.getTableBucketsOffset();
+
+        Set<PartitionInfo> partitionInfos = null;
+        Map<TableBucket, Long> allStoppingOffsets = new HashMap<>();
+
         if (isPartitioned) {
-            Set<PartitionInfo> partitionInfos = listPartitionSupplier.get();
-            return generatePartitionTableSplit(
-                    lakeSplits, isLogTable, tableBucketsOffset, partitionInfos);
+            partitionInfos = listPartitionSupplier.get();
+            for (PartitionInfo partitionInfo : partitionInfos) {
+                // partitions may have their own bucket count
+                Map<Integer, Long> offsets =
+                        stoppingOffsetInitializer.getBucketOffsets(
+                                partitionInfo.getPartitionName(),
+                                IntStream.range(0, partitionInfo.getBucketCount())
+                                        .boxed()
+                                        .collect(Collectors.toList()),
+                                bucketOffsetsRetriever);
+                for (Map.Entry<Integer, Long> offsetEntry : offsets.entrySet()) {
+                    allStoppingOffsets.put(
+                            new TableBucket(
+                                    tableInfo.getTableId(),
+                                    partitionInfo.getPartitionId(),
+                                    offsetEntry.getKey()),
+                            offsetEntry.getValue());
+                }
+            }
+        } else {
+            Map<Integer, Long> offsets =
+                    stoppingOffsetInitializer.getBucketOffsets(
+                            null,
+                            IntStream.range(0, bucketCount).boxed().collect(Collectors.toList()),
+                            bucketOffsetsRetriever);
+            for (Map.Entry<Integer, Long> offsetEntry : offsets.entrySet()) {
+                allStoppingOffsets.put(
+                        new TableBucket(tableInfo.getTableId(), null, offsetEntry.getKey()),
+                        offsetEntry.getValue());
+            }
+        }
+
+        List<SourceSplitBase> splits;
+        if (isPartitioned) {
+            splits =
+                    generatePartitionTableSplit(
+                            lakeSplits,
+                            isLogTable,
+                            tableBucketsOffset,
+                            partitionInfos,
+                            allStoppingOffsets,
+                            dvBatchRead,
+                            snapshotId);
         } else {
             Map<Integer, List<LakeSplit>> nonPartitionLakeSplits =
                     lakeSplits.isEmpty() ? null : lakeSplits.values().iterator().next();
             // non-partitioned table
-            return generateNoPartitionedTableSplit(
-                    nonPartitionLakeSplits, isLogTable, tableBucketsOffset);
+            splits =
+                    generateNoPartitionedTableSplit(
+                            nonPartitionLakeSplits,
+                            isLogTable,
+                            tableBucketsOffset,
+                            allStoppingOffsets,
+                            dvBatchRead,
+                            snapshotId);
         }
+        return dvBatchRead ? pinBuckets(splits, snapshotId) : splits;
+    }
+
+    /**
+     * Sets the rows of lake files one split reads at most when a bucket is read by several splits.
+     */
+    public void setFileGroupRows(long fileGroupRows) {
+        this.fileGroupRows = fileGroupRows;
+    }
+
+    /**
+     * Sets whether pinning a bucket's cut waits for a leader that still switches to the planned
+     * snapshot. If not, such a bucket keeps one split, which reads the snapshot its leader covers.
+     */
+    public void setWaitForCatchUp(boolean waitForCatchUp) {
+        this.waitForCatchUp = waitForCatchUp;
+    }
+
+    /**
+     * Pins one cut per bucket, so that several splits read the bucket with the same masks: groups
+     * of its lake files, and its log. The cut takes a hold per split, which the enumerator releases
+     * when the split's reader reports it finished, or when the read ends. A bucket whose leader
+     * cannot pin now keeps one split that pins its own cut when it starts; if the bucket has more
+     * lake files than one split reads, the split carries none of them and its reader plans them.
+     */
+    private List<SourceSplitBase> pinBuckets(List<SourceSplitBase> splits, long snapshotId)
+            throws Exception {
+        List<DvBucketPart> buckets = new ArrayList<>();
+        for (SourceSplitBase split : splits) {
+            if (split instanceof DvBucketSplit) {
+                buckets.add(((DvBucketSplit) split).getPart());
+            }
+        }
+        Map<TableBucket, List<DvBucketPart>> parts =
+                new DvBucketPlanner(DvAdmin.of(flussAdmin), tableInfo.getTablePath(), lakeSource)
+                        .withFileGroupRows(fileGroupRows)
+                        .withWaitForCatchUp(waitForCatchUp)
+                        .pin(snapshotId, buckets);
+        if (parts.isEmpty()) {
+            return splits;
+        }
+        List<SourceSplitBase> pinned = new ArrayList<>(splits.size());
+        for (SourceSplitBase split : splits) {
+            List<DvBucketPart> bucketParts =
+                    split instanceof DvBucketSplit ? parts.get(split.getTableBucket()) : null;
+            if (bucketParts == null) {
+                pinned.add(split);
+            } else {
+                for (DvBucketPart part : bucketParts) {
+                    pinned.add(new DvBucketSplit(part));
+                }
+            }
+        }
+        return pinned;
     }
 
     private Map<String, Map<Integer, List<LakeSplit>>> groupLakeSplits(List<LakeSplit> lakeSplits) {
@@ -133,11 +284,21 @@ public class LakeSplitGenerator {
         return result;
     }
 
+    /** Returns whether this is a bounded read of a primary key table with deletion vectors. */
+    private boolean isBatchReadWithDeletionVectors() {
+        return dvEnabled
+                && tableInfo.hasPrimaryKey()
+                && !(stoppingOffsetInitializer instanceof NoStoppingOffsetsInitializer);
+    }
+
     private List<SourceSplitBase> generatePartitionTableSplit(
             Map<String, Map<Integer, List<LakeSplit>>> lakeSplits,
             boolean isLogTable,
             Map<TableBucket, Long> tableBucketSnapshotLogOffset,
-            Set<PartitionInfo> partitionInfos) {
+            Set<PartitionInfo> partitionInfos,
+            Map<TableBucket, Long> allStoppingOffsets,
+            boolean dvBatchRead,
+            long snapshotId) {
         List<SourceSplitBase> splits = new ArrayList<>();
         Map<String, PartitionInfo> flussPartitionByName =
                 partitionInfos.stream()
@@ -157,23 +318,17 @@ public class LakeSplitGenerator {
             PartitionInfo flussPartition = flussPartitionByName.remove(partitionName);
             if (flussPartition != null) {
                 // mean the partition also exist in fluss partition
-                int partitionBucketCount = flussPartition.getBucketCount();
-                Map<Integer, Long> bucketEndOffset =
-                        stoppingOffsetInitializer.getBucketOffsets(
-                                partitionName,
-                                IntStream.range(0, partitionBucketCount)
-                                        .boxed()
-                                        .collect(Collectors.toList()),
-                                bucketOffsetsRetriever);
                 splits.addAll(
                         generateSplit(
                                 lakeSplitsOfPartition,
                                 flussPartition.getPartitionId(),
                                 partitionName,
-                                partitionBucketCount,
+                                flussPartition.getBucketCount(),
                                 isLogTable,
                                 tableBucketSnapshotLogOffset,
-                                bucketEndOffset));
+                                allStoppingOffsets,
+                                dvBatchRead,
+                                snapshotId));
 
             } else {
                 // only lake data
@@ -192,26 +347,19 @@ public class LakeSplitGenerator {
 
         // iterate remain fluss splits
         for (PartitionInfo flussPartition : flussPartitionByName.values()) {
-            String partitionName = flussPartition.getPartitionName();
-            int partitionBucketCount = flussPartition.getBucketCount();
-            Map<Integer, Long> bucketEndOffset =
-                    stoppingOffsetInitializer.getBucketOffsets(
-                            partitionName,
-                            IntStream.range(0, partitionBucketCount)
-                                    .boxed()
-                                    .collect(Collectors.toList()),
-                            bucketOffsetsRetriever);
             splits.addAll(
                     generateSplit(
                             null,
                             flussPartition.getPartitionId(),
-                            partitionName,
-                            partitionBucketCount,
+                            flussPartition.getPartitionName(),
+                            flussPartition.getBucketCount(),
                             isLogTable,
                             // Lake splits may be pruned while the partition still has tiered
                             // offsets.
                             tableBucketSnapshotLogOffset,
-                            bucketEndOffset));
+                            allStoppingOffsets,
+                            dvBatchRead,
+                            snapshotId));
         }
         return splits;
     }
@@ -223,7 +371,9 @@ public class LakeSplitGenerator {
             int numBuckets,
             boolean isLogTable,
             Map<TableBucket, Long> tableBucketSnapshotLogOffset,
-            Map<Integer, Long> bucketEndOffset) {
+            Map<TableBucket, Long> allStoppingOffsets,
+            boolean dvBatchRead,
+            long snapshotId) {
         List<SourceSplitBase> splits = new ArrayList<>();
         if (isLogTable) {
             if (lakeSplits != null) {
@@ -233,7 +383,10 @@ public class LakeSplitGenerator {
                 TableBucket tableBucket =
                         new TableBucket(tableInfo.getTableId(), partitionId, bucket);
                 Long snapshotLogOffset = tableBucketSnapshotLogOffset.get(tableBucket);
-                Long stoppingOffset = bucketEndOffset.get(bucket);
+                Long stoppingOffset = allStoppingOffsets.get(tableBucket);
+                if (stoppingOffset == null) {
+                    stoppingOffset = NO_STOPPING_OFFSET;
+                }
                 if (snapshotLogOffset == null) {
                     // no data committed to lake for this bucket, scan from fluss log
                     if (stoppingOffset == NO_STOPPING_OFFSET || stoppingOffset > 0) {
@@ -284,14 +437,31 @@ public class LakeSplitGenerator {
                 TableBucket tableBucket =
                         new TableBucket(tableInfo.getTableId(), partitionId, bucket);
                 Long snapshotLogOffset = tableBucketSnapshotLogOffset.get(tableBucket);
-                Long stoppingOffset = bucketEndOffset.get(bucket);
-                splits.add(
-                        generateSplitForPrimaryKeyTableBucket(
-                                lakeSplits != null ? lakeSplits.get(bucket) : null,
-                                tableBucket,
-                                partitionName,
-                                snapshotLogOffset,
-                                stoppingOffset));
+                Long stoppingOffset = allStoppingOffsets.get(tableBucket);
+                if (stoppingOffset == null) {
+                    stoppingOffset = NO_STOPPING_OFFSET;
+                }
+                if (dvBatchRead) {
+                    DvBucketSplit dvSplit =
+                            generateDvSplitForBucket(
+                                    lakeSplits != null ? lakeSplits.get(bucket) : null,
+                                    tableBucket,
+                                    partitionName,
+                                    snapshotLogOffset,
+                                    stoppingOffset,
+                                    snapshotId);
+                    if (dvSplit != null) {
+                        splits.add(dvSplit);
+                    }
+                } else {
+                    splits.add(
+                            generateSplitForPrimaryKeyTableBucket(
+                                    lakeSplits != null ? lakeSplits.get(bucket) : null,
+                                    tableBucket,
+                                    partitionName,
+                                    snapshotLogOffset,
+                                    stoppingOffset));
+                }
             }
         }
 
@@ -332,17 +502,43 @@ public class LakeSplitGenerator {
                 tableBucket, partitionName, lakeSplits, snapshotLogOffset, stoppingOffset);
     }
 
+    /**
+     * Builds the split of one bucket of a table with deletion vectors: its files in the snapshot
+     * and its log after the snapshot's readable offset, read with masks the split's reader fetches.
+     * Returns null for a bucket with nothing tiered and no log.
+     */
+    @Nullable
+    private DvBucketSplit generateDvSplitForBucket(
+            @Nullable List<LakeSplit> lakeSplits,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable Long snapshotLogOffset,
+            long stoppingOffset,
+            long snapshotId) {
+        boolean hasTieredData = snapshotLogOffset != null && snapshotLogOffset >= 0;
+        // An empty bucket contributes nothing to a bounded read; a split for it would subscribe
+        // the reader to a bucket with no records.
+        if (!hasTieredData && stoppingOffset != NO_STOPPING_OFFSET && stoppingOffset <= 0) {
+            return null;
+        }
+        // The lake files of a bucket with nothing tiered in the snapshot are not read: all its
+        // rows are still in the log.
+        return new DvBucketSplit(
+                tableBucket,
+                partitionName,
+                snapshotId,
+                hasTieredData ? snapshotLogOffset : -1L,
+                stoppingOffset,
+                hasTieredData ? lakeSplits : null);
+    }
+
     private List<SourceSplitBase> generateNoPartitionedTableSplit(
             @Nullable Map<Integer, List<LakeSplit>> lakeSplits,
             boolean isLogTable,
-            Map<TableBucket, Long> tableBucketSnapshotLogOffset) {
-        // iterate all bucket
-        // assume bucket is from 0 to bucket count
-        Map<Integer, Long> bucketEndOffset =
-                stoppingOffsetInitializer.getBucketOffsets(
-                        null,
-                        IntStream.range(0, bucketCount).boxed().collect(Collectors.toList()),
-                        bucketOffsetsRetriever);
+            Map<TableBucket, Long> tableBucketSnapshotLogOffset,
+            Map<TableBucket, Long> allStoppingOffsets,
+            boolean dvBatchRead,
+            long snapshotId) {
         return generateSplit(
                 lakeSplits,
                 null,
@@ -350,6 +546,8 @@ public class LakeSplitGenerator {
                 bucketCount,
                 isLogTable,
                 tableBucketSnapshotLogOffset,
-                bucketEndOffset);
+                allStoppingOffsets,
+                dvBatchRead,
+                snapshotId);
     }
 }

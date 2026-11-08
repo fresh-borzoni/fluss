@@ -275,7 +275,7 @@ class LakeSnapshotAndFlussLogSplitStateTest {
                                                 + "-"
                                                 + record.getRow().getInt(1)));
         LakeSplitReaderGenerator readerGenerator =
-                new LakeSplitReaderGenerator(null, null, lakeSource);
+                new LakeSplitReaderGenerator(null, null, lakeSource, () -> null, null);
         int emitted = 0;
         try (BoundedSplitReader reader = readerGenerator.getBoundedSplitScanner(split)) {
             CloseableIterator<RecordAndPos> batch;
