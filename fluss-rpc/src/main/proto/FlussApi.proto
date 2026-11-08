@@ -1759,3 +1759,114 @@ message PbLiteralValue {
   optional int32 timestamp_nano_of_millis_value = 12; // Nano of millis
   optional bytes decimal_bytes = 13;   // Serialized decimal (non-compact mode)
 }
+
+// Deletion vectors (tablet server internal).
+
+// Sent to the leader of a bucket of a table with deletion vectors. Every request kind needs the
+// permission to read the table. Besides the usual errors, it fails with
+// DELETION_VECTORS_NOT_READY, which is retriable, STALE_SNAPSHOT, whose message names the snapshot
+// ids as "requested <id>, current <id>", which clients read from it, and INVALID_REQUEST.
+message GetDvSnapshotRequest {
+  required int64 table_id = 1;
+  required int32 bucket_id = 2;
+  // The lake snapshot the read is planned on, or the base snapshot of a tiering round.
+  required int64 readable_snapshot_id = 3;
+  optional int64 partition_id = 4;
+  // Primary keys whose live position in readable_snapshot_id is requested. If set, the response
+  // carries key_positions; otherwise it carries the masks of a union read. A request names at
+  // most 100,000 keys (MAX_LOOKUP_KEYS); one that names more fails with INVALID_REQUEST.
+  repeated bytes lookup_keys = 5;
+
+  // A union read fetches its masks in parts, all of one cut. A request without log_end_offset pins
+  // a cut: the bucket's masks up to the high watermark, frozen until the read releases them. Each
+  // response carries only the masks of the lake files in lake_dv_file_names and the log mask from
+  // log_dv_from_offset on.
+  //
+  // The cut to serve the masks of: the log_end_offset of an earlier response for the same
+  // readable_snapshot_id. The server answers with the masks of exactly that cut, or fails with
+  // STALE_SNAPSHOT once it no longer holds them, also for a read that does not wait.
+  optional int64 log_end_offset = 6;
+  // Names (last path segment) of the lake data files whose masks are requested.
+  repeated string lake_dv_file_names = 7;
+  // The log offset from which the log mask is requested, in [0, log_end_offset]; none is requested
+  // if absent.
+  optional int64 log_dv_from_offset = 8;
+  // The most bytes of serialized log mask one response carries, at least one container of the
+  // bitmap; 1 MiB if absent. It must be positive.
+  optional int32 max_log_dv_bytes = 9;
+  // False: the read does not wait for its bucket's leader. A leader that covers the snapshot
+  // registered right before readable_snapshot_id, which is the newest registered, answers a pin at
+  // once with covered_snapshot_id and behind, and the reader reads the bucket on that snapshot. A
+  // leader that covers another snapshot answers a pin with covered_snapshot_id, as a stale
+  // snapshot. A leader that has no masks to serve yet (it rebuilds after a leader change or
+  // restart, replays its change list, or covers no snapshot) answers a pin with fold_cut. Nor
+  // does the read wait for lake-position lookups still pending: it gets the last masks built while
+  // none was pending, with a log_end_offset below the high watermark. Absent means true; such a
+  // read waits instead, and gets the errors DELETION_VECTORS_NOT_READY and STALE_SNAPSHOT.
+  optional bool wait_for_catch_up = 10;
+  // Releases holds of the cut log_end_offset of readable_snapshot_id, as a union read that pinned
+  // it ends; log_end_offset must be set. The server drops the cut once every hold of it is
+  // released, or when no request asked for it within kv.deletion-vectors.pinned-cut-idle-timeout.
+  // The response carries no masks.
+  optional bool release_cut = 11;
+  // Identifies a request that pins a cut, the same in every retry of it: a retry of a pin the
+  // server took already gets the same cut without pinning it again. A request id that pinned a
+  // cut of another snapshot pins a new cut.
+  optional int64 pin_request_id = 12;
+  // The holds a request that pins a cut takes, or a release drops, in [1, 4096]; 1 if absent. A
+  // read whose parts each release their own hold when they are done pins with one hold per part.
+  // The cut is dropped once all its holds are released.
+  optional int32 holds = 13;
+}
+
+message GetDvSnapshotResponse {
+  // Masks of the requested lake data files (LakeDv): per file, the positions of rows whose keys
+  // changed in Fluss after the snapshot, as the cut froze them.
+  repeated PbLakeDvEntry lake_dv_entries = 1;
+  // Masks of the log: offsets to skip in [log_dv_from_offset, log_dv_to_offset)
+  optional bytes log_dv_bitmap = 2;
+  // The cut: the offset the masks cover the log up to (exclusive). Absent for a key lookup, a
+  // release and an answer without masks.
+  optional int64 log_end_offset = 3;
+  // The snapshot's readable offset, where the log masks start. Absent for a key lookup, a release
+  // and a fold_cut answer.
+  optional int64 snapshot_start_offset = 4;
+  // Positions of the requested lookup_keys found in the snapshot
+  repeated PbDvKeyPosition key_positions = 5;
+  // The commit the snapshot's id named when Fluss registered it, for a lake that reuses snapshot
+  // ids after a rollback (Paimon): the reader checks the id names it still before using the masks
+  optional string lake_snapshot_identity = 6;
+  // With log_dv_from_offset: log_dv_bitmap holds the log mask of [log_dv_from_offset,
+  // log_dv_to_offset), where log_dv_to_offset > log_dv_from_offset unless it is log_end_offset.
+  optional int64 log_dv_to_offset = 7;
+
+  // The answers to a pin with wait_for_catch_up = false that gets no masks; the response then
+  // carries no masks.
+  //
+  // The leader has no masks to serve yet: the reader reads the bucket by key, its lake files and
+  // its log from the readable offset of the snapshot it planned on up to this offset, the log
+  // folded to the latest change of each key. It is the leader's high watermark, or the log end of
+  // the previous leader right after a leader change, which can be above the high watermark.
+  optional int64 fold_cut = 8;
+  // The leader covers this lake snapshot, not readable_snapshot_id: the reader plans the bucket
+  // again on it. snapshot_start_offset is its readable offset, from which the reader reads the
+  // log; log_end_offset is absent.
+  optional int64 covered_snapshot_id = 9;
+  // With covered_snapshot_id: the covered snapshot is the one registered right before the newest
+  // one, readable_snapshot_id, which the leader still catches up to. Otherwise the requested
+  // snapshot is stale.
+  optional bool behind = 10;
+}
+
+// The mask of one lake data file.
+message PbLakeDvEntry {
+  optional string file_path = 1;
+  // Serialized Roaring64Bitmap of the masked row positions
+  optional bytes deleted_positions_bitmap = 2;
+}
+
+// The live position of a requested lookup key; keys not found are left out.
+message PbDvKeyPosition {
+  optional string file_path = 1;
+  optional int64 pos = 2;
+}

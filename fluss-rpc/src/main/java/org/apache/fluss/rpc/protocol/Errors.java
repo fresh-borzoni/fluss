@@ -31,6 +31,7 @@ import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
 import org.apache.fluss.exception.DeletionDisabledException;
+import org.apache.fluss.exception.DeletionVectorsNotReadyException;
 import org.apache.fluss.exception.DiskWriteLockedException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
@@ -48,6 +49,7 @@ import org.apache.fluss.exception.InvalidDatabaseException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidProducerIdException;
 import org.apache.fluss.exception.InvalidReplicationFactorException;
+import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.InvalidScanRequestException;
 import org.apache.fluss.exception.InvalidServerRackInfoException;
@@ -85,6 +87,7 @@ import org.apache.fluss.exception.SecurityTokenException;
 import org.apache.fluss.exception.ServerNotExistException;
 import org.apache.fluss.exception.ServerTagAlreadyExistException;
 import org.apache.fluss.exception.ServerTagNotExistException;
+import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.TableAlreadyExistException;
@@ -319,7 +322,27 @@ public enum Errors {
     CONSUMER_OFFSET_METADATA_TOO_LARGE(
             80,
             "The metadata field of the consumer offset request is too large.",
-            ConsumerOffsetMetadataTooLargeException::new);
+            ConsumerOffsetMetadataTooLargeException::new),
+    DELETION_VECTORS_NOT_READY(
+            81,
+            "The bucket's deletion vectors are switching to the requested lake snapshot,"
+                    + " rebuilding, replaying their change list or looking up lake positions;"
+                    + " retry later.",
+            DeletionVectorsNotReadyException::new),
+    /**
+     * The error's message names the snapshot ids as {@code "requested <id>, current <id>"}, which
+     * clients read from it ({@link StaleSnapshotException#StaleSnapshotException(String)}): an
+     * error response carries no other fields. Servers must keep that form.
+     */
+    STALE_SNAPSHOT(
+            82,
+            "The bucket's deletion vectors cover another lake snapshot than the requested one, or"
+                    + " no longer hold the requested mask cut.",
+            StaleSnapshotException::new),
+    INVALID_REQUEST(
+            83,
+            "The request is malformed or names values beyond the bounds the server accepts.",
+            InvalidRequestException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

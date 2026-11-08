@@ -30,6 +30,8 @@ import org.apache.fluss.rpc.messages.FindConsumerGroupOwnerRequest;
 import org.apache.fluss.rpc.messages.FindConsumerGroupOwnerResponse;
 import org.apache.fluss.rpc.messages.GetConsumerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetConsumerOffsetsResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -241,4 +243,13 @@ public interface TabletServerGateway extends RpcGateway, AdminReadOnlyGateway {
      */
     @RPC(api = ApiKeys.SCAN_KV)
     CompletableFuture<ScanKvResponse> scanKv(ScanKvRequest request);
+
+    /**
+     * Gets the deletion vector masks of a union read of a bucket, or the positions of primary keys
+     * in a lake snapshot, from the bucket's leader.
+     *
+     * @return the masks, or the positions of the requested keys
+     */
+    @RPC(api = ApiKeys.GET_DV_SNAPSHOT)
+    CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(GetDvSnapshotRequest request);
 }

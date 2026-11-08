@@ -171,6 +171,50 @@ public class MetricNames {
     // for kv tablet
     public static final String KV_FLUSH_RATE = "kvFlushPerSecond";
     public static final String KV_FLUSH_LATENCY_MS = "kvFlushLatencyMs";
+
+    // for derived deletion vectors on the tablet server
+    public static final String DV_SWITCH_RATE = "dvSwitchPerSecond";
+    public static final String DV_SWITCH_LATENCY_MS = "dvSwitchLatencyMs";
+    public static final String DV_REBUILD_RATE = "dvRebuildPerSecond";
+    public static final String DV_REBUILD_LATENCY_MS = "dvRebuildLatencyMs";
+    public static final String DV_CHECKPOINT_RATE = "dvCheckpointPerSecond";
+    public static final String DV_CHECKPOINT_LATENCY_MS = "dvCheckpointLatencyMs";
+    public static final String DV_STALE_SNAPSHOT_RATE = "dvStaleSnapshotPerSecond";
+    public static final String DV_OWNER_FAULT_RATE = "dvOwnerFaultPerSecond";
+    public static final String DV_HAND_OFF_STALL_RATE = "dvHandOffStallPerSecond";
+    public static final String DV_HAND_OFF_OVERFLOW_RATE = "dvHandOffOverflowPerSecond";
+    public static final String DV_OWNER_STEP_MAX_MS = "dvOwnerStepMaxMs";
+    public static final String DV_OWNER_MAILBOX_DELAY_MAX_MS = "dvOwnerMailboxDelayMaxMs";
+    public static final String DV_REBUILDS_IN_PROGRESS = "dvRebuildsInProgress";
+    public static final String DV_LAST_REBUILD_MS = "dvLastRebuildMs";
+    public static final String DV_REPLAY_BACKLOG = "dvReplayBacklog";
+    public static final String DV_HEAP_BYTES = "dvHeapBytes";
+    public static final String DV_CHANGE_LIST_BYTES = "dvChangeListBytes";
+    public static final String DV_PINNED_CUTS = "dvPinnedCuts";
+    public static final String DV_PINNED_CUT_BYTES = "dvPinnedCutBytes";
+    public static final String DV_PINNED_CUT_EVICTION_RATE = "dvPinnedCutEvictionPerSecond";
+    public static final String DV_PINNED_CUT_EXPIRATION_RATE = "dvPinnedCutExpirationPerSecond";
+    // the steps of a union read's mask request on the bucket leader, in ms
+    /** The whole request: waits, applying, resolving, building and pinning the masks. */
+    public static final String DV_MASK_REQUEST_MS = "dvMaskRequestMs";
+    /** Waiting for the bucket to move to the requested snapshot. */
+    public static final String DV_MASK_WAIT_SWITCH_MS = "dvMaskWaitSwitchMs";
+    /** Waiting for the masks a move or a rebuild derives again (looking up lake positions). */
+    public static final String DV_MASK_WAIT_DERIVE_MS = "dvMaskWaitDeriveMs";
+    /** Waiting for a replay of the log tail (a rebuild, or after a failed one). */
+    public static final String DV_MASK_WAIT_REPLAY_MS = "dvMaskWaitReplayMs";
+    /** Applying the queued changes below the high watermark inside the request. */
+    public static final String DV_MASK_APPLY_MS = "dvMaskApplyMs";
+    /** Inline lookups of lake positions plus waiting for background lookups. */
+    public static final String DV_MASK_RESOLVE_WAIT_MS = "dvMaskResolveWaitMs";
+    /** Building (serializing) the masks. */
+    public static final String DV_MASK_BUILD_MS = "dvMaskBuildMs";
+    /**
+     * Reads that do not wait served below the high watermark because lake-position lookups were
+     * pending.
+     */
+    public static final String DV_MASK_FRONTIER_RATE = "dvMaskFrontierPerSecond";
+
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE =
             "preWriteBufferTruncateAsDuplicatedPerSecond";
     public static final String KV_PRE_WRITE_BUFFER_TRUNCATE_AS_ERROR_RATE =

@@ -1804,6 +1804,51 @@ public class ConfigOptions {
                                     + "bounded read then performs the lake + Fluss-log union read. "
                                     + "Currently only the Flink connector honours this option.");
 
+    public static final ConfigOption<Long> CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS =
+            key("client.scanner.deletion-vectors.file-group-rows")
+                    .longType()
+                    .defaultValue(1_000_000L)
+                    .withDescription(
+                            "The most rows of lake data files one split reads in a "
+                                    + "bounded union read of a primary-key table with deletion "
+                                    + "vectors. A bucket with more rows is read by several "
+                                    + "splits: groups of its lake files and one split for its "
+                                    + "log, all with the masks of one cut its leader pins for the "
+                                    + "read. Fewer rows read a bucket with more parallelism.");
+
+    public static final ConfigOption<Boolean> CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP =
+            key("client.scanner.deletion-vectors.wait-for-catch-up")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether a bounded union read of a primary-key table with "
+                                    + "deletion vectors waits for its bucket leaders: for a "
+                                    + "leader that still switches to the lake snapshot the read "
+                                    + "was planned on, for a leader that has no masks to serve "
+                                    + "yet, and for lake-position lookups still pending after a "
+                                    + "burst of writes. When false, a leader that covers the "
+                                    + "snapshot registered right before the newest one answers at "
+                                    + "once, and the bucket is read on that snapshot with a "
+                                    + "longer stretch of the log. While lookups are pending, the "
+                                    + "bucket is read with the last masks built while none was, "
+                                    + "and its log only up to their offset: exact, a moment "
+                                    + "older, and without the wait. Right after a leader switched "
+                                    + "to a new snapshot, that is the snapshot alone. A leader "
+                                    + "that has no masks to serve yet (rebuilding after a leader "
+                                    + "change or restart, replaying its change list, or covering "
+                                    + "no snapshot) answers at once too, and the bucket is read "
+                                    + "by primary key instead: its lake files and its log up to "
+                                    + "an offset the leader names, the log folded to the latest "
+                                    + "change of each key. That offset is the leader's high "
+                                    + "watermark, or, right after a leader change, the log end of "
+                                    + "the previous leader, which can be above the high "
+                                    + "watermark; the read then waits for the high watermark to "
+                                    + "reach it. A leader further behind is still waited for, as "
+                                    + "is one not reachable during an election. The default, "
+                                    + "true, waits, so a read sees the writes acknowledged before "
+                                    + "it. Suits read-heavy tables. Flink and Spark union reads "
+                                    + "take this option.");
+
     public static final ConfigOption<Integer> CLIENT_LOOKUP_QUEUE_SIZE =
             key("client.lookup.queue-size")
                     .intType()
@@ -2298,12 +2343,60 @@ public class ConfigOptions {
                     .withDescription(
                             "If true, compaction will be triggered automatically when tiering service writes to the datalake. It is disabled by default.");
 
+    public static final ConfigOption<Duration> TABLE_DATALAKE_AUTO_COMPACTION_INTERVAL =
+            key("table.datalake.auto-compaction.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(10))
+                    .withDescription(
+                            "For tables with deletion vectors and 'table.datalake.auto-compaction' "
+                                    + "enabled: the least time between two compactions of a "
+                                    + "bucket's lake files. A bucket is compacted once this much "
+                                    + "time passed since its last compaction and it has "
+                                    + "'table.datalake.auto-compaction.min-small-files' small "
+                                    + "files, enough medium or large files to merge, or a file "
+                                    + "whose deletes hide more than a fifth of its rows. The "
+                                    + "default bounds the compactions of a bucket to a few per "
+                                    + "hour whatever the tiering interval, so short tiering "
+                                    + "intervals add small files, not rewrites.");
+
+    public static final ConfigOption<Integer> TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES =
+            key("table.datalake.auto-compaction.min-small-files")
+                    .intType()
+                    .defaultValue(3)
+                    .withDescription(
+                            "For tables with deletion vectors and 'table.datalake.auto-compaction' "
+                                    + "enabled: the number of small lake files (below 1/16 of the "
+                                    + "target file size) a bucket needs before they are merged. "
+                                    + "Larger files are merged four of a size class at a time, so "
+                                    + "rows are rewritten a few times on their way to the target "
+                                    + "size instead of with every compaction.");
+
     public static final ConfigOption<Boolean> TABLE_DATALAKE_AUTO_EXPIRE_SNAPSHOT =
             key("table.datalake.auto-expire-snapshot")
                     .booleanType()
                     .defaultValue(false)
                     .withDescription(
                             "If true, snapshot expiration will be triggered automatically when tiering service commits to the datalake. It is disabled by default.");
+
+    public static final ConfigOption<Boolean> TABLE_DELETION_VECTORS_ENABLED =
+            key("table.deletion-vectors.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether union reads of the primary key table use deletion vectors to "
+                                    + "hide lake rows that were updated or deleted in Fluss. Tablet "
+                                    + "servers keep a primary key position index of the readable lake "
+                                    + "snapshot and derive the masks of each read from it and the "
+                                    + "changes after the snapshot's readable offset; each KV value "
+                                    + "carries the log offset of its version, so a change names the "
+                                    + "version it supersedes. On Iceberg, "
+                                    + "tiering commits data and deletes in one lake commit; on Paimon, "
+                                    + "the table uses Paimon deletion vectors and the readable snapshot "
+                                    + "is the latest compacted one. Must be set when the table is "
+                                    + "created. Requires a primary key table, "
+                                    + "'table.datalake.enabled' = true and the Iceberg or Paimon "
+                                    + "lake format; works with either changelog image mode and with "
+                                    + "'table.kv.ttl'.");
 
     public static final ConfigOption<MergeEngineType> TABLE_MERGE_ENGINE =
             key("table.merge-engine")
@@ -2479,6 +2572,79 @@ public class ConfigOptions {
                     .withDescription(
                             "The interval to perform periodic snapshot for kv data. "
                                     + "The default setting is 10 minutes.");
+
+    public static final ConfigOption<Integer> KV_DELETION_VECTORS_CHECKPOINT_INTERVAL =
+            key("kv.deletion-vectors.checkpoint-interval")
+                    .intType()
+                    .defaultValue(50)
+                    .withDescription(
+                            "For tables with deletion vectors enabled: the number of primary key "
+                                    + "position index changes a bucket applies between two "
+                                    + "checkpoints of its index. A restarted tablet "
+                                    + "server loads the newest checkpoint and applies only the later "
+                                    + "changes, and tiering removes changes older than the oldest "
+                                    + "checkpoint of all buckets.");
+
+    public static final ConfigOption<Integer> KV_DELETION_VECTORS_MAX_CONCURRENT_REBUILDS =
+            key("kv.deletion-vectors.max-concurrent-rebuilds")
+                    .intType()
+                    .defaultValue(4)
+                    .withDescription(
+                            "For tables with deletion vectors enabled: the maximum "
+                                    + "number of buckets whose deletion vector state a tablet "
+                                    + "server rebuilds at once, for example after a failover "
+                                    + "moved many leaders to it. A rebuild loads the bucket's "
+                                    + "position index and replays its log since the readable lake "
+                                    + "snapshot. Writes to the bucket continue meanwhile. Union "
+                                    + "reads that wait for the leaders are answered as not ready, "
+                                    + "and retried by the client, until the rebuild is done; "
+                                    + "union reads that do not wait read the bucket by primary "
+                                    + "key meanwhile (see "
+                                    + "'client.scanner.deletion-vectors.wait-for-catch-up').");
+
+    public static final ConfigOption<MemorySize> KV_DELETION_VECTORS_HEAP_MEMORY =
+            key("kv.deletion-vectors.heap-memory")
+                    .memoryType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "For tables with deletion vectors enabled: the heap memory "
+                                    + "the leaders of a tablet server may use, all together, to "
+                                    + "derive the masks of union reads: the changes waiting for "
+                                    + "the high watermark, the keys waiting for their lake "
+                                    + "positions, the mask bitmaps, the masks kept for "
+                                    + "reads that do not wait, and the map of each key's last "
+                                    + "version a rebuild keeps while it replays the log. The "
+                                    + "change lists, the updates and deletes since the readable "
+                                    + "lake snapshots, are kept in each bucket's local RocksDB "
+                                    + "and do not count. Once they take more, rebuilds move their "
+                                    + "maps to the local RocksDB and leaders drop the masks they "
+                                    + "keep across a switch to a newer snapshot, so union reads "
+                                    + "keep working however far tiering lags. The masks union "
+                                    + "reads pinned count towards it too, and take at most half "
+                                    + "of it (see 'kv.deletion-vectors.pinned-cut-idle-timeout'). "
+                                    + "By default 12% of the maximum heap.");
+
+    public static final ConfigOption<Duration> KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT =
+            key("kv.deletion-vectors.pinned-cut-idle-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(30))
+                    .withDescription(
+                            "For tables with deletion vectors enabled: how long a "
+                                    + "tablet server keeps the masks a union read pinned for a "
+                                    + "bucket after the last request for them, including a "
+                                    + "request that releases some of their holds. A union read pins "
+                                    + "the masks of one log offset per bucket, when it is planned "
+                                    + "or when a split that reads a whole bucket starts, and its "
+                                    + "readers fetch their parts of them, so all of them read the "
+                                    + "lake and the log as of the same offset. Pinned masks count "
+                                    + "towards 'kv.deletion-vectors.heap-memory' and take at most "
+                                    + "half of it, beyond which the least recently used are "
+                                    + "dropped. A split that reads a whole bucket and finds its "
+                                    + "pinned masks dropped before it started starts over with "
+                                    + "the masks of the current offset; a split that shares the "
+                                    + "offset with other splits of its bucket derives its masks "
+                                    + "from the keys of its lake files and the log. A split that "
+                                    + "started keeps the masks it fetched.");
 
     public static final ConfigOption<Integer> KV_SNAPSHOT_SCHEDULER_THREAD_NUM =
             key("kv.snapshot.scheduler-thread-num")
@@ -3106,6 +3272,110 @@ public class ConfigOptions {
                     .defaultValue(2)
                     .withDescription(
                             "The number of threads the tiering service uses to commit tables concurrently. Must be positive.");
+
+    public static final ConfigOption<Integer> LAKE_TIERING_DELETION_VECTORS_TRIM_INTERVAL =
+            key("lake.tiering.deletion-vectors.trim-interval")
+                    .intType()
+                    .defaultValue(20)
+                    .withDescription(
+                            "For tables with deletion vectors enabled: every this many primary "
+                                    + "key position index changes a table registers (on Iceberg about "
+                                    + "one per tiering round plus one per re-index or compaction, on "
+                                    + "Paimon one per advance of the readable snapshot), the "
+                                    + "tiering service removes the index changes no bucket with "
+                                    + "data needs any more, those before its checkpoint, and index "
+                                    + "changes of failed rounds. The count is kept with the index, "
+                                    + "so it holds across restarts of the tiering service. It "
+                                    + "checkpoints idle buckets itself, e.g. "
+                                    + "those of old partitions no round writes any more, so they do "
+                                    + "not keep the index history from being removed.");
+
+    public static final ConfigOption<Integer> LAKE_TIERING_DELETION_VECTORS_TRIM_RETAIN =
+            key("lake.tiering.deletion-vectors.trim-retain")
+                    .intType()
+                    .defaultValue(2)
+                    .withDescription(
+                            "The number of index changes kept before the oldest checkpoint a "
+                                    + "bucket with data needs when the index history of a table is "
+                                    + "trimmed.");
+
+    public static final ConfigOption<Duration> LAKE_TIERING_DELETION_VECTORS_ORPHAN_MIN_AGE =
+            key("lake.tiering.deletion-vectors.orphan-min-age")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(6))
+                    .withDescription(
+                            "An index change that was never registered is removed once it is "
+                                    + "this old. It must be longer than the longest tiering round.");
+
+    public static final ConfigOption<Integer>
+            LAKE_TIERING_DELETION_VECTORS_REINDEX_FILES_PER_SPLIT =
+                    key("lake.tiering.deletion-vectors.reindex-files-per-split")
+                            .intType()
+                            .defaultValue(16)
+                            .withDescription(
+                                    "For tables with deletion vectors enabled: the most rewritten lake "
+                                            + "files one split of a re-index reads. The tiering service "
+                                            + "re-indexes the files of a bucket another engine rewrote in "
+                                            + "splits of at most this many files and "
+                                            + "'lake.tiering.deletion-vectors.reindex-rows-per-split' "
+                                            + "rows, which its readers read in parallel. Must be "
+                                            + "positive.");
+
+    public static final ConfigOption<Long> LAKE_TIERING_DELETION_VECTORS_REINDEX_ROWS_PER_SPLIT =
+            key("lake.tiering.deletion-vectors.reindex-rows-per-split")
+                    .longType()
+                    .defaultValue(4_000_000L)
+                    .withDescription(
+                            "For tables with deletion vectors enabled: the most rows, as the "
+                                    + "lake files' metadata gives them, one split of a re-index "
+                                    + "reads, besides "
+                                    + "'lake.tiering.deletion-vectors.reindex-files-per-split'; a "
+                                    + "larger file is a split of its own. A split sorts the keys "
+                                    + "of its rows in bounded memory, spilling sorted runs to "
+                                    + "'lake.tiering.io.tmp.dirs'. Must be positive.");
+
+    public static final ConfigOption<MemorySize> LAKE_TIERING_DELETION_VECTORS_WRITE_BUFFER_SIZE =
+            key("lake.tiering.deletion-vectors.write-buffer-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("128mb"))
+                    .withDescription(
+                            "For tables with deletion vectors enabled: the heap memory the lake "
+                                    + "writers of one tiering source task share to sort the rows "
+                                    + "of their rounds by primary key. When it is full, the writer "
+                                    + "holding the most spills its sorted rows to the local "
+                                    + "directories of 'lake.tiering.io.tmp.dirs', so a round of any "
+                                    + "size is tiered within this memory. Must be positive.");
+
+    public static final ConfigOption<Integer>
+            LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET =
+                    key("lake.tiering.deletion-vectors.max-round-keys-per-bucket")
+                            .intType()
+                            .defaultValue(10_000_000)
+                            .withDescription(
+                                    "For tables with deletion vectors enabled: the most primary "
+                                            + "keys one tiering round changes in a bucket. The commit "
+                                            + "of a round looks up and deletes the superseded rows of "
+                                            + "all keys it changed. Once a bucket reaches this many "
+                                            + "keys, counted as the versions its writer holds with the "
+                                            + "versions of a key folded where they met in memory, or "
+                                            + "'lake.tiering.deletion-vectors.max-round-bytes-per-bucket', "
+                                            + "its round ends at the record just tiered and the next "
+                                            + "round, which starts at once, tiers the rest, so a backlog "
+                                            + "is tiered in several rounds of bounded size. Must be "
+                                            + "positive.");
+
+    public static final ConfigOption<MemorySize>
+            LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET =
+                    key("lake.tiering.deletion-vectors.max-round-bytes-per-bucket")
+                            .memoryType()
+                            .defaultValue(MemorySize.parse("1gb"))
+                            .withDescription(
+                                    "For tables with deletion vectors enabled: the most bytes of "
+                                            + "changed rows one tiering round holds for a bucket, in "
+                                            + "memory and spilled to local disk, in their encoded size. "
+                                            + "See "
+                                            + "'lake.tiering.deletion-vectors.max-round-keys-per-bucket'. "
+                                            + "Must be positive.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for fluss kafka

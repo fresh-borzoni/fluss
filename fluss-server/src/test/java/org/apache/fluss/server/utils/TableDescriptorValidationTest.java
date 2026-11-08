@@ -497,6 +497,17 @@ class TableDescriptorValidationTest {
     }
 
     @Test
+    void testDeletionVectorsAreNotSupportedYet() {
+        String dv = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        assertThatThrownBy(() -> validate(pkTableWithProperty(dv, "true"), DataLakeFormat.ICEBERG))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining(dv)
+                .hasMessageContaining("not supported yet");
+        assertThatCode(() -> validate(pkTableWithProperty(dv, "false"), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     void testLakeFormatMustMatchClusterWhenLakeIsDisabled() {
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
