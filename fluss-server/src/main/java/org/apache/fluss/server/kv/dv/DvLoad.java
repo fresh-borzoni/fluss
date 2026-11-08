@@ -19,6 +19,8 @@ package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.server.kv.dv.DerivedDvManager.RecoverySource;
+import org.apache.fluss.server.kv.dv.DvFrontiers.KeepReady;
+import org.apache.fluss.server.kv.dv.DvOwner.TailDiskException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,32 +32,38 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
+import java.util.Set;
 
+import static org.apache.fluss.server.kv.dv.DvMaskRequestTiming.ms;
 import static org.apache.fluss.server.kv.dv.DvOwner.deleteDownloads;
+import static org.apache.fluss.server.kv.dv.DvOwner.isDiskFailure;
 
 /**
- * A load of a bucket's state: the one path by which the bucket moves to a new version. A load does
- * its long work on a job thread, then the owner swaps it in:
+ * A load of a bucket's state: the one path by which the bucket moves to a new version or a new
+ * change list. A load does its long work on a job thread, then the owner swaps it in:
  *
  * <ul>
  *   <li>{@link SwitchLoad} (SWITCH): applies the index changes after the covered snapshot, up to a
  *       newer one. It downloads them, ingests them into the latest index, and swaps.
  *   <li>{@link FullLoad} (FULL): rebuilds the index of a snapshot from its newest checkpoint and
- *       the changes after it. It clears the latest index first: what the bucket covered may hold
- *       keys the snapshot deleted.
+ *       the changes after it, and replays the log from its readable offset into a fresh change
+ *       list. It clears the latest index first: what the bucket covered may hold keys the snapshot
+ *       deleted.
+ *   <li>{@link DvTailLoad} (TAIL): replays the change list of the covered snapshot from the log,
+ *       after it went missing.
  * </ul>
  *
  * <p>The covered version is read through its own RocksDB snapshot ({@link DvVersion}), so what a
  * load ingests never shows through. The swap's first step is its only fallible write: the file
  * dictionary batch of a switch, or of a full load. If it fails, nothing of the load is applied, and
  * the latest index is marked as ahead of the version ({@link DvLatestIndexState}). From there the
- * swap changes only memory.
+ * swap changes only memory, but for the trim of the change list, whose failure drops the change
+ * list, which is then replayed.
  *
- * <p>A load owns its downloads until they are swapped in, and {@link #close} releases what is left
- * on every exit. Each RocksDB call takes a lease ({@link DvDbLeases}) and the load checks {@code
- * closed} between calls, so a closing bucket waits for one call at most, but for a full load's
- * compaction, which it cancels.
+ * <p>A load owns its downloads and its replayed change list until they are swapped in, and {@link
+ * #close} releases what is left on every exit. Each RocksDB call takes a lease ({@link DvDbLeases})
+ * and the load checks {@code closed} between calls, so a closing bucket waits for one call at most,
+ * but for a full load's compaction, which it cancels.
  */
 abstract class DvLoad implements Closeable {
 
@@ -64,18 +72,21 @@ abstract class DvLoad implements Closeable {
     /** What a load builds. */
     enum Kind {
         SWITCH,
-        FULL
+        FULL,
+        TAIL
     }
 
     final DvOwner m;
     final RecoverySource src;
     final Kind kind;
-    // the snapshot the load covers, and its readable offset
+    // the snapshot the load covers, and where its change list starts
     final long snapshotId;
     final long readableOffset;
     final long startNanos = System.nanoTime();
     // the index data the load downloaded and did not ingest yet; ingesting moves the files away
     final List<PositionIndexStore.BucketData> downloads = new ArrayList<>();
+    // the replay of a full or tail load, until its change list is installed
+    @Nullable DvReplay replay;
     // A fault of the owner stopped the load: its job ends at its next unit, and its swap step
     // aborts and closes it. Volatile: the owner sets it, the job reads it.
     private volatile boolean cancelled;
@@ -88,7 +99,7 @@ abstract class DvLoad implements Closeable {
         this.readableOffset = readableOffset;
     }
 
-    /** Downloads and ingests on a job thread. Returns false if the load ends early. */
+    /** Downloads, replays and ingests on a job thread. Returns false if the load ends early. */
     abstract boolean load() throws Exception;
 
     /** Stops the load at its next unit, as a fault of the owner ended its work; an owner step. */
@@ -139,9 +150,14 @@ abstract class DvLoad implements Closeable {
     /** Runs after a swap, on a job thread, before the owner starts its next work. */
     void afterSwap() {}
 
-    /** Releases what the load still owns: downloads not ingested. */
+    /** Releases what the load still owns: downloads not ingested, a replay not installed. */
     @Override
     public void close() {
+        DvReplay r = replay;
+        replay = null;
+        if (r != null) {
+            r.finish();
+        }
         // deletes what was not ingested; ingestion moves the ingested files away
         deleteDownloads(downloads);
         downloads.clear();
@@ -166,7 +182,8 @@ abstract class DvLoad implements Closeable {
     /**
      * Switches from the covered snapshot {@code from}, readable from {@code fromOffset}, to {@code
      * snapshotId} by applying the index changes after chain index {@code start} up to {@code
-     * target}.
+     * target}. The masks are kept but for the keys the changes name ({@link DvTargetedDerivation}),
+     * unless that costs more than looking up every lake key of the change list.
      */
     static final class SwitchLoad extends DvLoad {
         private final List<PositionIndexStore.ChainEntry> chain;
@@ -176,6 +193,10 @@ abstract class DvLoad implements Closeable {
         private final long fromOffset;
         private final boolean dirty;
         private String identity;
+        @Nullable private DvTargetedDerivation targeted;
+        // the switch may keep the masks and derive only what it changes, as begin() found
+        private boolean targetable;
+        private long keptChanges;
         // the chain index of the last change the ingest started
         private int reached;
         @Nullable private Exception ingestFailure;
@@ -183,7 +204,11 @@ abstract class DvLoad implements Closeable {
         private long metaNanos;
         private long downloadNanos;
         private long ingestNanos;
+        private long applyNanos;
         private long swapNanos;
+        private long trimNanos;
+        private long rederiveNanos;
+        private long changesLeft;
         private final long t0 = System.currentTimeMillis();
 
         SwitchLoad(
@@ -215,7 +240,23 @@ abstract class DvLoad implements Closeable {
                 return false; // moved on meanwhile; the next plan starts over
             }
             m.latestIndex.startIngest();
+            // Only values are taken here: the covered version is retained after the downloads,
+            // so no lease of the RocksDB is held across remote reads.
+            if (m.targetedSwitches && !dirty && DvTargetedDerivation.targetable(m)) {
+                targetable = true;
+                keptChanges = m.maskState.tail.changesFrom(readableOffset);
+            }
             return true;
+        }
+
+        /**
+         * Retains the published covered version for the derivation's local reads, on the job
+         * thread; null if the bucket moved on from it or closes. The derivation releases it.
+         */
+        @Nullable
+        private DvVersion retainCovered() {
+            DvVersion v = m.state.version;
+            return v != null && v.snapshotId == from && !stopped() && v.tryRetain() ? v : null;
         }
 
         @Override
@@ -240,11 +281,18 @@ abstract class DvLoad implements Closeable {
                 sstFiles += c.localSsts.size();
             }
             downloadNanos = System.nanoTime() - downloadStart;
+            long prepareStart = System.nanoTime();
             identity = src.snapshotIdentity(chain.get(target));
+            // the keys the changes name, and their positions in the covered version, retained
+            // only for these local reads; a dirty latest index is no base for that
+            DvVersion v = targetable ? retainCovered() : null;
+            targeted =
+                    v == null ? null : DvTargetedDerivation.prepare(m, downloads, v, keptChanges);
+            rederiveNanos += System.nanoTime() - prepareStart;
             if (stopped()) {
                 return false;
             }
-            // The expensive part, off the owner: lookups are served meanwhile.
+            // The expensive part, off the owner: mask requests are served meanwhile.
             long ingestStart = System.nanoTime();
             try {
                 for (PositionIndexStore.BucketData c : downloads) {
@@ -266,6 +314,18 @@ abstract class DvLoad implements Closeable {
         }
 
         @Override
+        boolean readyToSwap() {
+            if (ingestFailure != null || m.closed || m.coveredSnapshotId != from) {
+                return true;
+            }
+            // the changes below the high watermark join the change list first, a chunk a step
+            long start = System.nanoTime();
+            boolean ready = m.maskState.readyToSwitch(m.highWatermark.getAsLong());
+            applyNanos += System.nanoTime() - start;
+            return ready;
+        }
+
+        @Override
         boolean swap() throws Exception {
             long swapStart = System.nanoTime();
             if (ingestFailure != null || m.closed || m.coveredSnapshotId != from) {
@@ -281,21 +341,31 @@ abstract class DvLoad implements Closeable {
             // Files the new snapshot removed leave the dictionary in one write, before anything
             // else changes: if it fails, the covered version stays whole, as after a failed
             // ingest.
+            Set<Integer> droppedFiles;
             try {
                 List<String> removed = new ArrayList<>();
                 for (PositionIndexStore.BucketData c : downloads) {
                     removed.addAll(c.removedFiles);
                 }
-                m.index.dropFiles(removed);
+                droppedFiles = m.index.dropFiles(removed);
             } catch (IOException | RuntimeException e) {
                 m.latestIndex.ingestFailed(chain, reached);
                 throw e;
             }
             // From here the switch is committed.
+            DvTargetedDerivation derivation = targeted;
             try {
+                // the changes below the high watermark join the change list before the switch;
+                // readyToSwap applied all but a chunk at most
+                applyNanos += m.maskState.applyAll(m.highWatermark.getAsLong());
+                if (derivation != null && !derivation.holdViews()) {
+                    derivation.abandonUnlessPosted();
+                    derivation = null;
+                }
                 for (int i = start + 1; i < target; i++) {
                     m.markPassed(chain.get(i).snapshotId);
                 }
+                // a switch of one registration keeps the latest frontier of the snapshot it leaves
                 switchTo(
                         DvVersion.open(
                                 m.db,
@@ -303,50 +373,131 @@ abstract class DvLoad implements Closeable {
                                 snapshotId,
                                 readableOffset,
                                 identity,
-                                m.entriesApplied + target - start));
+                                m.entriesApplied + target - start),
+                        derivation,
+                        target == start + 1);
+                // the masks of the files the new snapshot removed go only once it is covered
+                m.maskState.lakeMasks.dropFiles(droppedFiles);
                 m.coveredIdentity = identity;
                 m.entriesApplied += target - start;
+            } catch (RuntimeException e) {
+                // the masks cannot be kept: they are derived again once the change list is
+                // replayed
+                if (derivation != null) {
+                    derivation.abandonUnlessPosted();
+                }
+                derivation = null;
+                m.maskState.renew(KeepReady.NONE);
+                m.maskState.resetTail();
+                m.maskState.tailFailure = e;
+                m.maskState.reportTail(true);
+                throw e;
             } finally {
+                targeted = derivation;
                 // the latest index is the covered version's now
                 m.latestIndex.covered(target, chain, false);
             }
             m.index.maybeCheckpoint();
+            changesLeft = m.maskState.tail.changeCount();
             swapNanos = System.nanoTime() - swapStart;
             return true;
         }
 
-        /** Covers the new version; an owner step. */
-        private void switchTo(DvVersion next) {
+        /**
+         * Covers the new version: the changes it holds leave the change list, and the masks are
+         * derived again from the rest. An owner step. The keys whose superseded version the new
+         * snapshot holds are looked up in its index, read from disk in the background, and no masks
+         * are served until then.
+         */
+        private void switchTo(
+                DvVersion next,
+                @Nullable DvTargetedDerivation derivation,
+                boolean nextRegistration) {
+            long previousStart = m.snapshotStartOffset;
+            m.maskState.renew(nextRegistration ? KeepReady.NEXT_SNAPSHOT : KeepReady.NONE);
             m.markPassed(m.coveredSnapshotId);
             m.replaceVersion(next);
             m.coveredSnapshotId = next.snapshotId;
             m.snapshotStartOffset = next.readableOffset;
+            m.rebuild.clearReplayFailure();
             m.unreachable = Long.MIN_VALUE;
+            m.maskState.fullResolvePending = false;
+            if (derivation != null) {
+                derivation.swapped(previousStart, next.readableOffset);
+            } else {
+                m.maskState.lakeMasks.clear();
+            }
+            m.maskState.unresolved.clear();
+            long trimStart = System.nanoTime();
+            try {
+                // one range delete
+                m.maskState.tail.retainFrom(next.readableOffset);
+            } catch (IOException e) {
+                m.maskState.tailDiskFailed(e);
+                return;
+            } finally {
+                trimNanos += System.nanoTime() - trimStart;
+            }
+            if (derivation == null) {
+                m.maskState.resolveWholeTail();
+            }
+            m.maskState.reportTail(true);
+            m.maskState.scheduleResolve();
+        }
+
+        @Override
+        public void close() {
+            super.close();
+            // a derivation that did not post its result ends here: views and budget
+            DvTargetedDerivation d = targeted;
+            if (d != null) {
+                d.abandonUnlessPosted();
+            }
         }
 
         @Override
         void afterSwap() {
+            DvTargetedDerivation derivation = targeted;
+            if (derivation != null) {
+                long completeStart = System.nanoTime();
+                derivation.complete();
+                rederiveNanos += System.nanoTime() - completeStart;
+            }
             m.metrics.caughtUp(System.currentTimeMillis() - t0);
-            // lock_ms is the swap step: the covered version is read through its own RocksDB
+            // A targeted switch kept the masks but for the keys the changes name; the others look
+            // up every lake key again in the background resolves. lock_ms is the swap step, and
+            // drain_wait_ms is always 0: the covered version is read through its own RocksDB
             // snapshot, so nothing waits for its readers.
             LOG.info(
                     "Switched the deletion vectors of {} to snapshot {}: from_snapshot={}"
-                            + " to_snapshot={} index_changes={} load_ms={} total_ms={} from_offset={}"
-                            + " to_offset={} ssts={} meta_ms={} download_ms={} ingest_ms={} lock_ms={}",
+                            + " to_snapshot={} index_changes={} load_ms={} trim_ms={} rederive_ms={}"
+                            + " total_ms={} from_offset={} to_offset={}"
+                            + " ssts={} targeted={} change_keys={} removed_positions={}"
+                            + " relookup_keys={} tail_changes_left={} meta_ms={} download_ms={}"
+                            + " ingest_ms={} apply_ms={} lock_ms={} drain_wait_ms={}",
                     m.logName,
                     snapshotId,
                     from,
                     snapshotId,
                     target - start,
                     ms(downloadNanos + ingestNanos),
+                    ms(trimNanos),
+                    ms(rederiveNanos),
                     ms(System.nanoTime() - startNanos + metaNanos),
                     fromOffset,
                     readableOffset,
                     sstFiles,
+                    derivation != null,
+                    derivation == null ? -1 : derivation.changeKeys,
+                    derivation == null ? -1 : derivation.removed,
+                    derivation == null ? -1 : derivation.lookedUpAgain,
+                    changesLeft,
                     ms(metaNanos),
                     ms(downloadNanos),
                     ms(ingestNanos),
-                    ms(swapNanos));
+                    ms(applyNanos),
+                    ms(swapNanos),
+                    ms(0));
         }
     }
 
@@ -354,9 +505,10 @@ abstract class DvLoad implements Closeable {
 
     /**
      * Rebuilds the state to {@code snapshotId}: downloads its newest checkpoint and the index
-     * changes after it, on a job thread. Then it clears the latest index and ingests the download,
-     * and swaps: the file dictionary keeps the snapshot's files only, in one write, and the version
-     * is installed. Until then the covered version keeps serving.
+     * changes after it, and replays the log from its readable offset into a fresh change list, on a
+     * job thread. Then it clears the latest index and ingests the download, and swaps: the file
+     * dictionary keeps the snapshot's files only, in one write, and the version and change list are
+     * installed. Until then the covered version keeps serving.
      */
     static final class FullLoad extends DvLoad {
         private final List<PositionIndexStore.ChainEntry> chain;
@@ -365,6 +517,7 @@ abstract class DvLoad implements Closeable {
         @Nullable private PositionIndexStore.Checkpoint checkpoint;
         @Nullable private DerivedDvRebuildLimiter slots;
         private String identity;
+        @Nullable private Exception replayFailure;
         @Nullable private Exception ingestFailure;
         // the load cleared the latest index: only a full load may build on it now
         private volatile boolean cleared;
@@ -376,6 +529,8 @@ abstract class DvLoad implements Closeable {
         private long compactNanos = -1;
         private long slotWaitNanos;
         private long downloadNanos;
+        private long replayEarlyNanos;
+        private long replayFinalNanos;
         private long ingestNanos;
         private long t0;
 
@@ -391,6 +546,14 @@ abstract class DvLoad implements Closeable {
 
         @Override
         boolean begin() {
+            if (m.coveredSnapshotId < 0 && m.emptyLakeTracked) {
+                // Drop the empty lake's change list (the whole log) now rather than hold it next to
+                // the replayed one. A union read of the empty lake is not ready until the rebuild
+                // is done, then gets stale and plans again on the snapshot.
+                m.maskState.renew(KeepReady.NONE);
+                m.emptyLakeTracked = false;
+                m.maskState.resetTail();
+            }
             m.latestIndex.startIngest();
             return true;
         }
@@ -464,6 +627,15 @@ abstract class DvLoad implements Closeable {
                 sstFiles += d.localSsts.size();
             }
             downloadNanos = System.nanoTime() - downloadStart;
+            // DvReplay into a queue: the local log can run past the high watermark, and a change
+            // above it must not mask a version below it.
+            replay = DvReplay.start(m, src, readableOffset, this::stopped);
+            if (replay == null) {
+                return false;
+            }
+            long replayStart = System.nanoTime();
+            replayFailure = replay.replayEarlyPasses();
+            replayEarlyNanos = System.nanoTime() - replayStart;
             identity = src.snapshotIdentity(chain.get(upTo));
             // The index is loaded off the owner, as a switch ingests, so writes go on. It is
             // cleared first: what the bucket covered may hold keys the snapshot deleted, which
@@ -499,6 +671,14 @@ abstract class DvLoad implements Closeable {
                 ingestFailure = e;
             }
             ingestNanos = System.nanoTime() - ingestStart - Math.max(0, compactNanos);
+            if (replayFailure == null && ingestFailure == null) {
+                long finalStart = System.nanoTime();
+                if (!m.work.enterFinalPass(replay)) {
+                    return false;
+                }
+                replayFailure = replay.finalRead();
+                replayFinalNanos = System.nanoTime() - finalStart;
+            }
             return true;
         }
 
@@ -527,6 +707,16 @@ abstract class DvLoad implements Closeable {
             m.latestIndex.covered(upTo, chain, true);
             m.replaceVersion(
                     DvVersion.open(m.db, m.leases, snapshotId, readableOffset, identity, upTo + 1));
+            if (m.coveredSnapshotId == snapshotId) {
+                m.maskState.renew(KeepReady.SAME_SNAPSHOT);
+            } else if (m.coveredSnapshotId >= 0
+                    && upTo > 0
+                    && chain.get(upTo - 1).snapshotId == m.coveredSnapshotId) {
+                m.maskState.renew(KeepReady.NEXT_SNAPSHOT);
+            } else {
+                m.maskState.renew(KeepReady.NONE);
+            }
+            m.maskState.fromRebuild = true;
             m.markPassed(m.coveredSnapshotId);
             for (int i = 0; i < upTo; i++) {
                 m.markPassed(chain.get(i).snapshotId);
@@ -536,24 +726,54 @@ abstract class DvLoad implements Closeable {
             m.snapshotStartOffset = readableOffset;
             m.entriesApplied = upTo + 1;
             m.index.entriesAtCheckpoint = checkpoint == null ? 0 : checkpoint.chainIndex + 1;
+            if (replayFailure != null) {
+                // the index stays, union reads retry the replay and fail until it succeeds
+                m.maskState.resetTail();
+                m.maskState.tailFailure =
+                        isDiskFailure(replayFailure)
+                                ? new TailDiskException(replayFailure)
+                                : replayFailure;
+                m.maskState.reportTail(true);
+                LOG.warn(
+                        "The deletion vectors cover snapshot {} but cannot replay the log from"
+                                + " offset {}; union reads fail until a replay succeeds.",
+                        snapshotId,
+                        readableOffset,
+                        replayFailure);
+                return true;
+            }
+            DvReplay r = replay;
+            long installStart = System.nanoTime();
+            r.install();
+            long installNanos = System.nanoTime() - installStart;
             m.index.maybeCheckpoint();
             m.metrics.rebuilt(System.currentTimeMillis() - t0);
             long end = System.nanoTime();
             LOG.info(
                     "Rebuilt the deletion vectors of {}: kind=full snapshot={}"
-                            + " readable_offset={} load_index_ms={} total_ms={} index_changes={}"
-                            + " ssts={} checkpoint={} download_ms={} ingest_ms={} lock_ms={}"
+                            + " readable_offset={} log_end={} changes_replayed={} load_index_ms={}"
+                            + " replay_ms={} total_ms={} versions_spilled={} tail_changes={}"
+                            + " queued={} index_changes={} ssts={} checkpoint={} download_ms={}"
+                            + " ingest_ms={} replay_locked_ms={} install_ms={} lock_ms={}"
                             + " slot_wait_ms={} one_call_ssts={} compact_ms={}",
                     m.logName,
                     snapshotId,
                     readableOffset,
+                    r.next,
+                    r.changes,
                     ms(downloadNanos + ingestNanos + Math.max(0, compactNanos)),
+                    ms(replayEarlyNanos + replayFinalNanos),
                     ms(end - startNanos),
+                    r.versionsId >= 0,
+                    m.maskState.tail.changeCount(),
+                    m.maskState.tail.queue.size(),
                     upTo + 1 - from,
                     sstFiles,
                     checkpoint == null ? "-" : checkpoint.snapshotId,
                     ms(downloadNanos),
                     ms(ingestNanos),
+                    ms(replayFinalNanos),
+                    ms(installNanos),
                     ms(end - swapStart),
                     ms(slotWaitNanos),
                     oneCallSsts,
@@ -647,10 +867,5 @@ abstract class DvLoad implements Closeable {
     static void endSlot(DvOwner m, DerivedDvRebuildLimiter slots) {
         m.metrics.rebuildEnded();
         slots.release();
-    }
-
-    /** Nanoseconds as milliseconds with one decimal, for the log lines. */
-    static String ms(long nanos) {
-        return String.format(Locale.ROOT, "%.1f", nanos / 1_000_000.0);
     }
 }

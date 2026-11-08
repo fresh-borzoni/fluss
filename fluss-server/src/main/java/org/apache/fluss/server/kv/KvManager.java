@@ -37,6 +37,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
+import org.apache.fluss.server.kv.dv.DerivedDvHeapBudget;
 import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatisticsRegistry;
@@ -161,6 +162,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     /** The memory segment pool to allocate memorySegment. */
     private final LazyMemorySegmentPool memorySegmentPool;
     // the heap the deletion vector state of this server's buckets shares
+    private final DerivedDvHeapBudget dvHeapBudget;
     // the threads of this server's deletion vector buckets, shut down with this manager
     private final DerivedDvRuntime dvRuntime;
 
@@ -223,6 +225,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         ? new DerivedDvRuntime(conf)
                         : new DerivedDvRuntime(conf, ioExecutor);
         this.dvRuntime.registerMetrics(tabletServerMetricGroup);
+        this.dvHeapBudget = DerivedDvHeapBudget.of(conf, dvRuntime);
         this.zkClient = zkClient;
         this.clock = clock;
         this.serverMetricGroup = tabletServerMetricGroup;
@@ -709,6 +712,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     autoIncrementManager,
                                     clock,
                                     tableConfig,
+                                    dvHeapBudget,
                                     dvRuntime);
                     currentKvs.put(tableBucket, tablet);
 
@@ -899,6 +903,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         autoIncrementManager,
                         clock,
                         tableConfig,
+                        dvHeapBudget,
                         dvRuntime);
         currentKvs.put(tableBucket, kvTablet);
 

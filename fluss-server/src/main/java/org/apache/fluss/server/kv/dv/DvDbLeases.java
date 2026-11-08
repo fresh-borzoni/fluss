@@ -26,10 +26,10 @@ import java.util.concurrent.CompletableFuture;
 
 /**
  * The leases of a bucket's DV RocksDB: who may still call it. A lease covers one RocksDB call, such
- * as an ingest, a chunk of lookups or an export, or a RocksDB snapshot held open, such as a
- * version's. Leases never cover remote I/O, and jobs take a new one per unit, so a closing bucket
- * waits only for the calls in progress. A call that may take long, a full load's compaction, is
- * cancelled instead ({@link #tryAcquire(Runnable)}).
+ * as an ingest, a replayed batch, a chunk of lookups or an export, or a RocksDB snapshot held open,
+ * such as a version's. Leases never cover remote I/O, and jobs take a new one per unit, so a
+ * closing bucket waits only for the calls in progress. A call that may take long, a full load's
+ * compaction, is cancelled instead ({@link #tryAcquire(Runnable)}).
  *
  * <p>Once {@link #close} is called no lease is granted. The RocksDB closes when the last lease is
  * released, by {@link #close} itself if none is held within its wait, else by the last {@link

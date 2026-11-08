@@ -338,6 +338,7 @@ class KvTabletTest {
                     autoIncrementManager,
                     clock,
                     tableConf,
+                    DvTestManagers.budget(),
                     DvTestManagers.executors());
         }
         return KvTablet.create(

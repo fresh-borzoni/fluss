@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.dv;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -30,12 +31,18 @@ public final class TestingDvHooks implements DvTestHooks {
 
     @Nullable private volatile CountDownLatch rebuildGate;
     @Nullable private volatile CountDownLatch switchGate;
+    private volatile boolean resolvesPaused;
+    @Nullable private volatile Runnable beforeResolveLookup;
     @Nullable private volatile Runnable afterLookupRead;
     @Nullable private volatile Runnable afterIngest;
     @Nullable private volatile Consumer<BooleanSupplier> beforeCompaction;
     @Nullable private volatile Consumer<String> beforeFileDrop;
+    @Nullable private volatile Runnable afterDerivationChunk;
+    @Nullable private volatile Runnable beforeReadyServe;
+    @Nullable private volatile Runnable faultInNextDrain;
+    @Nullable private volatile IOException changeListWriteFailure;
 
-    /** Holds the rebuilds until {@code gate} counts down; none if null. */
+    /** Holds the rebuilds and replays until {@code gate} counts down; none if null. */
     public void holdRebuilds(@Nullable CountDownLatch gate) {
         this.rebuildGate = gate;
     }
@@ -43,6 +50,15 @@ public final class TestingDvHooks implements DvTestHooks {
     /** Holds the switches to newer snapshots until {@code gate} counts down; none if null. */
     public void holdSwitches(@Nullable CountDownLatch gate) {
         this.switchGate = gate;
+    }
+
+    /** Pauses the background resolves, which then neither apply nor look up. */
+    public void setResolvesPaused(boolean paused) {
+        this.resolvesPaused = paused;
+    }
+
+    public void setBeforeResolveLookup(@Nullable Runnable hook) {
+        this.beforeResolveLookup = hook;
     }
 
     public void setAfterLookupRead(@Nullable Runnable hook) {
@@ -59,6 +75,24 @@ public final class TestingDvHooks implements DvTestHooks {
 
     public void setBeforeFileDrop(@Nullable Consumer<String> hook) {
         this.beforeFileDrop = hook;
+    }
+
+    public void setAfterDerivationChunk(@Nullable Runnable hook) {
+        this.afterDerivationChunk = hook;
+    }
+
+    public void setBeforeReadyServe(@Nullable Runnable hook) {
+        this.beforeReadyServe = hook;
+    }
+
+    /** Runs {@code fault} in the owner's next drain of the hand-off, once. */
+    public void setFaultInNextDrain(@Nullable Runnable fault) {
+        this.faultInNextDrain = fault;
+    }
+
+    /** Makes the writes of the change list fail, as a full or broken disk does; none if null. */
+    public void failChangeListWrites(@Nullable IOException failure) {
+        this.changeListWriteFailure = failure;
     }
 
     @Override
@@ -79,6 +113,16 @@ public final class TestingDvHooks implements DvTestHooks {
     public boolean holdsSwitches() {
         CountDownLatch held = switchGate;
         return held != null && held.getCount() > 0;
+    }
+
+    @Override
+    public boolean pausesResolves() {
+        return resolvesPaused;
+    }
+
+    @Override
+    public void beforeResolveLookup() {
+        run(beforeResolveLookup);
     }
 
     @Override
@@ -104,6 +148,33 @@ public final class TestingDvHooks implements DvTestHooks {
         Consumer<String> hook = beforeFileDrop;
         if (hook != null) {
             hook.accept(fileName);
+        }
+    }
+
+    @Override
+    public void afterDerivationChunk() {
+        run(afterDerivationChunk);
+    }
+
+    @Override
+    public void beforeReadyServe() {
+        run(beforeReadyServe);
+    }
+
+    @Override
+    public void onDrain() {
+        Runnable fault = faultInNextDrain;
+        if (fault != null) {
+            faultInNextDrain = null;
+            fault.run();
+        }
+    }
+
+    @Override
+    public void beforeChangeListWrite() throws IOException {
+        IOException failure = changeListWriteFailure;
+        if (failure != null) {
+            throw failure;
         }
     }
 

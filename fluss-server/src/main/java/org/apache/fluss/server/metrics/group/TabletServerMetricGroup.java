@@ -82,12 +82,30 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Histogram dvCheckpointLatencyHistogram;
     private final Counter dvStaleSnapshotCount;
     private final Counter dvOwnerFaultCount;
+    private final Counter dvHandOffStallCount;
+    private final Counter dvHandOffOverflowCount;
     // the longest step of a bucket's owner, and the longest wait of a step in its mailbox, since
     // each gauge was last read, in nanoseconds
     private final AtomicLong dvOwnerStepMaxNanos = new AtomicLong();
     private final AtomicLong dvOwnerMailboxDelayMaxNanos = new AtomicLong();
     private final AtomicInteger dvRebuildsInProgress = new AtomicInteger();
     private final AtomicLong dvLastRebuildMs = new AtomicLong();
+    private final AtomicLong dvReplayBacklog = new AtomicLong();
+    private final AtomicLong dvHeapBytes = new AtomicLong();
+    private final AtomicLong dvChangeListBytes = new AtomicLong();
+    private final AtomicInteger dvPinnedCuts = new AtomicInteger();
+    private final AtomicLong dvPinnedCutBytes = new AtomicLong();
+    private final Counter dvPinnedCutEvictionCount;
+    private final Counter dvPinnedCutExpirationCount;
+    // the steps of union reads' mask requests
+    private final Histogram dvMaskRequestHistogram;
+    private final Histogram dvMaskWaitSwitchHistogram;
+    private final Histogram dvMaskWaitDeriveHistogram;
+    private final Histogram dvMaskWaitReplayHistogram;
+    private final Histogram dvMaskApplyHistogram;
+    private final Histogram dvMaskResolveWaitHistogram;
+    private final Histogram dvMaskBuildHistogram;
+    private final Counter dvMaskFrontierCount;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
 
@@ -172,6 +190,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.DV_STALE_SNAPSHOT_RATE, new MeterView(dvStaleSnapshotCount));
         dvOwnerFaultCount = new SimpleCounter();
         meter(MetricNames.DV_OWNER_FAULT_RATE, new MeterView(dvOwnerFaultCount));
+        dvHandOffStallCount = new SimpleCounter();
+        meter(MetricNames.DV_HAND_OFF_STALL_RATE, new MeterView(dvHandOffStallCount));
+        dvHandOffOverflowCount = new SimpleCounter();
+        meter(MetricNames.DV_HAND_OFF_OVERFLOW_RATE, new MeterView(dvHandOffOverflowCount));
         gauge(
                 MetricNames.DV_OWNER_STEP_MAX_MS,
                 () -> dvOwnerStepMaxNanos.getAndSet(0) / 1_000_000L);
@@ -180,6 +202,31 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
                 () -> dvOwnerMailboxDelayMaxNanos.getAndSet(0) / 1_000_000L);
         gauge(MetricNames.DV_REBUILDS_IN_PROGRESS, dvRebuildsInProgress::get);
         gauge(MetricNames.DV_LAST_REBUILD_MS, dvLastRebuildMs::get);
+        gauge(MetricNames.DV_REPLAY_BACKLOG, dvReplayBacklog::get);
+        gauge(MetricNames.DV_HEAP_BYTES, dvHeapBytes::get);
+        gauge(MetricNames.DV_CHANGE_LIST_BYTES, dvChangeListBytes::get);
+        gauge(MetricNames.DV_PINNED_CUTS, dvPinnedCuts::get);
+        gauge(MetricNames.DV_PINNED_CUT_BYTES, dvPinnedCutBytes::get);
+        dvPinnedCutEvictionCount = new SimpleCounter();
+        meter(MetricNames.DV_PINNED_CUT_EVICTION_RATE, new MeterView(dvPinnedCutEvictionCount));
+        dvPinnedCutExpirationCount = new SimpleCounter();
+        meter(MetricNames.DV_PINNED_CUT_EXPIRATION_RATE, new MeterView(dvPinnedCutExpirationCount));
+        dvMaskRequestHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_REQUEST_MS, dvMaskRequestHistogram);
+        dvMaskWaitSwitchHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_WAIT_SWITCH_MS, dvMaskWaitSwitchHistogram);
+        dvMaskWaitDeriveHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_WAIT_DERIVE_MS, dvMaskWaitDeriveHistogram);
+        dvMaskWaitReplayHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_WAIT_REPLAY_MS, dvMaskWaitReplayHistogram);
+        dvMaskApplyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_APPLY_MS, dvMaskApplyHistogram);
+        dvMaskResolveWaitHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_RESOLVE_WAIT_MS, dvMaskResolveWaitHistogram);
+        dvMaskBuildHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(MetricNames.DV_MASK_BUILD_MS, dvMaskBuildHistogram);
+        dvMaskFrontierCount = new SimpleCounter();
+        meter(MetricNames.DV_MASK_FRONTIER_RATE, new MeterView(dvMaskFrontierCount));
         kvTruncateAsDuplicatedCount = new SimpleCounter();
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
@@ -373,6 +420,14 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         return dvOwnerFaultCount;
     }
 
+    public Counter dvHandOffStallCount() {
+        return dvHandOffStallCount;
+    }
+
+    public Counter dvHandOffOverflowCount() {
+        return dvHandOffOverflowCount;
+    }
+
     public AtomicLong dvOwnerStepMaxNanos() {
         return dvOwnerStepMaxNanos;
     }
@@ -387,6 +442,66 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public AtomicLong dvLastRebuildMs() {
         return dvLastRebuildMs;
+    }
+
+    public AtomicLong dvReplayBacklog() {
+        return dvReplayBacklog;
+    }
+
+    public AtomicLong dvHeapBytes() {
+        return dvHeapBytes;
+    }
+
+    public AtomicLong dvChangeListBytes() {
+        return dvChangeListBytes;
+    }
+
+    public AtomicInteger dvPinnedCuts() {
+        return dvPinnedCuts;
+    }
+
+    public AtomicLong dvPinnedCutBytes() {
+        return dvPinnedCutBytes;
+    }
+
+    public Counter dvPinnedCutEvictionCount() {
+        return dvPinnedCutEvictionCount;
+    }
+
+    public Counter dvPinnedCutExpirationCount() {
+        return dvPinnedCutExpirationCount;
+    }
+
+    public Histogram dvMaskRequestHistogram() {
+        return dvMaskRequestHistogram;
+    }
+
+    public Histogram dvMaskWaitSwitchHistogram() {
+        return dvMaskWaitSwitchHistogram;
+    }
+
+    public Histogram dvMaskWaitDeriveHistogram() {
+        return dvMaskWaitDeriveHistogram;
+    }
+
+    public Histogram dvMaskWaitReplayHistogram() {
+        return dvMaskWaitReplayHistogram;
+    }
+
+    public Histogram dvMaskApplyHistogram() {
+        return dvMaskApplyHistogram;
+    }
+
+    public Histogram dvMaskResolveWaitHistogram() {
+        return dvMaskResolveWaitHistogram;
+    }
+
+    public Histogram dvMaskBuildHistogram() {
+        return dvMaskBuildHistogram;
+    }
+
+    public Counter dvMaskFrontierCount() {
+        return dvMaskFrontierCount;
     }
 
     public Counter kvTruncateAsDuplicatedCount() {

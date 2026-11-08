@@ -1000,8 +1000,8 @@ public final class Replica {
                         .advanceHistoricalCleanupOffset(restoreStartOffset);
             }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
-            // Rebuild the position index in the background, so the leader takes writes
-            // meanwhile. Lookups of the bucket are answered as not ready.
+            // Rebuild the position index and the log tail in the background, so the leader
+            // takes writes meanwhile. Union reads of the bucket are answered as not ready.
             if (kvTablet.getDvManager() != null) {
                 kvTablet.getDvManager()
                         .recoverInBackground(
@@ -1009,8 +1009,13 @@ public final class Replica {
                                         dvRemoteDataDir(),
                                         tableInfo,
                                         tableBucket,
+                                        logTablet,
+                                        remoteLogManager,
                                         snapshotContext.getZooKeeperClient(),
+                                        schemaGetter,
                                         new File(logTablet.getLogDir(), "derived-dv-recovery"),
+                                        snapshotContext.remoteLogPrefetchNumInRecoverKv(),
+                                        snapshotContext.remoteLogDownloadThreadsInRecoverKv(),
                                         snapshotContext.getDvMetadataCache()),
                                 snapshotContext.getDvRebuildLimiter());
             }

@@ -44,6 +44,7 @@ import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
+import org.apache.fluss.server.kv.dv.DerivedDvHeapBudget;
 import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvMetrics;
 import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
@@ -285,7 +286,9 @@ public final class KvTablet {
                         valueDecoder,
                         rowTtlTimestampProvider,
                         clock,
-                        skipUnchangedUpsert);
+                        skipUnchangedUpsert,
+                        rowTtlEnabled,
+                        dvManager);
         this.rocksDBStatistics = rocksDBStatistics;
         this.dvManager = dvManager;
         this.autoIncrementManager = autoIncrementManager;
@@ -349,6 +352,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 SystemClock.getInstance(),
                 new TableConfig(new Configuration()),
+                null,
                 null);
     }
 
@@ -375,6 +379,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            DerivedDvHeapBudget dvHeapBudget,
             DerivedDvRuntime dvRuntime)
             throws IOException {
         return create(
@@ -401,6 +406,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                dvHeapBudget,
                 dvRuntime);
     }
 
@@ -450,6 +456,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                null,
                 null);
     }
 
@@ -477,6 +484,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            @Nullable DerivedDvHeapBudget dvHeapBudget,
             @Nullable DerivedDvRuntime dvRuntime)
             throws IOException {
         checkNotNull(tableConfig, "tableConfig must not be null.");
@@ -563,6 +571,7 @@ public final class KvTablet {
 
         DerivedDvManager dvManager = null;
         if (tableConfig.isDeletionVectorsEnabled()) {
+            checkNotNull(dvHeapBudget, "Deletion vectors need the tablet server's budget.");
             checkNotNull(dvRuntime, "Deletion vectors need the tablet server's executors.");
             // the manager owns and closes it
             DvRocksDB dvRocksDB;
@@ -581,11 +590,18 @@ public final class KvTablet {
             dvManager =
                     new DerivedDvManager(
                             dvRocksDB,
+                            logTablet::getHighWatermark,
                             serverConf.get(ConfigOptions.KV_DELETION_VECTORS_CHECKPOINT_INTERVAL),
                             DerivedDvMetrics.of(serverMetricGroup),
+                            dvHeapBudget,
                             dvRuntime);
-            // names the bucket in the lines that log moves and rebuilds
+            // names the bucket in the lines that log mask requests, moves and rebuilds
             dvManager.setLogContext(tablePath.getTablePath(), tableBucket);
+            if (rowTtl.isPresent()) {
+                // row TTL removes values without a change in the log, so a replayed insert may
+                // supersede an expired version
+                dvManager.useRowTtl();
+            }
         }
 
         return new KvTablet(
@@ -657,6 +673,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                null,
                 null);
     }
 
@@ -686,6 +703,7 @@ public final class KvTablet {
             AutoIncrementManager autoIncrementManager,
             Clock clock,
             TableConfig tableConfig,
+            @Nullable DerivedDvHeapBudget dvHeapBudget,
             @Nullable DerivedDvRuntime dvRuntime)
             throws IOException {
         return create(
@@ -712,6 +730,7 @@ public final class KvTablet {
                 autoIncrementManager,
                 clock,
                 tableConfig,
+                dvHeapBudget,
                 dvRuntime);
     }
 
@@ -1690,6 +1709,15 @@ public final class KvTablet {
     @Nullable
     public DerivedDvManager getDvManager() {
         return dvManager;
+    }
+
+    /**
+     * Makes the write path hand its key changes to {@code manager} instead of the tablet's own
+     * manager, which the tablet still closes, as a test of the hand-off needs.
+     */
+    @VisibleForTesting
+    void handChangesTo(DerivedDvManager manager) {
+        kvWriteProcessor.setDvManager(manager);
     }
 
     /** Returns whether deletion vectors are enabled for this tablet. */

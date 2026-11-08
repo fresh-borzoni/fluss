@@ -30,8 +30,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -46,12 +48,43 @@ import java.util.concurrent.TimeUnit;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link DerivedDvRuntime}, the deletion vector threads of a tablet server. */
 class DerivedDvRuntimeTest {
 
     @TempDir Path tempDir;
+
+    /**
+     * After the server's executors shut down, a change can no longer schedule its resolve and a
+     * budget over its limit can no longer free in the background. Both are logged, not thrown.
+     */
+    @Test
+    void testWorkAfterShutdownIsNotThrown() throws Exception {
+        DerivedDvRuntime executors = new DerivedDvRuntime();
+        DerivedDvHeapBudget budget = new DerivedDvHeapBudget(1, executors);
+        DerivedDvManager manager =
+                new DerivedDvManager(
+                        DvRocksDB.open(tempDir.resolve("dv").toString()),
+                        () -> 0L,
+                        DvTestManagers.CHECKPOINT_INTERVAL,
+                        DerivedDvMetrics.noop(),
+                        budget,
+                        executors);
+        executors.shutdown();
+        try {
+            DvEntry change = new DvEntry("k1".getBytes(StandardCharsets.UTF_8), 10, 10, false, -1);
+            assertThatCode(
+                            () ->
+                                    DvTestManagers.handOver(
+                                            manager, Collections.singletonList(change)))
+                    .doesNotThrowAnyException();
+            assertThat(budget.totalBytes()).isGreaterThan(budget.limitBytes());
+        } finally {
+            manager.close();
+        }
+    }
 
     /**
      * The runtime names its threads, registers each pool's or share's queued and active tasks, and
@@ -73,7 +106,7 @@ class DerivedDvRuntimeTest {
         runtime.registerMetrics(new TabletServerMetricGroup(registry, "fluss", "host", "rack", 0));
         for (String pool :
                 new String[] {
-                    "request", "state", "advance", "rebuild", "checkpoint", "scheduler"
+                    "request", "state", "resolver", "advance", "rebuild", "checkpoint", "scheduler"
                 }) {
             for (String gauge : new String[] {"queued", "active"}) {
                 assertThat(metrics.keySet())
@@ -88,6 +121,8 @@ class DerivedDvRuntimeTest {
 
         assertThat(threadOf(runtime.bucketState()))
                 .startsWith("kv-deletion-vectors-bucket-state-thread-");
+        assertThat(threadOf(runtime.keyLookup()))
+                .startsWith("kv-deletion-vectors-key-lookup-thread-");
         assertThat(threadOf(runtime.switches()))
                 .startsWith("kv-deletion-vectors-index-load-thread-");
         assertThat(threadOf(runtime.rebuilds()::execute))
@@ -210,20 +245,66 @@ class DerivedDvRuntimeTest {
     }
 
     /**
+     * A delayed task runs on its pool, not on the scheduler: a task that blocks there leaves the
+     * scheduler free to fire the next timer on time.
+     */
+    @Test
+    void testTimersPostAndNeverBlock() throws Exception {
+        DerivedDvRuntime runtime = new DerivedDvRuntime(new Configuration());
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            CompletableFuture<String> blocked = new CompletableFuture<>();
+            runtime.executeAfter(
+                    10,
+                    runtime.keyLookup(),
+                    () -> {
+                        blocked.complete(Thread.currentThread().getName());
+                        awaitQuietly(release);
+                    },
+                    () -> {});
+            assertThat(blocked.get(10, TimeUnit.SECONDS))
+                    .startsWith("kv-deletion-vectors-key-lookup-thread-");
+
+            CompletableFuture<Void> fired = new CompletableFuture<>();
+            runtime.scheduler().schedule(() -> fired.complete(null), 10, TimeUnit.MILLISECONDS);
+            fired.get(10, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+            runtime.shutdown();
+        }
+    }
+
+    /** A delayed task whose pool shut down meanwhile runs its rejection, on the scheduler. */
+    @Test
+    void testADelayedTaskThatThePoolRejectsRunsItsRejection() throws Exception {
+        DerivedDvRuntime runtime = new DerivedDvRuntime(new Configuration());
+        ExecutorService closed = Executors.newSingleThreadExecutor();
+        closed.shutdown();
+        try {
+            CompletableFuture<Void> rejected = new CompletableFuture<>();
+            runtime.executeAfter(10, closed, () -> {}, () -> rejected.complete(null));
+            rejected.get(10, TimeUnit.SECONDS);
+        } finally {
+            runtime.shutdown();
+        }
+    }
+
+    /**
      * A {@link VirtualMachineError} that a task on a plain pool lets through reaches the threads'
-     * handler: both shares of the index-load threads, and the checkpoints.
+     * handler: the key lookups, both shares of the index-load threads, and the checkpoints.
      */
     @Test
     void testAVirtualMachineErrorOnAPlainPoolReachesTheHandler() throws Exception {
         RecordingHandler handler = new RecordingHandler();
-        DerivedDvRuntime runtime = new DerivedDvRuntime(handler);
+        DerivedDvRuntime runtime = new DerivedDvRuntime(1, handler);
         try {
+            runtime.keyLookup().execute(fail(new OutOfMemoryError("key lookup")));
             runtime.switches().execute(fail(new OutOfMemoryError("switch")));
             runtime.rebuilds().execute(fail(new OutOfMemoryError("rebuild")));
             runtime.checkpoints().execute(fail(new OutOfMemoryError("checkpoint")));
-            handler.await(3);
+            handler.await(4);
             assertThat(handler.messages())
-                    .containsExactlyInAnyOrder("switch", "rebuild", "checkpoint");
+                    .containsExactlyInAnyOrder("key lookup", "switch", "rebuild", "checkpoint");
         } finally {
             runtime.shutdown();
         }
@@ -236,7 +317,7 @@ class DerivedDvRuntimeTest {
     @Test
     void testOnlyAVirtualMachineErrorOfATimerReachesTheHandler() throws Exception {
         RecordingHandler handler = new RecordingHandler();
-        DerivedDvRuntime runtime = new DerivedDvRuntime(handler);
+        DerivedDvRuntime runtime = new DerivedDvRuntime(1, handler);
         try {
             runtime.scheduler()
                     .schedule(fail(new IllegalStateException("timer")), 0, TimeUnit.MILLISECONDS);
@@ -259,7 +340,7 @@ class DerivedDvRuntimeTest {
     @Test
     void testARequestIsAnsweredBeforeAVirtualMachineErrorReachesTheHandler() throws Exception {
         RecordingHandler handler = new RecordingHandler();
-        DerivedDvRuntime runtime = new DerivedDvRuntime(handler);
+        DerivedDvRuntime runtime = new DerivedDvRuntime(1, handler);
         try {
             CompletableFuture<Object> plain =
                     runtime.requests()
@@ -289,13 +370,15 @@ class DerivedDvRuntimeTest {
     @Test
     void testAFailedOwnerStepIsAFaultAndAVirtualMachineErrorReachesTheHandler() throws Exception {
         RecordingHandler handler = new RecordingHandler();
-        DerivedDvRuntime runtime = new DerivedDvRuntime(handler);
+        DerivedDvRuntime runtime = new DerivedDvRuntime(1, handler);
         DerivedDvMetrics metrics = DerivedDvMetrics.noop();
         DerivedDvManager manager =
                 new DerivedDvManager(
                         DvRocksDB.open(tempDir.resolve("faults").toString()),
+                        () -> 0L,
                         DvTestManagers.CHECKPOINT_INTERVAL,
                         metrics,
+                        new DerivedDvHeapBudget(Long.MAX_VALUE, runtime),
                         runtime);
         try {
             DvOwner owner = owner(manager);

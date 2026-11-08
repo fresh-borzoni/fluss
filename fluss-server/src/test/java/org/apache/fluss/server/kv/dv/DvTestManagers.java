@@ -18,6 +18,7 @@
 package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.DeletionVectorsNotReadyException;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 
 import javax.annotation.Nullable;
@@ -46,18 +47,25 @@ public final class DvTestManagers {
         return Shared.EXECUTORS;
     }
 
-    /** A manager with the default checkpoint interval and no metrics. */
+    /** The budget the tests' managers share: a share of the maximum heap, as by default. */
+    public static DerivedDvHeapBudget budget() {
+        return Shared.BUDGET;
+    }
+
+    /** A manager with the default checkpoint interval, no metrics and the default budget. */
     public static DerivedDvManager newManager(DvRocksDB db, LongSupplier highWatermark) {
         return newManager(db, highWatermark, CHECKPOINT_INTERVAL, DerivedDvMetrics.noop());
     }
 
-    /** A manager of {@code db} with its own {@link TestingDvHooks}. */
+    /** A manager with the default budget and its own {@link TestingDvHooks}. */
     public static DerivedDvManager newManager(
             DvRocksDB db, LongSupplier highWatermark, int checkpointInterval, DerivedDvMetrics m) {
         return new DerivedDvManager(
                 db,
+                highWatermark,
                 checkpointInterval,
                 m,
+                budget(),
                 executors(),
                 executors().bucketState(),
                 new TestingDvHooks());
@@ -66,6 +74,18 @@ public final class DvTestManagers {
     /** The hooks of a manager created with {@link TestingDvHooks}. */
     public static TestingDvHooks hooks(DerivedDvManager manager) {
         return (TestingDvHooks) manager.testHooks();
+    }
+
+    /**
+     * Hands the changes of a batch over, as the write path does: with the log end after the batch,
+     * one past its last record.
+     */
+    public static void handOver(DerivedDvManager manager, List<DvEntry> entries) {
+        long logEnd = -1;
+        for (DvEntry entry : entries) {
+            logEnd = Math.max(logEnd, entry.getRecordOffset() + 1);
+        }
+        manager.handleChangelogSynced(entries, logEnd);
     }
 
     /** Counts a background reader of the manager's RocksDB, which a close then waits for. */
@@ -85,19 +105,44 @@ public final class DvTestManagers {
         manager.setCloseWaitMillis(millis);
     }
 
+    /** How long the manager serves masks it built again; 0 turns the cache off. */
+    public static void setMaskCacheMillis(DerivedDvManager manager, long millis) {
+        manager.setMaskCacheMillis(millis);
+    }
+
     /** The manager's DV RocksDB. */
     public static DvRocksDB db(DerivedDvManager manager) {
         return manager.db();
     }
 
-    /** Makes the manager cover the empty lake, as a new leader does once it recovers. */
+    /**
+     * Makes the manager cover the empty lake of a bucket whose log is still empty, as a new leader
+     * does once it recovers, and waits until it serves masks.
+     */
     public static void coverTheEmptyLake(DerivedDvManager manager, LongSupplier logEnd)
             throws Exception {
-        manager.recover(new EmptyLake());
+        manager.recover(new EmptyLake(logEnd));
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (true) {
+            try {
+                DvTestReads.unionRead(manager, -1);
+                return;
+            } catch (DeletionVectorsNotReadyException e) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw e;
+                }
+                Thread.sleep(10);
+            }
+        }
     }
 
-    /** The durable state of a bucket whose lake has no snapshot yet. */
+    /** The durable state of a bucket whose lake has no snapshot and whose log is empty yet. */
     private static final class EmptyLake implements DerivedDvManager.RecoverySource {
+        private final LongSupplier logEnd;
+
+        EmptyLake(LongSupplier logEnd) {
+            this.logEnd = logEnd;
+        }
 
         @Nullable
         @Override
@@ -119,6 +164,20 @@ public final class DvTestManagers {
         @Override
         public PositionIndexStore.BucketData readChange(PositionIndexStore.ChainEntry entry) {
             throw new UnsupportedOperationException("the empty lake has no index changes");
+        }
+
+        @Override
+        public long replayLog(
+                long fromOffset, long toOffset, DerivedDvManager.ChangeConsumer consumer) {
+            if (logEnd.getAsLong() > fromOffset) {
+                throw new IllegalStateException("the log of the empty lake is not empty");
+            }
+            return fromOffset;
+        }
+
+        @Override
+        public long logEndOffset() {
+            return logEnd.getAsLong();
         }
 
         @Override
@@ -146,6 +205,8 @@ public final class DvTestManagers {
     // created on first use
     private static final class Shared {
         static final DerivedDvRuntime EXECUTORS = new DerivedDvRuntime();
+        static final DerivedDvHeapBudget BUDGET =
+                new DerivedDvHeapBudget(DerivedDvHeapBudget.defaultBytes(), EXECUTORS);
 
         static {
             Runtime.getRuntime()

@@ -20,11 +20,25 @@ package org.apache.fluss.server.kv.dv;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.LogRecord;
+import org.apache.fluss.record.LogRecordBatch;
+import org.apache.fluss.record.LogRecordReadContext;
+import org.apache.fluss.record.LogRecords;
+import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.server.kv.RemoteLogFetcher;
+import org.apache.fluss.server.log.FetchIsolation;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.ChunkedAllocationManager;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.FileUtils;
 
 import org.slf4j.Logger;
@@ -34,35 +48,52 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
-/** A {@link DerivedDvManager.RecoverySource} over ZooKeeper and the index store. */
+/** A {@link DerivedDvManager.RecoverySource} over ZooKeeper, the index store and the log. */
 public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource {
 
     private static final Logger LOG = LoggerFactory.getLogger(DerivedDvRecoverySource.class);
+    private static final int FETCH_BYTES = 8 * 1024 * 1024;
 
+    private final TableInfo tableInfo;
     private final TableBucket tableBucket;
+    private final LogTablet logTablet;
+    private final RemoteLogManager remoteLogManager;
     private final ZooKeeperClient zkClient;
+    private final SchemaGetter schemaGetter;
     private final DerivedDvMetadataCache cache;
     private final DerivedDvMetadataCache.CachingStore store;
     // the offsets file of the last readable registration this bucket read; chain listings made
     // after it are cached under it
     @Nullable private volatile String lastRegistration;
     private final File localTmp;
+    private final int remoteLogPrefetchNum;
+    private final int remoteLogDownloadThreads;
 
     public DerivedDvRecoverySource(
             String remoteDataDir,
             TableInfo tableInfo,
             TableBucket tableBucket,
+            LogTablet logTablet,
+            RemoteLogManager remoteLogManager,
             ZooKeeperClient zkClient,
+            SchemaGetter schemaGetter,
             File localTmp,
+            int remoteLogPrefetchNum,
+            int remoteLogDownloadThreads,
             DerivedDvMetadataCache cache) {
+        this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
+        this.logTablet = logTablet;
+        this.remoteLogManager = remoteLogManager;
         this.zkClient = zkClient;
+        this.schemaGetter = schemaGetter;
         this.cache = cache;
         this.store =
                 cache.store(
@@ -72,6 +103,8 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
         this.localTmp = localTmp;
         // removes downloads that an earlier leadership of the bucket left, e.g. on a crash
         FileUtils.deleteDirectoryQuietly(localTmp);
+        this.remoteLogPrefetchNum = remoteLogPrefetchNum;
+        this.remoteLogDownloadThreads = remoteLogDownloadThreads;
     }
 
     @Override
@@ -208,5 +241,116 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
             }
         }
         return new File(localTmp, prefix + "-" + System.nanoTime());
+    }
+
+    @Override
+    public long logEndOffset() {
+        return logTablet.localLogEndOffset();
+    }
+
+    @Override
+    public long replayLog(long fromOffset, long toOffset, DerivedDvManager.ChangeConsumer consumer)
+            throws Exception {
+        KeyEncoder keyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        tableInfo.getRowType(),
+                        tableInfo.getPhysicalPrimaryKeys(),
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
+        long next = fromOffset;
+        RemoteLogFetcher remote = null;
+        // keeps freed chunks of direct memory for reuse until it is closed
+        ChunkedAllocationManager.ChunkedFactory chunks =
+                new ChunkedAllocationManager.ChunkedFactory();
+        try (LogRecordReadContext readContext =
+                LogRecordReadContext.createReadContext(
+                        tableInfo,
+                        false,
+                        LogRecordReadContext.SchemaResolution.TARGET,
+                        null,
+                        schemaGetter,
+                        chunks)) {
+            while (next < toOffset) {
+                long localStart = logTablet.localLogStartOffset();
+                Iterable<LogRecordBatch> batches;
+                if (next < localStart) {
+                    // the offsets are in remote storage now; read them there, as KV recovery does
+                    if (remote == null) {
+                        remote =
+                                new RemoteLogFetcher(
+                                        remoteLogManager,
+                                        tableBucket,
+                                        localTmp,
+                                        remoteLogPrefetchNum,
+                                        remoteLogDownloadThreads);
+                    }
+                    batches = remote.fetch(next, localStart);
+                } else {
+                    LogRecords records =
+                            logTablet
+                                    .read(
+                                            next,
+                                            FETCH_BYTES,
+                                            FetchIsolation.LOG_END,
+                                            true,
+                                            null,
+                                            null)
+                                    .getRecords();
+                    if (records == MemoryLogRecords.EMPTY) {
+                        break;
+                    }
+                    batches = records.batches();
+                }
+                long before = next;
+                for (LogRecordBatch batch : batches) {
+                    if (batch.nextLogOffset() <= next) {
+                        continue;
+                    }
+                    if (batch.baseLogOffset() > next) {
+                        // a gap would let superseded versions through, so fail instead
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Cannot rebuild the deletion vectors of %s: the log has no offsets %d"
+                                                + " to %d.",
+                                        tableBucket, next, batch.baseLogOffset() - 1));
+                    }
+                    try (CloseableIterator<LogRecord> it = batch.records(readContext)) {
+                        while (it.hasNext()) {
+                            LogRecord r = it.next();
+                            if (r.logOffset() < next
+                                    || r.getChangeType() == ChangeType.UPDATE_BEFORE) {
+                                continue;
+                            }
+                            byte[] key = keyEncoder.encodeKey(r.getRow());
+                            long v = r.getChangeType() == ChangeType.DELETE ? -1 : r.logOffset();
+                            // only a change of a key without a live version writes +I
+                            consumer.accept(
+                                    Arrays.copyOf(key, key.length),
+                                    r.logOffset(),
+                                    v,
+                                    r.getChangeType() == ChangeType.INSERT);
+                        }
+                    }
+                    next = batch.nextLogOffset();
+                }
+                if (next == before) {
+                    if (before < localStart) {
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Cannot rebuild the deletion vectors of %s: the remote log has no"
+                                                + " offset %d.",
+                                        tableBucket, before));
+                    }
+                    break;
+                }
+            }
+        } finally {
+            if (remote != null) {
+                remote.close();
+            }
+            // after the read context, which releases its buffers into the chunks
+            chunks.close();
+        }
+        return next;
     }
 }

@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import static org.apache.fluss.server.kv.dv.DvMaskReads.NOT_READY_WAIT_MS;
 import static org.apache.fluss.server.kv.dv.DvOwner.RESOLVE_CHUNK;
 
 /**
@@ -41,9 +42,6 @@ import static org.apache.fluss.server.kv.dv.DvOwner.RESOLVE_CHUNK;
  * it and waits for that a moment.
  */
 final class DvLookups {
-
-    // how long a lookup waits for the catch-up it started before it is answered as not ready
-    static final long NOT_READY_WAIT_MS = 500;
 
     // the bucket's owner: lookups read its published state only, and post the catch-ups they need
     private final DvOwner m;

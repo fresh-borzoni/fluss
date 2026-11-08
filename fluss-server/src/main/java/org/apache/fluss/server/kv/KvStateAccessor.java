@@ -109,6 +109,36 @@ public final class KvStateAccessor {
         return localResult.isPresent() ? valueDecoder.decodeValue(localResult.value()) : null;
     }
 
+    /**
+     * Looks up a key's value like {@link #lookup} without a fallback, together with its version
+     * offset, the log offset of the change that wrote it: the tag of the tagged layout, or the
+     * version offset slot of the versioned layout. Returns null if the key has no value.
+     */
+    @Nullable
+    public TaggedValue lookupTagged(Key key, ValueDecoder valueDecoder) throws IOException {
+        KvStateLookupResult result = lookupPreWriteBuffer(key);
+        if (result.status() == KvStateLookupResult.Status.NOT_FOUND) {
+            result = lookupRocksDB(key);
+        }
+        if (!result.isPresent()) {
+            return null;
+        }
+        byte[] raw = result.value();
+        return new TaggedValue(
+                valueDecoder.decodeValue(raw), valueDecoder.decodeVersionOffset(raw));
+    }
+
+    /** A value and the tag of its raw bytes. */
+    public static final class TaggedValue {
+        public final BinaryValue value;
+        public final long tag;
+
+        TaggedValue(BinaryValue value, long tag) {
+            this.value = value;
+            this.tag = tag;
+        }
+    }
+
     /** Adds an insert mutation to the prewrite buffer. */
     public void insert(Key key, byte[] value, long logOffset) {
         if (historicalPartition) {

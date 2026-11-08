@@ -36,10 +36,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * The work queue of a bucket's owner ({@link DvOwner}): recovery and catch-ups to a target
- * snapshot, one at a time. A work plans its load, the load runs off the owner, and its swap is an
- * owner step; targets wanted meanwhile wait in the queue. Its methods run as owner steps unless
- * their javadoc names another thread.
+ * The work queue of a bucket's owner ({@link DvOwner}): recovery, catch-ups to a target snapshot
+ * and replays of the change list, one at a time. A work plans its load, the load runs off the
+ * owner, and its swap is an owner step; targets wanted meanwhile wait in the queue. Its methods run
+ * as owner steps unless their javadoc names another thread.
  */
 final class DvOwnerWork {
 
@@ -54,6 +54,8 @@ final class DvOwnerWork {
     // a switch a test holds is tried again after this backoff, doubling up to the maximum
     static final long HELD_RETRY_INITIAL_MS = 100;
     static final long HELD_RETRY_MAX_MS = 2_000;
+    // how long a load waits for the owner to acknowledge its final pass
+    static final long FINAL_PASS_ACK_MS = 30_000;
     // how long a leader transition waits for the bucket's owner to take the bucket over
     static final long TAKEOVER_WAIT_MS = 30_000;
 
@@ -220,6 +222,11 @@ final class DvOwnerWork {
         return done;
     }
 
+    /** Replays the change list of {@code snapshotId} if it is missing; numbered {@code replay}. */
+    void replay(long snapshotId, long replay) {
+        enqueue(new Replay(snapshotId, replay));
+    }
+
     /** Joins the work that reaches {@code snapshotId}, or queues one. */
     void want(long snapshotId, long attempt, @Nullable CompletableFuture<Boolean> done) {
         if (o.closed) {
@@ -326,8 +333,8 @@ final class DvOwnerWork {
             return;
         } catch (Throwable t) {
             // No job runs, so no swap of the load comes: the load ends here, and the work ends
-            // with the fault while it still runs, as after a fault of any step (logged, counted).
-            // It backs off as any failed load does.
+            // with the fault while it still runs, as after a fault of any step (logged, counted,
+            // the change list replayed). It backs off as any failed load does.
             endFaulted(l);
             if (t instanceof VirtualMachineError) {
                 // the mailbox handles it as a fault of this step, then rethrows it
@@ -367,14 +374,44 @@ final class DvOwnerWork {
     }
 
     /**
-     * Swaps a load in. What runs after the swap runs on the switch share of the index-load threads,
-     * and the work ends after it.
+     * Asks the owner to enter the final pass of {@code replay}, from its load's thread, and waits
+     * for the acknowledgement. Returns false if the bucket closed.
+     */
+    boolean enterFinalPass(DvReplay replay) {
+        CompletableFuture<Boolean> ack = new CompletableFuture<>();
+        o.post(
+                () -> {
+                    if (o.closed || replay.stopped()) {
+                        ack.complete(false);
+                        return;
+                    }
+                    o.finalPass = replay;
+                    // a batch dropped before is in the log before the final read
+                    o.handOff.resume();
+                    ack.complete(true);
+                });
+        try {
+            return ack.get(FINAL_PASS_ACK_MS, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Swaps a load in. What runs after the swap, a switch's targeted derivation, runs on the switch
+     * share of the index-load threads, and the work ends after it.
      */
     void swap(Work w, DvLoad l, boolean loaded, @Nullable Exception failure) {
         if (l.cancelled() || running != w || load != l) {
             // Not the load the owner runs: a fault stopped it, or its work ended. It swaps in
             // nothing; what it left in the latest index is recorded, and it releases what it holds
             // before the work ends and the next load starts.
+            if (o.finalPass != null && o.finalPass == l.replay) {
+                o.finalPass = null;
+            }
             endFaulted(l);
             if (running == w) {
                 finish(w, false, w.fault != null ? w.fault : failure);
@@ -410,6 +447,11 @@ final class DvOwnerWork {
             // fault handling ends its work
             endFaulted(l);
             throw t;
+        } finally {
+            // the replay's final pass ends with the load, swapped in or not
+            if (o.finalPass != null && o.finalPass == l.replay) {
+                o.finalPass = null;
+            }
         }
         if (failure != null || !covered || !loaded || running != w) {
             l.close();
@@ -457,6 +499,10 @@ final class DvOwnerWork {
 
     /** What a plan decided. */
     void planned(Work w, DvOwnerPlanner.Plan plan) {
+        if (plan.registrations != null) {
+            o.planner.noteRegistrations(
+                    plan.registrations.covered, plan.registrations.next, plan.registrations.newest);
+        }
         if (running != w) {
             if (plan.load != null) {
                 plan.load.close();
@@ -601,6 +647,38 @@ final class DvOwnerWork {
                     w.complete(covered);
                 }
             }
+        }
+    }
+
+    /** Replays the change list of the covered snapshot if it is missing. */
+    final class Replay extends Work {
+        private final long snapshotId;
+        private final long number;
+
+        Replay(long snapshotId, long number) {
+            this.snapshotId = snapshotId;
+            this.number = number;
+        }
+
+        @Override
+        void start() {
+            DvTailLoad l = DvTailLoad.ifMissing(o, snapshotId);
+            if (l == null) {
+                finish(this, true, null);
+                return;
+            }
+            startLoad(this, l, o.rebuild.limiter::execute);
+        }
+
+        @Override
+        void end(boolean covered, @Nullable Exception failure) {
+            if (failure != null) {
+                LOG.warn(
+                        "Replaying the deletion vector change list of snapshot {} failed.",
+                        snapshotId,
+                        failure);
+            }
+            o.rebuild.replayEnded(number, failure);
         }
     }
 

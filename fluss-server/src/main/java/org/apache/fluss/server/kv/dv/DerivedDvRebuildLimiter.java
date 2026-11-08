@@ -28,8 +28,9 @@ import java.util.concurrent.Semaphore;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
- * Bounds how many deletion vector rebuilds run at once on a tablet server. A rebuild downloads a
- * bucket's index after a leader change. That costs I/O, so a failover that moves many leaders to
+ * Bounds how many deletion vector rebuilds run at once on a tablet server. A rebuild replays a
+ * bucket's log since its covered snapshot, and after a leader change also downloads the bucket's
+ * index. That costs I/O and memory for the replayed keys, so a failover that moves many leaders to
  * one server rebuilds them a few at a time.
  */
 @Internal
@@ -102,7 +103,7 @@ public final class DerivedDvRebuildLimiter {
         this.testHooks = testHooks;
     }
 
-    /** Runs before a rebuild starts; see {@link DvTestHooks#beforeRebuild}. */
+    /** Runs before a rebuild or replay starts; see {@link DvTestHooks#beforeRebuild}. */
     void beforeRebuild() throws InterruptedIOException {
         testHooks.beforeRebuild();
     }
@@ -115,7 +116,7 @@ public final class DerivedDvRebuildLimiter {
         return testHooks.holdsSwitches();
     }
 
-    /** Runs {@code rebuild} in the background; it takes a slot when it starts loading. */
+    /** Runs {@code rebuild} in the background; it takes a slot when it starts replaying. */
     void execute(Runnable rebuild) {
         executor.execute(rebuild);
     }

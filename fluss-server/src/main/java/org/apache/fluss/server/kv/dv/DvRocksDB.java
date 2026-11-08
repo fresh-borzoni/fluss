@@ -49,12 +49,13 @@ import java.util.List;
 /**
  * The local RocksDB of a bucket's deletion vector state, separate from the KV tablet's RocksDB.
  *
- * <p>It holds two column families:
+ * <p>It holds three column families:
  *
  * <ul>
  *   <li>RowPosIndex: the position index, encoded primary key to the {@code FilePos} (file id and
  *       row position) of the key's live row in the covered snapshot.
  *   <li>FileDict: the mapping between file ids and data file names.
+ *   <li>Tail: the change lists, their updates and deletes ({@link DvChangeListStore}).
  * </ul>
  *
  * <p>The state is rebuilt from the published index changes whenever a replica becomes leader, so it
@@ -64,6 +65,7 @@ public class DvRocksDB implements Closeable {
 
     static final String CF_ROW_POS_INDEX = "RowPosIndex";
     static final String CF_FILE_DICT = "FileDict";
+    static final String CF_TAIL = "Tail";
 
     private static final int MAX_OPEN_FILES = 64;
     private static final long WRITE_BUFFER_BYTES = 4L << 20;
@@ -85,6 +87,7 @@ public class DvRocksDB implements Closeable {
 
     private final RowPosIndex rowPosIndex;
     private final FileDict fileDict;
+    private final DvChangeListStore changeListStore;
     private boolean closed;
     // the block cache of this RocksDB alone, when the tablet server has no shared one
     @Nullable private final Cache ownBlockCache;
@@ -110,9 +113,10 @@ public class DvRocksDB implements Closeable {
         this.writeOptions = writeOptions;
         this.bloomFilter = bloomFilter;
         this.cfHandles = cfHandles;
-        // cfHandles order: [default, RowPosIndex, FileDict]
+        // cfHandles order: [default, RowPosIndex, FileDict, Tail]
         this.rowPosIndex = new RowPosIndex(db, cfHandles.get(1), writeOptions);
         this.fileDict = new FileDict(db, cfHandles.get(2), writeOptions);
+        this.changeListStore = new DvChangeListStore(db, cfHandles.get(3), writeOptions);
     }
 
     /**
@@ -188,7 +192,9 @@ public class DvRocksDB implements Closeable {
                                     CF_ROW_POS_INDEX.getBytes(StandardCharsets.UTF_8),
                                     indexCfOptions),
                             new ColumnFamilyDescriptor(
-                                    CF_FILE_DICT.getBytes(StandardCharsets.UTF_8), cfOptions));
+                                    CF_FILE_DICT.getBytes(StandardCharsets.UTF_8), cfOptions),
+                            new ColumnFamilyDescriptor(
+                                    CF_TAIL.getBytes(StandardCharsets.UTF_8), cfOptions));
             List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
             RocksDB db = RocksDB.open(dbOptions, dbPath, cfDescriptors, cfHandles);
             DvRocksDB dvRocksDB =
@@ -203,6 +209,8 @@ public class DvRocksDB implements Closeable {
                             ownBlockCache,
                             new File(dbPath + "-tmp"));
             try {
+                // change lists are rebuilt from the log
+                dvRocksDB.changeListStore.clear();
                 // scratch files of a previous run, e.g. a checkpoint export a crash left
                 FileUtils.deleteDirectoryQuietly(dvRocksDB.tmpDir);
                 Files.createDirectories(dvRocksDB.tmpDir.toPath());
@@ -258,6 +266,11 @@ public class DvRocksDB implements Closeable {
         } catch (RocksDBException e) {
             throw new IOException(e);
         }
+    }
+
+    /** The change lists of the bucket. */
+    public DvChangeListStore changeListStore() {
+        return changeListStore;
     }
 
     /** Whether the RocksDB is closed. */

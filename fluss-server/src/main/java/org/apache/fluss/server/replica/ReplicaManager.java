@@ -24,6 +24,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.ConfigException;
+import org.apache.fluss.exception.DeletionVectorsNotReadyException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.HistoricalPartitionThrottledException;
@@ -38,6 +39,7 @@ import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
@@ -97,7 +99,10 @@ import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
+import org.apache.fluss.server.kv.dv.DvMaskRequest;
+import org.apache.fluss.server.kv.dv.DvPinnedCut;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
@@ -129,6 +134,7 @@ import org.apache.fluss.server.replica.historical.HistoricalPartitionManager;
 import org.apache.fluss.server.storage.DiskUsageMonitor;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.utils.FatalErrorHandler;
+import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
@@ -1479,6 +1485,86 @@ public class ReplicaManager implements ServerReconfigurable {
                         responseCallback.accept(new NotifyLakeTableOffsetResponse());
                     }
                 });
+    }
+
+    /**
+     * Pins the cut of a union read of a bucket, or releases it, and answers with the requested
+     * parts of its masks.
+     *
+     * @param tableId the table ID
+     * @param partitionId the partition ID, null for non-partitioned tables
+     * @param bucketId the bucket ID
+     * @param readableSnapshotId the lake snapshot the read is planned on
+     * @param masks which masks the read asks for
+     * @return a {@link GetDvSnapshotResponse} containing the masks
+     */
+    public GetDvSnapshotResponse getDvSnapshot(
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long readableSnapshotId,
+            DvMaskRequest masks) {
+        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+        try {
+            DerivedDvManager dvManager = dvLeaderKvTablet(tb).getDvManager();
+            if (masks.releasesCut()) {
+                dvManager.releaseCut(readableSnapshotId, masks.cut(), masks.holds());
+                return new GetDvSnapshotResponse();
+            }
+            try {
+                DvPinnedCut cut =
+                        masks.cut() == null
+                                ? dvManager.pinCut(
+                                        readableSnapshotId,
+                                        masks.waitForCatchUp(),
+                                        masks.pinRequestId(),
+                                        masks.holds())
+                                : pinnedCut(tb, dvManager, readableSnapshotId, masks.cut());
+                return ServerRpcMessageUtils.buildDvCutResponse(cut, masks);
+            } catch (StaleSnapshotException e) {
+                if (masks.waitForCatchUp() || masks.cut() != null) {
+                    // A cut that is gone is stale for a read that does not wait too: the leader
+                    // may still cover the snapshot, which the read pins again or reads by key.
+                    throw e;
+                }
+                // a read that does not wait plans the bucket again on the covered snapshot
+                return ServerRpcMessageUtils.buildDvCoveredSnapshotResponse(e);
+            } catch (DeletionVectorsNotReadyException e) {
+                if (masks.waitForCatchUp() || !e.isRebuilding()) {
+                    throw e;
+                }
+                // a read that does not wait reads the bucket by key up to the cut
+                dvManager.foldCutServed(e.getRebuildingCut());
+                return ServerRpcMessageUtils.buildDvFoldResponse(e.getRebuildingCut());
+            }
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to get DV snapshot for "
+                            + tb
+                            + " snapshot "
+                            + readableSnapshotId
+                            + (masks.cut() == null ? "" : " cut " + masks.cut()),
+                    e);
+        }
+    }
+
+    /**
+     * Returns a cut a union read pinned. A cut the bucket does not hold fails as stale. The message
+     * names the bucket and the cut after the snapshot ids, which clients read from it.
+     */
+    private static DvPinnedCut pinnedCut(
+            TableBucket tb, DerivedDvManager dvManager, long snapshotId, long cut)
+            throws IOException {
+        try {
+            return dvManager.pinnedCut(snapshotId, cut);
+        } catch (StaleSnapshotException e) {
+            throw new StaleSnapshotException(
+                    e.getCurrentSnapshotId(),
+                    e.getRequestedSnapshotId(),
+                    "bucket " + tb + ", cut " + cut);
+        }
     }
 
     /**

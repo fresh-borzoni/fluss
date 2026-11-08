@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.annotation.Internal;
 
+import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.function.BooleanSupplier;
 
@@ -34,7 +35,7 @@ public interface DvTestHooks {
 
     // ---- a tablet server's, run by its rebuild limiter ----
 
-    /** Runs before a rebuild of a bucket starts; it may wait. */
+    /** Runs before a rebuild or replay of a bucket starts; it may wait. */
     default void beforeRebuild() throws InterruptedIOException {}
 
     /** Whether the server's leaders put off their switches to newer snapshots. */
@@ -43,6 +44,14 @@ public interface DvTestHooks {
     }
 
     // ---- a bucket's ----
+
+    /** Whether the background resolves neither apply nor look up. */
+    default boolean pausesResolves() {
+        return false;
+    }
+
+    /** Runs before each lookup of a resolve, on a key-lookup thread. */
+    default void beforeResolveLookup() {}
 
     /** Runs after a tiering lookup read the index, before it answers. */
     default void afterLookupRead() {}
@@ -58,4 +67,16 @@ public interface DvTestHooks {
 
     /** Runs for each file a switch or rebuild drops from the file dictionary, before the drop. */
     default void beforeFileDrop(String fileName) {}
+
+    /** Runs after a switch's derivation added a chunk of keys and their old positions. */
+    default void afterDerivationChunk() {}
+
+    /** Runs before a read that does not wait is served the published frontier, on its thread. */
+    default void beforeReadyServe() {}
+
+    /** Runs at the start of each drain of the hand-off, an owner step. */
+    default void onDrain() {}
+
+    /** Runs before each write of the change list to the bucket's RocksDB. */
+    default void beforeChangeListWrite() throws IOException {}
 }
