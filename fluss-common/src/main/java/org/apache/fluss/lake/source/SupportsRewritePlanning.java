@@ -21,11 +21,14 @@ import org.apache.fluss.annotation.PublicEvolving;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
+
 /**
  * A {@link LakeSource} that can tell how the data files of a lake table changed between two
- * snapshots. Tables with deletion vectors need it: their position index follows the lake's data
- * files. Fluss checks a lake source for this capability before it reads or tiers such a table, and
- * fails with a clear error otherwise.
+ * snapshots, and which commit a snapshot id names. Tables with deletion vectors need it: their
+ * position index follows the lake's data files, and union reads apply masks to the snapshot they
+ * were made for only. Fluss checks a lake source for this capability before it reads or tiers such
+ * a table, and fails with a clear error otherwise.
  *
  * @param <Split> the split type of the lake source
  * @since 1.1
@@ -55,4 +58,14 @@ public interface SupportsRewritePlanning<Split extends LakeSplit> {
      */
     @Nullable
     DataDeltaPlan<Split> planRewrite(long baseSnapshotId, @Nullable Long targetSnapshotId);
+
+    /**
+     * Describes the commit snapshot {@code snapshotId} names now, so that a reused snapshot id,
+     * e.g. of a commit after a rollback, is told apart from the snapshot it named before. Returns
+     * "none" if the snapshot does not exist, and null for a lake that never reuses snapshot ids.
+     * Fluss records it when it registers a readable snapshot of a table with deletion vectors.
+     * Union reads check it before they apply the snapshot's masks. Reads only.
+     */
+    @Nullable
+    String snapshotIdentity(long snapshotId) throws IOException;
 }

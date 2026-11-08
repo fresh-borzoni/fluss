@@ -35,7 +35,7 @@ import java.util.List;
 
 /**
  * A testing implementation of {@link LakeSource}. As a lake with deletion vectors, it plans no
- * rewrites.
+ * rewrites and never reuses snapshot ids.
  */
 public class TestingLakeSource
         implements LakeSource<LakeSplit>, SupportsRewritePlanning<LakeSplit> {
@@ -187,6 +187,12 @@ public class TestingLakeSource
     @Override
     public DataDeltaPlan<LakeSplit> planRewrite(
             long baseSnapshotId, @Nullable Long targetSnapshotId) {
+        return null;
+    }
+
+    @Nullable
+    @Override
+    public String snapshotIdentity(long snapshotId) {
         return null;
     }
 }
