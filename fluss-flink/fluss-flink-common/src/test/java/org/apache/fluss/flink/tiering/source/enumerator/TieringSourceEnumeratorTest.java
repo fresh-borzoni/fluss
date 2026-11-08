@@ -22,6 +22,7 @@ import org.apache.fluss.client.admin.ListOffsetsResult;
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.TieringCommitterInitContext;
 import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
@@ -33,13 +34,20 @@ import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.flink.sink.testutils.TestAdminAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
+import org.apache.fluss.flink.tiering.TestingWriteResult;
+import org.apache.fluss.flink.tiering.committer.TestingCommittable;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.TieringTestBase;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
+import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
+import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
+import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
@@ -92,6 +100,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.withSettings;
 
 /** Unit tests for {@link TieringSourceEnumerator} and {@link TieringSplitGenerator}. */
 class TieringSourceEnumeratorTest extends TieringTestBase {
@@ -1218,6 +1227,121 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             assertThat(validatedTable.get()).isNotNull();
             assertThat(validatedTable.get().getTablePath()).isEqualTo(tablePath);
             assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+        }
+    }
+
+    /** A table with deletion vectors on a lake format without them is refused before its round. */
+    @Test
+    void testDeletionVectorTableOnLakeWithoutThemIsRefused() throws Exception {
+        TableInfo dvTable = pkTableInfo(true);
+        assertThatThrownBy(
+                        () ->
+                                TieringSourceEnumerator.validateTable(
+                                        new TestingLakeTieringFactory(), dvTable, null))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining(SupportsDeletionVectorTiering.class.getName())
+                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(dvTable.getTablePath().toString());
+        // a table without deletion vectors passes
+        TieringSourceEnumerator.validateTable(
+                new TestingLakeTieringFactory(), pkTableInfo(false), null);
+    }
+
+    /**
+     * A lake with deletion vectors validates their tables as every table, and then with what Fluss
+     * registered; other tables only as every table.
+     */
+    @Test
+    void testDeletionVectorTableIsValidatedByItsLake() throws Exception {
+        List<String> validations = new ArrayList<>();
+        DvTestingLakeTieringFactory factory = new DvTestingLakeTieringFactory(validations);
+        TieringSourceEnumerator.validateTable(factory, pkTableInfo(true), 5L);
+        TieringSourceEnumerator.validateTable(factory, pkTableInfo(false), null);
+        assertThat(validations).containsExactly("plain", "deletion vectors, registered 5", "plain");
+    }
+
+    /**
+     * The lake committer of a table with deletion vectors is checked before the table's first round
+     * writes data: one that does not commit the way its lake does is refused.
+     */
+    @Test
+    void testDeletionVectorCommitterIsCheckedBeforeTheRoundWrites() throws Exception {
+        TableInfo dvTable = pkTableInfo(true);
+        CommitterInitContext context =
+                new TieringCommitterInitContext(
+                        dvTable.getTablePath(), dvTable, new Configuration(), flussConf);
+        // the testing lake committer takes no deletes
+        assertThatThrownBy(
+                        () ->
+                                TieringSourceEnumerator.checkDeletionVectorCommitter(
+                                        new DvTestingLakeTieringFactory(new ArrayList<>()),
+                                        dvTable,
+                                        context))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining(SupportsPositionDeleteCommit.class.getName())
+                .hasMessageContaining(dvTable.getTablePath().toString());
+
+        @SuppressWarnings("unchecked")
+        PartitionMarkDoneCommitter<TestingWriteResult, TestingCommittable> takesDeletes =
+                mock(
+                        PartitionMarkDoneCommitter.class,
+                        withSettings().extraInterfaces(SupportsPositionDeleteCommit.class));
+        TieringSourceEnumerator.checkDeletionVectorCommitter(
+                new DvTestingLakeTieringFactory(new ArrayList<>()) {
+                    @Override
+                    public PartitionMarkDoneCommitter<TestingWriteResult, TestingCommittable>
+                            createLakeCommitter(CommitterInitContext committerInitContext) {
+                        return takesDeletes;
+                    }
+                },
+                dvTable,
+                context);
+    }
+
+    private static TableInfo pkTableInfo(boolean deletionVectors) {
+        return TableInfo.of(
+                TablePath.of(DEFAULT_DB, "dv-validation"),
+                1L,
+                1,
+                TableDescriptor.builder()
+                        .schema(DEFAULT_PK_TABLE_SCHEMA)
+                        .distributedBy(DEFAULT_BUCKET_NUM, "id")
+                        .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, deletionVectors)
+                        .build(),
+                "/remote",
+                1L,
+                1L);
+    }
+
+    /** A testing lake that tiers tables with deletion vectors, recording its validations. */
+    private static class DvTestingLakeTieringFactory extends TestingLakeTieringFactory
+            implements SupportsDeletionVectorTiering {
+        private final List<String> validations;
+
+        private DvTestingLakeTieringFactory(List<String> validations) {
+            this.validations = validations;
+        }
+
+        @Override
+        public void validateTable(TableInfo tableInfo) {
+            validations.add("plain");
+        }
+
+        @Override
+        public boolean mergesByPrimaryKey() {
+            return false;
+        }
+
+        @Override
+        public LakeSource<?> createLakeSource(TablePath lakeTablePath) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void validateDeletionVectorTable(
+                TableInfo tableInfo, @Nullable Long registeredSnapshotId) {
+            validations.add("deletion vectors, registered " + registeredSnapshotId);
         }
     }
 

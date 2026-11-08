@@ -531,13 +531,12 @@ class TableDescriptorValidationTest {
                 .isInstanceOf(InvalidConfigException.class)
                 .hasMessageContaining(lake);
 
-        assertThatThrownBy(
+        assertThatCode(
                         () ->
                                 validate(
                                         pkTableWithProperties(dv, "true", lake, "true"),
                                         DataLakeFormat.PAIMON))
-                .isInstanceOf(InvalidConfigException.class)
-                .hasMessageContaining("not supported yet for the paimon lake format");
+                .doesNotThrowAnyException();
         assertThatThrownBy(
                         () ->
                                 validate(
@@ -555,6 +554,8 @@ class TableDescriptorValidationTest {
         walImage.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
         walImage.put(ConfigOptions.TABLE_CHANGELOG_IMAGE.key(), "WAL");
         assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(pkTableWithProperties(walImage), DataLakeFormat.PAIMON))
                 .doesNotThrowAnyException();
     }
 
@@ -627,6 +628,8 @@ class TableDescriptorValidationTest {
         Map<String, String> versionedTtl = new HashMap<>(versioned);
         versionedTtl.put(ttl, "1 h");
         assertThatCode(() -> validate(pkTableWithProperties(versionedTtl), DataLakeFormat.ICEBERG))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validate(pkTableWithProperties(versionedTtl), DataLakeFormat.PAIMON))
                 .doesNotThrowAnyException();
         for (KvValueLayout other : Arrays.asList(KvValueLayout.PLAIN, KvValueLayout.TAGGED)) {
             Map<String, String> wrong = new HashMap<>(versionedTtl);

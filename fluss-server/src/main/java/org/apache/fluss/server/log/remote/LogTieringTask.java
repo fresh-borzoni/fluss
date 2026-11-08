@@ -71,6 +71,9 @@ public class LogTieringTask implements Runnable {
 
     private volatile boolean cancelled = false;
 
+    // whether the last run kept expired segments only for the deletion vectors of the bucket
+    private boolean dvRetaining = false;
+
     public LogTieringTask(
             Replica replica,
             RemoteLogTablet remoteLog,
@@ -140,13 +143,20 @@ public class LogTieringTask implements Runnable {
                     candidateToCopyLogSegments(logTablet);
             // Only delete segments that have been tiered to lake to ensure data safety
             TableConfig tableConfig = replica.getTableInfo().getTableConfig();
+            Long lakeLogEndOffset =
+                    tableConfig.isDataLakeEnabled() ? logTablet.getLakeLogEndOffset() : null;
+            // Deletion vectors also need the log from their snapshot's readable offset, which on
+            // Paimon lags the tiered offset: a new leader replays it to rebuild their state.
+            Long dvRetainOffset = lakeLogEndOffset != null ? replica.getDvLogRetainOffset() : null;
             List<RemoteLogSegment> expiredRemoteLogSegments =
                     remoteLog.expiredRemoteLogSegments(
                             clock.milliseconds(),
-                            tableConfig.isDataLakeEnabled()
-                                    ? logTablet.getLakeLogEndOffset()
-                                    : null,
+                            lakeLogEndOffset,
+                            dvRetainOffset,
                             tableConfig.getLogTTLMs());
+            if (dvRetainOffset != null) {
+                logDvRetention(dvRetainOffset, lakeLogEndOffset);
+            }
 
             // 1. For these candidateToCopySegments, we will first copy segment files to
             // remote before commit the remote log manifest.
@@ -215,6 +225,43 @@ public class LogTieringTask implements Runnable {
                         "Error occurred while copying log segments of bucket: {}", tableBucket, ex);
             }
         }
+    }
+
+    /**
+     * Logs when the deletion vectors of the bucket start or stop keeping expired segments that are
+     * tiered to the lake. The bytes they keep are the bucket's remote log metric {@code
+     * dvRetainedSize}.
+     */
+    private void logDvRetention(long dvRetainOffset, long lakeLogEndOffset) {
+        int retained = remoteLog.getDvRetainedSegments();
+        if (retained > 0 && !dvRetaining) {
+            LOG.info(
+                    "Keeping {} expired remote log segments ({} bytes) of bucket {} that are tiered"
+                            + " to the lake up to offset {}: its deletion vectors need the log"
+                            + " from offset {}, the readable offset of their lake snapshot.",
+                    retained,
+                    remoteLog.getDvRetainedSizeInBytes(),
+                    tableBucket,
+                    lakeLogEndOffset,
+                    dvRetainOffset);
+        } else if (retained == 0 && dvRetaining) {
+            LOG.info(
+                    "The deletion vectors of bucket {} keep no expired remote log segments any"
+                            + " more; they need the log from offset {}.",
+                    tableBucket,
+                    dvRetainOffset);
+        } else if (retained > 0) {
+            LOG.debug(
+                    "Keeping {} expired remote log segments ({} bytes) of bucket {} for its"
+                            + " deletion vectors, which need the log from offset {}; tiered up to"
+                            + " offset {}.",
+                    retained,
+                    remoteLog.getDvRetainedSizeInBytes(),
+                    tableBucket,
+                    dvRetainOffset,
+                    lakeLogEndOffset);
+        }
+        dvRetaining = retained > 0;
     }
 
     private List<EnrichedLogSegment> candidateToCopyLogSegments(LogTablet log) {

@@ -27,6 +27,7 @@ import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
@@ -82,6 +83,14 @@ public class RemoteLogTablet {
     private volatile int numRemoteLogSegments;
 
     /**
+     * The expired segments that are tiered to the lake but kept for the deletion vectors of the
+     * bucket, and their bytes, as of the last expiry check.
+     */
+    private volatile int dvRetainedSegments;
+
+    private volatile long dvRetainedSizeInBytes;
+
+    /**
      * It represents the remote log start offset of the segments that have copied to remote storage.
      */
     private volatile long remoteLogStartOffset;
@@ -103,7 +112,11 @@ public class RemoteLogTablet {
         reset();
     }
 
-    public void registerMetrics(BucketMetricGroup bucketMetricGroup) {
+    /**
+     * Registers the remote log metrics of the bucket, and for a table with deletion vectors the
+     * bytes they keep, see {@link #getDvRetainedSizeInBytes()}.
+     */
+    public void registerMetrics(BucketMetricGroup bucketMetricGroup, boolean deletionVectors) {
         inWriteLock(
                 lock,
                 () -> {
@@ -112,6 +125,11 @@ public class RemoteLogTablet {
                         remoteLogMetrics = null;
                     }
                     MetricGroup metricGroup = bucketMetricGroup.addGroup("remoteLog");
+                    if (deletionVectors) {
+                        metricGroup.gauge(
+                                MetricNames.REMOTE_LOG_DV_RETAINED_SIZE,
+                                this::getDvRetainedSizeInBytes);
+                    }
                     metricGroup.gauge(MetricNames.LOG_NUM_SEGMENTS, () -> numRemoteLogSegments);
                     metricGroup.gauge(
                             MetricNames.LOG_START_OFFSET,
@@ -129,6 +147,20 @@ public class RemoteLogTablet {
 
     public long getRemoteSizeInBytes() {
         return remoteSizeInBytes;
+    }
+
+    /**
+     * Returns how many expired segments the last expiry check kept only for the deletion vectors of
+     * the bucket: they are tiered to the lake, but end after the first offset the deletion vectors
+     * need.
+     */
+    public int getDvRetainedSegments() {
+        return dvRetainedSegments;
+    }
+
+    /** Returns the bytes of the segments of {@link #getDvRetainedSegments()}. */
+    public long getDvRetainedSizeInBytes() {
+        return dvRetainedSizeInBytes;
     }
 
     public void unregisterMetrics() {
@@ -163,13 +195,43 @@ public class RemoteLogTablet {
      */
     public List<RemoteLogSegment> expiredRemoteLogSegments(
             long currentTimeMs, Long lakeLogEndOffset, long ttlMs) {
+        return expiredRemoteLogSegments(currentTimeMs, lakeLogEndOffset, null, ttlMs);
+    }
+
+    /**
+     * Returns the expired segments based on the given time, the lake log end offset and, for a
+     * table with deletion vectors, the first offset they need.
+     *
+     * <p>Only segments that have been tiered to lake (i.e., remoteLogEndOffset <= lakeLogEndOffset)
+     * can be safely deleted. The deletion vectors of a table replay and read the log from the
+     * readable offset of their lake snapshot, which on Paimon lags the tiered offset, so a tiered
+     * segment that ends after {@code dvRetainOffset} is kept too. The segments kept only for that
+     * are counted in {@link #getDvRetainedSegments()} and {@link #getDvRetainedSizeInBytes()}.
+     *
+     * @param currentTimeMs the current time in milliseconds
+     * @param lakeLogEndOffset the log end offset that has been synced to lake, null if data lake is
+     *     disabled
+     * @param dvRetainOffset the first offset the deletion vectors of the bucket need, null if the
+     *     table has none or data lake is disabled
+     * @param ttlMs the current table log TTL in milliseconds
+     * @return list of expired segments that can be safely deleted
+     */
+    public List<RemoteLogSegment> expiredRemoteLogSegments(
+            long currentTimeMs,
+            @Nullable Long lakeLogEndOffset,
+            @Nullable Long dvRetainOffset,
+            long ttlMs) {
         if (ttlMs <= 0) {
+            dvRetainedSegments = 0;
+            dvRetainedSizeInBytes = 0L;
             return Collections.emptyList();
         }
         return inReadLock(
                 lock,
                 () -> {
                     List<RemoteLogSegment> expiredSegments = new ArrayList<>();
+                    int retainedSegments = 0;
+                    long retainedBytes = 0L;
                     for (Map.Entry<Long, Set<UUID>> entry :
                             timestampToRemoteLogSegmentId.entrySet()) {
                         long ts = entry.getKey();
@@ -178,13 +240,18 @@ public class RemoteLogTablet {
                                 RemoteLogSegment segment = idToRemoteLogSegment.get(uuid);
                                 if (lakeLogEndOffset != null) {
                                     // if datalake is enabled, only include segments that have been
-                                    // tiered to lake.
-                                    if (segment.remoteLogEndOffset() <= lakeLogEndOffset) {
-                                        expiredSegments.add(segment);
+                                    // tiered to lake, and none that deletion vectors still need.
+                                    if (segment.remoteLogEndOffset() > lakeLogEndOffset) {
+                                        continue;
                                     }
-                                } else {
-                                    expiredSegments.add(segment);
+                                    if (dvRetainOffset != null
+                                            && segment.remoteLogEndOffset() > dvRetainOffset) {
+                                        retainedSegments++;
+                                        retainedBytes += segment.segmentSizeInBytes();
+                                        continue;
+                                    }
                                 }
+                                expiredSegments.add(segment);
                             }
                         } else {
                             // no further expired segments since the segments
@@ -192,6 +259,8 @@ public class RemoteLogTablet {
                             break;
                         }
                     }
+                    dvRetainedSegments = retainedSegments;
+                    dvRetainedSizeInBytes = retainedBytes;
                     return expiredSegments;
                 });
     }

@@ -22,6 +22,7 @@ import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.adapter.StreamOperatorParametersAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
@@ -29,10 +30,12 @@ import org.apache.fluss.flink.tiering.TestingWriteResult;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -392,6 +395,100 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         factory.release.complete(null);
         awaitCommitEvent();
         assertThat(output).hasSize(1);
+    }
+
+    /**
+     * A round of an older tiering epoch that completes while a newer round of its table commits is
+     * stale: the coordinator handed the table out again. It is dropped, not committed.
+     */
+    @Test
+    void testOlderRoundIsDroppedWhileANewerOneCommits() throws Exception {
+        TablePath table = TablePath.of("fluss", "stale_round_dropped");
+        long tableId = createTable(table, DEFAULT_PK_TABLE_DESCRIPTOR);
+        TableBucket bucket = new TableBucket(tableId, 0);
+        BlockingLakeTieringFactory factory = new BlockingLakeTieringFactory(table);
+        reopenCommitter(factory, 2);
+        committerOperator.processElement(withEpoch(table, bucket, 1, 2L));
+        factory.started.get(10, TimeUnit.SECONDS);
+
+        committerOperator.processElement(withEpoch(table, bucket, 2, 1L));
+
+        factory.release.complete(null);
+        awaitCommitEvent();
+        assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(1);
+        assertThat(mailbox.hasMail()).isFalse();
+        // the dropped round's files are deleted: no lake snapshot references them
+        CommonTestUtils.waitUntil(
+                () -> factory.committers.get(table).abortedWriteResults().contains(2),
+                Duration.ofSeconds(30),
+                "the dropped round's files were not deleted");
+    }
+
+    /**
+     * A round of a newer tiering epoch that completes while an older round of its table commits
+     * waits for that commit, then commits.
+     */
+    @Test
+    void testNewerRoundWaitsForTheOlderCommit() throws Exception {
+        TablePath table = TablePath.of("fluss", "newer_round_waits");
+        long tableId = createTable(table, DEFAULT_PK_TABLE_DESCRIPTOR);
+        TableBucket bucket = new TableBucket(tableId, 0);
+        BlockingLakeTieringFactory factory = new BlockingLakeTieringFactory(table);
+        reopenCommitter(factory, 2);
+        committerOperator.processElement(withEpoch(table, bucket, 1, 1L));
+        factory.started.get(10, TimeUnit.SECONDS);
+        mailboxExecutor.execute(() -> factory.release.complete(null), "Release older commit");
+
+        committerOperator.processElement(withEpoch(table, bucket, 2, 2L));
+
+        assertThat(factory.release).isCompleted();
+        // both rounds end, the older one first
+        awaitCommitEvent();
+        assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(2);
+    }
+
+    /** A late result of an older round of a table does not mix into the table's newer round. */
+    @Test
+    void testLateResultOfAnOlderRoundIsDropped() throws Exception {
+        TablePath table = TablePath.of("fluss", "late_stale_result");
+        long tableId = createTable(table, DEFAULT_PK_TABLE_DESCRIPTOR);
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 0), 1, 2L, 2));
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 0), 1, 1L, 2));
+        assertThat(mockOperatorEventGateway.getEventsSent()).isEmpty();
+
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 1), 1, 2L, 2));
+        awaitCommitEvent();
+        assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(1);
+
+        // a newer round's first result discards an older round's partial results
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 0), 2, 3L, 2));
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 0), 3, 4L, 2));
+        committerOperator.processElement(withEpoch(table, new TableBucket(tableId, 1), 3, 4L, 2));
+        awaitCommitEvent();
+        assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(2);
+    }
+
+    private StreamRecord<TableBucketWriteResult<TestingWriteResult>> withEpoch(
+            TablePath table, TableBucket bucket, int writeResult, long tieringEpoch) {
+        return withEpoch(table, bucket, writeResult, tieringEpoch, 1);
+    }
+
+    private StreamRecord<TableBucketWriteResult<TestingWriteResult>> withEpoch(
+            TablePath table,
+            TableBucket bucket,
+            int writeResult,
+            long tieringEpoch,
+            int numberOfWriteResults) {
+        return new StreamRecord<>(
+                createTableBucketWriteResultStreamRecord(
+                                table,
+                                bucket,
+                                writeResult,
+                                writeResult,
+                                writeResult,
+                                numberOfWriteResults)
+                        .getValue()
+                        .withTieringEpoch(tieringEpoch));
     }
 
     @ParameterizedTest
@@ -978,6 +1075,74 @@ class TieringCommitOperatorTest extends FlinkTestBase {
         assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(eventsSent);
     }
 
+    /**
+     * A re-index split that failed fails its held round at once, instead of the round waiting for
+     * the other splits and resuming on an incomplete re-index.
+     */
+    @Test
+    void testFailedReindexSplitFailsItsHeldRoundAtOnce() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "held_round_failed_split");
+        long tableId = 4713L;
+        holdRound(tableId, tablePath, 2);
+
+        committerOperator.processElement(
+                new StreamRecord<>(
+                        new TableBucketWriteResult<>(
+                                tablePath,
+                                new TableBucket(tableId, 0),
+                                null,
+                                null,
+                                -1,
+                                -1,
+                                2,
+                                RowPosResult.failed(
+                                        REINDEX_CHANGE_ID, 0, "two live rows of one key"))));
+
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        assertThat(lastSourceEvent())
+                .isInstanceOfSatisfying(
+                        FailedTieringEvent.class,
+                        event -> {
+                            assertThat(event.getTableId()).isEqualTo(tableId);
+                            assertThat(event.failReason()).contains("two live rows of one key");
+                        });
+        // a late result of the failed re-index finds no round to resume
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 1));
+        assertThat(mailbox.hasMail()).isFalse();
+    }
+
+    /**
+     * A held round dropped because its table's next round started deletes what it wrote and no lake
+     * snapshot references: here, its re-index change.
+     */
+    @Test
+    void testDroppedHeldRoundDeletesItsReindexChange() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "held_round_dropped_cleanup");
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        FsPath lakeDir =
+                PositionIndexStore.lakeTableDirOf(
+                        admin.getTableInfo(tablePath).get(),
+                        () ->
+                                FlussConfigUtils.getDefaultRemoteDataDir(
+                                        FLUSS_CLUSTER_EXTENSION.getClientConfig()));
+        PositionIndexStore.forTable(lakeDir, null)
+                .writeReindexPlan(REINDEX_CHANGE_ID, 0, 1, Collections.emptyList());
+        FsPath change = new FsPath(lakeDir, "rowPos/" + REINDEX_CHANGE_ID);
+        assertThat(change.getFileSystem().exists(change)).isTrue();
+        holdRound(tableId, tablePath, 1);
+
+        committerOperator.processElement(
+                createTableBucketWriteResultStreamRecord(
+                        tablePath, new TableBucket(tableId, 0), 1, 10, 20L, 1));
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        awaitCommitEvent();
+
+        CommonTestUtils.waitUntil(
+                () -> !change.getFileSystem().exists(change),
+                Duration.ofSeconds(30),
+                "the dropped held round's re-index change was not deleted");
+    }
+
     /** Holds a round of {@code tableId} that waits for the re-index of {@code buckets} buckets. */
     // the index change of the held rounds' re-index
     private static final long REINDEX_CHANGE_ID = 7L;
@@ -994,7 +1159,8 @@ class TieringCommitOperatorTest extends FlinkTestBase {
                         null,
                         null,
                         buckets,
-                        System.currentTimeMillis());
+                        System.currentTimeMillis(),
+                        null);
         Class<?> heldRoundClass = null;
         for (Class<?> c : TieringCommitOperator.class.getDeclaredClasses()) {
             if (c.getSimpleName().equals("HeldRound")) {

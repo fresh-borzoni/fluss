@@ -120,6 +120,11 @@ public class PaimonTestUtils {
             this.messages = messages;
         }
 
+        /** The commit messages of the compaction, to commit them some other way. */
+        public List<CommitMessage> messages() {
+            return messages;
+        }
+
         /**
          * Commit the compaction operation.
          *

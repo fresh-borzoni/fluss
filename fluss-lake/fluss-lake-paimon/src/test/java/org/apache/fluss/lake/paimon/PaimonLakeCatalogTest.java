@@ -19,9 +19,12 @@ package org.apache.fluss.lake.paimon;
 
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidConfigException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.lake.lakestorage.TestingLakeCatalogContext;
+import org.apache.fluss.lake.paimon.utils.PaimonConversions;
 import org.apache.fluss.lake.paimon.utils.PaimonTestUtils.CompactHelper;
 import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.metadata.AggFunctions;
@@ -34,6 +37,7 @@ import org.apache.fluss.types.DataTypes;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.schema.SchemaChange;
@@ -51,16 +55,22 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import javax.annotation.Nullable;
+
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
+import static org.apache.fluss.config.ConfigOptions.TABLE_DELETION_VECTORS_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE;
+import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.LAKESTREAM_ENABLED_OPTION_KEY;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.PARTITION_GENERATE_LEGACY_NAME_OPTION_KEY;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
@@ -160,6 +170,230 @@ class PaimonLakeCatalogTest {
         assertThatThrownBy(() -> flussPaimonCatalog.createTable(tablePath, descriptor, context))
                 .isInstanceOf(TableAlreadyExistException.class)
                 .hasMessageContaining("schema is not compatible");
+    }
+
+    /**
+     * A table with deletion vectors tiers rows that Fluss's merge engine already merged. So a
+     * Paimon merge engine that merges them again is rejected, whichever merge engine Fluss uses.
+     */
+    @ParameterizedTest
+    @CsvSource({
+        "default,partial-update",
+        "default,aggregation",
+        "default,first-row",
+        "first_row,first-row",
+        "versioned,partial-update",
+        "aggregation,aggregation"
+    })
+    void testDeletionVectorsRejectPaimonMergeEnginesOtherThanDeduplicate(
+            String flussMergeEngine, String paimonMergeEngine) {
+        TablePath tablePath = TablePath.of("dv_merge_engine_db", "rejected_table");
+        TableDescriptor descriptor =
+                deletionVectorsTableDescriptor(flussMergeEngine, paimonMergeEngine);
+        assertThatThrownBy(
+                        () ->
+                                flussPaimonCatalog.createTable(
+                                        tablePath,
+                                        descriptor,
+                                        new TestingLakeCatalogContext(descriptor)))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(
+                        "Paimon option 'merge-engine' = 'deduplicate', but it is '"
+                                + paimonMergeEngine
+                                + "'");
+        assertThatThrownBy(
+                        () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
+                .isInstanceOf(Catalog.TableNotExistException.class);
+    }
+
+    /**
+     * With a sequence field Paimon keeps the row of the largest sequence value, not the last row
+     * Fluss tiered, so a table with deletion vectors rejects it.
+     */
+    @Test
+    void testDeletionVectorsRejectPaimonSequenceField() {
+        TablePath tablePath = TablePath.of("dv_merge_engine_db", "sequence_table");
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("amount", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .build())
+                        .property(TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
+                        .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .customProperty("paimon.sequence.field", "amount")
+                        .distributedBy(1, "id")
+                        .build();
+        assertThatThrownBy(
+                        () ->
+                                flussPaimonCatalog.createTable(
+                                        tablePath,
+                                        descriptor,
+                                        new TestingLakeCatalogContext(descriptor)))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining("'sequence.field'");
+        assertThatThrownBy(
+                        () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
+                .isInstanceOf(Catalog.TableNotExistException.class);
+    }
+
+    /**
+     * Paimon's deduplicate merge engine, set or left as the default, accepts a table with deletion
+     * vectors of every Fluss merge engine. It cannot be changed afterwards.
+     */
+    @ParameterizedTest
+    @CsvSource({
+        "default,",
+        "default,deduplicate",
+        "first_row,",
+        "versioned,deduplicate",
+        "aggregation,"
+    })
+    void testDeletionVectorsTakeDeduplicateMergeEngine(
+            String flussMergeEngine, @Nullable String paimonMergeEngine) throws Exception {
+        TablePath tablePath = TablePath.of("dv_merge_engine_db", "dedup_" + flussMergeEngine);
+        TableDescriptor descriptor =
+                deletionVectorsTableDescriptor(flussMergeEngine, paimonMergeEngine);
+        TestingLakeCatalogContext context = new TestingLakeCatalogContext(descriptor, descriptor);
+        flussPaimonCatalog.createTable(tablePath, descriptor, context);
+
+        FileStoreTable table =
+                (FileStoreTable)
+                        flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath));
+        CoreOptions options = table.coreOptions();
+        assertThat(options.mergeEngine()).isEqualTo(CoreOptions.MergeEngine.DEDUPLICATE);
+        assertThat(options.deletionVectorsEnabled()).isTrue();
+        // what the split planner and the readable snapshot retriever tell such tables by
+        assertThat(PaimonConversions.isFlussDeletionVectorsTable(table.options())).isTrue();
+
+        assertThatThrownBy(
+                        () ->
+                                flussPaimonCatalog.alterTable(
+                                        tablePath,
+                                        Collections.singletonList(
+                                                TableChange.set(
+                                                        "paimon.merge-engine", "partial-update")),
+                                        context))
+                .isInstanceOf(InvalidConfigException.class)
+                .hasMessageContaining("merge-engine cannot be changed");
+    }
+
+    /**
+     * With ignore-delete, under any of its keys, Paimon drops the deletes Fluss tiers, so a deleted
+     * key keeps its lake row. A table with deletion vectors rejects it.
+     */
+    @ParameterizedTest
+    @ValueSource(
+            strings = {
+                "ignore-delete",
+                "first-row.ignore-delete",
+                "deduplicate.ignore-delete",
+                "partial-update.ignore-delete"
+            })
+    void testDeletionVectorsRejectPaimonIgnoreDelete(String ignoreDeleteKey) {
+        TablePath tablePath = TablePath.of("dv_options_db", "ignore_delete_table");
+        TableDescriptor descriptor =
+                deletionVectorsTableDescriptor(
+                        Collections.singletonMap("paimon." + ignoreDeleteKey, "true"));
+        assertThatThrownBy(
+                        () ->
+                                flussPaimonCatalog.createTable(
+                                        tablePath,
+                                        descriptor,
+                                        new TestingLakeCatalogContext(descriptor)))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining("'ignore-delete'");
+        assertThatThrownBy(
+                        () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
+                .isInstanceOf(Catalog.TableNotExistException.class);
+    }
+
+    /**
+     * Paimon drops expired rows when it compacts, while Fluss keeps them, so a table with deletion
+     * vectors rejects Paimon's record-level expiration.
+     */
+    @Test
+    void testDeletionVectorsRejectPaimonRecordLevelExpiration() {
+        TablePath tablePath = TablePath.of("dv_options_db", "record_expire_table");
+        Map<String, String> paimonOptions = new HashMap<>();
+        paimonOptions.put("paimon.record-level.expire-time", "1 d");
+        paimonOptions.put("paimon.record-level.time-field", "ts");
+        TableDescriptor descriptor = deletionVectorsTableDescriptor(paimonOptions);
+        assertThatThrownBy(
+                        () ->
+                                flussPaimonCatalog.createTable(
+                                        tablePath,
+                                        descriptor,
+                                        new TestingLakeCatalogContext(descriptor)))
+                .isInstanceOf(InvalidTableException.class)
+                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining("'record-level.expire-time'");
+        assertThatThrownBy(
+                        () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
+                .isInstanceOf(Catalog.TableNotExistException.class);
+    }
+
+    /**
+     * The Paimon catalog applies its {@code table-default.*} options to every table it creates, so
+     * a table with deletion vectors checks the options it ends up with, not only those Fluss sets.
+     */
+    @ParameterizedTest
+    @CsvSource({
+        "merge-engine,partial-update,'merge-engine'",
+        "ignore-delete,true,'ignore-delete'",
+        "deduplicate.ignore-delete,true,'ignore-delete'",
+        "record-level.expire-time,1 d,'record-level.expire-time'",
+        "sequence.field,amount,'sequence.field'"
+    })
+    void testDeletionVectorsRejectCatalogTableDefaults(String option, String value, String reported)
+            throws Exception {
+        Configuration configuration = new Configuration();
+        configuration.setString("warehouse", tempWarehouseDir.toURI().toString());
+        configuration.setString("table-default." + option, value);
+        configuration.setString("table-default.record-level.time-field", "ts");
+        TablePath tablePath = TablePath.of("dv_options_db", "table_default_table");
+        TableDescriptor descriptor = deletionVectorsTableDescriptor(Collections.emptyMap());
+        try (PaimonLakeCatalog catalog = new PaimonLakeCatalog(configuration)) {
+            assertThatThrownBy(
+                            () ->
+                                    catalog.createTable(
+                                            tablePath,
+                                            descriptor,
+                                            new TestingLakeCatalogContext(descriptor)))
+                    .isInstanceOf(InvalidTableException.class)
+                    .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                    .hasMessageContaining(reported)
+                    .hasMessageContaining("table-default.");
+            assertThatThrownBy(() -> catalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
+                    .isInstanceOf(Catalog.TableNotExistException.class);
+        }
+
+        // A table without deletion vectors takes the defaults.
+        TableDescriptor plain =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("amount", DataTypes.INT())
+                                        .column("ts", DataTypes.TIMESTAMP_LTZ())
+                                        .primaryKey("id")
+                                        .build())
+                        .property(TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
+                        .distributedBy(1, "id")
+                        .build();
+        TablePath plainPath = TablePath.of("dv_options_db", "table_default_plain");
+        try (PaimonLakeCatalog catalog = new PaimonLakeCatalog(configuration)) {
+            catalog.createTable(plainPath, plain, new TestingLakeCatalogContext(plain));
+            assertThat(catalog.getPaimonCatalog().getTable(toPaimon(plainPath)).options())
+                    .containsEntry(option, value);
+        }
     }
 
     @Test
@@ -1269,6 +1503,54 @@ class PaimonLakeCatalogTest {
         Schema expectedSchema = SchemaUpdate.applySchemaChanges(schema, schemaChanges);
         return new TestingLakeCatalogContext(
                 getTableDescriptor(schema), getTableDescriptor(expectedSchema));
+    }
+
+    /**
+     * A primary-key table with deletion vectors, with a Fluss merge engine ("default" for none) and
+     * a Paimon one (none if null).
+     */
+    private TableDescriptor deletionVectorsTableDescriptor(
+            String flussMergeEngine, @Nullable String paimonMergeEngine) {
+        TableDescriptor.Builder builder =
+                TableDescriptor.builder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("amount", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .build())
+                        .property(TABLE_DATALAKE_ENABLED.key(), "true")
+                        .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
+                        .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .distributedBy(1, "id");
+        if (!"default".equals(flussMergeEngine)) {
+            builder.property(TABLE_MERGE_ENGINE.key(), flussMergeEngine);
+        }
+        if ("versioned".equals(flussMergeEngine)) {
+            builder.property(TABLE_MERGE_ENGINE_VERSION_COLUMN.key(), "amount");
+        }
+        if (paimonMergeEngine != null) {
+            builder.customProperty("paimon.merge-engine", paimonMergeEngine);
+        }
+        return builder.build();
+    }
+
+    /** A primary-key table with deletion vectors and the given custom properties. */
+    private TableDescriptor deletionVectorsTableDescriptor(Map<String, String> customProperties) {
+        return TableDescriptor.builder()
+                .schema(
+                        Schema.newBuilder()
+                                .column("id", DataTypes.BIGINT())
+                                .column("amount", DataTypes.INT())
+                                .column("ts", DataTypes.TIMESTAMP_LTZ())
+                                .primaryKey("id")
+                                .build())
+                .property(TABLE_DATALAKE_ENABLED.key(), "true")
+                .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
+                .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                .customProperties(customProperties)
+                .distributedBy(1, "id")
+                .build();
     }
 
     private TableDescriptor getTableDescriptor(Schema schema) {

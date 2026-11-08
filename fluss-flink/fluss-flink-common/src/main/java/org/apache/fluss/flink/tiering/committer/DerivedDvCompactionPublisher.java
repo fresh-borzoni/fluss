@@ -20,10 +20,13 @@ package org.apache.fluss.flink.tiering.committer;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
+import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.source.DataDeltaPlan;
+import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
@@ -32,6 +35,7 @@ import org.slf4j.Logger;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -42,12 +46,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.partitionName;
+
 /**
  * Publishes the index changes of Fluss's own compactions from the positions the compactions in the
  * tiering writers handed over ({@link CompactionIndexPart}), so their rewrites need no re-index.
  *
  * <p>On a lake that takes deletes, the round's compaction is a lake commit of its own, before the
- * round's ({@link #publishCompactionIndex}).
+ * round's ({@link #publishCompactionIndex}). On a lake that merges by key, the compactions make a
+ * readable snapshot, published after the round's commit ({@link #publishHandedOverIndex}).
  *
  * <p>Crash rule: a hand-off that is not published, because it does not match the lake or the
  * committer failed, leaves the rewrite unindexed. The re-index of {@link DerivedDvReindexer} then
@@ -155,6 +162,161 @@ final class DerivedDvCompactionPublisher<WriteResult, Committable> {
             }
         }
         return false;
+    }
+
+    /**
+     * Publishes the index change of a merging round's newly readable snapshot from the positions
+     * the round's compactions in the tiering writers handed over ({@link CompactionIndexPart}),
+     * instead of re-indexing the snapshot's new files. In every bucket, the compactions must have
+     * written exactly the files that became readable since the chain's end and replaced exactly
+     * those that left it. Otherwise returns false and the files are re-indexed, e.g. for another
+     * engine's compaction, one without a hand-off, or an earlier round's files not yet indexed.
+     */
+    <Split extends LakeSplit> boolean publishHandedOverIndex(
+            TablePath tablePath,
+            PositionIndexStore store,
+            DataDeltaPlan<Split> plan,
+            long base,
+            long readable,
+            List<TableBucketWriteResult<WriteResult>> results) {
+        Map<TableBucket, CompactionIndexPart> parts = new HashMap<>();
+        // partition name (null if unpartitioned) -> bucket id -> bucket
+        Map<String, Map<Integer, TableBucket>> buckets = new HashMap<>();
+        Set<Long> changeIds = new HashSet<>();
+        String reason = null;
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            Object wr = r.writeResult();
+            if (!(wr instanceof CompactionIndexPartProvider)
+                    || !((CompactionIndexPartProvider) wr).compacted()) {
+                continue;
+            }
+            CompactionIndexPart part = ((CompactionIndexPartProvider) wr).compactionIndexPart();
+            if (part == null) {
+                reason = "a compacted bucket handed no positions over";
+                continue;
+            }
+            parts.put(r.tableBucket(), part);
+            changeIds.add(part.changeId());
+            buckets.computeIfAbsent(r.partitionName(), k -> new HashMap<>())
+                    .put(r.tableBucket().getBucket(), r.tableBucket());
+        }
+        if (parts.isEmpty() && reason == null) {
+            return false; // no compaction of this round
+        }
+        if (reason == null && changeIds.size() > 1) {
+            reason = "the compactions handed over different changes";
+        }
+        if (reason == null) {
+            Map<TableBucket, Set<String>> added = new HashMap<>();
+            for (Split split : plan.getSplits()) {
+                String partitionName = partitionName(split);
+                TableBucket tb =
+                        buckets.getOrDefault(partitionName, Collections.emptyMap())
+                                .get(split.bucket());
+                if (tb == null) {
+                    reason =
+                            "files of bucket "
+                                    + split.bucket()
+                                    + " of partition "
+                                    + partitionName
+                                    + " became readable that no compaction of the round wrote";
+                    break;
+                }
+                added.computeIfAbsent(tb, k -> new HashSet<>())
+                        .add(DeletionVectorCapabilities.onlyFileName(split));
+            }
+            Map<TableBucket, Set<String>> removed = new HashMap<>();
+            for (Map.Entry<String, Map<Integer, List<String>>> pe :
+                    plan.getDeletedFiles().entrySet()) {
+                for (Map.Entry<Integer, List<String>> be : pe.getValue().entrySet()) {
+                    TableBucket tb =
+                            buckets.getOrDefault(pe.getKey(), Collections.emptyMap())
+                                    .get(be.getKey());
+                    if (tb == null) {
+                        reason =
+                                "files of bucket "
+                                        + be.getKey()
+                                        + " of partition "
+                                        + pe.getKey()
+                                        + " left the readable snapshot that no compaction of"
+                                        + " the round replaced";
+                        break;
+                    }
+                    removed.computeIfAbsent(tb, k -> new HashSet<>()).addAll(be.getValue());
+                }
+            }
+            for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {
+                if (reason != null) {
+                    break;
+                }
+                TableBucket tb = e.getKey();
+                if (!new HashSet<>(e.getValue().addedFiles().values())
+                                .equals(added.getOrDefault(tb, Collections.emptySet()))
+                        || !new HashSet<>(e.getValue().removedFiles())
+                                .equals(removed.getOrDefault(tb, Collections.emptySet()))) {
+                    reason =
+                            "the files the compaction of "
+                                    + tb
+                                    + " wrote or replaced are not those of readable snapshot "
+                                    + readable;
+                }
+            }
+        }
+        if (reason == null) {
+            long changeId = changeIds.iterator().next();
+            try {
+                long t0 = System.currentTimeMillis();
+                String identity = context.snapshotIdentity(tablePath, readable);
+                store.commitChange(changeId, assignFileIds(store, changeId, parts));
+                store.register(base, readable, changeId, identity);
+                context.metrics.compactionHandOffs.inc();
+                LOG.info(
+                        "The compactions of {} in the tiering writers handed the positions of"
+                                + " readable snapshot {} to index change {} ({} buckets, no re-index),"
+                                + " published in {} ms.",
+                        tablePath,
+                        readable,
+                        changeId,
+                        parts.size(),
+                        System.currentTimeMillis() - t0);
+                return true;
+            } catch (Exception e) {
+                reason = "publishing failed: " + e;
+            }
+        }
+        LOG.info(
+                "Readable snapshot {} of {} is re-indexed from the lake: {}.",
+                readable,
+                tablePath,
+                reason);
+        for (long changeId : changeIds) {
+            try {
+                store.abortChange(changeId);
+            } catch (Exception e) {
+                LOG.debug("Could not delete the position index change {}.", changeId, e);
+            }
+        }
+        return false;
+    }
+
+    /** Deletes the positions the round's compactions handed over, which no change publishes. */
+    void discardHandedOverIndex(
+            PositionIndexStore store, List<TableBucketWriteResult<WriteResult>> results) {
+        Set<Long> changeIds = new HashSet<>();
+        for (TableBucketWriteResult<WriteResult> r : results) {
+            Object wr = r.writeResult();
+            if (wr instanceof CompactionIndexPartProvider
+                    && ((CompactionIndexPartProvider) wr).compactionIndexPart() != null) {
+                changeIds.add(((CompactionIndexPartProvider) wr).compactionIndexPart().changeId());
+            }
+        }
+        for (long changeId : changeIds) {
+            try {
+                store.abortChange(changeId);
+            } catch (Exception e) {
+                LOG.debug("Could not delete the position index change {}.", changeId, e);
+            }
+        }
     }
 
     /**

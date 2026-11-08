@@ -26,9 +26,12 @@ import java.io.IOException;
  * ({@code table.deletion-vectors.enabled}). Fluss checks a committer of such a table for this
  * capability before a round commits, and fails the round with a clear error otherwise.
  *
- * <p>Fluss resolves the rows a round supersedes and commits their deletes with the data ({@link
- * SupportsPositionDeleteCommit}). This interface holds the checks that the lake table still
- * descends from what Fluss registered.
+ * <p>A lake implements one of two ways to commit such a round, chosen by {@link
+ * org.apache.fluss.lake.writer.SupportsDeletionVectorTiering#mergesByPrimaryKey()}: Fluss resolves
+ * the rows a round supersedes and commits their deletes with the data ({@link
+ * SupportsPositionDeleteCommit}), or the lake merges rows by primary key itself and reports which
+ * snapshot is readable ({@link SupportsPrimaryKeyMergeCommit}). This interface holds what both
+ * share: the checks that the lake table still descends from what Fluss registered.
  *
  * @since 1.1
  */

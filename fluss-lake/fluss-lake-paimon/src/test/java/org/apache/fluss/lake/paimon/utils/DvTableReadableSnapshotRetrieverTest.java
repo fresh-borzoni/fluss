@@ -49,6 +49,7 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
@@ -59,6 +60,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
 
@@ -288,15 +291,33 @@ class DvTableReadableSnapshotRetrieverTest {
         assertThat(thirdOffsetsFile.getFileSystem().exists(thirdOffsetsFile)).isTrue();
     }
 
-    @Test
-    void testGetReadableSnapshotAndOffsets() throws Exception {
+    /**
+     * Runs the flow on a table with Paimon deletion vectors, and on one whose Fluss table also has
+     * {@code table.deletion-vectors.enabled}. They differ in step 9 only.
+     */
+    @ParameterizedTest(name = "flussDeletionVectors={0}")
+    @ValueSource(booleans = {false, true})
+    void testGetReadableSnapshotAndOffsets(boolean flussDeletionVectors) throws Exception {
         int bucket0 = 0;
         int bucket1 = 1;
         int bucket2 = 2;
 
         // Given: create a DV table with 3 buckets: b1, b2, b3
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "test_dv_flow");
+        TablePath tablePath =
+                TablePath.of(DEFAULT_DB, "test_dv_flow" + (flussDeletionVectors ? "_fluss" : ""));
         tableId = createDvTable(tablePath, 3);
+        if (flussDeletionVectors) {
+            // As Fluss mirrors table.deletion-vectors.enabled of a table it creates with it. The
+            // table itself is created without, as this test registers snapshots without the
+            // tiering epoch such a table needs.
+            paimonCatalog.alterTable(
+                    toPaimon(tablePath),
+                    SchemaChange.setOption(
+                            PaimonConversions.FLUSS_CONF_PREFIX
+                                    + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            "true"),
+                    false);
+        }
         FileStoreTable fileStoreTable = getPaimonTable(tablePath);
 
         CompactHelper compactHelper = new CompactHelper(fileStoreTable, compactionTempDir);
@@ -544,26 +565,62 @@ class DvTableReadableSnapshotRetrieverTest {
                 .rootCause()
                 .isInstanceOf(LakeTableSnapshotNotExistException.class);
 
-        // Step 9: Compact bucket2 only. Bucket0 still has L0 from snapshot12, so resolving its
-        // readable offset needs the deleted snapshot6. Readable advancement pauses.
-        compactHelper.compactBucket(bucket2).commit();
-        long snapshot14 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
-        readableSnapshotAndOffsets =
-                retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot14);
-        assertThat(readableSnapshotAndOffsets).isNull();
-        commitSnapshot(tableId, tablePath, snapshot14, Collections.emptyMap(), null);
-        assertThat(flussAdmin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
-                .isEqualTo(snapshot14);
-        assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getSnapshotId())
-                .isEqualTo(snapshot11);
-        assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getTableBucketsOffset())
-                .isEqualTo(expectedReadableOffsets);
+        if (flussDeletionVectors) {
+            // Step 9: Compact bucket2 only. Bucket0 still has L0 from snapshot12, and the
+            // registration
+            // of snapshot6, where its last flush ended, is deleted. Its offset in the registered
+            // readable snapshot11 still holds, as compactions only move files up, so the readable
+            // snapshot advances.
+            compactHelper.compactBucket(bucket2).commit();
+            long snapshot13 = latestSnapshot(fileStoreTable);
+            long snapshot14 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
+            readableSnapshotAndOffsets =
+                    retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot14);
+            assertThat(readableSnapshotAndOffsets).isNotNull();
+            assertThat(readableSnapshotAndOffsets.getReadableSnapshotId()).isEqualTo(snapshot13);
+            expectedReadableOffsets.put(tb2, 11L);
+            assertThat(readableSnapshotAndOffsets.getReadableOffsets())
+                    .isEqualTo(expectedReadableOffsets);
+            commitSnapshot(
+                    tableId,
+                    tablePath,
+                    snapshot14,
+                    Collections.emptyMap(),
+                    readableSnapshotAndOffsets);
+            assertThat(flussAdmin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
+                    .isEqualTo(snapshot14);
+            assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getSnapshotId())
+                    .isEqualTo(snapshot13);
+            assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getTableBucketsOffset())
+                    .isEqualTo(expectedReadableOffsets);
 
-        // Another APPEND alone cannot recover the missing flush offsets.
-        long snapshot15 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
-        assertThat(retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot15))
-                .isNull();
-        commitSnapshot(tableId, tablePath, snapshot15, Collections.emptyMap(), null);
+            // Snapshot13 is registered, so another APPEND does not recompute it.
+            long snapshot15 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
+            assertThat(retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot15))
+                    .isNull();
+            commitSnapshot(tableId, tablePath, snapshot15, Collections.emptyMap(), null);
+        } else {
+            // Step 9: Compact bucket2 only. Bucket0 still has L0 from snapshot12, so resolving its
+            // readable offset needs the deleted snapshot6. Readable advancement pauses.
+            compactHelper.compactBucket(bucket2).commit();
+            long snapshot14 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
+            readableSnapshotAndOffsets =
+                    retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot14);
+            assertThat(readableSnapshotAndOffsets).isNull();
+            commitSnapshot(tableId, tablePath, snapshot14, Collections.emptyMap(), null);
+            assertThat(flussAdmin.getLatestLakeSnapshot(tablePath).get().getSnapshotId())
+                    .isEqualTo(snapshot14);
+            assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getSnapshotId())
+                    .isEqualTo(snapshot11);
+            assertThat(flussAdmin.getReadableLakeSnapshot(tablePath).get().getTableBucketsOffset())
+                    .isEqualTo(expectedReadableOffsets);
+
+            // Another APPEND alone cannot recover the missing flush offsets.
+            long snapshot15 = writeAndCommitData(fileStoreTable, Collections.emptyMap());
+            assertThat(retrieveReadableSnapshotAndOffsets(tablePath, fileStoreTable, snapshot15))
+                    .isNull();
+            commitSnapshot(tableId, tablePath, snapshot15, Collections.emptyMap(), null);
+        }
 
         // Step 10: Flush the affected bucket0's remaining L0. Its readable offset now comes from
         // snapshot15, so snapshot6 is no longer needed. Bucket1 still has L0, whose previous flush

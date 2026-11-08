@@ -46,7 +46,9 @@ import java.time.Duration;
 import java.util.Optional;
 
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
+import static org.apache.fluss.server.testutils.LakeTieringTestUtils.takeTableToTier;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateTableRequest;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -121,6 +123,73 @@ class CommitLakeTableSnapshotFencingITCase {
         assertRegistered(tableId, 3);
         assertAccepted(commit(tableId, 4, null));
         assertRegistered(tableId, 4);
+    }
+
+    /**
+     * A tiering service that sends no tiering epoch predates deletion vectors: it commits a round's
+     * rows without deleting the old ones. Its commits of a table with deletion vectors are refused,
+     * and the coordinator hands the table only to a service that declares it supports them.
+     */
+    @Test
+    void testCommitWithoutEpochOfTableWithDeletionVectorsIsRejected() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "dv_commit_without_epoch");
+        coordinatorGateway
+                .createTable(
+                        newCreateTableRequest(
+                                tablePath,
+                                TableDescriptor.builder()
+                                        .schema(
+                                                Schema.newBuilder()
+                                                        .column("f1", DataTypes.INT())
+                                                        .primaryKey("f1")
+                                                        .build())
+                                        .property(
+                                                ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+                                        .property(
+                                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                                "true")
+                                        .property(
+                                                ConfigOptions.TABLE_DATALAKE_FRESHNESS,
+                                                Duration.ofMillis(100))
+                                        .build(),
+                                false))
+                .get();
+        long tableId = zkClient.getTable(tablePath).get().tableId;
+
+        PbCommitLakeTableSnapshotRespForTable resp = commit(tableId, 1, null);
+        assertThat(resp.getErrorCode()).isEqualTo(Errors.UNSUPPORTED_VERSION.code());
+        assertThat(resp.getErrorMessage())
+                .contains(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .contains("tiering epoch");
+        assertThat(zkClient.getLakeTable(tableId)).isEmpty();
+
+        // a service that does not declare the support never gets the table, also once it is
+        // pending; tables of other tests it may get
+        LakeTableTieringManager tieringManager =
+                FLUSS_CLUSTER_EXTENSION
+                        .getCoordinatorServer()
+                        .getCoordinatorService()
+                        .getLakeTableTieringManager();
+        waitUntil(
+                () ->
+                        tieringManager.getTableState(tableId)
+                                == LakeTableTieringManager.TieringState.Pending,
+                Duration.ofMinutes(1),
+                "Table " + tableId + " is not pending");
+        LakeTieringHeartbeatResponse response;
+        do {
+            response =
+                    coordinatorGateway
+                            .lakeTieringHeartbeat(
+                                    new LakeTieringHeartbeatRequest().setRequestTable(true))
+                            .get();
+            assertThat(response.hasTieringTable() ? response.getTieringTable().getTableId() : -1L)
+                    .isNotEqualTo(tableId);
+        } while (response.hasTieringTable());
+
+        long tieringEpoch = takeTableToTier(coordinatorGateway, tableId);
+        assertAccepted(commit(tableId, 1, tieringEpoch));
+        assertRegistered(tableId, 1);
     }
 
     private static long createLakeTable(TablePath tablePath) throws Exception {

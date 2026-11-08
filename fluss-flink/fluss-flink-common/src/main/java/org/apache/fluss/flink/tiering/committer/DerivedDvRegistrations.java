@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.TieringCommitResult;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
@@ -40,6 +41,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -112,6 +114,86 @@ final class DerivedDvRegistrations<WriteResult, Committable> {
                     tablePath,
                     e);
         }
+    }
+
+    /**
+     * Registers a merging round's lake commit in Fluss; its readable snapshot is in the index chain
+     * by now.
+     */
+    TieringCommitResult<Committable> register(
+            long tableId, TablePath tablePath, Registration<Committable> registration)
+            throws Exception {
+        LakeCommitResult result = registration.result;
+        if (result.committedIsReadable()) {
+            protectReadableSnapshot(tablePath, result.getCommittedSnapshotId());
+        } else if (result.getReadableSnapshot() != null) {
+            protectReadableSnapshot(
+                    tablePath, result.getReadableSnapshot().getReadableSnapshotId());
+        }
+        context.flussTableLakeSnapshotCommitter.commit(
+                tableId,
+                tablePath,
+                keepingIndexedSnapshots(tableId, tablePath, result),
+                registration.offsetsFile,
+                registration.logEndOffsets,
+                registration.logMaxTieredTimestamps);
+        LakeCommitResult.ReadableSnapshot readable = result.getReadableSnapshot();
+        if (readable != null) {
+            maybeTrimIndexChain(
+                    tableId,
+                    tablePath,
+                    context.indexStore(tableId, tablePath),
+                    context.withoutDroppedPartitions(
+                            tablePath, readable.getReadableLogEndOffsets()));
+        }
+        LOG.info(
+                "Round of {} on a lake that merges by key: lake snapshot {}, readable"
+                        + " snapshot {}.",
+                tablePath,
+                result.getCommittedSnapshotId(),
+                result.committedIsReadable()
+                        ? String.valueOf(result.getCommittedSnapshotId())
+                        : readable == null
+                                ? "unchanged"
+                                : String.valueOf(readable.getReadableSnapshotId()));
+        return new TieringCommitResult<>(registration.committable, result.getTieringStats());
+    }
+
+    /**
+     * Returns the result of a merging round's lake commit, keeping the registered snapshots the
+     * chain needs as well as those the lake committer asked to keep. Lakes that merge by key number
+     * their snapshots in commit order, so the smaller id is the earlier one.
+     */
+    private LakeCommitResult keepingIndexedSnapshots(
+            long tableId, TablePath tablePath, LakeCommitResult result) throws Exception {
+        LakeCommitResult.ReadableSnapshot readable = result.getReadableSnapshot();
+        Long lakeKeeps = result.getEarliestSnapshotIDToKeep();
+        if (readable == null
+                || result.committedIsReadable()
+                || LakeCommitResult.KEEP_ALL_PREVIOUS.equals(lakeKeeps)) {
+            return result;
+        }
+        Long indexKeeps = earliestSnapshotToKeep(tableId, tablePath);
+        // Both are null on the first readable snapshot of a table; a conditional expression of
+        // Long and long would unbox them.
+        Long keep;
+        if (indexKeeps == null) {
+            keep = lakeKeeps;
+        } else if (lakeKeeps == null) {
+            keep = indexKeeps;
+        } else {
+            keep = Math.min(lakeKeeps, indexKeeps);
+        }
+        if (Objects.equals(keep, lakeKeeps)) {
+            return result;
+        }
+        return LakeCommitResult.withReadableSnapshot(
+                result.getCommittedSnapshotId(),
+                readable.getReadableSnapshotId(),
+                readable.getTieredLogEndOffsets(),
+                readable.getReadableLogEndOffsets(),
+                keep,
+                result.getTieringStats());
     }
 
     /**
