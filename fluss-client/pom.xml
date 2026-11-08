@@ -49,6 +49,13 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- deletion vector masks of union reads -->
+        <dependency>
+            <groupId>org.roaringbitmap</groupId>
+            <artifactId>RoaringBitmap</artifactId>
+            <version>${roaringbitmap.version}</version>
+        </dependency>
+
         <!-- Unshaded Arrow dependencies for the Arrow scan batch API (ArrowBatchData).
              Marked as "provided" to avoid Arrow class conflicts with consumers that
              bring their own Arrow version. Currently only the internal tiering service
@@ -114,6 +121,18 @@
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
             <!-- TODO: fluss-clients shouldn't publish bundled jar -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

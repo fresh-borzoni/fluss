@@ -311,6 +311,13 @@ public class IcebergLakeSource
         return new Replayed(new DataDeltaPlan<>(current.snapshotId(), splits, removedByBucket));
     }
 
+    /** Iceberg snapshot ids are random and never reused, so a snapshot id names one commit. */
+    @Override
+    @Nullable
+    public String snapshotIdentity(long snapshotId) {
+        return null;
+    }
+
     /** The rewrite plan replayed from the snapshots since the base, or null for no rewrite. */
     private static final class Replayed {
         @Nullable final DataDeltaPlan<IcebergSplit> plan;

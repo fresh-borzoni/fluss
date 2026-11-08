@@ -90,8 +90,8 @@ final class IndexLayout {
     static final String FILE_DICT = "filedict.txt";
 
     // Format versions of the store's files.
-    // A chain entry's name, and its content: the identity the lake gave the snapshot. Readers
-    // compare it with the identity the lake gives now, so a change of
+    // A chain entry's name, and its content: the identity SupportsRewritePlanning#snapshotIdentity
+    // gave the snapshot. Readers compare it with the identity the lake gives now, so a change of
     // that string is a change of this format.
     static final int CHAIN_ENTRY_VERSION = 1;
     // A change directory: _STARTED, _COMMITTED and the SSTs written before the change commits.
