@@ -154,7 +154,9 @@ public final class TieringSourceReader<WriteResult>
     @Override
     protected TieringSplitState initializedState(FlinkTieringSplit split) {
         TieringSplit tieringSplit = split.unwrap();
-        if (tieringSplit.isTieringSnapshotSplit() || tieringSplit.isTieringLogSplit()) {
+        if (tieringSplit.isTieringSnapshotSplit()
+                || tieringSplit.isTieringLogSplit()
+                || tieringSplit.isTieringRowPosSplit()) {
             return new TieringSplitState(tieringSplit);
         } else {
             throw new UnsupportedOperationException("Unsupported split type: " + split);

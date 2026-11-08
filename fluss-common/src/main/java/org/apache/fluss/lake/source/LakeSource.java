@@ -102,6 +102,39 @@ public interface LakeSource<Split extends LakeSplit> extends Serializable {
     LakeSource<Split> copy();
 
     /**
+     * Plans the change of the position index of a table with deletion vectors from snapshot {@code
+     * baseSnapshotId} (-1 for none) to snapshot {@code targetSnapshotId} (null for the current
+     * one). It compares the readable data files of the two snapshots, so expired snapshots in
+     * between cannot hide a rewrite.
+     *
+     * <p>Returns one split per data file whose rows the index must learn (read with {@link
+     * RecordReader#readWithPos()}), and the data files that left the snapshot. Returns every
+     * readable file of the target if the base is gone, or null if the base's index already fits the
+     * target.
+     *
+     * <p>Files whose positions the tiering writer reports itself (see {@code
+     * PositionIndexDeltaProvider}) may be left out. A lake that merges rows by primary key itself
+     * (see {@code LakeTieringFactory#mergesByPrimaryKey()}) reports no positions, so every data
+     * file that became readable since the base is planned.
+     */
+    @Nullable
+    default DataDeltaPlan<Split> planRewrite(long baseSnapshotId, @Nullable Long targetSnapshotId) {
+        return null;
+    }
+
+    /**
+     * Describes the commit snapshot {@code snapshotId} names now, so that a reused snapshot id,
+     * e.g. of a commit after a rollback, is told apart from the snapshot it named before. Returns
+     * "none" if the snapshot does not exist, and null for a lake that never reuses snapshot ids.
+     * Fluss records it when it registers a readable snapshot of a table with deletion vectors.
+     * Union reads check it before they apply the snapshot's masks.
+     */
+    @Nullable
+    default String snapshotIdentity(long snapshotId) throws IOException {
+        return null;
+    }
+
+    /**
      * Context interface for planners, providing the snapshot id of the table in data-lake to plan
      * splits.
      */

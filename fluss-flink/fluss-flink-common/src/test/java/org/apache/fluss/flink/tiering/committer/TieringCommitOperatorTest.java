@@ -33,6 +33,7 @@ import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
+import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.testutils.common.CheckedThread;
@@ -891,6 +892,152 @@ class TieringCommitOperatorTest extends FlinkTestBase {
                         maxTimestamp,
                         numberOfWriteResults);
         return new StreamRecord<>(tableBucketWriteResult);
+    }
+
+    /**
+     * Tests that a held round resumes once every bucket its re-index waits for reported, and that a
+     * result arriving twice for a bucket, e.g. from a reader that failed over, counts once.
+     */
+    @Test
+    void testHeldRoundWaitsForEveryBucketOfItsReindex() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "held_round");
+        long tableId = 4711L;
+        holdRound(tableId, tablePath, 2);
+
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 0));
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 0));
+        assertThat(heldRounds()).containsKey(tableId);
+        assertThat(mockOperatorEventGateway.getEventsSent()).isEmpty();
+
+        // the last bucket resumes the round, which fails here: none of its parts exist
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 1));
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        awaitCommitEvent();
+        assertThat(lastSourceEvent()).isInstanceOf(FailedTieringEvent.class);
+    }
+
+    /** A result of another re-index request than the one a held round waits for is dropped. */
+    @Test
+    void testHeldRoundDropsResultsOfAnotherReindex() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "held_round_stale");
+        long tableId = 4712L;
+        holdRound(tableId, tablePath, 1);
+
+        TableBucketWriteResult<TestingWriteResult> stale =
+                rowPosResult(tablePath, tableId, 0).getValue();
+        committerOperator.processElement(
+                new StreamRecord<>(
+                        new TableBucketWriteResult<>(
+                                tablePath,
+                                stale.tableBucket(),
+                                null,
+                                null,
+                                -1,
+                                -1,
+                                1,
+                                new RowPosResult(
+                                        42L,
+                                        0,
+                                        0,
+                                        null,
+                                        null,
+                                        stale.getRowPosResult().getNewFileDictEntries(),
+                                        stale.getRowPosResult().getSstMetas()))));
+        assertThat(heldRounds()).containsKey(tableId);
+
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 0));
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        awaitCommitEvent();
+        assertThat(lastSourceEvent()).isInstanceOf(FailedTieringEvent.class);
+    }
+
+    /**
+     * Tests that a table's next round drops its held round. The enumerator starts the next round
+     * only after the held round failed there, e.g. because its re-index could not be requested. The
+     * next round commits, and a late result of the dropped round's re-index finds no round to
+     * resume.
+     */
+    @Test
+    void testNextRoundOfATableDropsItsHeldRound() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "held_round_dropped");
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        holdRound(tableId, tablePath, 1);
+
+        Map<TableBucket, Long> expectedLogEndOffsets = new HashMap<>();
+        for (int bucket = 0; bucket < 3; bucket++) {
+            TableBucket tableBucket = new TableBucket(tableId, bucket);
+            committerOperator.processElement(
+                    createTableBucketWriteResultStreamRecord(
+                            tablePath, tableBucket, bucket, 10 + bucket, 20L + bucket, 3));
+            expectedLogEndOffsets.put(tableBucket, 10L + bucket);
+        }
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        verifyLakeSnapshot(tablePath, tableId, 1, expectedLogEndOffsets);
+
+        int eventsSent = mockOperatorEventGateway.getEventsSent().size();
+        committerOperator.processElement(rowPosResult(tablePath, tableId, 0));
+        assertThat(heldRounds()).doesNotContainKey(tableId);
+        assertThat(mailbox.hasMail()).isFalse();
+        assertThat(mockOperatorEventGateway.getEventsSent()).hasSize(eventsSent);
+    }
+
+    /** Holds a round of {@code tableId} that waits for the re-index of {@code buckets} buckets. */
+    private void holdRound(long tableId, TablePath tablePath, int buckets) throws Exception {
+        java.lang.reflect.Constructor<?> reindexCtor =
+                DerivedDvTieringCommitter.Reindex.class.getDeclaredConstructors()[0];
+        reindexCtor.setAccessible(true);
+        Object reindex =
+                reindexCtor.newInstance(
+                        tablePath,
+                        1L,
+                        2L,
+                        // the change id of results built without one
+                        -1L,
+                        null,
+                        null,
+                        buckets,
+                        System.currentTimeMillis());
+        Class<?> heldRoundClass = null;
+        for (Class<?> c : TieringCommitOperator.class.getDeclaredClasses()) {
+            if (c.getSimpleName().equals("HeldRound")) {
+                heldRoundClass = c;
+            }
+        }
+        java.lang.reflect.Constructor<?> heldCtor =
+                heldRoundClass.getDeclaredConstructor(
+                        List.class, DerivedDvTieringCommitter.Reindex.class);
+        heldCtor.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<Long, Object> held = (Map<Long, Object>) heldRounds();
+        held.put(tableId, heldCtor.newInstance(new ArrayList<>(), reindex));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<Long, ?> heldRounds() throws Exception {
+        java.lang.reflect.Field field = TieringCommitOperator.class.getDeclaredField("heldRounds");
+        field.setAccessible(true);
+        return (Map<Long, ?>) field.get(committerOperator);
+    }
+
+    /** A bucket's re-index result whose SST does not exist. */
+    private static StreamRecord<TableBucketWriteResult<TestingWriteResult>> rowPosResult(
+            TablePath tablePath, long tableId, int bucket) {
+        return new StreamRecord<>(
+                new TableBucketWriteResult<>(
+                        tablePath,
+                        new TableBucket(tableId, bucket),
+                        null,
+                        null,
+                        -1,
+                        -1,
+                        2,
+                        new RowPosResult(
+                                bucket,
+                                null,
+                                null,
+                                Collections.singletonMap(bucket, "f" + bucket),
+                                Collections.singletonList(
+                                        new RowPosResult.SstMeta("missing.sst", 1)))));
     }
 
     private void awaitCommitEvent() throws Exception {

@@ -22,6 +22,10 @@ import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.metadata.TablePath;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.Serializable;
@@ -77,9 +81,39 @@ public interface LakeTieringFactory<WriteResult, CommittableT> extends Serializa
     }
 
     /**
+     * Returns whether the lake table merges rows by primary key itself, as a merge-tree table does.
+     *
+     * <p>Tiering a table with deletion vectors then commits no deletes: the lake supersedes old
+     * rows on its own. The committer reports in its {@link
+     * org.apache.fluss.lake.committer.LakeCommitResult} which snapshot is readable and from which
+     * log offset per bucket; this may lag the commit. The position index follows the readable
+     * snapshots and learns their files through {@link LakeSource#planRewrite}. Otherwise tiering
+     * resolves the superseded rows and commits their deletes with the data ({@link
+     * LakeCommitter#commitWithDeletes}), so every commit is readable at its tiered offsets.
+     *
+     * <p>This check must not access lake resources.
+     */
+    default boolean mergesByPrimaryKey() {
+        return false;
+    }
+
+    /**
      * Returns the serializer for committable objects.
      *
      * @return the serializer for committable objects
      */
     SimpleVersionedSerializer<CommittableT> getCommittableSerializer();
+
+    /**
+     * Creates a {@link LakeSource} of the lake table using the factory's configuration. Tiering
+     * uses it for deletion vectors, to plan the re-index of rewritten data files and to read the
+     * positions of their rows.
+     *
+     * @param tablePath the table path to create the lake source for
+     * @return the lake source, or null if not supported
+     */
+    @Nullable
+    default LakeSource<?> createLakeSource(TablePath tablePath) {
+        return null;
+    }
 }

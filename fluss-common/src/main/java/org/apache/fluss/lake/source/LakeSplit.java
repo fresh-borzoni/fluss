@@ -19,6 +19,9 @@ package org.apache.fluss.lake.source;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
+import javax.annotation.Nullable;
+
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -55,4 +58,41 @@ public interface LakeSplit extends java.io.Serializable {
      *     belong to a specific partition in non-partitioned table.
      */
     List<String> partition();
+
+    /**
+     * Returns the file name of the data file in this split.
+     *
+     * <p>Deletion vectors are keyed by data file, so a split that covers exactly one data file
+     * returns its name. The position index and the union-read masks refer to files by this name.
+     *
+     * @return the file name, or null if the split does not cover exactly one data file
+     */
+    @Nullable
+    default String fileName() {
+        return null;
+    }
+
+    /**
+     * Returns the names of the data files this split reads, in the form of {@link #fileName()}.
+     *
+     * <p>A split of several data files is masked by the masks of its own files only. Each row read
+     * with {@link RecordReader#readWithPos()} names its file.
+     *
+     * @return the file names, or null if unknown
+     */
+    @Nullable
+    default List<String> fileNames() {
+        String fileName = fileName();
+        return fileName == null ? null : Collections.singletonList(fileName);
+    }
+
+    /**
+     * Returns the number of rows in the data files of this split as their metadata gives it,
+     * deleted rows included. Work over lake files, such as re-indexing them, is split by it.
+     *
+     * @return the number of rows, or -1 if unknown
+     */
+    default long rowCount() {
+        return -1;
+    }
 }

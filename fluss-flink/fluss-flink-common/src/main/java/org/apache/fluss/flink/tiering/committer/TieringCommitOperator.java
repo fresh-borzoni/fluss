@@ -28,8 +28,10 @@ import org.apache.fluss.client.tiering.TieringCommitter;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
+import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.source.TieringSource;
 import org.apache.fluss.lake.committer.LakeCommitter;
+import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.metadata.TableBucket;
@@ -53,6 +55,7 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -85,6 +88,9 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  * of the tiering progress.
  *
  * <p>Rounds of tables with deletion vectors are committed by a {@link DerivedDvTieringCommitter}.
+ * Such a round may be held until the tiering readers re-index lake files rewritten since its base.
+ * The operator then requests the re-index from the enumerator ({@link RowPosRequestEvent}),
+ * collects the readers' results and commits the round again. A held round takes no commit thread.
  */
 public class TieringCommitOperator<WriteResult, Committable>
         extends AbstractStreamOperator<CommittableMessage<Committable>>
@@ -124,6 +130,10 @@ public class TieringCommitOperator<WriteResult, Committable>
 
     // Table ID -> accumulator for the current tiering round.
     private final Map<Long, TableWriteResultAccumulator<WriteResult>> tableWriteResultAccumulators;
+
+    // Table ID -> round of a table with deletion vectors held until its re-index is done. A held
+    // round is not in committingTables. Mailbox-thread confined.
+    private final Map<Long, HeldRound<WriteResult>> heldRounds = new HashMap<>();
 
     // Only picks the log level of commit failures. Mailbox-thread confined.
     private final ConsecutiveCommitFailureCounter consecutiveCommitFailures =
@@ -201,6 +211,10 @@ public class TieringCommitOperator<WriteResult, Committable>
     public void processElement(StreamRecord<TableBucketWriteResult<WriteResult>> streamRecord)
             throws Exception {
         TableBucketWriteResult<WriteResult> tableBucketWriteResult = streamRecord.getValue();
+        if (tableBucketWriteResult.isRowPosResult()) {
+            handleRowPosResult(tableBucketWriteResult);
+            return;
+        }
         TableBucket tableBucket = tableBucketWriteResult.tableBucket();
         long tableId = tableBucket.getTableId();
         TableWriteResultAccumulator<WriteResult> accumulator =
@@ -212,15 +226,78 @@ public class TieringCommitOperator<WriteResult, Committable>
         accumulator.add(tableBucketWriteResult);
 
         if (accumulator.isComplete()) {
-            // Bound submitted rounds as well as threads; yield so completions can free capacity.
-            while (committingTables.size() >= commitThreads) {
-                mailboxExecutor.yield();
-            }
+            awaitCommitCapacity();
             tableWriteResultAccumulators.remove(tableId);
+            HeldRound<WriteResult> stale = heldRounds.remove(tableId);
+            if (stale != null) {
+                // The enumerator starts a table's next round only after the previous one ended,
+                // so the held round failed there, e.g. because its re-index could not be
+                // requested. This round registers any lake commit it made before it was held.
+                LOG.warn(
+                        "Derived DV: dropping the held round of {} (re-index of snapshot {}), as"
+                                + " the table's next round started.",
+                        stale.reindex.tablePath,
+                        stale.reindex.compactSnapshotId);
+            }
             checkState(committingTables.add(tableId), "Table %s is already committing.", tableId);
             commitAsync(
                     tableId, tableBucketWriteResult.tablePath(), accumulator.bucketWriteResults);
         }
+    }
+
+    /** Bounds submitted rounds as well as threads; yields so completions can free capacity. */
+    private void awaitCommitCapacity() throws InterruptedException {
+        // Completions never wait for stream input, so yielding to them cannot deadlock.
+        while (committingTables.size() >= commitThreads) {
+            mailboxExecutor.yield();
+        }
+    }
+
+    /**
+     * Collects a bucket's re-index result of a held round. Once every split of the re-index
+     * reported, commits the round again on the re-indexed snapshot.
+     */
+    private void handleRowPosResult(TableBucketWriteResult<WriteResult> tableBucketWriteResult)
+            throws InterruptedException {
+        long tableId = tableBucketWriteResult.tableBucket().getTableId();
+        HeldRound<WriteResult> held = heldRounds.get(tableId);
+        if (held == null) {
+            LOG.warn(
+                    "Dropping a re-index result of table {} that has no held round.",
+                    tableBucketWriteResult.tablePath());
+            return;
+        }
+        RowPosResult result = tableBucketWriteResult.getRowPosResult();
+        if (result.getChangeId() != held.reindex.changeId) {
+            // A result of an earlier request, e.g. of a round that failed meanwhile.
+            LOG.warn(
+                    "Dropping a re-index result of {} for index change {}; the held round waits"
+                            + " for change {}.",
+                    tableBucketWriteResult.tableBucket(),
+                    result.getChangeId(),
+                    held.reindex.changeId);
+            return;
+        }
+        if (held.rowPosResults
+                        .computeIfAbsent(tableBucketWriteResult.tableBucket(), k -> new HashMap<>())
+                        .put(result.getSplit(), result)
+                != null) {
+            // A reader that failed over reports its split again.
+            LOG.info(
+                    "Re-index result of split {} of {} for index change {} arrived again.",
+                    result.getSplit(),
+                    tableBucketWriteResult.tableBucket(),
+                    result.getChangeId());
+        } else {
+            held.received++;
+        }
+        if (held.received < held.reindex.expectedResults) {
+            return;
+        }
+        heldRounds.remove(tableId);
+        awaitCommitCapacity();
+        checkState(committingTables.add(tableId), "Table %s is already committing.", tableId);
+        resumeAsync(tableId, held);
     }
 
     @Override
@@ -257,6 +334,17 @@ public class TieringCommitOperator<WriteResult, Committable>
                 });
     }
 
+    /** Publishes the re-index of a held round and commits the round again. */
+    private void resumeAsync(long tableId, HeldRound<WriteResult> held) {
+        submit(
+                tableId,
+                held.reindex.tablePath,
+                held.writeResults,
+                () ->
+                        dvCommitter.resumeRound(
+                                tableId, held.reindex, held.results(), held.writeResults));
+    }
+
     private void submit(
             long tableId,
             TablePath tablePath,
@@ -288,10 +376,23 @@ public class TieringCommitOperator<WriteResult, Committable>
             long tableId,
             List<TableBucketWriteResult<WriteResult>> results,
             DerivedDvTieringCommitter.Outcome<Committable> outcome) {
-        reportFinished(
-                tableId,
-                outcome.result(),
-                results.stream().anyMatch(TableBucketWriteResult::endedEarly));
+        DerivedDvTieringCommitter.Reindex reindex = outcome.reindex();
+        if (reindex == null) {
+            reportFinished(
+                    tableId,
+                    outcome.result(),
+                    results.stream().anyMatch(TableBucketWriteResult::endedEarly));
+            return;
+        }
+        // Registered before the request is sent, so no result arrives without its held round.
+        heldRounds.put(tableId, new HeldRound<>(results, reindex));
+        for (RowPosRequestEvent request : reindex.requests) {
+            operatorEventGateway.sendEventToCoordinator(new SourceEventWrapper(request));
+        }
+        LOG.info(
+                "Derived DV: round of {} holds until rewritten files are re-indexed (snapshot {}).",
+                reindex.tablePath,
+                reindex.compactSnapshotId);
     }
 
     @VisibleForTesting
@@ -363,6 +464,29 @@ public class TieringCommitOperator<WriteResult, Committable>
     @FunctionalInterface
     private interface RoundCommit<Committable> {
         DerivedDvTieringCommitter.Outcome<Committable> commit() throws Exception;
+    }
+
+    /** A round of a table with deletion vectors held until its re-index is done. */
+    private static final class HeldRound<WriteResult> {
+        private final List<TableBucketWriteResult<WriteResult>> writeResults;
+        private final DerivedDvTieringCommitter.Reindex reindex;
+        // one result per split of the re-index, by bucket and split
+        private final Map<TableBucket, Map<Integer, RowPosResult>> rowPosResults =
+                new LinkedHashMap<>();
+        private int received;
+
+        private HeldRound(
+                List<TableBucketWriteResult<WriteResult>> writeResults,
+                DerivedDvTieringCommitter.Reindex reindex) {
+            this.writeResults = writeResults;
+            this.reindex = reindex;
+        }
+
+        private List<RowPosResult> results() {
+            List<RowPosResult> results = new ArrayList<>();
+            rowPosResults.values().forEach(splits -> results.addAll(splits.values()));
+            return results;
+        }
     }
 
     /** Collects one table's tiering round with constant-time validation of each result. */

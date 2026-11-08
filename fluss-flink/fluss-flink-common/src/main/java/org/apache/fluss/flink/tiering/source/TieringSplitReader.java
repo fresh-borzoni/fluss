@@ -28,6 +28,7 @@ import org.apache.fluss.client.table.scanner.log.LogScannerImpl;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringWriterInitContext;
@@ -39,7 +40,18 @@ import org.apache.fluss.flink.source.reader.BoundedSplitReader;
 import org.apache.fluss.flink.source.reader.RecordAndPos;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.batch.ArrowRecordBatch;
+import org.apache.fluss.lake.dv.FilePos;
+import org.apache.fluss.lake.dv.RowPosSstIndex;
+import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.dv.index.SpillingPositionSorter;
+import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.RowPosResult;
+import org.apache.fluss.lake.source.RowWithPosResult;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
@@ -52,6 +64,8 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ArrowBatchData;
+import org.apache.fluss.row.encode.KeyEncoder;
+import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
@@ -67,10 +81,12 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -79,6 +95,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -141,7 +158,11 @@ public class TieringSplitReader<WriteResult>
     private final TieringMetrics tieringMetrics;
     private final boolean unshadedArrowAvailable;
     @Nullable private final String[] ioTmpDirs;
+    private final Queue<TieringRowPosSplit> pendingRowPosSplits;
 
+    // The most entries a re-index split holds in memory before it spills a sorted run.
+    @VisibleForTesting static final int MAX_REINDEX_SORT_BUFFER_ENTRIES = 500_000;
+    private final int reindexSortBufferEntries;
     // A bucket's round ends early once its lake writer holds this many keys or bytes.
     private final long maxRoundKeysPerBucket;
     private final long maxRoundBytesPerBucket;
@@ -198,6 +219,7 @@ public class TieringSplitReader<WriteResult>
         this.tieringMetrics = tieringMetrics;
         this.unshadedArrowAvailable = checkUnshadedArrowAvailable(userClassLoader);
         this.ioTmpDirs = ioTmpDirs;
+        this.pendingRowPosSplits = new ArrayDeque<>();
         this.maxRoundKeysPerBucket =
                 connection
                         .getConfiguration()
@@ -207,6 +229,18 @@ public class TieringSplitReader<WriteResult>
                         .getConfiguration()
                         .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET)
                         .getBytes();
+        // a split of fewer rows never spills
+        this.reindexSortBufferEntries =
+                (int)
+                        Math.max(
+                                1,
+                                Math.min(
+                                        MAX_REINDEX_SORT_BUFFER_ENTRIES,
+                                        connection
+                                                .getConfiguration()
+                                                .get(
+                                                        ConfigOptions
+                                                                .LAKE_TIERING_DELETION_VECTORS_REINDEX_ROWS_PER_SPLIT)));
         checkArgument(
                 maxRoundKeysPerBucket > 0 && maxRoundBytesPerBucket > 0,
                 "%s and %s must be positive.",
@@ -226,6 +260,10 @@ public class TieringSplitReader<WriteResult>
 
     @Override
     public RecordsWithSplitIds<TableBucketWriteResult<WriteResult>> fetch() throws IOException {
+        if (!pendingRowPosSplits.isEmpty()) {
+            return processRowPosSplit(pendingRowPosSplits.poll());
+        }
+
         // check empty splits
         if (!currentEmptySplits.isEmpty()) {
             LOG.info("Empty split(s) {} finished.", currentEmptySplits);
@@ -291,6 +329,10 @@ public class TieringSplitReader<WriteResult>
         for (FlinkTieringSplit flinkSplit : splitsChange.splits()) {
             TieringSplit split = flinkSplit.unwrap();
             LOG.info("add split {}", split.splitId());
+            if (split.isTieringRowPosSplit()) {
+                pendingRowPosSplits.add(split.asTieringRowPosSplit());
+                continue;
+            }
             if (split.shouldSkipCurrentRound()) {
                 // if the split is forced to ignore,
                 // mark it as empty
@@ -724,6 +766,18 @@ public class TieringSplitReader<WriteResult>
         return lastWrittenTimestamp;
     }
 
+    /**
+     * A local directory for temporary files under one of the tiering service's IO directories, or
+     * null for the JVM's temporary directory.
+     */
+    @Nullable
+    private File localTmpDir(String name) {
+        if (ioTmpDirs == null || ioTmpDirs.length == 0) {
+            return null;
+        }
+        return new File(ioTmpDirs[ThreadLocalRandom.current().nextInt(ioTmpDirs.length)], name);
+    }
+
     /** Whether a round-buffering lake writer reached the round's key or byte limit. */
     private boolean isRoundFull(LakeWriter<?> lakeWriter) {
         if (!(lakeWriter instanceof RoundBufferingLakeWriter)) {
@@ -881,6 +935,7 @@ public class TieringSplitReader<WriteResult>
                 logEndOffset,
                 maxTimestamp,
                 checkNotNull(currentTableNumberOfSplits),
+                null,
                 endedEarly);
     }
 
@@ -1068,6 +1123,212 @@ public class TieringSplitReader<WriteResult>
         lakeWriters.clear();
 
         // don't need to close connection, will be closed by TieringSourceReader
+    }
+
+    /**
+     * Processes a row position split: re-indexes the rewritten lake files of one bucket. A split of
+     * a table dropped meanwhile ends without indexing. Its held round then fails in the committer,
+     * and the other tables' rounds go on.
+     */
+    @SuppressWarnings("unchecked")
+    private TableBucketWriteResultWithSplitIds processRowPosSplit(TieringRowPosSplit rowPosSplit)
+            throws IOException {
+        TableInfo rowPosTableInfo;
+        try (Table table = connection.getTable(rowPosSplit.getTablePath())) {
+            rowPosTableInfo = table.getTableInfo();
+        } catch (Exception e) {
+            if (isDropped(rowPosSplit)) {
+                return droppedTableResult(rowPosSplit);
+            }
+            throw new IOException("Failed to load table info for " + rowPosSplit.getTablePath(), e);
+        }
+        if (rowPosTableInfo.getTableId() != rowPosSplit.getTableBucket().getTableId()) {
+            return droppedTableResult(rowPosSplit);
+        }
+        try {
+            // the lake table may live under a custom lake table path
+            LakeSource<?> lakeSource =
+                    lakeTieringFactory.createLakeSource(rowPosTableInfo.getLakeTablePath());
+            if (lakeSource == null) {
+                throw new IOException(
+                        "LakeSource is null for table "
+                                + rowPosSplit.getTablePath()
+                                + ". Cannot process RowPos split.");
+            }
+            return processRowPosSplitInternal(
+                    rowPosSplit, (LakeSource<LakeSplit>) lakeSource, rowPosTableInfo);
+        } catch (IOException | RuntimeException e) {
+            // Dropping the table may drop its lake table too, while its files are read.
+            if (isDropped(rowPosSplit)) {
+                return droppedTableResult(rowPosSplit);
+            }
+            throw e;
+        }
+    }
+
+    /** Whether the split's table was dropped, or dropped and created again under its path. */
+    private boolean isDropped(TieringSplit split) {
+        try {
+            // the admin is a shared per-connection instance, so it must not be closed here
+            TableInfo tableInfo = connection.getAdmin().getTableInfo(split.getTablePath()).get();
+            return tableInfo.getTableId() != split.getTableBucket().getTableId();
+        } catch (Exception e) {
+            return ExceptionUtils.findThrowable(e, TableNotExistException.class).isPresent();
+        }
+    }
+
+    /**
+     * The result of a re-index split of a dropped table. It has no index part, so the held round
+     * completes and fails on the dropped table instead of the reader failing the job.
+     */
+    private TableBucketWriteResultWithSplitIds droppedTableResult(TieringRowPosSplit rowPosSplit) {
+        LOG.info(
+                "Table {} (id {}) was dropped; its re-index split {} ends without indexing.",
+                rowPosSplit.getTablePath(),
+                rowPosSplit.getTableBucket().getTableId(),
+                rowPosSplit.splitId());
+        TableBucketWriteResult<WriteResult> result =
+                new TableBucketWriteResult<>(
+                        rowPosSplit.getTablePath(),
+                        rowPosSplit.getTableBucket(),
+                        rowPosSplit.getPartitionName(),
+                        null,
+                        -1,
+                        -1,
+                        rowPosSplit.getTotalExpectedResults(),
+                        new RowPosResult(
+                                rowPosSplit.getCompactSnapshotId(),
+                                rowPosSplit.getSplit(),
+                                rowPosSplit.getTableBucket().getBucket(),
+                                rowPosSplit.getTableBucket().getPartitionId(),
+                                rowPosSplit.getPartitionName(),
+                                Collections.emptyMap(),
+                                Collections.emptyList()));
+        return new TableBucketWriteResultWithSplitIds(
+                Collections.singletonMap(rowPosSplit.getTableBucket(), result),
+                Collections.singletonMap(rowPosSplit.getTableBucket(), rowPosSplit.splitId()));
+    }
+
+    /**
+     * Indexes every live row of the split's files by its encoded primary key, the way tablet
+     * servers look keys up, and writes the result as the bucket's index part of the re-index.
+     */
+    private <Split extends LakeSplit> TableBucketWriteResultWithSplitIds processRowPosSplitInternal(
+            TieringRowPosSplit rowPosSplit, LakeSource<Split> lakeSource, TableInfo tableInfo)
+            throws IOException {
+        long t0 = System.currentTimeMillis();
+        RowType rowType = tableInfo.getRowType();
+        List<String> pkNames = tableInfo.getPhysicalPrimaryKeys();
+        int[] pkIndexes = new int[pkNames.size()];
+        int[][] projection = new int[pkNames.size()][];
+        for (int i = 0; i < pkNames.size(); i++) {
+            pkIndexes[i] = rowType.getFieldIndex(pkNames.get(i));
+            projection[i] = new int[] {pkIndexes[i]};
+        }
+        lakeSource.withProject(projection);
+        KeyEncoder keyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        rowType.project(pkIndexes),
+                        pkNames,
+                        tableInfo.getTableConfig(),
+                        tableInfo.isDefaultBucketKey());
+
+        SimpleVersionedSerializer<Split> splitSerializer = lakeSource.getSplitSerializer();
+        int[] fileIds = rowPosSplit.getFileIds();
+        PositionIndexStore.ReindexPlan plan =
+                PositionIndexStore.readReindexPlan(rowPosSplit.getPlanReference());
+        if (plan.lakeSplits.size() != fileIds.length) {
+            throw new IOException(
+                    String.format(
+                            "The re-index plan %s has %d files, but the split has %d file ids.",
+                            rowPosSplit.getPlanReference(),
+                            plan.lakeSplits.size(),
+                            fileIds.length));
+        }
+        int bucketId = rowPosSplit.getTableBucket().getBucket();
+        Map<Integer, String> newFileDictEntries = new HashMap<>();
+        File localTmpDir = localTmpDir("dv-reindex");
+        PositionIndexStore.BucketPart part;
+        long rows;
+        // Sorts the keys in bounded memory: a split's files may hold more rows than fit in the
+        // heap. Two live rows of one key fail the split, since picking one would leave the other
+        // unmasked.
+        try (SpillingPositionSorter entries =
+                new SpillingPositionSorter(
+                        localTmpDir,
+                        reindexSortBufferEntries,
+                        (key, first, second) ->
+                                new IllegalStateException(
+                                        String.format(
+                                                "DV re-index of %s bucket %s: two live rows of one"
+                                                        + " key, in %s at %d and in %s at %d.",
+                                                rowPosSplit.getTablePath(),
+                                                rowPosSplit.getTableBucket(),
+                                                newFileDictEntries.get(first.fileId()),
+                                                first.rowPosition(),
+                                                newFileDictEntries.get(second.fileId()),
+                                                second.rowPosition())))) {
+            for (int idx = 0; idx < fileIds.length; idx++) {
+                Split lakeSplit =
+                        splitSerializer.deserialize(
+                                plan.splitSerializerVersion, plan.lakeSplits.get(idx));
+                int fileId = fileIds[idx];
+                newFileDictEntries.put(fileId, lakeSplit.fileName());
+                RecordReader recordReader = lakeSource.createRecordReader(() -> lakeSplit);
+                try (CloseableIterator<RowWithPosResult> iter = recordReader.readWithPos()) {
+                    while (iter.hasNext()) {
+                        RowWithPosResult rwp = iter.next();
+                        byte[] key = keyEncoder.encodeKey(rwp.getRow());
+                        entries.add(
+                                Arrays.copyOf(key, key.length), new FilePos(fileId, rwp.getPos()));
+                    }
+                }
+            }
+            rows = entries.size();
+            // The committer commits and registers this part along with the other buckets'.
+            part =
+                    PositionIndexStore.forTable(
+                                    new FsPath(rowPosSplit.getRemoteUploadBasePath()), localTmpDir)
+                            .writeBucket(
+                                    rowPosSplit.getCompactSnapshotId(),
+                                    rowPosSplit.getTableBucket(),
+                                    // a bucket's splits write different SSTs
+                                    "s" + rowPosSplit.getSplit() + "_",
+                                    entries.sorted());
+        }
+        Long partitionId = rowPosSplit.getTableBucket().getPartitionId();
+        List<RowPosResult.SstMeta> resultMetas = new ArrayList<>();
+        for (RowPosSstIndex.SstFileEntry f : part.files) {
+            resultMetas.add(new RowPosResult.SstMeta(f.getFileName(), f.getFileSize()));
+        }
+        LOG.info(
+                "DV re-index of {} bucket {} (split {}): {} files, {} live rows in {} ms.",
+                rowPosSplit.getTablePath(),
+                rowPosSplit.getTableBucket(),
+                rowPosSplit.getSplit(),
+                fileIds.length,
+                rows,
+                System.currentTimeMillis() - t0);
+        TableBucketWriteResult<WriteResult> result =
+                new TableBucketWriteResult<>(
+                        rowPosSplit.getTablePath(),
+                        rowPosSplit.getTableBucket(),
+                        rowPosSplit.getPartitionName(),
+                        null,
+                        -1,
+                        -1,
+                        rowPosSplit.getTotalExpectedResults(),
+                        new RowPosResult(
+                                rowPosSplit.getCompactSnapshotId(),
+                                rowPosSplit.getSplit(),
+                                bucketId,
+                                partitionId,
+                                rowPosSplit.getPartitionName(),
+                                newFileDictEntries,
+                                resultMetas));
+        return new TableBucketWriteResultWithSplitIds(
+                Collections.singletonMap(rowPosSplit.getTableBucket(), result),
+                Collections.singletonMap(rowPosSplit.getTableBucket(), rowPosSplit.splitId()));
     }
 
     private void subscribeLog(TieringLogSplit logSplit) {

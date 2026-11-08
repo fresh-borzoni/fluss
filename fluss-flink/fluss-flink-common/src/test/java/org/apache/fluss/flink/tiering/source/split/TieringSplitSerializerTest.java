@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.source.split;
 
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.metadata.TableBucket;
@@ -382,5 +383,58 @@ class TieringSplitSerializerTest {
 
         assertThat(flinkSplit.unwrap().getPartitionName()).isEqualTo("p1");
         assertThat(flinkSplit.unwrap().getTableBucket().getPartitionId()).isEqualTo(100L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testTieringRowPosSplitSerde(Boolean isPartitionedTable) throws Exception {
+        TableBucket bucket = isPartitionedTable ? partitionedTableBucket : tableBucket;
+        TablePath path = isPartitionedTable ? partitionedTablePath : tablePath;
+        String partitionName = isPartitionedTable ? "1024" : null;
+
+        int[] fileIds = {10, 11, 12};
+        TieringRowPosSplit tieringSplit =
+                new TieringRowPosSplit(
+                        path,
+                        bucket,
+                        partitionName,
+                        fileIds,
+                        "/remote/lake/table/snapshot/rowPos/100/_plan/3",
+                        3,
+                        5,
+                        100L,
+                        "/remote/lake/table/snapshot");
+
+        byte[] serialized = serializer.serialize(new FlinkTieringSplit(tieringSplit));
+        TieringRowPosSplit deserializedSplit =
+                serializer
+                        .deserialize(serializer.getVersion(), serialized)
+                        .unwrap()
+                        .asTieringRowPosSplit();
+        assertThat(deserializedSplit).isEqualTo(tieringSplit);
+    }
+
+    @Test
+    void testTieringRowPosSplitSingleFileSerde() throws Exception {
+        int[] fileIds = {42};
+        TieringRowPosSplit tieringSplit =
+                new TieringRowPosSplit(
+                        tablePath,
+                        tableBucket,
+                        null,
+                        fileIds,
+                        "/remote/lake/table/snapshot2/rowPos/200/_plan/0",
+                        0,
+                        1,
+                        200L,
+                        "/remote/lake/table/snapshot2");
+
+        byte[] serialized = serializer.serialize(new FlinkTieringSplit(tieringSplit));
+        TieringRowPosSplit deserializedSplit =
+                serializer
+                        .deserialize(serializer.getVersion(), serialized)
+                        .unwrap()
+                        .asTieringRowPosSplit();
+        assertThat(deserializedSplit).isEqualTo(tieringSplit);
     }
 }

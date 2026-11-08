@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.tiering.source.split;
 
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.flink.tiering.source.TieringSource;
@@ -31,6 +32,7 @@ import org.apache.flink.core.memory.DataOutputSerializer;
 
 import java.io.IOException;
 
+import static org.apache.fluss.client.tiering.TieringRowPosSplit.TIERING_ROW_POS_SPLIT_FLAG;
 import static org.apache.fluss.client.tiering.TieringSplit.TIERING_LOG_SPLIT_FLAG;
 import static org.apache.fluss.client.tiering.TieringSplit.TIERING_SNAPSHOT_SPLIT_FLAG;
 
@@ -111,6 +113,18 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
             out.writeLong(tieringSnapshotSplit.getSnapshotId());
             // write log offset of snapshot
             out.writeLong(tieringSnapshotSplit.getLogOffsetOfSnapshot());
+        } else if (split.isTieringRowPosSplit()) {
+            // Row position split: some files of one bucket to re-index, by reference
+            TieringRowPosSplit rowPosSplit = split.asTieringRowPosSplit();
+            int[] fileIds = rowPosSplit.getFileIds();
+            out.writeInt(fileIds.length);
+            for (int fileId : fileIds) {
+                out.writeInt(fileId);
+            }
+            out.writeUTF(rowPosSplit.getPlanReference());
+            out.writeInt(rowPosSplit.getSplit());
+            out.writeLong(rowPosSplit.getCompactSnapshotId());
+            out.writeUTF(rowPosSplit.getRemoteUploadBasePath());
         } else {
             // Log split
             TieringLogSplit tieringLogSplit = split.asTieringLogSplit();
@@ -177,6 +191,29 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
                             logOffsetOfSnapshot,
                             numberOfSplits,
                             skipCurrentRound,
+                            splitIndex,
+                            tieringRoundTimestamp);
+        } else if (splitKind == TIERING_ROW_POS_SPLIT_FLAG) {
+            int fileCount = in.readInt();
+            int[] fileIds = new int[fileCount];
+            for (int i = 0; i < fileCount; i++) {
+                fileIds[i] = in.readInt();
+            }
+            String planReference = in.readUTF();
+            int rowPosSplitIndex = in.readInt();
+            long compactSnapshotId = in.readLong();
+            String remoteUploadBasePath = in.readUTF();
+            tieringSplit =
+                    new TieringRowPosSplit(
+                            tablePath,
+                            tableBucket,
+                            partitionName,
+                            fileIds,
+                            planReference,
+                            rowPosSplitIndex,
+                            numberOfSplits,
+                            compactSnapshotId,
+                            remoteUploadBasePath,
                             splitIndex,
                             tieringRoundTimestamp);
         } else if (splitKind == TIERING_LOG_SPLIT_FLAG) {

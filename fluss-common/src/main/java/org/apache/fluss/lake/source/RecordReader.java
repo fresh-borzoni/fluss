@@ -43,4 +43,25 @@ public interface RecordReader {
      * @throws IOException if an I/O error occurs
      */
     CloseableIterator<LogRecord> read() throws IOException;
+
+    /**
+     * Reads the split and returns each row with its physical row position, as a lazy iterator.
+     *
+     * <p>Like {@link #read()}, it respects the projection set with {@link
+     * LakeSource#withProject(int[][])}. The caller should project only the columns it needs before
+     * creating the reader, e.g. only the primary key columns to index a data file.
+     *
+     * <p>The position is the physical row position in the underlying data file. Deletes already
+     * committed to the lake are applied, so the rows they delete are skipped and positions may have
+     * gaps.
+     *
+     * <p>The {@link RowWithPosResult} the iterator returns may be reused across calls, so callers
+     * extract the values they need before advancing.
+     *
+     * @return a closeable iterator of rows with their physical positions
+     * @throws IOException if an I/O error occurs
+     */
+    default CloseableIterator<RowWithPosResult> readWithPos() throws IOException {
+        throw new UnsupportedOperationException("readWithPos is not supported");
+    }
 }
