@@ -271,6 +271,14 @@ class SparkTieringJobRunner(
     try {
       val tableInfo = admin.getTableInfo(tablePath).get()
       require(tableInfo.getTableId == tableId, s"Table $tablePath was dropped and recreated")
+      // This service commits a round's rows without deleting the old versions of their keys, so
+      // it does not tier a table with deletion vectors. The coordinator does not hand it one,
+      // since it does not declare it supports them; the round fails if one comes anyway.
+      require(
+        !tableInfo.getTableConfig.isDeletionVectorsEnabled,
+        s"Table $tablePath has '${ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()}' enabled;" +
+          " the Spark tiering service does not tier tables with deletion vectors."
+      )
       lakeTieringFactory match {
         case validator: TieringTableValidator => validator.validateTable(tableInfo)
         case _ =>

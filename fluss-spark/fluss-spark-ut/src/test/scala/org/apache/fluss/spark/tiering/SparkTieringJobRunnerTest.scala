@@ -20,7 +20,7 @@ package org.apache.fluss.spark.tiering
 import org.apache.fluss.client.Connection
 import org.apache.fluss.client.admin.{Admin, ListOffsetsResult, OffsetSpec}
 import org.apache.fluss.client.tiering.{FlussTableLakeSnapshotCommitter, TieringSplitGenerator}
-import org.apache.fluss.config.Configuration
+import org.apache.fluss.config.{ConfigOptions, Configuration}
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException
 import org.apache.fluss.lake.committer.{CommitterInitContext, LakeCommitter}
 import org.apache.fluss.lake.writer.LakeTieringFactory
@@ -30,7 +30,7 @@ import org.apache.fluss.types.DataTypes
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.SparkSession
 import org.assertj.core.api.Assertions.assertThat
-import org.mockito.ArgumentMatchers.{any, anyString, eq => eqTo}
+import org.mockito.ArgumentMatchers.{any, anyLong, anyString, eq => eqTo}
 import org.mockito.Mockito.{doAnswer, doThrow, mock, never, times, verify, when}
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -183,6 +183,43 @@ class SparkTieringJobRunnerTest extends AnyFunSuite {
     verify(lakeCommitter, org.mockito.Mockito.atLeastOnce()).getMissingLakeSnapshot(null)
     verify(lakeCommitter, org.mockito.Mockito.atLeastOnce()).close()
     verify(f.sc, never()).cancelJobGroup(anyString())
+  }
+
+  test("a table with deletion vectors is not tiered and its round fails") {
+    val f = new Fixture
+    val tablePath = TablePath.of("db", "dv_table")
+    val descriptor = TableDescriptor
+      .builder()
+      .schema(Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build())
+      .distributedBy(1, "id")
+      .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
+      .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+      .build()
+    val tableInfo = TableInfo.of(tablePath, 1L, 1, descriptor, "remote", 0L, 0L)
+    when(f.admin.getTableInfo(tablePath)).thenReturn(CompletableFuture.completedFuture(tableInfo))
+    when(f.coordinator.heartbeatAndRequestTable())
+      .thenReturn(Some((1L, 2L, tablePath)))
+      .thenReturn(None)
+    val failed = new CountDownLatch(1)
+    doAnswer {
+      _ =>
+        failed.countDown()
+        null
+    }.when(f.coordinator).markTableFailed(1L, 2L)
+    val runner = f.runner
+    try {
+      runner.startAsync()
+      assertThat(failed.await(5, TimeUnit.SECONDS)).isTrue()
+    } finally {
+      runner.stop(5.seconds)
+    }
+    verify(f.generator, never())
+      .generateTableSplits(any(classOf[TableInfo]), any(classOf[java.util.List[PartitionInfo]]))
+    verify(f.lakeFactory, never()).createLakeCommitter(any(classOf[CommitterInitContext]))
+    verify(f.coordinator, never()).markTableFinished(
+      anyLong(),
+      anyLong(),
+      any(classOf[org.apache.fluss.lake.committer.TieringStats]))
   }
 
   test("split generation reuses supplied partition metadata without querying it again") {

@@ -187,7 +187,9 @@ object TieringCoordinator extends Logging {
   private val HEARTBEAT_TIMEOUT_MINUTES = 3L
 
   private[tiering] def basicHeartBeat(): LakeTieringHeartbeatRequest = {
-    new LakeTieringHeartbeatRequest()
+    // This service does not tier tables with deletion vectors, so the coordinator skips them in
+    // the tables it hands out here.
+    new LakeTieringHeartbeatRequest().setSupportsDeletionVectors(false)
   }
 
   private[tiering] def buildTieringHeartBeat(
