@@ -18,7 +18,12 @@
 
 package org.apache.fluss.lake.iceberg.maintenance;
 
+import org.apache.fluss.lake.dv.index.CompactionIndexPart;
+
 import org.apache.iceberg.util.DataFileSet;
+import org.apache.iceberg.util.DeleteFileSet;
+
+import javax.annotation.Nullable;
 
 import java.io.Serializable;
 
@@ -30,12 +35,48 @@ public class RewriteDataFileResult implements Serializable {
     private final long snapshotId;
     private final DataFileSet deletedDataFiles;
     private final DataFileSet addedDataFiles;
+    // Null when read from a result written before this field existed.
+    private final DeleteFileSet deletedDeleteFiles;
+    // the positions of the rewritten rows, handed to the position index of a table with deletion
+    // vectors; null if none were handed over
+    @Nullable private final CompactionIndexPart indexPart;
+    // the compacted bucket (see IcebergRewriteDataFiles#bucketKey), or null if unknown
+    @Nullable private final String bucketKey;
 
     public RewriteDataFileResult(
             long snapshotId, DataFileSet deletedDataFiles, DataFileSet addedDataFiles) {
+        this(snapshotId, deletedDataFiles, addedDataFiles, DeleteFileSet.create(), null, null);
+    }
+
+    public RewriteDataFileResult(
+            long snapshotId,
+            DataFileSet deletedDataFiles,
+            DataFileSet addedDataFiles,
+            DeleteFileSet deletedDeleteFiles,
+            @Nullable CompactionIndexPart indexPart,
+            @Nullable String bucketKey) {
         this.snapshotId = snapshotId;
         this.deletedDataFiles = deletedDataFiles;
         this.addedDataFiles = addedDataFiles;
+        this.deletedDeleteFiles = deletedDeleteFiles;
+        this.indexPart = indexPart;
+        this.bucketKey = bucketKey;
+    }
+
+    /** Returns the key of the compacted bucket, or null if unknown. */
+    @Nullable
+    public String bucketKey() {
+        return bucketKey;
+    }
+
+    /**
+     * Returns the bucket's index part of the rewrite, with the new position of every row it kept.
+     * Returns null if the positions were not handed over; the rewritten files must then be
+     * re-indexed from the lake.
+     */
+    @Nullable
+    public CompactionIndexPart indexPart() {
+        return indexPart;
     }
 
     public DataFileSet deletedDataFiles() {
@@ -44,6 +85,15 @@ public class RewriteDataFileResult implements Serializable {
 
     public DataFileSet addedDataFiles() {
         return addedDataFiles;
+    }
+
+    /**
+     * Returns the position delete files that only reference deleted data files. The rewrite applied
+     * them, so the rewrite of a table with deletion vectors removes them with the data files; that
+     * of another table keeps them.
+     */
+    public DeleteFileSet deletedDeleteFiles() {
+        return deletedDeleteFiles == null ? DeleteFileSet.create() : deletedDeleteFiles;
     }
 
     public long snapshotId() {
@@ -59,6 +109,10 @@ public class RewriteDataFileResult implements Serializable {
                 + deletedDataFiles
                 + ", addedDataFiles="
                 + addedDataFiles
+                + ", deletedDeleteFiles="
+                + deletedDeleteFiles()
+                + (indexPart == null ? "" : ", indexPart=" + indexPart)
+                + (bucketKey == null ? "" : ", bucket=" + bucketKey)
                 + '}';
     }
 }

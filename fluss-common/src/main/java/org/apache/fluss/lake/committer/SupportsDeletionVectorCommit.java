@@ -55,4 +55,15 @@ public interface SupportsDeletionVectorCommit {
      * @throws IOException if the lake metadata cannot be read
      */
     void checkCurrentSnapshotDescendsFrom(long snapshotId) throws IOException;
+
+    /**
+     * Keeps snapshot {@code snapshotId} from expiring while it is among the most recent readable
+     * snapshots, as the lake does for the readable snapshots it commits. Called before Fluss
+     * registers as readable a snapshot it did not commit, e.g. a rewrite by another engine.
+     * Idempotent and best effort: a failure must not fail the round, and a lake without such
+     * protection does nothing.
+     *
+     * @param snapshotId the lake snapshot Fluss is about to register as readable
+     */
+    void protectReadableSnapshot(long snapshotId);
 }

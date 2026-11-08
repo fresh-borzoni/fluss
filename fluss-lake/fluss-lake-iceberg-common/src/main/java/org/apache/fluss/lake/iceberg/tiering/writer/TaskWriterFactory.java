@@ -19,9 +19,11 @@
 package org.apache.fluss.lake.iceberg.tiering.writer;
 
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.data.GenericAppenderFactory;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.FileAppenderFactory;
@@ -102,6 +104,40 @@ public class TaskWriterFactory {
                     partition,
                     bucket);
         }
+    }
+
+    /**
+     * The schema a rewrite of data files reads and writes: the table's, followed by the row lineage
+     * fields ({@code _row_id}, {@code _last_updated_sequence_number}) on a table with row lineage
+     * (format version 3). Its spec requires a writer that moves rows to keep their lineage.
+     */
+    public static Schema rewriteSchema(Table table) {
+        return TableUtil.supportsRowLineage(table)
+                ? MetadataColumns.schemaWithRowLineage(table.schema())
+                : table.schema();
+    }
+
+    /**
+     * Creates the writer of a rewrite of data files, e.g. a compaction, which writes records of
+     * {@link #rewriteSchema}. On a table with row lineage, the rows keep their lineage, as in
+     * Iceberg's own rewrites. Otherwise it is {@link #createTaskWriter(Table, String, int)}.
+     */
+    public static TaskWriter<Record> createRewriteWriter(
+            Table table, @Nullable String partition, int bucket) {
+        if (!TableUtil.supportsRowLineage(table)) {
+            return createTaskWriter(table, partition, bucket);
+        }
+        FileFormat format = fileFormat(table);
+        // A rewrite writes the live rows of files, one per key, so it writes data files only.
+        return new GenericRecordAppendOnlyWriter(
+                table,
+                format,
+                new GenericAppenderFactory(rewriteSchema(table), table.spec()),
+                OutputFileFactory.builderFor(table, bucket, 0).format(format).build(),
+                table.io(),
+                targetFileSize(table),
+                partition,
+                bucket);
     }
 
     private static FileFormat fileFormat(Table icebergTable) {
