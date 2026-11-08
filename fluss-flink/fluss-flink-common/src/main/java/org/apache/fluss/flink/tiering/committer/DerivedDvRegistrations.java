@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
+import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.TieringStats;
@@ -29,6 +30,7 @@ import org.slf4j.Logger;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -54,6 +56,28 @@ final class DerivedDvRegistrations<WriteResult, Committable> {
 
     DerivedDvRegistrations(DerivedDvContext<WriteResult, Committable> context) {
         this.context = context;
+    }
+
+    /**
+     * Registers a rewritten snapshot in Fluss, readable at the base's tiered offsets: union reads
+     * plan on it, and the next round looks it up as its base.
+     */
+    void registerSnapshot(
+            long tableId, TablePath tablePath, long snapshotId, LakeSnapshot baseSnapshot)
+            throws Exception {
+        Map<TableBucket, Long> offsets =
+                context.withoutDroppedPartitions(tablePath, baseSnapshot.getTableBucketsOffset());
+        String offsetsFile =
+                context.flussTableLakeSnapshotCommitter.prepareCompleteLakeSnapshot(
+                        tableId, tablePath, offsets);
+        context.flussTableLakeSnapshotCommitter.commit(
+                tableId,
+                tablePath,
+                readableAtTieredOffsets(
+                        snapshotId, offsets, null, earliestSnapshotToKeep(tableId, tablePath)),
+                offsetsFile,
+                Collections.emptyMap(),
+                Collections.emptyMap());
     }
 
     /**

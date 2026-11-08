@@ -33,9 +33,13 @@ import org.apache.fluss.lake.committer.SupportsDeletionVectorCommit;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
 import org.apache.fluss.lake.dv.DeletionVectorCapabilities;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.SupportsRewritePlanning;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
@@ -289,6 +293,15 @@ final class DerivedDvContext<WriteResult, Committable> {
         return DeletionVectorCapabilities.tiering(lakeTieringFactory, tablePath);
     }
 
+    /** The lake source of the table's lake table, which may live under a custom lake path. */
+    @SuppressWarnings("unchecked")
+    SupportsRewritePlanning<LakeSplit> rewritePlanning(TablePath tablePath, TableInfo tableInfo) {
+        LakeSource<LakeSplit> lakeSource =
+                (LakeSource<LakeSplit>)
+                        dvTiering(tablePath).createLakeSource(tableInfo.getLakeTablePath());
+        return DeletionVectorCapabilities.rewritePlanning(lakeSource, tablePath);
+    }
+
     /**
      * Creates the lake committer of a round of a table with deletion vectors, and checks that it
      * commits the way the lake does: it takes deletes ({@link SupportsPositionDeleteCommit}). The
@@ -338,5 +351,14 @@ final class DerivedDvContext<WriteResult, Committable> {
                 lakeTieringFactory.getClass().getName());
         return ((PartitionMarkDoneCommitter<WriteResult, Committable>) lakeCommitter)
                 .preparePartitionMarkDone(committable);
+    }
+
+    /** The name of the split's partition, or null if the table is not partitioned. */
+    @Nullable
+    static String partitionName(LakeSplit split) {
+        List<String> values = split.partition();
+        return values == null || values.isEmpty()
+                ? null
+                : String.join(ResolvedPartitionSpec.PARTITION_SPEC_SEPARATOR, values);
     }
 }

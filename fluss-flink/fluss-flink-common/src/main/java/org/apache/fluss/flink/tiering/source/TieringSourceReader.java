@@ -22,6 +22,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringSplit;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.adapter.SingleThreadMultiplexSourceReaderBaseAdapter;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
@@ -63,14 +64,16 @@ public final class TieringSourceReader<WriteResult>
             SourceReaderContext context,
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
-            String[] ioTmpDirs) {
+            String[] ioTmpDirs,
+            Configuration lakeTieringConfig) {
         this(
                 elementsQueue,
                 context,
                 connection,
                 lakeTieringFactory,
                 DEFAULT_POLL_TIMEOUT,
-                ioTmpDirs);
+                ioTmpDirs,
+                lakeTieringConfig);
     }
 
     @VisibleForTesting
@@ -81,7 +84,14 @@ public final class TieringSourceReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout) {
-        this(elementsQueue, context, connection, lakeTieringFactory, pollTimeout, new String[0]);
+        this(
+                elementsQueue,
+                context,
+                connection,
+                lakeTieringFactory,
+                pollTimeout,
+                new String[0],
+                new Configuration());
     }
 
     @VisibleForTesting
@@ -92,7 +102,8 @@ public final class TieringSourceReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout,
-            String[] ioTmpDirs) {
+            String[] ioTmpDirs,
+            Configuration lakeTieringConfig) {
         super(
                 elementsQueue,
                 createFetcherManager(
@@ -101,7 +112,8 @@ public final class TieringSourceReader<WriteResult>
                         connection,
                         lakeTieringFactory,
                         pollTimeout,
-                        ioTmpDirs),
+                        ioTmpDirs,
+                        lakeTieringConfig),
                 new TableBucketWriteResultEmitter<>(),
                 context.getConfiguration(),
                 context);
@@ -115,7 +127,8 @@ public final class TieringSourceReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout,
-            String[] ioTmpDirs) {
+            String[] ioTmpDirs,
+            Configuration lakeTieringConfig) {
         TieringMetrics tieringMetrics = new TieringMetrics(context.metricGroup());
         ClassLoader userClassLoader = context.getUserCodeClassLoader().asClassLoader();
         return new TieringSourceFetcherManager<>(
@@ -127,7 +140,8 @@ public final class TieringSourceReader<WriteResult>
                                 userClassLoader,
                                 pollTimeout,
                                 tieringMetrics,
-                                ioTmpDirs),
+                                ioTmpDirs,
+                                lakeTieringConfig),
                 context.getConfiguration(),
                 (ignore) -> {});
     }
@@ -154,7 +168,9 @@ public final class TieringSourceReader<WriteResult>
     @Override
     protected TieringSplitState initializedState(FlinkTieringSplit split) {
         TieringSplit tieringSplit = split.unwrap();
-        if (tieringSplit.isTieringSnapshotSplit() || tieringSplit.isTieringLogSplit()) {
+        if (tieringSplit.isTieringSnapshotSplit()
+                || tieringSplit.isTieringLogSplit()
+                || tieringSplit.isTieringRowPosSplit()) {
             return new TieringSplitState(tieringSplit);
         } else {
             throw new UnsupportedOperationException("Unsupported split type: " + split);

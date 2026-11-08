@@ -31,10 +31,13 @@ import java.io.IOException;
  * at once. The reading should consider the pushed-down optimizations (project, filters, limits,
  * etc.) from {@link LakeSource}.
  *
+ * <p>A reader may hold resources, e.g. a catalog connection. The caller closes the reader on every
+ * exit once it is done with it, after the iterators it returned, also if it never read.
+ *
  * @since 0.8
  */
 @PublicEvolving
-public interface RecordReader {
+public interface RecordReader extends AutoCloseable {
 
     /**
      * Read a {@link LakeSplit} into a closeable iterator.
@@ -43,4 +46,14 @@ public interface RecordReader {
      * @throws IOException if an I/O error occurs
      */
     CloseableIterator<LogRecord> read() throws IOException;
+
+    /**
+     * Releases the resources of the reader. Called once the caller is done with the reader and the
+     * iterators it returned, also if it never read. Closing a closed reader does nothing. The
+     * default does nothing.
+     *
+     * @throws IOException if a resource cannot be released
+     */
+    @Override
+    default void close() throws IOException {}
 }

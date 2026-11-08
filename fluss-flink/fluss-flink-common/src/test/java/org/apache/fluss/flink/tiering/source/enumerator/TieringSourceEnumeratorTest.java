@@ -23,6 +23,7 @@ import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.tiering.TieringSplitGenerator;
@@ -34,6 +35,7 @@ import org.apache.fluss.flink.sink.testutils.TestAdminAdapter;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
+import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.TieringTestBase;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
@@ -67,9 +69,11 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -795,6 +799,182 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
         }
     }
 
+    /**
+     * A re-index request names its splits by reference: each becomes a row position split of its
+     * bucket's files, assigned like any other split.
+     */
+    @Test
+    void testRowPosRequestSplitsAreAssigned() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-row-pos-request");
+        try (FlussMockSplitEnumeratorContext<FlinkTieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(3)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+            enumerator.start();
+            registerReaderAndHandleSplitRequests(context, enumerator, 3, 0);
+
+            enumerator.handleSourceEvent(
+                    1,
+                    new RowPosRequestEvent(
+                            77L,
+                            tablePath,
+                            5L,
+                            "/lake",
+                            Arrays.asList(
+                                    new RowPosRequestEvent.Split(
+                                            null, null, 0, 0, new int[] {10, 11}, "/lake/plan/0"),
+                                    new RowPosRequestEvent.Split(
+                                            null, null, 0, 1, new int[] {12}, "/lake/plan/1"),
+                                    new RowPosRequestEvent.Split(
+                                            null, null, 2, 2, new int[] {13}, "/lake/plan/2")),
+                            3));
+
+            List<TieringSplit> assigned = new ArrayList<>();
+            context.getSplitsAssignmentSequence()
+                    .forEach(
+                            a ->
+                                    a.assignment()
+                                            .values()
+                                            .forEach(
+                                                    l -> l.forEach(f -> assigned.add(f.unwrap()))));
+            assertThat(assigned)
+                    .containsExactlyInAnyOrder(
+                            new TieringRowPosSplit(
+                                    tablePath,
+                                    new TableBucket(77L, 0),
+                                    null,
+                                    new int[] {10, 11},
+                                    "/lake/plan/0",
+                                    0,
+                                    3,
+                                    5L,
+                                    "/lake"),
+                            new TieringRowPosSplit(
+                                    tablePath,
+                                    new TableBucket(77L, 0),
+                                    null,
+                                    new int[] {12},
+                                    "/lake/plan/1",
+                                    1,
+                                    3,
+                                    5L,
+                                    "/lake"),
+                            new TieringRowPosSplit(
+                                    tablePath,
+                                    new TableBucket(77L, 2),
+                                    null,
+                                    new int[] {13},
+                                    "/lake/plan/2",
+                                    2,
+                                    3,
+                                    5L,
+                                    "/lake"));
+        }
+    }
+
+    /**
+     * A re-index request whose splits cannot be built fails only the round of its table. The
+     * re-index another table's held round waits for is still assigned, and the failed table is
+     * scheduled again. The job does not fail over and lose every held round.
+     */
+    @Test
+    void testBadRowPosRequestFailsOnlyTheRoundOfItsTable() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-bad-row-pos-request");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 10);
+        TablePath heldTablePath = TablePath.of(DEFAULT_DB, "tiering-held-round");
+        long heldTableId = 78L;
+        int numSubtasks = 3;
+        try (FlussMockSplitEnumeratorContext<FlinkTieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(numSubtasks)) {
+            TieringSourceEnumerator enumerator = createTieringSourceEnumerator(flussConf, context);
+            enumerator.start();
+            registerReaderAndHandleSplitRequests(context, enumerator, numSubtasks, 0);
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 200L);
+            context.getSplitsAssignmentSequence().clear();
+
+            // another table's round is held for this re-index
+            enumerator.handleSourceEvent(
+                    1,
+                    new RowPosRequestEvent(
+                            heldTableId,
+                            heldTablePath,
+                            5L,
+                            "/lake",
+                            Arrays.asList(
+                                    new RowPosRequestEvent.Split(
+                                            null, null, 0, 0, new int[] {10}, "/lake/plan/0"),
+                                    new RowPosRequestEvent.Split(
+                                            null, null, 1, 1, new int[] {11}, "/lake/plan/1")),
+                            2));
+            // a partition without an id cannot make a split
+            enumerator.handleSourceEvent(
+                    1,
+                    new RowPosRequestEvent(
+                            tableId,
+                            tablePath,
+                            6L,
+                            "/lake",
+                            Collections.singletonList(
+                                    new RowPosRequestEvent.Split(
+                                            "p", null, 0, 0, new int[] {12}, "/lake/plan/0")),
+                            1));
+
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+            retry(
+                    Duration.ofSeconds(30),
+                    () -> {
+                        if (!context.getPeriodicCallables().isEmpty()) {
+                            context.runPeriodicCallable(0);
+                        }
+                        for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                            enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+                        }
+                        // the failed table is tiered again
+                        assertThat(assignedSplits(context))
+                                .anySatisfy(
+                                        split -> {
+                                            assertThat(split.isTieringLogSplit()).isTrue();
+                                            assertThat(split.getTableBucket().getTableId())
+                                                    .isEqualTo(tableId);
+                                        });
+                    });
+            assertThat(assignedSplits(context))
+                    .filteredOn(TieringSplit::isTieringRowPosSplit)
+                    .extracting(split -> split.getTableBucket().getTableId())
+                    .containsExactly(heldTableId, heldTableId);
+        }
+    }
+
+    /**
+     * The idle round of a table with deletion vectors names a bucket of its latest snapshot whose
+     * partition still exists. The snapshot keeps a dropped partition's offsets until the table
+     * registers again, and the idle round must not fail to register.
+     */
+    @Test
+    void testIdleRoundNamesABucketOfAPartitionTheTableHas() {
+        Map<TableBucket, Long> offsets = new LinkedHashMap<>();
+        offsets.put(new TableBucket(7L, 1L, 0), 10L);
+        offsets.put(new TableBucket(7L, 1L, 1), 11L);
+        offsets.put(new TableBucket(7L, 2L, 0), 12L);
+        Map<Long, String> partitions = Collections.singletonMap(2L, "b");
+
+        Map.Entry<TableBucket, Long> idle =
+                TieringSourceEnumerator.idleRoundBucket(offsets, partitions);
+
+        assertThat(idle.getKey()).isEqualTo(new TableBucket(7L, 2L, 0));
+        assertThat(idle.getValue()).isEqualTo(12L);
+        assertThat(TieringSourceEnumerator.idleRoundBucket(offsets, Collections.emptyMap()))
+                .isNull();
+        Map<TableBucket, Long> unpartitioned = Collections.singletonMap(new TableBucket(7L, 0), 3L);
+        assertThat(
+                        TieringSourceEnumerator.idleRoundBucket(
+                                        unpartitioned, Collections.emptyMap())
+                                .getKey())
+                .isEqualTo(new TableBucket(7L, 0));
+    }
+
     @Test
     void testHandleReaderFailOver() throws Throwable {
         TableDescriptor tableDescriptor =
@@ -931,6 +1111,18 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                                     .isEqualTo(tieringRoundTimestamp);
                             assertThat(split.unwrap().getTieringEpoch()).isEqualTo(tieringEpoch);
                         });
+    }
+
+    private static List<TieringSplit> assignedSplits(
+            FlussMockSplitEnumeratorContext<FlinkTieringSplit> context) {
+        List<TieringSplit> assigned = new ArrayList<>();
+        context.getSplitsAssignmentSequence()
+                .forEach(
+                        a ->
+                                a.assignment()
+                                        .values()
+                                        .forEach(l -> l.forEach(f -> assigned.add(f.unwrap()))));
+        return assigned;
     }
 
     private void registerReaderAndHandleSplitRequests(

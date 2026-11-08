@@ -26,14 +26,20 @@ final class DerivedDvMetrics {
 
     final Counter rounds;
     final Counter changedKeys;
+    final Counter reindexes;
+    final Counter reindexMs;
     volatile long lastLookupMs;
     volatile long lastLakeCommitMs;
+    volatile long lastReindexMs;
 
     DerivedDvMetrics(MetricGroup metricGroup) {
         MetricGroup dv = metricGroup.addGroup("derivedDeletionVectors");
         this.rounds = dv.counter("rounds", new ConcurrentCounter());
         this.changedKeys = dv.counter("changedKeys", new ConcurrentCounter());
+        this.reindexes = dv.counter("reindexes", new ConcurrentCounter());
+        this.reindexMs = dv.counter("reindexMs", new ConcurrentCounter());
         dv.gauge("lastLookupMs", (Gauge<Long>) () -> lastLookupMs);
         dv.gauge("lastLakeCommitMs", (Gauge<Long>) () -> lastLakeCommitMs);
+        dv.gauge("lastReindexMs", (Gauge<Long>) () -> lastReindexMs);
     }
 }

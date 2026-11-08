@@ -23,6 +23,7 @@ import org.apache.fluss.exception.FencedTieringEpochException;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
+import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.source.TieringTestBase;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.metadata.TablePath;
@@ -33,6 +34,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
@@ -105,6 +107,108 @@ class TieringSourceEnumeratorCoordinatorFailoverTest extends TieringTestBase {
                     Duration.ofMinutes(1),
                     () -> {
                         // the heartbeat the event asked for; taking one blocks if none is left
+                        if (!context.getOneTimeCallables().isEmpty()) {
+                            context.runNextOneTimeCallable();
+                        }
+                        assertThatThrownBy(
+                                        () ->
+                                                tieringManager.validateTieringEpoch(
+                                                        tableId, newEpoch))
+                                .isInstanceOf(FencedTieringEpochException.class);
+                    });
+        }
+    }
+
+    /**
+     * The new coordinator hands the table out again while the round the previous one assigned still
+     * runs. That round's failure is stale: it leaves the new round tiering.
+     */
+    @Test
+    void testStaleRoundFailureKeepsTheLiveRound() throws Throwable {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "tiering-stale-round-failure");
+        long tableId = createTable(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR);
+        appendRow(tablePath, DEFAULT_LOG_TABLE_DESCRIPTOR, 0, 10);
+        try (FlussMockSplitEnumeratorContext<FlinkTieringSplit> context =
+                new FlussMockSplitEnumeratorContext<>(DEFAULT_BUCKET_NUM)) {
+            TieringSourceEnumerator enumerator =
+                    new TieringSourceEnumerator(
+                            new Configuration(clientConf),
+                            context,
+                            new TestingLakeTieringFactory(),
+                            500);
+            enumerator.start();
+            for (int subtask = 0; subtask < DEFAULT_BUCKET_NUM; subtask++) {
+                context.registerSourceReader(subtask, 0, "localhost-" + subtask);
+                enumerator.addReader(subtask);
+            }
+            long oldEpoch = takeRound(context, enumerator);
+            String listeners =
+                    Endpoint.toListenersString(
+                            FLUSS_CLUSTER_EXTENSION
+                                    .getCoordinatorServer()
+                                    .getRpcServer()
+                                    .getBindEndpoints());
+            FLUSS_CLUSTER_EXTENSION.stopCoordinatorServer();
+            FLUSS_CLUSTER_EXTENSION.startCoordinatorServer(listeners);
+            retry(
+                    Duration.ofMinutes(1),
+                    () ->
+                            FLUSS_CLUSTER_EXTENSION
+                                    .newCoordinatorClient()
+                                    .lakeTieringHeartbeat(new LakeTieringHeartbeatRequest())
+                                    .get());
+            LakeTableTieringManager tieringManager =
+                    FLUSS_CLUSTER_EXTENSION
+                            .getCoordinatorServer()
+                            .getCoordinatorService()
+                            .getLakeTableTieringManager();
+            // the new coordinator hands the table out again before the old round ends
+            long newEpoch = takeRound(context, enumerator);
+            assertThat(newEpoch).isGreaterThan(oldEpoch);
+
+            // a re-index the old round requested is not read
+            context.getSplitsAssignmentSequence().clear();
+            enumerator.handleSourceEvent(
+                    0,
+                    new RowPosRequestEvent(
+                                    tableId,
+                                    tablePath,
+                                    5L,
+                                    "/lake",
+                                    Collections.singletonList(
+                                            new RowPosRequestEvent.Split(
+                                                    null, null, 0, 0, new int[] {1}, "/lake/0")),
+                                    1)
+                            .withTieringEpoch(oldEpoch));
+            enumerator.handleSplitRequest(0, "localhost-0");
+            context.getSplitsAssignmentSequence()
+                    .forEach(
+                            a ->
+                                    a.assignment()
+                                            .values()
+                                            .forEach(
+                                                    splits ->
+                                                            assertThat(splits)
+                                                                    .noneMatch(
+                                                                            split ->
+                                                                                    split.unwrap()
+                                                                                            .isTieringRowPosSplit())));
+
+            // the old round fails at its commit; its failure is not the new round's
+            enumerator.handleSourceEvent(0, new FailedTieringEvent(tableId, oldEpoch, "fenced"));
+            while (!context.getOneTimeCallables().isEmpty()) {
+                context.runNextOneTimeCallable();
+            }
+            // a heartbeat reports the tables this service tiers
+            context.runPeriodicCallable(0);
+            tieringManager.validateTieringEpoch(tableId, newEpoch);
+
+            // the new round's end is reported under its own epoch
+            enumerator.handleSourceEvent(
+                    0, new FinishedTieringEvent(tableId, newEpoch, null, false));
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> {
                         if (!context.getOneTimeCallables().isEmpty()) {
                             context.runNextOneTimeCallable();
                         }

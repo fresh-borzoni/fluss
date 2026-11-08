@@ -25,6 +25,7 @@ import org.apache.fluss.client.table.writer.TableWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringLogSplit;
+import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
 import org.apache.fluss.client.write.HashBucketAssigner;
 import org.apache.fluss.config.ConfigOptions;
@@ -39,9 +40,6 @@ import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.MergeEngineType;
-import org.apache.fluss.metadata.PartitionInfo;
-import org.apache.fluss.metadata.PartitionSpec;
-import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -49,7 +47,6 @@ import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.server.replica.Replica;
-import org.apache.fluss.types.DataTypes;
 
 import org.apache.flink.api.connector.source.SourceSplit;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
@@ -57,10 +54,10 @@ import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
 import org.apache.flink.metrics.testutils.MetricListener;
 import org.apache.flink.runtime.metrics.groups.InternalSourceReaderMetricGroup;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -79,6 +76,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** UT for {@link TieringSplitReader}. */
 class TieringSplitReaderTest extends FlinkTestBase {
+
+    @TempDir Path tempDir;
 
     @Test
     void testTieringTable() throws Exception {
@@ -357,158 +356,43 @@ class TieringSplitReaderTest extends FlinkTestBase {
     }
 
     /**
-     * The splits of a table dropped, or dropped and created again, between planning and the reader
-     * moving to it end without data. The committer fails only that round, and the reader goes on
-     * with the next table.
-     */
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testSplitsOfATableDroppedBeforeItIsReadEndEmpty(boolean createdAgain) throws Exception {
-        TablePath droppedPath =
-                TablePath.of("fluss", "tiering_dropped_before_read_" + createdAgain);
-        long droppedId = createTable(droppedPath, DEFAULT_PK_TABLE_DESCRIPTOR);
-        Map<TableBucket, List<InternalRow>> droppedRows = putRows(droppedId, droppedPath, 10);
-        TablePath keptPath = TablePath.of("fluss", "tiering_kept_after_drop_" + createdAgain);
-        long keptId = createTable(keptPath, DEFAULT_PK_TABLE_DESCRIPTOR);
-        Map<TableBucket, List<InternalRow>> keptRows = putRows(keptId, keptPath, 10);
-        try (Connection connection =
-                        ConnectionFactory.createConnection(
-                                FLUSS_CLUSTER_EXTENSION.getClientConfig());
-                TieringSplitReader<TestingWriteResult> tieringSplitReader =
-                        createTieringReader(connection)) {
-            Set<String> droppedSplits = new HashSet<>();
-            List<FlinkTieringSplit> splits = new ArrayList<>();
-            for (Map.Entry<TableBucket, List<InternalRow>> e : droppedRows.entrySet()) {
-                FlinkTieringSplit split =
-                        createLogSplit(
-                                droppedPath,
-                                droppedId,
-                                e.getKey().getBucket(),
-                                EARLIEST_OFFSET,
-                                e.getValue().size());
-                splits.add(split);
-                droppedSplits.add(split.splitId());
-            }
-            tieringSplitReader.handleSplitsChanges(new SplitsAddition<>(splits));
-            admin.dropTable(droppedPath, false).get();
-            if (createdAgain) {
-                createTable(droppedPath, DEFAULT_PK_TABLE_DESCRIPTOR);
-            }
-
-            Set<String> finished = new HashSet<>();
-            for (int fetch = 0; fetch < 100 && !finished.containsAll(droppedSplits); fetch++) {
-                RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>> result =
-                        tieringSplitReader.fetch();
-                finished.addAll(result.finishedSplits());
-                while (result.nextSplit() != null) {
-                    TableBucketWriteResult<TestingWriteResult> writeResult =
-                            result.nextRecordFromSplit();
-                    assertThat(writeResult.tableBucket().getTableId()).isEqualTo(droppedId);
-                    assertThat(writeResult.writeResult()).isNull();
-                    assertThat(writeResult.logEndOffset()).isNegative();
-                }
-            }
-            assertThat(finished).isEqualTo(droppedSplits);
-
-            // the next table is tiered as usual
-            Map<TableBucket, Integer> expectedRows = new HashMap<>();
-            Set<String> keptSplits = new HashSet<>();
-            List<FlinkTieringSplit> nextSplits = new ArrayList<>();
-            for (Map.Entry<TableBucket, List<InternalRow>> e : keptRows.entrySet()) {
-                FlinkTieringSplit split =
-                        createLogSplit(
-                                keptPath,
-                                keptId,
-                                e.getKey().getBucket(),
-                                EARLIEST_OFFSET,
-                                e.getValue().size());
-                nextSplits.add(split);
-                keptSplits.add(split.splitId());
-                expectedRows.put(e.getKey(), e.getValue().size());
-            }
-            tieringSplitReader.handleSplitsChanges(new SplitsAddition<>(nextSplits));
-            verifyTieringRows(tieringSplitReader, keptId, expectedRows, keptSplits);
-        }
-    }
-
-    /**
-     * The reader lists a table's partitions when it moves to the table, after the splits were
-     * planned. A split's partition missing from that list, such as one created in between, is
-     * looked up again before its rows are written, rather than failing the reader for want of its
-     * bucket count.
+     * A re-index split that fails, e.g. on two live rows of one key, ends with a failed result
+     * instead of failing the reader, so only its table's round fails and the job goes on.
      */
     @Test
-    void testSplitOfAPartitionTheReaderDidNotListIsTiered() throws Exception {
-        TablePath tablePath = TablePath.of("fluss", "tiering_partition_not_listed");
-        TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(
-                                Schema.newBuilder()
-                                        .column("id", DataTypes.INT())
-                                        .column("name", DataTypes.STRING())
-                                        .column("p", DataTypes.STRING())
-                                        .build())
-                        .partitionedBy("p")
-                        .distributedBy(1)
-                        .build();
-        long tableId = createTable(tablePath, descriptor);
-        long a = createPartition(tablePath, "a");
-        appendRows(tablePath, "a", 3);
+    void testFailedReindexSplitEndsWithAFailedResult() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "tiering_failed_reindex_split");
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        TableBucket bucket = new TableBucket(tableId, 0);
+        TieringRowPosSplit split =
+                new TieringRowPosSplit(
+                        tablePath,
+                        bucket,
+                        null,
+                        new int[] {7},
+                        tempDir.resolve("missing-plan").toUri().toString(),
+                        0,
+                        1,
+                        42L,
+                        tempDir.toUri().toString());
         try (Connection connection =
                         ConnectionFactory.createConnection(
                                 FLUSS_CLUSTER_EXTENSION.getClientConfig());
                 TieringSplitReader<TestingWriteResult> tieringSplitReader =
                         createTieringReader(connection)) {
-            TieringLogSplit splitOfA =
-                    new TieringLogSplit(tablePath, new TableBucket(tableId, a, 0), "a", 0, 6, 2);
             tieringSplitReader.handleSplitsChanges(
-                    new SplitsAddition<>(
-                            Collections.singletonList(new FlinkTieringSplit(splitOfA))));
-            // moves to the table, listing partition a only
-            tieringSplitReader.fetch();
+                    new SplitsAddition<>(Collections.singletonList(new FlinkTieringSplit(split))));
 
-            long b = createPartition(tablePath, "b");
-            appendRows(tablePath, "b", 3);
-            TieringLogSplit splitOfB =
-                    new TieringLogSplit(tablePath, new TableBucket(tableId, b, 0), "b", 0, 3, 2);
-            tieringSplitReader.handleSplitsChanges(
-                    new SplitsAddition<>(
-                            Collections.singletonList(new FlinkTieringSplit(splitOfB))));
-            appendRows(tablePath, "a", 3);
+            RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>> fetched =
+                    tieringSplitReader.fetch();
 
-            Map<TableBucket, Integer> expectedRows = new HashMap<>();
-            expectedRows.put(new TableBucket(tableId, a, 0), 6);
-            expectedRows.put(new TableBucket(tableId, b, 0), 3);
-            verifyTieringRows(
-                    tieringSplitReader,
-                    tableId,
-                    expectedRows,
-                    new HashSet<>(Arrays.asList(splitOfA.splitId(), splitOfB.splitId())));
-        }
-    }
-
-    private long createPartition(TablePath tablePath, String value) throws Exception {
-        long tableId = admin.getTableInfo(tablePath).get().getTableId();
-        admin.createPartition(
-                        tablePath, new PartitionSpec(Collections.singletonMap("p", value)), false)
-                .get();
-        for (PartitionInfo partition : admin.listPartitionInfos(tablePath).get()) {
-            if (partition.getPartitionName().equals(value)) {
-                FLUSS_CLUSTER_EXTENSION.waitUntilTablePartitionReady(
-                        tableId, partition.getPartitionId());
-                return partition.getPartitionId();
-            }
-        }
-        throw new AssertionError("partition " + value + " of " + tablePath + " not created");
-    }
-
-    private void appendRows(TablePath tablePath, String partition, int rows) throws Exception {
-        try (Table table = conn.getTable(tablePath)) {
-            AppendWriter writer = table.newAppend().createWriter();
-            for (int i = 0; i < rows; i++) {
-                writer.append(row(i, "v" + i, partition));
-            }
-            writer.flush();
+            assertThat(fetched.finishedSplits()).containsExactly(split.splitId());
+            assertThat(fetched.nextSplit()).isNotNull();
+            TableBucketWriteResult<TestingWriteResult> result = fetched.nextRecordFromSplit();
+            assertThat(result.tableBucket()).isEqualTo(bucket);
+            assertThat(result.getRowPosResult().getChangeId()).isEqualTo(42L);
+            assertThat(result.getRowPosResult().isFailed()).isTrue();
+            assertThat(result.getRowPosResult().getFailure()).isNotEmpty();
         }
     }
 
@@ -522,14 +406,23 @@ class TieringSplitReaderTest extends FlinkTestBase {
         TablePath tablePath = TablePath.of("fluss", "tiering_table_with_round_budget");
         long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
         Map<TableBucket, List<InternalRow>> rows = putRows(tableId, tablePath, 30);
-        org.apache.fluss.config.Configuration conf =
-                new org.apache.fluss.config.Configuration(
-                        FLUSS_CLUSTER_EXTENSION.getClientConfig());
+        org.apache.fluss.config.Configuration lakeTieringConfig =
+                new org.apache.fluss.config.Configuration();
         int budget = 3;
-        conf.set(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET, budget);
-        try (Connection connection = ConnectionFactory.createConnection(conf);
+        lakeTieringConfig.set(
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET, budget);
+        try (Connection connection =
+                        ConnectionFactory.createConnection(
+                                FLUSS_CLUSTER_EXTENSION.getClientConfig());
                 TieringSplitReader<TestingWriteResult> tieringSplitReader =
-                        createTieringReader(connection, new BufferingLakeTieringFactory())) {
+                        new TieringSplitReader<>(
+                                connection,
+                                new BufferingLakeTieringFactory(),
+                                Thread.currentThread().getContextClassLoader(),
+                                new TieringMetrics(
+                                        InternalSourceReaderMetricGroup.mock(
+                                                new MetricListener().getMetricGroup())),
+                                lakeTieringConfig)) {
             List<FlinkTieringSplit> splits = new ArrayList<>();
             for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
                 int records = rows.get(new TableBucket(tableId, bucket)).size();

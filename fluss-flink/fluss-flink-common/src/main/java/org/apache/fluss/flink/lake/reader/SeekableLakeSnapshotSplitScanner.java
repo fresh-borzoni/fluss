@@ -21,6 +21,7 @@ package org.apache.fluss.flink.lake.reader;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.RecordReaders;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.utils.CloseableIterator;
@@ -92,10 +93,11 @@ public class SeekableLakeSnapshotSplitScanner implements BatchScanner {
         } else {
             int currentLakeSplitIndex = nextLakeSplitIndex;
             LakeSplit split = lakeSplits.get(currentLakeSplitIndex);
+            // the iterator owns the reader and closes it with itself
             CloseableIterator<LogRecord> lakeRecords =
-                    lakeSource
-                            .createRecordReader((LakeSource.ReaderContext<LakeSplit>) () -> split)
-                            .read();
+                    RecordReaders.read(
+                            lakeSource.createRecordReader(
+                                    (LakeSource.ReaderContext<LakeSplit>) () -> split));
             currentLakeRecordIterator =
                     new IndexedLakeSplitRecordIterator(lakeRecords, currentLakeSplitIndex);
             nextLakeSplitIndex += 1;

@@ -17,10 +17,12 @@
 
 package org.apache.fluss.lake.source;
 
+import javax.annotation.Nullable;
+
 import java.util.List;
 
-/** A testing implementation of {@link LakeSplit}. */
-public class TestingLakeSplit implements LakeSplit {
+/** A testing implementation of {@link LakeSplit}; it names no data files and counts no rows. */
+public class TestingLakeSplit implements LakeSplit, SupportsDataFiles {
 
     private final int bucket;
     private final List<String> partition;
@@ -43,5 +45,16 @@ public class TestingLakeSplit implements LakeSplit {
     @Override
     public List<String> partition() {
         return partition;
+    }
+
+    @Nullable
+    @Override
+    public List<String> fileNames() {
+        return null;
+    }
+
+    @Override
+    public long rowCount() {
+        return -1;
     }
 }
