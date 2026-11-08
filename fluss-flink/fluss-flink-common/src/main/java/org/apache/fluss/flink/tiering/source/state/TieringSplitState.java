@@ -36,6 +36,11 @@ public class TieringSplitState {
         this.tieringSplit = tieringSplit;
     }
 
+    /** Returns the tiering epoch of the split's round, see {@link TieringSplit#getTieringEpoch}. */
+    public long getTieringEpoch() {
+        return tieringSplit.getTieringEpoch();
+    }
+
     /** Returns a copy of the split wrapped for the Flink source framework. */
     public FlinkTieringSplit toSourceSplit() {
         return new FlinkTieringSplit(tieringSplit.copy(tieringSplit.getNumberOfSplits()));

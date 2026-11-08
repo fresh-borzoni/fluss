@@ -37,7 +37,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -248,6 +250,91 @@ class LakeTableTieringManagerTest {
                 .hasMessage(
                         "The tiering epoch %d is not match current epoch %d in coordinator for table %d.",
                         3, 2, tableId1);
+    }
+
+    @Test
+    void testCommitsAreFencedOnTieringEpoch() throws Exception {
+        long tableId = 1L;
+        TablePath tablePath = TablePath.of("db", "table");
+        tableTieringManager.addNewLakeTable(
+                createTableInfo(tableId, tablePath, Duration.ofSeconds(10)));
+        manualClock.advanceTime(Duration.ofSeconds(10));
+        assertRequestTable(tableId, tablePath, 1);
+
+        // the service the table is assigned to commits
+        tableTieringManager.validateTieringEpoch(tableId, 1);
+        assertThat(tableTieringManager.inTieringEpoch(tableId, 1, () -> "registered"))
+                .isEqualTo("registered");
+
+        // the service is cut off, and the table is handed to another one under epoch 2
+        manualClock.advanceTime(Duration.ofMillis(TIERING_SERVICE_TIMEOUT_MS));
+        tableTieringManager.checkTieringServiceTimeout();
+        assertRequestTable(tableId, tablePath, 2);
+        List<String> registered = new ArrayList<>();
+        assertThatThrownBy(() -> tableTieringManager.validateTieringEpoch(tableId, 1))
+                .isInstanceOf(FencedTieringEpochException.class)
+                .hasMessage(
+                        "The tiering epoch %d is not match current epoch %d in coordinator for table %d.",
+                        1, 2, tableId);
+        assertThatThrownBy(
+                        () ->
+                                tableTieringManager.inTieringEpoch(
+                                        tableId, 1, () -> registered.add("stale")))
+                .isInstanceOf(FencedTieringEpochException.class);
+        assertThat(registered).isEmpty();
+        tableTieringManager.inTieringEpoch(tableId, 2, () -> registered.add("current"));
+        assertThat(registered).containsExactly("current");
+
+        // a finished round keeps its epoch, but commits nothing more under it
+        tableTieringManager.finishTableTiering(tableId, 2, false, TieringStats.UNKNOWN);
+        assertThatThrownBy(() -> tableTieringManager.validateTieringEpoch(tableId, 2))
+                .isInstanceOf(FencedTieringEpochException.class)
+                .hasMessage(
+                        "The table %d is no longer tiered under epoch %d, it is in %s state.",
+                        tableId, 2, LakeTableTieringManager.TieringState.Scheduled);
+
+        tableTieringManager.removeLakeTable(tableId);
+        assertThatThrownBy(() -> tableTieringManager.validateTieringEpoch(tableId, 2))
+                .isInstanceOf(TableNotExistException.class);
+    }
+
+    @Test
+    void testTieringEpochsGrowAcrossCoordinatorFailover() throws Exception {
+        long tableId = 1L;
+        TablePath tablePath = TablePath.of("db", "table");
+        TableInfo tableInfo = createTableInfo(tableId, tablePath, Duration.ofSeconds(10));
+        long lastTiered = manualClock.milliseconds() - Duration.ofSeconds(10).toMillis();
+
+        // the first coordinator hands the table out a few times
+        tableTieringManager.initWithLakeTables(
+                Collections.singletonList(Tuple2.of(tableInfo, lastTiered)), 0);
+        assertRequestTable(tableId, tablePath, 1);
+        for (long epoch = 1; epoch < 5; epoch++) {
+            tableTieringManager.reportTieringFail(tableId, epoch);
+            assertRequestTable(tableId, tablePath, epoch + 1);
+        }
+
+        // the next coordinator starts above every epoch the first one handed out, so the rounds
+        // the first one assigned commit nothing under it
+        LakeTableTieringManager next = createLakeTableTieringManager();
+        try {
+            next.initWithLakeTables(Collections.singletonList(Tuple2.of(tableInfo, lastTiered)), 1);
+            long epoch = (1L << 32) + 1;
+            assertThat(
+                            waitValue(
+                                    () -> Optional.ofNullable(next.requestTable()),
+                                    Duration.ofSeconds(10),
+                                    "Request tiering table timeout"))
+                    .isEqualTo(new LakeTieringTableInfo(tableId, tablePath, epoch));
+            for (long old = 1; old <= 5; old++) {
+                long stale = old;
+                assertThatThrownBy(() -> next.validateTieringEpoch(tableId, stale))
+                        .isInstanceOf(FencedTieringEpochException.class);
+            }
+            next.validateTieringEpoch(tableId, epoch);
+        } finally {
+            next.close();
+        }
     }
 
     @Test

@@ -24,7 +24,10 @@ import org.apache.fluss.lake.committer.LakeCommitter;
 import org.apache.flink.api.connector.source.SourceOutput;
 import org.apache.flink.connector.base.source.reader.RecordEmitter;
 
-/** The emitter to emit {@link TableBucketWriteResult} to downstream {@link LakeCommitter}. */
+/**
+ * The emitter to emit {@link TableBucketWriteResult} to downstream {@link LakeCommitter}, with the
+ * tiering epoch of the split's round, which fences the round's commits.
+ */
 public class TableBucketWriteResultEmitter<WriteResult>
         implements RecordEmitter<
                 TableBucketWriteResult<WriteResult>,
@@ -35,6 +38,6 @@ public class TableBucketWriteResultEmitter<WriteResult>
             TableBucketWriteResult<WriteResult> writeResult,
             SourceOutput<TableBucketWriteResult<WriteResult>> sourceOutput,
             TieringSplitState splitState) {
-        sourceOutput.collect(writeResult);
+        sourceOutput.collect(writeResult.withTieringEpoch(splitState.getTieringEpoch()));
     }
 }

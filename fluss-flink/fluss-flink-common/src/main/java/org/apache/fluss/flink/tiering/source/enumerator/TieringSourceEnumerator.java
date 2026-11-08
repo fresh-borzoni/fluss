@@ -132,7 +132,8 @@ public class TieringSourceEnumerator
     private Connection connection;
     private Admin flussAdmin;
     private TieringSplitGenerator splitGenerator;
-    private int flussCoordinatorEpoch;
+    // read by asynchronous heartbeat requests as well
+    private volatile int flussCoordinatorEpoch;
 
     private volatile boolean isFailOvering = false;
 
@@ -478,6 +479,7 @@ public class TieringSourceEnumerator
                     waitHeartbeatResponse(
                             coordinatorGateway.lakeTieringHeartbeat(
                                     heartBeatWithRequestNewTieringTable(tieringHeartbeatRequest)));
+            adoptCoordinatorEpoch(heartbeatResponse);
             if (heartbeatResponse.hasTieringTable()) {
                 PbLakeTieringTableInfo tieringTable = heartbeatResponse.getTieringTable();
                 lakeTieringInfo =
@@ -494,7 +496,9 @@ public class TieringSourceEnumerator
             }
         } else {
             // report heartbeat to fluss coordinator
-            waitHeartbeatResponse(coordinatorGateway.lakeTieringHeartbeat(tieringHeartbeatRequest));
+            adoptCoordinatorEpoch(
+                    waitHeartbeatResponse(
+                            coordinatorGateway.lakeTieringHeartbeat(tieringHeartbeatRequest)));
         }
 
         // if come to here, we can remove currentFinishedTables/failedTableEpochs to avoid send
@@ -502,6 +506,22 @@ public class TieringSourceEnumerator
         currentFinishedTables.forEach(finishedTables::remove);
         currentFailedTableEpochs.forEach(failedTableEpochs::remove);
         return lakeTieringInfo;
+    }
+
+    /**
+     * Adopts the epoch of a coordinator elected after this service registered. Heartbeats must
+     * carry that epoch, or the coordinator rejects every report of this service and its tables time
+     * out again and again. Rounds the previous coordinator assigned stay fenced: their tiering
+     * epochs are below the new coordinator's.
+     */
+    private void adoptCoordinatorEpoch(LakeTieringHeartbeatResponse response) {
+        if (response.getCoordinatorEpoch() > flussCoordinatorEpoch) {
+            LOG.info(
+                    "Fluss coordinator failed over from epoch {} to {}.",
+                    flussCoordinatorEpoch,
+                    response.getCoordinatorEpoch());
+            flussCoordinatorEpoch = response.getCoordinatorEpoch();
+        }
     }
 
     private void generateTieringSplits(Tuple3<Long, Long, TablePath> tieringTable)
@@ -537,7 +557,8 @@ public class TieringSourceEnumerator
             // shuffle tiering split to avoid splits tiering skew
             // after introduce tiering max duration
             Collections.shuffle(tieringSplits);
-            List<TieringSplit> splitsWithMetadata = populateTieringRoundMetadata(tieringSplits);
+            List<TieringSplit> splitsWithMetadata =
+                    populateTieringRoundMetadata(tieringSplits, tieringTable.f1);
             LOG.info(
                     "Generate Tiering {} splits for table {} with cost {}ms.",
                     splitsWithMetadata.size(),
@@ -601,7 +622,8 @@ public class TieringSourceEnumerator
                 TimeUnit.MILLISECONDS);
     }
 
-    private List<TieringSplit> populateTieringRoundMetadata(List<TieringSplit> tieringSplits) {
+    private List<TieringSplit> populateTieringRoundMetadata(
+            List<TieringSplit> tieringSplits, long tieringEpoch) {
         int numberOfSplits = tieringSplits.size();
         if (numberOfSplits == 0) {
             return Collections.emptyList();
@@ -612,7 +634,7 @@ public class TieringSourceEnumerator
             splitsWithMetadata.add(
                     tieringSplits
                             .get(splitIndex)
-                            .copy(numberOfSplits, splitIndex, tieringRoundTimestamp));
+                            .copy(numberOfSplits, splitIndex, tieringRoundTimestamp, tieringEpoch));
         }
         return splitsWithMetadata;
     }

@@ -139,6 +139,7 @@ import org.apache.fluss.rpc.messages.PbTableBucket;
 import org.apache.fluss.rpc.messages.PbTableInfo;
 import org.apache.fluss.rpc.messages.PbTableOffsets;
 import org.apache.fluss.rpc.messages.PbTabletServerLoad;
+import org.apache.fluss.rpc.messages.PbTieringEpochForTable;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
 import org.apache.fluss.rpc.messages.RebalanceRequest;
@@ -1580,6 +1581,19 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         stats);
             } catch (Throwable e) {
                 pbHeartbeatRespForTable.setError(ApiError.fromThrowable(e).toErrorResponse());
+            }
+        }
+
+        // Only checked, without the coordinator epoch: a round's commit is fenced on its tiering
+        // epoch alone as well.
+        for (PbTieringEpochForTable checkedTable : request.getCheckedTablesList()) {
+            PbHeartbeatRespForTable pbHeartbeatRespForTable =
+                    heartbeatResponse.addCheckedTableResp().setTableId(checkedTable.getTableId());
+            try {
+                lakeTableTieringManager.validateTieringEpoch(
+                        checkedTable.getTableId(), checkedTable.getTieringEpoch());
+            } catch (Throwable t) {
+                pbHeartbeatRespForTable.setError(ApiError.fromThrowable(t).toErrorResponse());
             }
         }
 

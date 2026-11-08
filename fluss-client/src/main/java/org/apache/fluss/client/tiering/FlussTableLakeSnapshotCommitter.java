@@ -21,6 +21,8 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.ApiException;
+import org.apache.fluss.exception.FencedTieringEpochException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -29,8 +31,11 @@ import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
+import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
 import org.apache.fluss.rpc.messages.PbBucketOffset;
 import org.apache.fluss.rpc.messages.PbCommitLakeTableSnapshotRespForTable;
+import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
 import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotMetadata;
@@ -42,12 +47,16 @@ import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.utils.ExceptionUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -69,7 +78,15 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  */
 public class FlussTableLakeSnapshotCommitter implements AutoCloseable {
 
+    private static final Logger LOG =
+            LoggerFactory.getLogger(FlussTableLakeSnapshotCommitter.class);
+
     private final Configuration flussConf;
+
+    // Per table, the tiering epoch the coordinator assigned its current round under. Commits
+    // carry it, so the coordinator rejects those of a round whose table it handed to another
+    // tiering service. A table without one commits unfenced, as older clients do.
+    private final Map<Long, Long> tieringEpochs = new ConcurrentHashMap<>();
 
     private CoordinatorGateway coordinatorGateway;
     private RpcClient rpcClient;
@@ -88,6 +105,62 @@ public class FlussTableLakeSnapshotCommitter implements AutoCloseable {
         this.coordinatorGateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, rpcClient, CoordinatorGateway.class);
+    }
+
+    /**
+     * Fences the commits of table {@code tableId} on {@code tieringEpoch} from now on, or on none
+     * if it is {@link TieringSplit#UNKNOWN_TIERING_EPOCH}. The coordinator rejects them with a
+     * {@link FencedTieringEpochException} once the table stops being tiered under the epoch. A
+     * table has one round at a time, and the round sets this before it commits anything.
+     */
+    public void fenceOnTieringEpoch(long tableId, long tieringEpoch) {
+        if (tieringEpoch == TieringSplit.UNKNOWN_TIERING_EPOCH) {
+            tieringEpochs.remove(tableId);
+        } else {
+            tieringEpochs.put(tableId, tieringEpoch);
+        }
+    }
+
+    /**
+     * Throws a {@link FencedTieringEpochException}, wrapped in an {@link IOException}, if table
+     * {@code tableId} stopped being tiered under the epoch its commits are fenced on. A round
+     * checks this right before its lake commit, which the coordinator cannot reject. Otherwise a
+     * round of a table handed to another tiering service would commit to the lake on top of that
+     * service's rounds. Returns normally if the table is not fenced or the coordinator does not
+     * check epochs.
+     */
+    public void checkTieringEpoch(long tableId) throws IOException {
+        Long tieringEpoch = tieringEpochs.get(tableId);
+        if (tieringEpoch == null) {
+            return;
+        }
+        LakeTieringHeartbeatRequest request = new LakeTieringHeartbeatRequest();
+        request.addCheckedTable().setTableId(tableId).setTieringEpoch(tieringEpoch);
+        LakeTieringHeartbeatResponse response;
+        try {
+            response = coordinatorGateway.lakeTieringHeartbeat(request).get();
+        } catch (Exception e) {
+            throw new IOException(
+                    String.format(
+                            "Fail to check the tiering epoch %d of table %d.",
+                            tieringEpoch, tableId),
+                    ExceptionUtils.stripExecutionException(e));
+        }
+        for (PbHeartbeatRespForTable resp : response.getCheckedTableRespsList()) {
+            if (resp.getTableId() == tableId && resp.hasError()) {
+                ApiException error = ApiError.fromErrorMessage(resp.getError()).exception();
+                LOG.info(
+                        "Table {} is no longer tiered under epoch {}, so its round stops: {}",
+                        tableId,
+                        tieringEpoch,
+                        error.getMessage());
+                throw new IOException(
+                        String.format(
+                                "Table %d is no longer tiered under epoch %d.",
+                                tableId, tieringEpoch),
+                        error);
+            }
+        }
     }
 
     /** Commits the initial lake snapshot of a Fluss table without any Fluss log offsets. */
@@ -372,6 +445,10 @@ public class FlussTableLakeSnapshotCommitter implements AutoCloseable {
         }
         if (earliestSnapshotIDToKeep != null) {
             pbLakeTableSnapshotMetadata.setEarliestSnapshotIdToKeep(earliestSnapshotIDToKeep);
+        }
+        Long tieringEpoch = tieringEpochs.get(tableId);
+        if (tieringEpoch != null) {
+            pbLakeTableSnapshotMetadata.setTieringEpoch(tieringEpoch);
         }
 
         // Add PbLakeTableSnapshotInfo for metrics reporting (to notify tablet servers about
