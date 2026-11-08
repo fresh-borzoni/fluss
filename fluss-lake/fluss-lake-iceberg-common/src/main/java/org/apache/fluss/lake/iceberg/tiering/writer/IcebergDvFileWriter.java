@@ -1,0 +1,89 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.fluss.lake.iceberg.tiering.writer;
+
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.deletes.BaseDVFileWriter;
+import org.apache.iceberg.deletes.DVFileWriter;
+import org.apache.iceberg.deletes.PositionDeleteIndex;
+import org.apache.iceberg.io.DeleteWriteResult;
+import org.apache.iceberg.io.OutputFileFactory;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.function.Function;
+
+/**
+ * Writes Iceberg v3 Puffin deletion vectors (RoaringBitmap) that mark deleted row positions in
+ * existing data files. On v3 tables, a round writes its deletes with it.
+ */
+public class IcebergDvFileWriter implements Closeable {
+
+    private final Table table;
+    private final WrittenDeleteFiles writtenFiles;
+    private final DVFileWriter dvWriter;
+    private boolean completed;
+
+    /**
+     * @param loadPreviousDvs returns the current deletion vector positions of the data file at a
+     *     path, or null if it has none. The writer merges the new positions into the existing
+     *     deletion vector and replaces its delete file, so every data file keeps one deletion
+     *     vector across rounds, as Iceberg v3 requires.
+     */
+    public IcebergDvFileWriter(
+            Table table, int partitionId, Function<String, PositionDeleteIndex> loadPreviousDvs) {
+        this.table = table;
+        this.writtenFiles = new WrittenDeleteFiles(table.io());
+        OutputFileFactory outputFileFactory =
+                OutputFileFactory.builderFor(table, partitionId, 0)
+                        .format(FileFormat.PUFFIN)
+                        .ioSupplier(() -> writtenFiles)
+                        .build();
+        this.dvWriter = new BaseDVFileWriter(outputFileFactory, loadPreviousDvs);
+    }
+
+    /** Marks the given row positions as deleted in the given data file. */
+    public void delete(DataFile dataFile, long... positions) {
+        PartitionSpec spec = table.specs().get(dataFile.specId());
+        for (long position : positions) {
+            dvWriter.delete(dataFile.location(), position, spec, dataFile.partition());
+        }
+    }
+
+    /** Writes the Puffin deletion-vector delete files and returns them. */
+    public DeleteWriteResult complete() throws IOException {
+        dvWriter.close();
+        DeleteWriteResult result = dvWriter.result();
+        completed = true;
+        return result;
+    }
+
+    /**
+     * Deletes what the writer wrote unless {@link #complete()} returned it, e.g. the Puffin file of
+     * a write that failed in the middle. Writes nothing.
+     */
+    @Override
+    public void close() {
+        if (!completed) {
+            writtenFiles.deleteAll();
+        }
+    }
+}

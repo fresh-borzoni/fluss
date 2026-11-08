@@ -20,9 +20,11 @@ package org.apache.fluss.lake.iceberg.tiering;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommitterInitContext;
 import org.apache.fluss.lake.committer.LakeCommitter;
+import org.apache.fluss.lake.iceberg.utils.IcebergSnapshotLineage;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.lake.writer.TieringTableValidator;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.TableInfo;
@@ -31,6 +33,8 @@ import org.apache.fluss.utils.IOUtils;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
@@ -38,11 +42,14 @@ import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 /** Implementation of {@link LakeTieringFactory} for Iceberg. */
 public class IcebergLakeTieringFactory
         implements LakeTieringFactory<IcebergWriteResult, IcebergCommittable>,
-                TieringTableValidator {
+                TieringTableValidator,
+                SupportsDeletionVectorTiering {
 
     private static final long serialVersionUID = 1L;
 
     private final IcebergCatalogProvider icebergCatalogProvider;
+    // what the job's committers keep across rounds, created where they run
+    @Nullable private transient IcebergCommitterState committerState;
 
     public IcebergLakeTieringFactory(Configuration icebergConfig) {
         this.icebergCatalogProvider = new IcebergCatalogProvider(icebergConfig);
@@ -61,10 +68,32 @@ public class IcebergLakeTieringFactory
             Table icebergTable = icebergCatalog.loadTable(toIceberg(tableInfo.getLakeTablePath()));
             IcebergPartitionSpecValidator.validate(icebergTable, tableInfo);
         } finally {
-            if (icebergCatalog instanceof AutoCloseable) {
-                IOUtils.closeQuietly(
-                        (AutoCloseable) icebergCatalog, "iceberg-catalog-table-validator");
-            }
+            closeQuietly(icebergCatalog);
+        }
+    }
+
+    /**
+     * Checks the Iceberg table of a table with deletion vectors: no rollback past {@code
+     * registeredSnapshotId}.
+     */
+    @Override
+    public void validateDeletionVectorTable(
+            TableInfo tableInfo, @Nullable Long registeredSnapshotId) throws IOException {
+        if (registeredSnapshotId == null) {
+            return;
+        }
+        Catalog icebergCatalog = icebergCatalogProvider.get();
+        try {
+            Table icebergTable = icebergCatalog.loadTable(toIceberg(tableInfo.getLakeTablePath()));
+            IcebergSnapshotLineage.checkDescendsFrom(icebergTable, registeredSnapshotId);
+        } finally {
+            closeQuietly(icebergCatalog);
+        }
+    }
+
+    private static void closeQuietly(Catalog icebergCatalog) {
+        if (icebergCatalog instanceof AutoCloseable) {
+            IOUtils.closeQuietly((AutoCloseable) icebergCatalog, "iceberg-catalog-table-validator");
         }
     }
 
@@ -77,7 +106,16 @@ public class IcebergLakeTieringFactory
     public LakeCommitter<IcebergWriteResult, IcebergCommittable> createLakeCommitter(
             CommitterInitContext committerInitContext) throws IOException {
         return new IcebergLakeCommitter(
-                icebergCatalogProvider, committerInitContext.tableInfo().getLakeTablePath());
+                icebergCatalogProvider,
+                committerInitContext.tableInfo().getLakeTablePath(),
+                committerState());
+    }
+
+    private synchronized IcebergCommitterState committerState() {
+        if (committerState == null) {
+            committerState = new IcebergCommitterState();
+        }
+        return committerState;
     }
 
     @Override

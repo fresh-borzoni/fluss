@@ -204,6 +204,18 @@ public class TieringSplitGenerator {
                                 ? lakeSnapshotInfo.getTableBucketsOffset().get(tableBucket)
                                 : null;
                 long latestBucketOffset = latestBucketsOffset.get(bucket);
+                if (tableInfo.isDeletionVectorsEnabled()) {
+                    // A table with deletion vectors is tiered from the log, never from a KV
+                    // snapshot: its index is updated from the round's changes, deletes included.
+                    generateSplitForLogTableBucket(
+                                    tableInfo.getTablePath(),
+                                    tableBucket,
+                                    partitionName,
+                                    lastCommittedBucketOffset,
+                                    latestBucketOffset)
+                            .ifPresent(splits::add);
+                    continue;
+                }
                 boolean needsKvSnapshot =
                         !historicalPartition
                                 && latestBucketOffset > 0
