@@ -76,6 +76,8 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
     private final File localTmp;
     private final int remoteLogPrefetchNum;
     private final int remoteLogDownloadThreads;
+    // the change list the new leader restored with its KV snapshot, if any
+    @Nullable private volatile DvRestoredChangeList restored;
 
     public DerivedDvRecoverySource(
             String remoteDataDir,
@@ -106,6 +108,21 @@ public class DerivedDvRecoverySource implements DerivedDvManager.RecoverySource 
         FileUtils.deleteDirectoryQuietly(localTmp);
         this.remoteLogPrefetchNum = remoteLogPrefetchNum;
         this.remoteLogDownloadThreads = remoteLogDownloadThreads;
+    }
+
+    /**
+     * Gives the source the change list the new leader restored with its KV snapshot, which its
+     * first load uses if it may; before the recovery starts.
+     */
+    public DerivedDvRecoverySource withRestoredChangeList(DvRestoredChangeList restored) {
+        this.restored = restored;
+        return this;
+    }
+
+    @Nullable
+    @Override
+    public DvRestoredChangeList restoredChangeList() {
+        return restored;
     }
 
     @Override

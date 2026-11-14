@@ -179,6 +179,15 @@ public class MetricNames {
     public static final String DV_REBUILD_LATENCY_MS = "dvRebuildLatencyMs";
     public static final String DV_CHECKPOINT_RATE = "dvCheckpointPerSecond";
     public static final String DV_CHECKPOINT_LATENCY_MS = "dvCheckpointLatencyMs";
+    // the change list saved with a KV snapshot, and rebuilds that used it
+    public static final String DV_CHANGE_LIST_CHECKPOINT_RATE = "dvChangeListCheckpointPerSecond";
+    public static final String DV_CHANGE_LIST_CHECKPOINT_SKIP_RATE =
+            "dvChangeListCheckpointSkipPerSecond";
+    public static final String DV_CHANGE_LIST_CHECKPOINT_LATENCY_MS =
+            "dvChangeListCheckpointLatencyMs";
+    public static final String DV_CHANGE_LIST_CHECKPOINT_UPLOAD_BYTES_RATE =
+            "dvChangeListCheckpointUploadBytesPerSecond";
+    public static final String DV_REBUILD_FROM_CHECKPOINT_RATE = "dvRebuildFromCheckpointPerSecond";
     public static final String DV_STALE_SNAPSHOT_RATE = "dvStaleSnapshotPerSecond";
     public static final String DV_OWNER_FAULT_RATE = "dvOwnerFaultPerSecond";
     public static final String DV_HAND_OFF_STALL_RATE = "dvHandOffStallPerSecond";

@@ -152,6 +152,7 @@ final class DvOwnerFaults {
      */
     void closeStep() {
         o.work.closeWork();
+        o.changeListExport.close();
         o.maskReads.closed();
         o.finalPass = null;
         o.maskState.reportTail(true);

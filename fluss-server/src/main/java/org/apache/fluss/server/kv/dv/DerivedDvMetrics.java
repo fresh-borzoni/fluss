@@ -64,7 +64,13 @@ public final class DerivedDvMetrics {
                         new DescriptiveStatisticsHistogram(1),
                         new DescriptiveStatisticsHistogram(1),
                         new DescriptiveStatisticsHistogram(1),
-                        new DescriptiveStatisticsHistogram(1)));
+                        new DescriptiveStatisticsHistogram(1)),
+                new ChangeListCheckpoints(
+                        new SimpleCounter(),
+                        new SimpleCounter(),
+                        new DescriptiveStatisticsHistogram(1),
+                        new SimpleCounter(),
+                        new SimpleCounter()));
     }
 
     public static DerivedDvMetrics of(TabletServerMetricGroup group) {
@@ -99,7 +105,13 @@ public final class DerivedDvMetrics {
                         group.dvMaskWaitReplayHistogram(),
                         group.dvMaskApplyHistogram(),
                         group.dvMaskResolveWaitHistogram(),
-                        group.dvMaskBuildHistogram()));
+                        group.dvMaskBuildHistogram()),
+                new ChangeListCheckpoints(
+                        group.dvChangeListCheckpointCount(),
+                        group.dvChangeListCheckpointSkipCount(),
+                        group.dvChangeListCheckpointLatencyHistogram(),
+                        group.dvChangeListCheckpointUploadBytes(),
+                        group.dvRebuildFromCheckpointCount()));
     }
 
     private final Counter catchUps;
@@ -137,6 +149,7 @@ public final class DerivedDvMetrics {
     // union read answers that read the bucket by key, as row TTL may have removed a version
     private final Counter rowTtlFolds;
     private final MaskRequestHistograms maskRequests;
+    private final ChangeListCheckpoints changeListCheckpoints;
 
     private DerivedDvMetrics(
             Counter catchUps,
@@ -162,7 +175,8 @@ public final class DerivedDvMetrics {
             Counter pinnedCutExpirations,
             Counter frontierReads,
             Counter rowTtlFolds,
-            MaskRequestHistograms maskRequests) {
+            MaskRequestHistograms maskRequests,
+            ChangeListCheckpoints changeListCheckpoints) {
         this.catchUps = catchUps;
         this.catchUpMs = catchUpMs;
         this.rebuilds = rebuilds;
@@ -187,6 +201,24 @@ public final class DerivedDvMetrics {
         this.frontierReads = frontierReads;
         this.rowTtlFolds = rowTtlFolds;
         this.maskRequests = maskRequests;
+        this.changeListCheckpoints = changeListCheckpoints;
+    }
+
+    /** Records a change list saved with a KV snapshot, and the bytes it uploaded. */
+    void changeListCheckpointed(long millis, long uploadedBytes) {
+        changeListCheckpoints.attached.inc();
+        changeListCheckpoints.latencyMs.update(millis);
+        changeListCheckpoints.uploadBytes.inc(uploadedBytes);
+    }
+
+    /** Records a KV snapshot of a bucket with deletion vectors saved without its change list. */
+    void changeListCheckpointSkipped() {
+        changeListCheckpoints.skipped.inc();
+    }
+
+    /** Records a rebuild that loaded the change list saved with the KV snapshot it restored. */
+    void rebuiltFromCheckpoint() {
+        changeListCheckpoints.rebuildsFromCheckpoint.inc();
     }
 
     /** Records a catch-up that applied the index changes after the covered snapshot. */
@@ -383,6 +415,28 @@ public final class DerivedDvMetrics {
     }
 
     /** The histograms of the steps of union reads' mask requests. */
+    /** The metrics of change lists saved with KV snapshots. */
+    private static final class ChangeListCheckpoints {
+        final Counter attached;
+        final Counter skipped;
+        final Histogram latencyMs;
+        final Counter uploadBytes;
+        final Counter rebuildsFromCheckpoint;
+
+        ChangeListCheckpoints(
+                Counter attached,
+                Counter skipped,
+                Histogram latencyMs,
+                Counter uploadBytes,
+                Counter rebuildsFromCheckpoint) {
+            this.attached = attached;
+            this.skipped = skipped;
+            this.latencyMs = latencyMs;
+            this.uploadBytes = uploadBytes;
+            this.rebuildsFromCheckpoint = rebuildsFromCheckpoint;
+        }
+    }
+
     private static final class MaskRequestHistograms {
         final Histogram total;
         final Histogram waitMove;

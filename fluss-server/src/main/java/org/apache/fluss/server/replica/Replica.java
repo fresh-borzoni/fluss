@@ -69,6 +69,7 @@ import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRecoverySource;
+import org.apache.fluss.server.kv.dv.DvRestoredChangeList;
 import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.kv.historical.LocalValueLookupResult;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
@@ -948,6 +949,8 @@ public final class Replica {
         // Lake is the durable base for local historical KV state. Historical replicas therefore
         // never restore a normal KV snapshot, even if one exists from older code.
         Optional<CompletedSnapshot> optCompletedSnapshot = recovery.snapshot;
+        // the view of the restored KV that the deletion vectors' change list checkpoint needs
+        DvRestoredChangeList.LinkedView dvKvView = null;
         try {
             Long rowCount;
             AutoIncIDRange autoIncIDRange;
@@ -964,6 +967,18 @@ public final class Replica {
                                 logTablet.getDataDir(), physicalPath, tableBucket);
                 // down the snapshot to target tablet dir
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
+                if (tableConfig.isDeletionVectorsEnabled()) {
+                    // before the KV opens the files: the view is the KV at the snapshot's offset
+                    dvKvView =
+                            DvRestoredChangeList.linkIfUsable(
+                                    snapshotContext.isDvChangeListCheckpointEnabled(),
+                                    tableConfig.getKvTTL().isPresent(),
+                                    completedSnapshot,
+                                    tabletDir
+                                            .toPath()
+                                            .resolve(RocksDBKvBuilder.DB_INSTANCE_DIR_STRING),
+                                    logTablet.getLogDir());
+                }
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
                 kvTablet = kvManager.loadKv(tabletDir, schemaGetter, this::onKvFlushComplete);
@@ -1022,9 +1037,21 @@ public final class Replica {
             // Rebuild the position index and the log tail in the background, so the leader
             // takes writes meanwhile. Union reads of the bucket are answered as not ready.
             if (kvTablet.getDvManager() != null) {
-                kvTablet.getDvManager()
-                        .recoverInBackground(
-                                new DerivedDvRecoverySource(
+                DerivedDvManager dvManager = kvTablet.getDvManager();
+                KvTablet kv = kvTablet;
+                DvRestoredChangeList restoredChangeList =
+                        DvRestoredChangeList.restored(
+                                dvManager.logName(),
+                                tableBucket,
+                                snapshotContext.isDvChangeListCheckpointEnabled(),
+                                tableConfig.getKvTTL().isPresent(),
+                                optCompletedSnapshot.orElse(null),
+                                dvKvView,
+                                kv::decodeVersionOffset);
+                // the restored change list owns the view from here on
+                dvKvView = null;
+                dvManager.recoverInBackground(
+                        new DerivedDvRecoverySource(
                                         dvRemoteDataDir(),
                                         tableInfo,
                                         tableBucket,
@@ -1035,10 +1062,15 @@ public final class Replica {
                                         new File(logTablet.getLogDir(), "derived-dv-recovery"),
                                         snapshotContext.remoteLogPrefetchNumInRecoverKv(),
                                         snapshotContext.remoteLogDownloadThreadsInRecoverKv(),
-                                        snapshotContext.getDvMetadataCache()),
-                                snapshotContext.getDvRebuildLimiter());
+                                        snapshotContext.getDvMetadataCache())
+                                .withRestoredChangeList(restoredChangeList),
+                        snapshotContext.getDvRebuildLimiter());
             }
         } catch (Exception e) {
+            if (dvKvView != null) {
+                // linked for a KV init that failed before handing it on
+                dvKvView.discard();
+            }
             throw new KvStorageException(
                     String.format(
                             "Fail to init kv tablet for %s of table %s.",
@@ -1307,6 +1339,13 @@ public final class Replica {
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
                             snapshotSize);
+            DerivedDvManager dvManager = kvTablet.getDvManager();
+            if (dvManager != null
+                    && snapshotContext.isDvChangeListCheckpointEnabled()
+                    && !getTableConfig().getKvTTL().isPresent()) {
+                // the change list of the deletion vectors is saved with each KV snapshot
+                kvTabletSnapshotTarget.setDvChangeListCheckpoints(dvManager);
+            }
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,
