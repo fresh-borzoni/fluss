@@ -630,6 +630,31 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>Histogram</td>
     </tr>
     <tr>
+      <td>dvChangeListCheckpointPerSecond</td>
+      <td>Change lists of buckets with derived deletion vectors saved with a KV snapshot, per second (see <code>kv.deletion-vectors.change-list-checkpoint.enabled</code>).</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvChangeListCheckpointSkipPerSecond</td>
+      <td>KV snapshots of buckets with derived deletion vectors saved without their change list, per second: the change list was being replayed, the lake was ahead of the KV snapshot, its changes were not applied in time, or it was not written within a second of the KV snapshot's files, in which case the next KV snapshot saves what was written. A KV snapshot never waits longer for it. A new leader that restores such a KV snapshot replays the log from the readable snapshot.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvChangeListCheckpointLatencyMs</td>
+      <td>The time to save a change list with a KV snapshot in ms, from the snapshot's start to the upload of its new changes.</td>
+      <td>Histogram</td>
+    </tr>
+    <tr>
+      <td>dvChangeListCheckpointUploadBytesPerSecond</td>
+      <td>Bytes of change lists uploaded with KV snapshots per second. Each KV snapshot uploads the changes since the one before, so this follows the rate of updates and deletes, not how far tiering lags.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvRebuildFromCheckpointPerSecond</td>
+      <td>Rebuilds per second that loaded the change list saved with the restored KV snapshot and replayed the log only from its offset.</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
       <td>dvStaleSnapshotPerSecond</td>
       <td>Requests for a lake snapshot a bucket no longer covers, per second. The client plans again on the newer snapshot.</td>
       <td>Meter</td>
@@ -671,7 +696,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
     <tr>
       <td>dvReplayBacklog</td>
-      <td>Log offsets the running rebuilds of this server still have to replay, summed over their buckets.</td>
+      <td>Log offsets the running rebuilds of this server still have to replay, summed over their buckets. A rebuild that loaded a change list saved with a KV snapshot replays from the KV snapshot's offset.</td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -747,7 +772,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     <tr>
       <td rowspan="2">dvPool</td>
       <td>queued</td>
-      <td>Tasks waiting in a thread pool of the server's deletion vectors, or in a share of one, labeled with <code>pool</code>: request, state (the buckets' state transitions), resolver (lake-position lookups of changed keys), advance (planning and switch loads) and rebuild, both on the index-load threads, checkpoint (on the server's IO pool), or scheduler.</td>
+      <td>Tasks waiting in a thread pool of the server's deletion vectors, or in a share of one, labeled with <code>pool</code>: request, state (the buckets' state transitions), resolver (lake-position lookups of changed keys), advance (planning and switch loads) and rebuild, both on the index-load threads, checkpoint (index checkpoints, on the server's IO pool), change-list (the change lists saved with KV snapshots and the expiry of restored KV views, on the server's IO pool), or scheduler.</td>
       <td>Gauge</td>
     </tr>
     <tr>

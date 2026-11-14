@@ -275,9 +275,26 @@ public final class FlussClusterExtension
 
     /** Start a coordinator server with the given listeners. */
     public void startCoordinatorServer(String bindListeners) throws Exception {
+        startCoordinatorServer(bindListeners, new Configuration());
+    }
+
+    /**
+     * Stops the coordinator server and starts a new one on the same endpoints, so clients reach it
+     * at the same address, with {@code overwriteConfig} over the cluster's configuration.
+     */
+    public void restartCoordinatorServer(Configuration overwriteConfig) throws Exception {
+        String listeners =
+                Endpoint.toListenersString(coordinatorServer.getRpcServer().getBindEndpoints());
+        stopCoordinatorServer();
+        startCoordinatorServer(listeners, overwriteConfig);
+    }
+
+    private void startCoordinatorServer(String bindListeners, Configuration overwriteConfig)
+            throws Exception {
         if (coordinatorServer == null) {
             // if no coordinator server exists, create a new coordinator server and start
             Configuration conf = new Configuration(clusterConf);
+            overwriteConfig.toMap().forEach(conf::setString);
             conf.setString(ConfigOptions.ZOOKEEPER_ADDRESS, zooKeeperServer.getConnectString());
             conf.setString(ConfigOptions.BIND_LISTENERS, bindListeners);
             setRemoteDataDir(conf);

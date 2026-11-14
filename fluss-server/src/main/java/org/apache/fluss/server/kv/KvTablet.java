@@ -1705,6 +1705,17 @@ public final class KvTablet {
                 });
     }
 
+    /**
+     * The version offset a raw value of this KV carries, the log offset of the change that wrote
+     * it: its tag, or its version offset slot in the versioned layout.
+     */
+    public long decodeVersionOffset(byte[] raw) {
+        MemorySegment segment = MemorySegment.wrap(raw);
+        return kvValueLayout.hasVersionOffsetSlot()
+                ? kvValueLayout.readVersionOffset(segment, 0)
+                : kvValueLayout.readValueTag(segment);
+    }
+
     /** Returns the deletion vector manager of this tablet, or null if they are disabled. */
     @Nullable
     public DerivedDvManager getDvManager() {

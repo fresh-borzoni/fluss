@@ -34,11 +34,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RunnableFuture;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -83,6 +86,12 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     private volatile long logOffsetOfLatestSnapshot;
 
     private volatile long snapshotSize;
+
+    // saves the change list of a bucket with deletion vectors with each snapshot, or null
+    @Nullable private volatile DvChangeListCheckpoints dvChangeListCheckpoints;
+    // the change list of the snapshot in flight, and the snapshot's id
+    @Nullable private volatile DvChangeListCheckpoints.Checkpoint dvCheckpoint;
+    private volatile long dvCheckpointSnapshotId = -1;
 
     @VisibleForTesting
     KvTabletSnapshotTarget(
@@ -156,6 +165,11 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.snapshotsCleaner = new SnapshotsCleaner();
     }
 
+    /** Saves the bucket's deletion vector change list with each snapshot from now on. */
+    public void setDvChangeListCheckpoints(@Nullable DvChangeListCheckpoints checkpoints) {
+        this.dvChangeListCheckpoints = checkpoints;
+    }
+
     @Override
     public long currentSnapshotId() {
         try {
@@ -185,13 +199,79 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         int bucketLeaderEpoch = bucketLeaderEpochSupplier.get();
         int coordinatorEpoch = coordinatorEpochSupplier.get();
         SnapshotLocation snapshotLocation = initSnapshotLocation(currentSnapshotId);
+        RunnableFuture<SnapshotResult> snapshot =
+                snapshotRunner.snapshot(currentSnapshotId, tabletState, snapshotLocation);
+        DvChangeListCheckpoints checkpoints = dvChangeListCheckpoints;
+        if (checkpoints != null) {
+            // the change list at the snapshot's offset, saved after the kv files
+            DvChangeListCheckpoints.Checkpoint checkpoint =
+                    checkpoints.prepare(currentSnapshotId, logOffset, snapshotLocation);
+            dvCheckpoint = checkpoint;
+            dvCheckpointSnapshotId = currentSnapshotId;
+            snapshot = withChangeList(snapshot, checkpoint);
+        }
         return Optional.of(
                 new PeriodicSnapshotManager.SnapshotRunnable(
-                        snapshotRunner.snapshot(currentSnapshotId, tabletState, snapshotLocation),
+                        snapshot,
                         currentSnapshotId,
                         coordinatorEpoch,
                         bucketLeaderEpoch,
                         snapshotLocation));
+    }
+
+    /**
+     * The snapshot, then its change list if it is ready: the IO pool writes it meanwhile, and the
+     * async thread waits a short bound for it at most.
+     */
+    private static RunnableFuture<SnapshotResult> withChangeList(
+            RunnableFuture<SnapshotResult> kvSnapshot,
+            DvChangeListCheckpoints.Checkpoint checkpoint) {
+        return new FutureTask<SnapshotResult>(
+                () -> {
+                    kvSnapshot.run();
+                    SnapshotResult result = kvSnapshot.get();
+                    DvChangeListHandle changeList = checkpoint.attach();
+                    return changeList == null ? result : result.withDvChangeList(changeList);
+                }) {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                kvSnapshot.cancel(mayInterruptIfRunning);
+                return super.cancel(mayInterruptIfRunning);
+            }
+        };
+    }
+
+    /**
+     * Tells the change list its snapshot was committed, and how to read back whether the committed
+     * metadata holds it: a coordinator that does not know the field drops it when it writes the
+     * metadata. The change list reads it off this thread.
+     */
+    private static void commitChangeList(
+            DvChangeListCheckpoints.Checkpoint checkpoint,
+            long snapshotId,
+            SnapshotResult snapshotResult) {
+        FsPath metadata = CompletedSnapshot.getMetadataFilePath(snapshotResult.getSnapshotPath());
+        long flushedLogOffset = snapshotResult.getTabletState().getFlushedLogOffset();
+        checkpoint.committed(
+                () -> {
+                    DvChangeListHandle kept =
+                            new CompletedSnapshotHandle(snapshotId, metadata, flushedLogOffset)
+                                    .retrieveCompleteSnapshot()
+                                    .getKvSnapshotHandle()
+                                    .getDvChangeList();
+                    return kept != null && kept.isSupported();
+                });
+    }
+
+    /** Takes the change list of snapshot {@code snapshotId} for its outcome, or null. */
+    @Nullable
+    private DvChangeListCheckpoints.Checkpoint takeDvCheckpoint(long snapshotId) {
+        DvChangeListCheckpoints.Checkpoint checkpoint = dvCheckpoint;
+        if (checkpoint == null || dvCheckpointSnapshotId != snapshotId) {
+            return null;
+        }
+        dvCheckpoint = null;
+        return checkpoint;
     }
 
     private SnapshotLocation initSnapshotLocation(long snapshotId) {
@@ -245,6 +325,10 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                 tableBucket,
                 cause);
         rocksIncrementalSnapshot.notifySnapshotAbort(snapshotId);
+        DvChangeListCheckpoints.Checkpoint checkpoint = takeDvCheckpoint(snapshotId);
+        if (checkpoint != null) {
+            checkpoint.aborted();
+        }
         // cleanup the target snapshot location at the end
         snapshotLocation.disposeOnFailure();
     }
@@ -272,6 +356,10 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
      */
     private void updateStateOnCommitSuccess(long snapshotId, SnapshotResult snapshotResult) {
         long flushedLogOffset = snapshotResult.getTabletState().getFlushedLogOffset();
+        DvChangeListCheckpoints.Checkpoint checkpoint = takeDvCheckpoint(snapshotId);
+        if (checkpoint != null) {
+            commitChangeList(checkpoint, snapshotId, snapshotResult);
+        }
         try {
             logOffsetOfLatestSnapshot = flushedLogOffset;
             snapshotSize = snapshotResult.getSnapshotSize();
@@ -345,6 +433,10 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             // Therefore, we must not clean up the snapshot files and not update local state.
             // This avoids the risk of discarding a successfully committed snapshot that
             // connectors may already be reading, which would cause data loss or job failure.
+            DvChangeListCheckpoints.Checkpoint checkpoint = takeDvCheckpoint(snapshotId);
+            if (checkpoint != null) {
+                checkpoint.uncertain();
+            }
         }
 
         // throw the exception to make PeriodicSnapshotManager can catch the exception

@@ -43,6 +43,8 @@ final class DvTailLoad extends DvLoad {
 
     @Nullable private DerivedDvRebuildLimiter slots;
     @Nullable private Exception failure;
+    // how the replay starts: from the change list the new leader restored, or not
+    private final DvCheckpointReplay replayStart;
     private long slotWaitNanos;
     private long replayEarlyNanos;
     private long replayFinalNanos;
@@ -50,6 +52,7 @@ final class DvTailLoad extends DvLoad {
 
     DvTailLoad(DvOwner m, RecoverySource src, long snapshotId, long startOffset) {
         super(m, src, Kind.TAIL, snapshotId, startOffset);
+        this.replayStart = new DvCheckpointReplay(m);
     }
 
     /** The tail load the covered snapshot needs, or null if it needs none; an owner step. */
@@ -71,13 +74,13 @@ final class DvTailLoad extends DvLoad {
         slotWaitNanos = System.nanoTime() - slotStart;
         slots.beforeRebuild();
         t0 = System.currentTimeMillis();
-        replay = DvReplay.start(m, src, readableOffset, this::stopped);
+        replay = replayStart.start(src, readableOffset, this::stopped);
         if (replay == null) {
             return false;
         }
-        long replayStart = System.nanoTime();
+        long replayStartNanos = System.nanoTime();
         failure = replay.replayEarlyPasses();
-        replayEarlyNanos = System.nanoTime() - replayStart;
+        replayEarlyNanos = System.nanoTime() - replayStartNanos;
         if (failure == null) {
             long finalStart = System.nanoTime();
             if (!m.work.enterFinalPass(replay)) {
@@ -140,7 +143,7 @@ final class DvTailLoad extends DvLoad {
                 "Rebuilt the deletion vectors of {}: kind=changes snapshot={}"
                         + " readable_offset={} log_end={} changes_replayed={} load_index_ms={}"
                         + " replay_ms={} total_ms={} versions_spilled={} tail_changes={}"
-                        + " queued={} replay_locked_ms={} install_ms={} lock_ms={} slot_wait_ms={}",
+                        + " queued={} replay_locked_ms={} install_ms={} lock_ms={} slot_wait_ms={} {}",
                 m.logName,
                 m.coveredSnapshotId,
                 readableOffset,
@@ -155,7 +158,8 @@ final class DvTailLoad extends DvLoad {
                 ms(replayFinalNanos),
                 ms(installNanos),
                 ms(end - swapStart),
-                ms(slotWaitNanos));
+                ms(slotWaitNanos),
+                replayStart.logFields(r));
         return true;
     }
 

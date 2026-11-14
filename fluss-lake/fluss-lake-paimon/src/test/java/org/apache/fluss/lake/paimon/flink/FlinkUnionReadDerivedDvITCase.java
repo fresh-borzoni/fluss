@@ -537,6 +537,118 @@ class FlinkUnionReadDerivedDvITCase extends FlinkUnionReadTestBase {
     }
 
     /**
+     * New leaders rebuild their buckets from the change lists their old leaders saved with the KV
+     * snapshots they restore, and replay the log only from the snapshots' offsets, while tiering
+     * stalls. Keys inserted before a KV snapshot and updated after it are masked in the log.
+     */
+    @Test
+    void testTabletServerRestartFromTheChangeListCheckpoint() throws Exception {
+        String tableName = "derived_restart_checkpoint";
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        long tableId = createDerivedTable(tablePath, false, true);
+        Map<String, String> expected = new TreeMap<>();
+        try (Connection writes = ConnectionFactory.createConnection(clientConf)) {
+            JobClient jobClient = buildTieringJob(execEnv);
+            try {
+                List<InternalRow> rows = new ArrayList<>();
+                for (int i = 0; i < 30; i++) {
+                    rows.add(rowOf(i, "v_" + i, null));
+                    expected.put(rowKey(i, null), rowString(i, "v_" + i, null));
+                }
+                upsert(writes, tablePath, rows);
+                tickUntilReadableAdvances(writes, tablePath, Long.MIN_VALUE, null);
+                expected.put(rowKey(-1, null), rowString(-1, "tick", null));
+                waitUntilAllReadable(tablePath, tableId, false);
+            } finally {
+                jobClient.cancel().get();
+            }
+
+            try (Table table = writes.getTable(tablePath)) {
+                UpsertWriter writer = table.newUpsert().createWriter();
+                for (int i = 0; i < 10; i++) {
+                    writer.upsert(rowOf(i, "updated_" + i, null));
+                    expected.put(rowKey(i, null), rowString(i, "updated_" + i, null));
+                }
+                for (int i = 40; i < 50; i++) {
+                    writer.upsert(rowOf(i, "new_" + i, null));
+                    expected.put(rowKey(i, null), rowString(i, "new_" + i, null));
+                }
+                writer.delete(rowOf(10, "x", null));
+                expected.remove(rowKey(10, null));
+                writer.flush();
+            }
+            for (int b = 0; b < BUCKETS; b++) {
+                TableBucket tb = new TableBucket(tableId, b);
+                for (int attempt = 0; ; attempt++) {
+                    org.apache.fluss.server.kv.snapshot.CompletedSnapshot snapshot =
+                            FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+                    org.apache.fluss.server.kv.snapshot.DvChangeListHandle changeList =
+                            snapshot.getKvSnapshotHandle().getDvChangeList();
+                    if (changeList != null && changeList.end() == snapshot.getLogOffset()) {
+                        break;
+                    }
+                    // its change list was late for it: the next snapshot carries it, once the
+                    // bucket has new data
+                    assertThat(attempt)
+                            .as("KV snapshots of %s without their whole change list", tb)
+                            .isLessThan(5);
+                    try (Table table = writes.getTable(tablePath)) {
+                        UpsertWriter writer = table.newUpsert().createWriter();
+                        for (int i = 1000; i < 1030; i++) {
+                            writer.upsert(rowOf(i, "late" + attempt, null));
+                            expected.put(rowKey(i, null), rowString(i, "late" + attempt, null));
+                        }
+                        writer.flush();
+                    }
+                }
+            }
+            try (Table table = writes.getTable(tablePath)) {
+                UpsertWriter writer = table.newUpsert().createWriter();
+                // inserted before the KV snapshots, updated after them
+                for (int i = 40; i < 45; i++) {
+                    writer.upsert(rowOf(i, "again_" + i, null));
+                    expected.put(rowKey(i, null), rowString(i, "again_" + i, null));
+                }
+                writer.upsert(rowOf(10, "back_10", null));
+                expected.put(rowKey(10, null), rowString(10, "back_10", null));
+                writer.flush();
+            }
+
+            Set<Integer> leaders = new TreeSet<>();
+            for (int b = 0; b < BUCKETS; b++) {
+                leaders.add(FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(new TableBucket(tableId, b)));
+            }
+            for (int leader : leaders) {
+                FLUSS_CLUSTER_EXTENSION.stopTabletServer(leader);
+                FLUSS_CLUSTER_EXTENSION.startTabletServer(leader);
+            }
+            assertUnionRead(tableName, expected);
+            for (int b = 0; b < BUCKETS; b++) {
+                TableBucket tb = new TableBucket(tableId, b);
+                String fields =
+                        org.apache.fluss.testutils.common.CommonTestUtils.waitValue(
+                                () -> {
+                                    org.apache.fluss.server.kv.KvTablet kv =
+                                            FLUSS_CLUSTER_EXTENSION
+                                                    .waitAndGetLeaderReplica(tb)
+                                                    .getKvTablet();
+                                    String f =
+                                            kv == null || kv.getDvManager() == null
+                                                    ? ""
+                                                    : kv.getDvManager()
+                                                            .lastRebuildCheckpointFields();
+                                    return f.isEmpty()
+                                            ? java.util.Optional.<String>empty()
+                                            : java.util.Optional.of(f);
+                                },
+                                Duration.ofMinutes(2),
+                                "no rebuild of " + tb);
+                assertThat(fields).contains("ckpt=used");
+            }
+        }
+    }
+
+    /**
      * Union reads stay exact after a tiered partition is dropped in Fluss. Its lake rows are read
      * from the lake alone, no tablet server is asked for its masks, and the next round stops
      * carrying its offsets.

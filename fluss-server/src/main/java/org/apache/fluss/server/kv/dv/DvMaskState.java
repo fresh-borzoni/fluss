@@ -269,7 +269,11 @@ final class DvMaskState {
 
     /** A new, empty tail in the bucket's RocksDB. */
     DvChangeList newTail() {
-        return new DvChangeList(o.db.changeListStore(), o.tailIds.incrementAndGet(), o.testHooks);
+        return new DvChangeList(
+                o.db.changeListStore(),
+                o.tailIds.incrementAndGet(),
+                o.snapshotStartOffset,
+                o.testHooks);
     }
 
     /**

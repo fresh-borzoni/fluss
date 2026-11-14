@@ -72,9 +72,15 @@ final class DvChangeList {
     private final DvTestHooks testHooks;
     // the id of the change list's changes in the store, unique per bucket
     final long id;
+    // The readable offset the change list was built from: a superseded version before it is named
+    // only as such (-1). A change-list checkpoint records it, and a new leader uses the checkpoint
+    // only from a readable offset at or after it.
+    final long base;
     private long pendingCount;
     private long storedBytes;
     private boolean dropped;
+    // retainFrom removed the changes below it from disk
+    private long retainedFrom = Long.MIN_VALUE;
     // runs of stored pending changes {last offset, changes, bytes}, to count what a trim removes
     private final ArrayDeque<long[]> storedRuns = new ArrayDeque<>();
     // estimated heap bytes of the queued changes
@@ -82,9 +88,10 @@ final class DvChangeList {
     // the record offset of the last change applied; changes arrive in log order
     private long lastApplied = -1;
 
-    DvChangeList(DvChangeListStore store, long id, DvTestHooks testHooks) {
+    DvChangeList(DvChangeListStore store, long id, long base, DvTestHooks testHooks) {
         this.store = store;
         this.id = id;
+        this.base = base;
         this.testHooks = testHooks;
     }
 
@@ -209,6 +216,35 @@ final class DvChangeList {
         return hasBelow(hw);
     }
 
+    /**
+     * Appends changes a change-list checkpoint saved, in offset order, after every change applied
+     * so far: they were below the high watermark of the leader that saved them, so they skip the
+     * queue. A superseded version at or after {@code startOffset} becomes a dead version; the keys
+     * of the others are looked up once the change list is installed.
+     */
+    void appendCommitted(List<Pending> changes, long startOffset) throws IOException {
+        if (changes.isEmpty()) {
+            return;
+        }
+        long bytes = 0;
+        for (Pending c : changes) {
+            if (c.offset <= lastApplied) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Checkpointed change at offset %d after offset %d.",
+                                c.offset, lastApplied));
+            }
+            lastApplied = c.offset;
+            bytes += DvChangeListStore.storedPendingBytes(c.key);
+            if (c.previous >= startOffset) {
+                deadVersions.addLong(c.previous);
+                deadVersionChanges++;
+            }
+        }
+        pendingCount += changes.size();
+        writeRun(changes, bytes);
+    }
+
     private void writeRun(List<Pending> run, long bytes) throws IOException {
         testHooks.beforeChangeListWrite();
         store.writePending(id, run);
@@ -236,6 +272,11 @@ final class DvChangeList {
         return n;
     }
 
+    /** The offset below which {@link #retainFrom} removed the changes from disk. */
+    long retainedFrom() {
+        return retainedFrom;
+    }
+
     /** Removes the change list's changes from disk; later calls do nothing. */
     void drop() throws IOException {
         if (!dropped) {
@@ -250,6 +291,7 @@ final class DvChangeList {
      */
     void retainFrom(long offset) throws IOException {
         testHooks.beforeChangeListWrite();
+        retainedFrom = Math.max(retainedFrom, offset);
         store.deletePendingBelow(id, offset);
         // a run partly below the offset stays counted until a later trim
         while (!storedRuns.isEmpty() && storedRuns.peekFirst()[0] < offset) {

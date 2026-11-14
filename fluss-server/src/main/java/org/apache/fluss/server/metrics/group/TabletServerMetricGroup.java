@@ -80,6 +80,11 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Histogram dvRebuildLatencyHistogram;
     private final Counter dvCheckpointCount;
     private final Histogram dvCheckpointLatencyHistogram;
+    private final Counter dvChangeListCheckpointCount;
+    private final Counter dvChangeListCheckpointSkipCount;
+    private final Histogram dvChangeListCheckpointLatencyHistogram;
+    private final Counter dvChangeListCheckpointUploadBytes;
+    private final Counter dvRebuildFromCheckpointCount;
     private final Counter dvStaleSnapshotCount;
     private final Counter dvOwnerFaultCount;
     private final Counter dvHandOffStallCount;
@@ -186,6 +191,26 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.DV_CHECKPOINT_RATE, new MeterView(dvCheckpointCount));
         dvCheckpointLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
         histogram(MetricNames.DV_CHECKPOINT_LATENCY_MS, dvCheckpointLatencyHistogram);
+        dvChangeListCheckpointCount = new SimpleCounter();
+        meter(
+                MetricNames.DV_CHANGE_LIST_CHECKPOINT_RATE,
+                new MeterView(dvChangeListCheckpointCount));
+        dvChangeListCheckpointSkipCount = new SimpleCounter();
+        meter(
+                MetricNames.DV_CHANGE_LIST_CHECKPOINT_SKIP_RATE,
+                new MeterView(dvChangeListCheckpointSkipCount));
+        dvChangeListCheckpointLatencyHistogram = new DescriptiveStatisticsHistogram(WINDOW_SIZE);
+        histogram(
+                MetricNames.DV_CHANGE_LIST_CHECKPOINT_LATENCY_MS,
+                dvChangeListCheckpointLatencyHistogram);
+        dvChangeListCheckpointUploadBytes = new SimpleCounter();
+        meter(
+                MetricNames.DV_CHANGE_LIST_CHECKPOINT_UPLOAD_BYTES_RATE,
+                new MeterView(dvChangeListCheckpointUploadBytes));
+        dvRebuildFromCheckpointCount = new SimpleCounter();
+        meter(
+                MetricNames.DV_REBUILD_FROM_CHECKPOINT_RATE,
+                new MeterView(dvRebuildFromCheckpointCount));
         dvStaleSnapshotCount = new SimpleCounter();
         meter(MetricNames.DV_STALE_SNAPSHOT_RATE, new MeterView(dvStaleSnapshotCount));
         dvOwnerFaultCount = new SimpleCounter();
@@ -410,6 +435,26 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Histogram dvCheckpointLatencyHistogram() {
         return dvCheckpointLatencyHistogram;
+    }
+
+    public Counter dvChangeListCheckpointCount() {
+        return dvChangeListCheckpointCount;
+    }
+
+    public Counter dvChangeListCheckpointSkipCount() {
+        return dvChangeListCheckpointSkipCount;
+    }
+
+    public Histogram dvChangeListCheckpointLatencyHistogram() {
+        return dvChangeListCheckpointLatencyHistogram;
+    }
+
+    public Counter dvChangeListCheckpointUploadBytes() {
+        return dvChangeListCheckpointUploadBytes;
+    }
+
+    public Counter dvRebuildFromCheckpointCount() {
+        return dvRebuildFromCheckpointCount;
     }
 
     public Counter dvStaleSnapshotCount() {

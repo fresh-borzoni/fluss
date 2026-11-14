@@ -106,7 +106,14 @@ class DerivedDvRuntimeTest {
         runtime.registerMetrics(new TabletServerMetricGroup(registry, "fluss", "host", "rack", 0));
         for (String pool :
                 new String[] {
-                    "request", "state", "resolver", "advance", "rebuild", "checkpoint", "scheduler"
+                    "request",
+                    "state",
+                    "resolver",
+                    "advance",
+                    "rebuild",
+                    "checkpoint",
+                    "change-list",
+                    "scheduler"
                 }) {
             for (String gauge : new String[] {"queued", "active"}) {
                 assertThat(metrics.keySet())
@@ -291,7 +298,8 @@ class DerivedDvRuntimeTest {
 
     /**
      * A {@link VirtualMachineError} that a task on a plain pool lets through reaches the threads'
-     * handler: the key lookups, both shares of the index-load threads, and the checkpoints.
+     * handler: the key lookups, both shares of the index-load threads, the index checkpoints and
+     * the change lists.
      */
     @Test
     void testAVirtualMachineErrorOnAPlainPoolReachesTheHandler() throws Exception {
@@ -302,9 +310,11 @@ class DerivedDvRuntimeTest {
             runtime.switches().execute(fail(new OutOfMemoryError("switch")));
             runtime.rebuilds().execute(fail(new OutOfMemoryError("rebuild")));
             runtime.checkpoints().execute(fail(new OutOfMemoryError("checkpoint")));
-            handler.await(4);
+            runtime.changeLists().execute(fail(new OutOfMemoryError("change list")));
+            handler.await(5);
             assertThat(handler.messages())
-                    .containsExactlyInAnyOrder("key lookup", "switch", "rebuild", "checkpoint");
+                    .containsExactlyInAnyOrder(
+                            "key lookup", "switch", "rebuild", "checkpoint", "change list");
         } finally {
             runtime.shutdown();
         }

@@ -170,6 +170,33 @@ public class DvChangeListStore {
         }
 
         /**
+         * Reads the next at most {@code max} changes whole, in offset order: offset, superseded
+         * version and key. Returns false once there are no changes left.
+         */
+        boolean next(int max, DvChangeListSegment.EntrySink sink) throws IOException {
+            int read = 0;
+            while (read < max && it.isValid()) {
+                byte[] storeKey = it.key();
+                if (compareUnsigned(storeKey, end) >= 0) {
+                    break;
+                }
+                byte[] value = it.value();
+                sink.accept(
+                        ByteBuffer.wrap(storeKey, PREFIX_BYTES, Long.BYTES).getLong(),
+                        ByteBuffer.wrap(value).getLong(),
+                        Arrays.copyOfRange(value, Long.BYTES, value.length));
+                read++;
+                it.next();
+            }
+            try {
+                it.status();
+            } catch (RocksDBException e) {
+                throw new IOException("Failed to iterate a change list", e);
+            }
+            return read > 0;
+        }
+
+        /**
          * The offset of the next change the cursor reads, or {@link Long#MAX_VALUE} if it read them
          * all; a later cursor from there continues where this one stopped.
          */
@@ -194,7 +221,13 @@ public class DvChangeListStore {
 
     // ---- A replay's map of each key's last version. ----
 
-    /** The last versions of {@code keys} in map {@code mapId}, -1 for keys it does not hold. */
+    /** A key a replay's map of last versions does not hold. */
+    static final long MISSING = Long.MIN_VALUE;
+
+    /**
+     * The last versions of {@code keys} in map {@code mapId}: -1 for a key whose last change
+     * deleted it, {@link #MISSING} for keys the map does not hold.
+     */
     long[] getVersions(long mapId, List<byte[]> keys) throws IOException {
         long[] out = new long[keys.size()];
         if (keys.isEmpty()) {
@@ -209,7 +242,7 @@ public class DvChangeListStore {
                     db.multiGetAsList(Collections.nCopies(keys.size(), cfHandle), storeKeys);
             for (int i = 0; i < out.length; i++) {
                 byte[] value = values.get(i);
-                out[i] = value == null ? -1 : ByteBuffer.wrap(value).getLong();
+                out[i] = value == null ? MISSING : ByteBuffer.wrap(value).getLong();
             }
             return out;
         } catch (RocksDBException e) {

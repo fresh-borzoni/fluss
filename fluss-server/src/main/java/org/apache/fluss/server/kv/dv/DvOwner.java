@@ -19,6 +19,7 @@ package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.dv.DerivedDvManager.RecoverySource;
 import org.apache.fluss.server.kv.dv.DvFrontiers.KeepReady;
 
@@ -114,6 +115,7 @@ final class DvOwner {
     final DvOwnerIndex index = new DvOwnerIndex(this);
     final DvOwnerHandOff drain = new DvOwnerHandOff(this);
     final DvOwnerFaults faults = new DvOwnerFaults(this);
+    final DvOwnerChangeListExport changeListExport = new DvOwnerChangeListExport(this);
 
     DvOwner(
             DvRocksDB dvRocksDB,
@@ -216,6 +218,10 @@ final class DvOwner {
     int inFlight = 0;
     // where the state is rebuilt and advanced from; null until the bucket's leader recovers
     @Nullable RecoverySource recoverySource;
+    // the bucket, which a saved change list's segments name; set before the first recovery
+    volatile TableBucket tableBucket = new TableBucket(-1, -1);
+    // the change-list checkpoint's fields of the last rebuild's log line, for tests
+    volatile String lastRebuildCheckpointFields = "";
 
     // A frontier covers exactly [snapshotStartOffset, cut), so it answers any read whose floor its
     // cut reaches. A read that does not wait reuses the latest frontier for this long while no

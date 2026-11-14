@@ -26,16 +26,20 @@ import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.kv.snapshot.DvChangeListCheckpoints;
 
 import javax.annotation.Nullable;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
@@ -79,7 +83,7 @@ import java.util.function.LongSupplier;
  * <p>Some field and method names call a switch a move, and the change list the tail.
  */
 @Internal
-public class DerivedDvManager implements Closeable {
+public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
 
     // the bucket's state and the steps that change it
     private final DvOwner owner;
@@ -180,6 +184,46 @@ public class DerivedDvManager implements Closeable {
                         + (partitionId == null ? "-" : partitionId)
                         + " bucket="
                         + bucket.getBucket());
+        owner.tableBucket = bucket;
+    }
+
+    /** How the bucket is named in log lines. */
+    public String logName() {
+        return owner.logName;
+    }
+
+    /**
+     * The change-list checkpoint's fields of the last rebuild's log line, empty before the first
+     * rebuild installed its change list.
+     */
+    @VisibleForTesting
+    public String lastRebuildCheckpointFields() {
+        return owner.lastRebuildCheckpointFields;
+    }
+
+    /** How long a KV snapshot waits for the change list below its offset. */
+    @VisibleForTesting
+    void setChangeListPrepareWaitMillis(long millis) {
+        owner.changeListExport.prepareWaitMs = millis;
+    }
+
+    /** How long a KV snapshot waits for its change list after its KV files. */
+    @VisibleForTesting
+    void setChangeListAttachWaitMillis(long millis) {
+        owner.changeListExport.attachWaitMs = millis;
+    }
+
+    /**
+     * Starts saving the bucket's change list with KV snapshot {@code kvSnapshotId} at {@code
+     * logOffset} into {@code location}, in the snapshot's synchronous phase ({@link
+     * DvOwnerChangeListExport}).
+     */
+    @Override
+    public Checkpoint prepare(
+            long kvSnapshotId,
+            long logOffset,
+            org.apache.fluss.server.kv.snapshot.SnapshotLocation location) {
+        return owner.changeListExport.prepare(kvSnapshotId, logOffset, location);
     }
 
     /**
@@ -259,6 +303,12 @@ public class DerivedDvManager implements Closeable {
         void uploadCheckpoint(
                 long snapshotId, @Nullable String localSst, Map<Integer, String> fileDict)
                 throws Exception;
+
+        /** The change list the new leader restored with its KV snapshot, or null. */
+        @Nullable
+        default DvRestoredChangeList restoredChangeList() {
+            return null;
+        }
     }
 
     /** Receives one replayed change. */
@@ -277,7 +327,42 @@ public class DerivedDvManager implements Closeable {
      * bucket took the leadership over.
      */
     public void recoverInBackground(RecoverySource src, DerivedDvRebuildLimiter limiter) {
+        expireRestoredView(src);
         owner.work.recover(src, limiter);
+    }
+
+    /**
+     * Releases the view of the restored KV once no load used it for a while, to free its disk. The
+     * scheduler only hands the check to the change lists' share of the IO pool, which re-arms it
+     * until the view is gone; at the server's shutdown the check is dropped, and the bucket's close
+     * releases the view.
+     */
+    private void expireRestoredView(RecoverySource src) {
+        DvRestoredChangeList restored = src.restoredChangeList();
+        if (restored != null) {
+            scheduleViewExpiry(restored, DvRestoredChangeList.VIEW_MAX_AGE_MS);
+        }
+    }
+
+    private void scheduleViewExpiry(DvRestoredChangeList restored, long delayMs) {
+        try {
+            owner.runtime.executeAfter(
+                    delayMs,
+                    owner.runtime.changeLists(),
+                    () -> {
+                        long now = System.currentTimeMillis();
+                        restored.expireIfDue(now);
+                        long next = restored.nextExpiryCheckMs(now);
+                        if (next >= 0 && !owner.closed) {
+                            scheduleViewExpiry(restored, next);
+                        }
+                    },
+                    () -> {
+                        // the server shuts down; the bucket's close releases the view
+                    });
+        } catch (RejectedExecutionException e) {
+            // the server shuts down; the bucket's close releases the view
+        }
     }
 
     /**
@@ -672,6 +757,44 @@ public class DerivedDvManager implements Closeable {
     @VisibleForTesting
     void releaseDb() {
         owner.leases.release();
+    }
+
+    /**
+     * The changes of the installed change list from {@code from} on, in offset order, once the
+     * changes below the high watermark are applied: offset, superseded version and key. Null if the
+     * change list is missing.
+     */
+    @VisibleForTesting
+    @Nullable
+    List<DvChangeList.Pending> changeListFrom(long from) {
+        List<DvChangeList.Pending> changes = new ArrayList<>();
+        boolean[] present = new boolean[1];
+        onOwner(
+                () -> {
+                    owner.drain.drainHandOff();
+                    owner.maskState.applyUpTo(owner.highWatermark.getAsLong());
+                    if (owner.maskState.tailMissing()) {
+                        return;
+                    }
+                    present[0] = true;
+                    try (DvChangeListStore.PendingCursor cursor =
+                            owner.db
+                                    .changeListStore()
+                                    .pendingCursor(
+                                            owner.maskState.tail.id, null, from, Long.MAX_VALUE)) {
+                        while (cursor.next(
+                                1024,
+                                (offset, superseded, key) ->
+                                        changes.add(
+                                                new DvChangeList.Pending(
+                                                        offset, superseded, key)))) {
+                            // reads them all
+                        }
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+        return present[0] ? changes : null;
     }
 
     /** What a test sees of the bucket's state, read at one point. */

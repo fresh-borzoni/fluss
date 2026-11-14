@@ -76,7 +76,11 @@ import java.util.function.IntSupplier;
  * <p>Planning and switch loads, and rebuilds, share the index-load pool, but each kind runs on its
  * own share of its threads ({@link BoundedConcurrencyExecutor}): work beyond the share waits
  * without a thread, so a long rebuild never holds up a switch. Exports and uploads of index
- * checkpoints run on the server's IO pool ({@code server.io-pool.size}), at most 2 at a time.
+ * checkpoints run on the server's IO pool ({@code server.io-pool.size}), at most 2 at a time. The
+ * change lists saved with KV snapshots (their segments, the deletes of segments no snapshot
+ * references, the read-back of the committed metadata) and the expiry checks of restored KV views
+ * run on a share of their own of the IO pool, also at most 2 at a time, so a long index export
+ * never makes a KV snapshot's change list late.
  *
  * <p>Errors follow Fluss's other server pools: the threads hand a {@link VirtualMachineError} to
  * {@code FatalExitExceptionHandler}, which stops the tablet server, after the job, step or request
@@ -97,7 +101,9 @@ public final class DerivedDvRuntime {
     static final int KEY_LOOKUP_THREADS = 4;
     static final int SWITCH_THREADS = 2;
     static final int CHECKPOINT_THREADS = 2;
-    static final int IO_THREADS = 2;
+    static final int CHANGE_LIST_THREADS = 2;
+    // the IO pool of a runtime whose server gives it none: a thread for each slot of its lanes
+    static final int IO_THREADS = CHECKPOINT_THREADS + CHANGE_LIST_THREADS;
 
     private final DerivedDvRequestExecutor requests;
     private final ThreadPoolExecutor bucketState;
@@ -107,6 +113,7 @@ public final class DerivedDvRuntime {
     private final DerivedDvRebuildLimiter rebuilds;
     private final ScheduledThreadPoolExecutor scheduler;
     private final BoundedConcurrencyExecutor checkpoints;
+    private final BoundedConcurrencyExecutor changeLists;
     // the IO pool the runtime created as the server gave it none, which it then shuts down
     @Nullable private final ExecutorService ownIo;
 
@@ -191,9 +198,9 @@ public final class DerivedDvRuntime {
                 ioExecutor == null
                         ? fixed(IO_THREADS, "kv-deletion-vectors-io", fatalErrorHandler)
                         : null;
-        this.checkpoints =
-                new BoundedConcurrencyExecutor(
-                        ioExecutor == null ? ownIo : ioExecutor, CHECKPOINT_THREADS);
+        Executor io = ioExecutor == null ? ownIo : ioExecutor;
+        this.checkpoints = new BoundedConcurrencyExecutor(io, CHECKPOINT_THREADS);
+        this.changeLists = new BoundedConcurrencyExecutor(io, CHANGE_LIST_THREADS);
     }
 
     /** The executor of the server's deletion vector requests. */
@@ -224,6 +231,15 @@ public final class DerivedDvRuntime {
     /** Exports and uploads index checkpoints, on the server's IO pool. */
     Executor checkpoints() {
         return checkpoints;
+    }
+
+    /**
+     * Writes and deletes the segments of the change lists saved with KV snapshots, reads back the
+     * committed metadata, and checks the restored KV views for expiry, on a share of the server's
+     * IO pool apart from the index checkpoints.
+     */
+    Executor changeLists() {
+        return changeLists;
     }
 
     /** Runs timers, which only post work to owners and pools. */
@@ -258,7 +274,7 @@ public final class DerivedDvRuntime {
      * Registers each pool's or share's queued and active tasks as gauges {@code queued} and {@code
      * active}, in the group {@code dvPool} of {@code group} with the variable {@code pool}:
      * request, state, resolver (the key lookups), advance (planning and switch loads), rebuild,
-     * checkpoint, and scheduler.
+     * checkpoint, change-list, and scheduler.
      */
     public void registerMetrics(MetricGroup group) {
         MetricGroup pools = group.addGroup("dvPool");
@@ -270,6 +286,7 @@ public final class DerivedDvRuntime {
         register(pools, "advance", switches::queued, switches::active);
         register(pools, "rebuild", rebuilds.lane()::queued, rebuilds.lane()::active);
         register(pools, "checkpoint", checkpoints::queued, checkpoints::active);
+        register(pools, "change-list", changeLists::queued, changeLists::active);
         register(pools, "scheduler", () -> scheduler.getQueue().size(), scheduler::getActiveCount);
     }
 
@@ -293,6 +310,7 @@ public final class DerivedDvRuntime {
         rebuilds.lane().shutdown();
         indexLoad.shutdown();
         checkpoints.shutdown();
+        changeLists.shutdown();
         if (ownIo != null) {
             ownIo.shutdown();
         }

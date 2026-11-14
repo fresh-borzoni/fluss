@@ -22,6 +22,7 @@ import org.apache.fluss.utils.json.JsonSerdeTestBase;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -41,8 +42,129 @@ class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFi
                     + "\"snapshot_incremental_size\":3},\"log_offset\":10,\"row_count\":1234,"
                     + "\"auto_inc_id_range\":[{\"column_id\":2,\"start\":10000,\"end\":20000}]}";
 
+    // GOLDEN_JSON with the change list of derived deletion vectors, as a DV bucket's leader writes
+    static final String GOLDEN_DV_JSON =
+            GOLDEN_JSON.substring(0, GOLDEN_JSON.length() - 1)
+                    + ",\"dv_change_list\":{\"version\":1,\"from\":4,\"end\":10,"
+                    + "\"valid_from\":2,\"lake_snapshot_id\":42,\"entries\":5,\"segments\":["
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/dvcl-a\",\"size\":30},"
+                    + "\"local_path\":\"dvcl-a\",\"from\":4,\"end\":8,\"entries\":3},"
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/dvcl-b\",\"size\":20},"
+                    + "\"local_path\":\"dvcl-b\",\"from\":8,\"end\":10,\"entries\":2}]}}";
+
     KvSnapshotFileMetadataJsonSerdeTest() {
         super(KvSnapshotFileMetadataJsonSerde.INSTANCE);
+    }
+
+    @Test
+    void testOldFormatHasNoDvChangeList() {
+        KvSnapshotFileMetadata metadata =
+                KvSnapshotFileMetadataJsonSerde.fromJson(
+                        GOLDEN_JSON.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(metadata.getDvChangeList()).isNull();
+        assertThat(metadata).isEqualTo(createObjects()[0]);
+    }
+
+    @Test
+    void testDvChangeListLeavesTheSnapshotAsItIs() {
+        // a reader that does not use the change list sees the same snapshot with or without it
+        KvSnapshotFileMetadata with =
+                KvSnapshotFileMetadataJsonSerde.fromJson(
+                        GOLDEN_DV_JSON.getBytes(StandardCharsets.UTF_8));
+        KvSnapshotFileMetadata without = createObjects()[0];
+
+        assertThat(withoutDvChangeList(with)).isEqualTo(without);
+        assertThat(with.getDvChangeList()).isEqualTo(dvChangeList());
+    }
+
+    @Test
+    void testDvChangeListRoundTrip() {
+        KvSnapshotFileMetadata metadata = withDvChangeList(createObjects()[0], dvChangeList());
+
+        String json =
+                new String(
+                        KvSnapshotFileMetadataJsonSerde.toJson(metadata), StandardCharsets.UTF_8);
+
+        assertThat(json).isEqualTo(GOLDEN_DV_JSON);
+        assertThat(KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8)))
+                .isEqualTo(metadata);
+    }
+
+    @Test
+    void testUnknownDvChangeListVersionKeepsTheSnapshot() {
+        // a newer change list: the snapshot stays readable, the change list is not used or written
+        String json =
+                GOLDEN_JSON.substring(0, GOLDEN_JSON.length() - 1)
+                        + ",\"dv_change_list\":{\"version\":2,\"something\":[1,2]}}";
+
+        KvSnapshotFileMetadata metadata =
+                KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(withoutDvChangeList(metadata)).isEqualTo(createObjects()[0]);
+        assertThat(metadata.getDvChangeList()).isNotNull();
+        assertThat(metadata.getDvChangeList().isSupported()).isFalse();
+        assertThat(metadata.getDvChangeList().getVersion()).isEqualTo(2);
+        assertThat(metadata.getDvChangeList().getSegments()).isEmpty();
+        assertThat(
+                        new String(
+                                KvSnapshotFileMetadataJsonSerde.toJson(metadata),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(GOLDEN_JSON);
+    }
+
+    @Test
+    void testDvChangeListWithoutVersionIsUnsupported() {
+        String json =
+                GOLDEN_DV_JSON.replace(
+                        "\"dv_change_list\":{\"version\":1,", "\"dv_change_list\":{");
+
+        KvSnapshotFileMetadata metadata =
+                KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(metadata.getDvChangeList().isSupported()).isFalse();
+        assertThat(metadata.getDvChangeList().getVersion()).isEqualTo(-1);
+    }
+
+    static KvSnapshotFileMetadata.DvChangeList dvChangeList() {
+        return new KvSnapshotFileMetadata.DvChangeList(
+                4,
+                10,
+                2,
+                42,
+                5,
+                Arrays.asList(
+                        new KvSnapshotFileMetadata.DvChangeListSegment(
+                                new KvSnapshotFileMetadata.FileHandle(
+                                        "oss://bucket/snapshot/shared/dvcl-a", 30, "dvcl-a"),
+                                4,
+                                8,
+                                3),
+                        new KvSnapshotFileMetadata.DvChangeListSegment(
+                                new KvSnapshotFileMetadata.FileHandle(
+                                        "oss://bucket/snapshot/shared/dvcl-b", 20, "dvcl-b"),
+                                8,
+                                10,
+                                2)));
+    }
+
+    private static KvSnapshotFileMetadata withDvChangeList(
+            KvSnapshotFileMetadata m, KvSnapshotFileMetadata.DvChangeList dvChangeList) {
+        return new KvSnapshotFileMetadata(
+                m.getTableBucket(),
+                m.getSnapshotId(),
+                m.getSnapshotLocation(),
+                m.getSharedFiles(),
+                m.getPrivateFiles(),
+                m.getIncrementalSize(),
+                m.getLogOffset(),
+                m.getRowCount(),
+                m.getAutoIncrementRanges(),
+                dvChangeList);
+    }
+
+    private static KvSnapshotFileMetadata withoutDvChangeList(KvSnapshotFileMetadata m) {
+        return withDvChangeList(m, null);
     }
 
     @Test

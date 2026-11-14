@@ -2647,6 +2647,21 @@ public class ConfigOptions {
                                     + "from the keys of its lake files and the log. A split that "
                                     + "started keeps the masks it fetched.");
 
+    public static final ConfigOption<Boolean> KV_DELETION_VECTORS_CHANGE_LIST_CHECKPOINT_ENABLED =
+            key("kv.deletion-vectors.change-list-checkpoint.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "For tables with deletion vectors enabled and without row TTL: whether "
+                                    + "a bucket's leader saves its change list with each KV "
+                                    + "snapshot, and whether a new leader uses the change list of "
+                                    + "the KV snapshot it restores. A new leader then replays the "
+                                    + "log only from the KV snapshot's offset instead of from the "
+                                    + "readable snapshot's, so its rebuild grows with "
+                                    + "'kv.snapshot.interval' rather than with the tiering lag. "
+                                    + "When off, or when the KV snapshot has no change list, the "
+                                    + "leader replays the log from the readable snapshot.");
+
     public static final ConfigOption<Integer> KV_SNAPSHOT_SCHEDULER_THREAD_NUM =
             key("kv.snapshot.scheduler-thread-num")
                     .intType()

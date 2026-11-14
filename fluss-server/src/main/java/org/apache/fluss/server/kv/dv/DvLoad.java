@@ -516,6 +516,8 @@ abstract class DvLoad implements Closeable {
         private int from;
         @Nullable private PositionIndexStore.Checkpoint checkpoint;
         @Nullable private DerivedDvRebuildLimiter slots;
+        // how the replay starts: from the change list the new leader restored, or not
+        private final DvCheckpointReplay replayStart = new DvCheckpointReplay(m);
         private String identity;
         @Nullable private Exception replayFailure;
         @Nullable private Exception ingestFailure;
@@ -629,13 +631,13 @@ abstract class DvLoad implements Closeable {
             downloadNanos = System.nanoTime() - downloadStart;
             // DvReplay into a queue: the local log can run past the high watermark, and a change
             // above it must not mask a version below it.
-            replay = DvReplay.start(m, src, readableOffset, this::stopped);
+            replay = replayStart.start(src, readableOffset, this::stopped);
             if (replay == null) {
                 return false;
             }
-            long replayStart = System.nanoTime();
+            long replayStartNanos = System.nanoTime();
             replayFailure = replay.replayEarlyPasses();
-            replayEarlyNanos = System.nanoTime() - replayStart;
+            replayEarlyNanos = System.nanoTime() - replayStartNanos;
             identity = src.snapshotIdentity(chain.get(upTo));
             // The index is loaded off the owner, as a switch ingests, so writes go on. It is
             // cleared first: what the bucket covered may hold keys the snapshot deleted, which
@@ -755,7 +757,7 @@ abstract class DvLoad implements Closeable {
                             + " replay_ms={} total_ms={} versions_spilled={} tail_changes={}"
                             + " queued={} index_changes={} ssts={} checkpoint={} download_ms={}"
                             + " ingest_ms={} replay_locked_ms={} install_ms={} lock_ms={}"
-                            + " slot_wait_ms={} one_call_ssts={} compact_ms={}",
+                            + " slot_wait_ms={} one_call_ssts={} compact_ms={} {}",
                     m.logName,
                     snapshotId,
                     readableOffset,
@@ -777,7 +779,8 @@ abstract class DvLoad implements Closeable {
                     ms(end - swapStart),
                     ms(slotWaitNanos),
                     oneCallSsts,
-                    compactNanos < 0 ? -1 : ms(compactNanos));
+                    compactNanos < 0 ? -1 : ms(compactNanos),
+                    replayStart.logFields(r));
             return true;
         }
 

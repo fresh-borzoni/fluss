@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -41,6 +42,7 @@ public final class TestingDvHooks implements DvTestHooks {
     @Nullable private volatile Runnable beforeReadyServe;
     @Nullable private volatile Runnable faultInNextDrain;
     @Nullable private volatile IOException changeListWriteFailure;
+    private final AtomicInteger changeListWritesFailed = new AtomicInteger();
 
     /** Holds the rebuilds and replays until {@code gate} counts down; none if null. */
     public void holdRebuilds(@Nullable CountDownLatch gate) {
@@ -93,6 +95,11 @@ public final class TestingDvHooks implements DvTestHooks {
     /** Makes the writes of the change list fail, as a full or broken disk does; none if null. */
     public void failChangeListWrites(@Nullable IOException failure) {
         this.changeListWriteFailure = failure;
+    }
+
+    /** The writes of the change list {@link #failChangeListWrites} failed so far. */
+    public int changeListWritesFailed() {
+        return changeListWritesFailed.get();
     }
 
     @Override
@@ -174,6 +181,7 @@ public final class TestingDvHooks implements DvTestHooks {
     public void beforeChangeListWrite() throws IOException {
         IOException failure = changeListWriteFailure;
         if (failure != null) {
+            changeListWritesFailed.incrementAndGet();
             throw failure;
         }
     }

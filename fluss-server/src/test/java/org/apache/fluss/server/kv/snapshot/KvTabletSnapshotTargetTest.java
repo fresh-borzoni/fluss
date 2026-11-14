@@ -66,6 +66,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -351,6 +352,171 @@ class KvTabletSnapshotTargetTest {
         assertThat(remoteKvCopyBytes.getCount())
                 .isEqualTo(uploadedBytes.get())
                 .isGreaterThan(bytesAfterFailedCommit);
+    }
+
+    @Test
+    void testChangeListIsSavedWithTheSnapshot(@TempDir Path kvTabletDir) throws Exception {
+        AtomicBoolean shouldFail = new AtomicBoolean(true);
+        CompletedSnapshotHandleStore completedSnapshotHandleStore =
+                TestCompletedSnapshotHandleStore.newBuilder()
+                        .setAddFunction(
+                                (snapshot) -> {
+                                    if (shouldFail.get()) {
+                                        throw new FlussException("refused");
+                                    }
+                                    return null;
+                                })
+                        .build();
+        FsPath remoteKvTabletDir = FsPath.fromLocalFile(kvTabletDir.toFile());
+        KvTabletSnapshotTarget kvTabletSnapshotTarget =
+                createSnapshotTarget(remoteKvTabletDir, completedSnapshotHandleStore);
+        FakeChangeLists changeLists = new FakeChangeLists();
+        kvTabletSnapshotTarget.setDvChangeListCheckpoints(changeLists);
+        periodicSnapshotManager = createSnapshotManager(kvTabletSnapshotTarget);
+        periodicSnapshotManager.start();
+        TestRocksIncrementalSnapshot rocksIncrementalSnapshot =
+                (TestRocksIncrementalSnapshot) kvTabletSnapshotTarget.getRocksIncrementalSnapshot();
+        rocksDBExtension.getRocksDb().put("key".getBytes(), "val".getBytes());
+
+        // snapshot 1 is not committed: its change list's new segment goes with it
+        periodicSnapshotManager.triggerSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(rocksIncrementalSnapshot.abortedSnapshots).contains(1L));
+        retry(Duration.ofMinutes(1), () -> assertThat(changeLists.aborted.get()).isEqualTo(1));
+        assertThat(changeLists.prepared).containsExactly("1@1");
+        assertThat(changeLists.committed).isEmpty();
+        File failedSegment = localFile(changeLists.lastSegment);
+        retry(Duration.ofMinutes(1), () -> assertThat(failedSegment).doesNotExist());
+
+        // snapshot 2 is committed with its change list, written after the kv files
+        shouldFail.set(false);
+        logOffsetGenerator.set(5);
+        periodicSnapshotManager.triggerSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(rocksIncrementalSnapshot.completedSnapshots).contains(2L));
+
+        assertThat(changeLists.prepared).containsExactly("1@1", "2@5");
+        // the committed metadata holds the change list
+        assertThat(changeLists.committed).containsExactly(true);
+        assertThat(changeLists.aborted.get()).isEqualTo(1);
+        assertThat(localFile(changeLists.lastSegment)).exists();
+        DvChangeListHandle saved = changeLists.written;
+        assertThat(saved.end()).isEqualTo(5);
+        assertThat(saved.segments().get(0).file().getKvFileHandle().getFilePath())
+                .isEqualTo(changeLists.lastSegment);
+    }
+
+    @Test
+    void testChangeListTheCoordinatorDropsIsReported(@TempDir Path kvTabletDir) throws Exception {
+        // a coordinator that does not know the change list's field writes the metadata without it
+        CompletedSnapshotStore store =
+                new CompletedSnapshotStore(
+                        1,
+                        new SharedKvFileRegistry(),
+                        Collections.emptyList(),
+                        TestCompletedSnapshotHandleStore.newBuilder().build(),
+                        directExecutor(),
+                        (consumeKvSnapshotForBucket) -> false);
+        CompletedKvSnapshotCommitter oldCoordinator =
+                (snapshot, coordinatorEpoch, bucketLeaderEpoch) ->
+                        store.add(
+                                new CompletedSnapshot(
+                                        snapshot.getTableBucket(),
+                                        snapshot.getSnapshotID(),
+                                        snapshot.getSnapshotLocation(),
+                                        snapshot.getKvSnapshotHandle().withDvChangeList(null),
+                                        snapshot.getLogOffset(),
+                                        snapshot.getRowCount(),
+                                        snapshot.getAutoIncIDRanges()));
+        KvTabletSnapshotTarget kvTabletSnapshotTarget =
+                createSnapshotTargetWithCustomCommitter(
+                        FsPath.fromLocalFile(kvTabletDir.toFile()), oldCoordinator);
+        FakeChangeLists changeLists = new FakeChangeLists();
+        kvTabletSnapshotTarget.setDvChangeListCheckpoints(changeLists);
+        periodicSnapshotManager = createSnapshotManager(kvTabletSnapshotTarget);
+        periodicSnapshotManager.start();
+        TestRocksIncrementalSnapshot rocksIncrementalSnapshot =
+                (TestRocksIncrementalSnapshot) kvTabletSnapshotTarget.getRocksIncrementalSnapshot();
+        rocksDBExtension.getRocksDb().put("key".getBytes(), "val".getBytes());
+
+        periodicSnapshotManager.triggerSnapshot();
+        retry(
+                Duration.ofMinutes(1),
+                () -> assertThat(rocksIncrementalSnapshot.completedSnapshots).contains(1L));
+
+        // the snapshot is committed, but its metadata lacks the change list attached to it
+        assertThat(changeLists.written).isNotNull();
+        assertThat(changeLists.committed).containsExactly(false);
+        assertThat(changeLists.aborted.get()).isZero();
+    }
+
+    private static File localFile(String path) {
+        return new File(new FsPath(path).toUri().getPath());
+    }
+
+    /** Saves a one-segment change list of a few bytes into the snapshot's shared directory. */
+    private static final class FakeChangeLists implements DvChangeListCheckpoints {
+        final java.util.List<String> prepared = new java.util.concurrent.CopyOnWriteArrayList<>();
+        // whether each committed snapshot's metadata held its change list
+        final java.util.List<Boolean> committed = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final AtomicInteger aborted = new AtomicInteger();
+        volatile String lastSegment;
+        volatile DvChangeListHandle written;
+
+        @Override
+        public Checkpoint prepare(long kvSnapshotId, long logOffset, SnapshotLocation location) {
+            prepared.add(kvSnapshotId + "@" + logOffset);
+            return new Checkpoint() {
+                @Override
+                public DvChangeListHandle attach() {
+                    try {
+                        SnapshotLocation.FsSnapshotOutputStream out =
+                                location.createSnapshotOutputStream(SnapshotFileScope.SHARED);
+                        out.write(new byte[] {1, 2, 3});
+                        KvFileHandle file = out.closeAndGetHandle();
+                        lastSegment = file.getFilePath();
+                        written =
+                                new DvChangeListHandle(
+                                        0,
+                                        logOffset,
+                                        0,
+                                        -1,
+                                        1,
+                                        Collections.singletonList(
+                                                new DvChangeListHandle.Segment(
+                                                        KvFileHandleAndLocalPath.of(file, "seg"),
+                                                        0,
+                                                        logOffset,
+                                                        1)));
+                        return written;
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                }
+
+                @Override
+                public void committed(Callable<Boolean> changeListKept) {
+                    // the change list reads it back off the snapshot's thread; here, at once
+                    try {
+                        committed.add(changeListKept.call());
+                    } catch (Exception e) {
+                        throw new AssertionError("the committed metadata is readable", e);
+                    }
+                }
+
+                @Override
+                public void aborted() {
+                    aborted.incrementAndGet();
+                }
+
+                @Override
+                public void uncertain() {
+                    throw new AssertionError("the outcome is known");
+                }
+            };
+        }
     }
 
     @Test
