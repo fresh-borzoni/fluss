@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.BooleanSupplier;
 
+import static org.apache.fluss.server.kv.dv.DvChangeListStore.MISSING;
+
 /**
  * A log replay into a fresh change list in the bucket's RocksDB, which readers see only once it is
  * installed. Each batch it writes takes a lease of the RocksDB of its own.
@@ -50,6 +52,15 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
 
     private static final Logger LOG = LoggerFactory.getLogger(DvReplay.class);
 
+    /**
+     * The version offsets keys had where a replay resumes after a change-list checkpoint: the KV
+     * restored from the KV snapshot at that offset.
+     */
+    interface BaseVersions {
+        /** The version offset of each key, or -1 if the key had no value. */
+        long[] versionsAt(List<byte[]> keys) throws IOException;
+    }
+
     // A replay makes another pass before its final pass while the log end is more than this
     // many offsets ahead. This keeps the final pass, whose drained changes the owner buffers,
     // short.
@@ -64,6 +75,21 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
     private final BooleanSupplier stopped;
     private final RecoverySource src;
     private final long startOffset;
+    // where the replay started reading the log: the start offset, or the end of a change-list
+    // checkpoint loaded into the change list first
+    final long resumedAt;
+    // names a key's version where the replay resumed, for keys it has not replayed; null: such a
+    // key's superseded version is before the start offset
+    @Nullable private final BaseVersions base;
+    // keys named from the base, and the time it took, for the rebuild's log line
+    long baseReads;
+    long baseNanos;
+    // runs once the change list is installed, an owner step
+    @Nullable Runnable onInstall;
+    // runs when the base cannot be read, before the replay fails: the base is not used again
+    @Nullable Runnable onBaseFailure;
+    // runs once the replay ends, installed or not
+    @Nullable Runnable onFinish;
     final DvChangeList tail;
     // The last version of each key replayed, to name the version a replayed change
     // supersedes, as the log does not. In memory until the budget asks the replay to spill;
@@ -90,14 +116,22 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
     long changes;
 
     private DvReplay(
-            DvOwner m, RecoverySource src, long startOffset, long listId, BooleanSupplier stopped) {
+            DvOwner m,
+            RecoverySource src,
+            long startOffset,
+            long resumeAt,
+            @Nullable BaseVersions base,
+            long listId,
+            BooleanSupplier stopped) {
         this.m = m;
         this.stopped = stopped;
         this.src = src;
         this.startOffset = startOffset;
-        this.tail = new DvChangeList(m.db.changeListStore(), listId, m.testHooks);
-        this.next = startOffset;
-        reportBacklog(startOffset);
+        this.resumedAt = resumeAt;
+        this.base = base;
+        this.tail = new DvChangeList(m.db.changeListStore(), listId, startOffset, m.testHooks);
+        this.next = resumeAt;
+        reportBacklog(resumeAt);
         m.rebuild.replaying = this;
     }
 
@@ -108,10 +142,27 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
     @Nullable
     static DvReplay start(
             DvOwner m, RecoverySource src, long startOffset, BooleanSupplier stopped) {
+        return start(m, src, startOffset, startOffset, null, stopped);
+    }
+
+    /**
+     * Starts a replay of the change list from {@code startOffset} that reads the log from {@code
+     * resumeAt}: the changes before it are loaded from a change-list checkpoint, and {@code base}
+     * names the version a key had at {@code resumeAt}. Returns null if the load stopped already.
+     */
+    @Nullable
+    static DvReplay start(
+            DvOwner m,
+            RecoverySource src,
+            long startOffset,
+            long resumeAt,
+            @Nullable BaseVersions base,
+            BooleanSupplier stopped) {
         if (stopped.getAsBoolean()) {
             return null;
         }
-        return new DvReplay(m, src, startOffset, m.tailIds.incrementAndGet(), stopped);
+        return new DvReplay(
+                m, src, startOffset, resumeAt, base, m.tailIds.incrementAndGet(), stopped);
     }
 
     /** Whether the replay's load stops: the bucket closes, or a fault stopped the load. */
@@ -163,11 +214,12 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
         // looked up there. So the replay names an expired version in the log exactly, which
         // the write path cannot: its KV value is gone.
         boolean supersedesNothing = insert && !m.rowTtl;
-        if (versionsId >= 0 || m.rebuild.spillReplayVersions) {
-            if (versionsId < 0) {
+        if (versionsId >= 0 || m.rebuild.spillReplayVersions || base != null) {
+            if (versionsId < 0 && m.rebuild.spillReplayVersions) {
                 spillVersions();
             }
-            // the map is on disk: the superseded versions are named a batch at a time
+            // the map is on disk, or keys it lacks are named from the base: the superseded
+            // versions are named a batch at a time
             unversioned.add(new DvEntry(key, recordOffset, versionOffset, supersedesNothing, -1));
             if (unversioned.size() >= REPLAY_APPLY_BATCH) {
                 nameVersions();
@@ -192,8 +244,9 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
     }
 
     /**
-     * Names the version each waiting change supersedes from the spilled map, reading the changes'
-     * keys in one lookup and writing their new last versions back together.
+     * Names the version each waiting change supersedes from the map of last versions, on disk or on
+     * the heap, reading the changes' keys in one lookup and writing their new last versions back
+     * together. A key the map lacks is named from the base, if any, else as before the start.
      */
     private void nameVersions() {
         if (unversioned.isEmpty()) {
@@ -205,13 +258,17 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
             Map<ByteBuffer, Long> last = new HashMap<>();
             List<byte[]> distinct = new ArrayList<>();
             for (DvEntry e : unversioned) {
-                if (last.putIfAbsent(ByteBuffer.wrap(e.getKey()), -1L) == null) {
+                if (last.putIfAbsent(ByteBuffer.wrap(e.getKey()), MISSING) == null) {
                     distinct.add(e.getKey());
                 }
             }
-            long[] read = m.db.changeListStore().getVersions(versionsId, distinct);
+            long[] read =
+                    versionsId >= 0
+                            ? m.db.changeListStore().getVersions(versionsId, distinct)
+                            : heapVersions(distinct);
+            long[] based = baseVersions(distinct, read);
             for (int i = 0; i < distinct.size(); i++) {
-                last.put(ByteBuffer.wrap(distinct.get(i)), read[i]);
+                last.put(ByteBuffer.wrap(distinct.get(i)), read[i] == MISSING ? based[i] : read[i]);
             }
             named = new ArrayList<>(unversioned.size());
             for (DvEntry e : unversioned) {
@@ -224,7 +281,11 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
                                 e.isInsert(),
                                 last.put(k, e.getVersionOffset())));
             }
-            putVersions(last);
+            if (versionsId >= 0) {
+                putVersions(last);
+            } else {
+                putHeapVersions(last);
+            }
             unversioned.clear();
         } catch (IOException e) {
             throw new TailDiskException(e);
@@ -234,6 +295,66 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
         for (DvEntry e : named) {
             enqueue(e);
         }
+    }
+
+    /** The heap map's last versions of {@code keys}, {@link #MISSING} for those it lacks. */
+    private long[] heapVersions(List<byte[]> keys) {
+        long[] out = new long[keys.size()];
+        for (int i = 0; i < out.length; i++) {
+            Long v = lastVersions.get(ByteBuffer.wrap(keys.get(i)));
+            out[i] = v == null ? MISSING : v;
+        }
+        return out;
+    }
+
+    private void putHeapVersions(Map<ByteBuffer, Long> versions) {
+        for (Map.Entry<ByteBuffer, Long> e : versions.entrySet()) {
+            if (lastVersions.put(e.getKey(), e.getValue()) == null) {
+                lastVersionBytes += 112 + ((16 + e.getKey().capacity() + 7) & ~7L);
+            }
+        }
+    }
+
+    /**
+     * The base's versions of the keys the map lacks ({@code read} is {@link #MISSING}), aligned
+     * with {@code keys}; -1 for all of them without a base.
+     */
+    private long[] baseVersions(List<byte[]> keys, long[] read) {
+        long[] out = new long[keys.size()];
+        java.util.Arrays.fill(out, -1);
+        if (base == null) {
+            return out;
+        }
+        List<byte[]> unseen = new ArrayList<>();
+        for (int i = 0; i < read.length; i++) {
+            if (read[i] == MISSING) {
+                unseen.add(keys.get(i));
+            }
+        }
+        if (unseen.isEmpty()) {
+            return out;
+        }
+        long start = System.nanoTime();
+        long[] versions;
+        try {
+            versions = base.versionsAt(unseen);
+        } catch (IOException e) {
+            // The load fails as for a disk failure, retriable after a backoff, and its retry
+            // replays without the view, which this releases.
+            Runnable hook = onBaseFailure;
+            if (hook != null) {
+                hook.run();
+            }
+            throw new TailDiskException(e);
+        }
+        baseNanos += System.nanoTime() - start;
+        baseReads += unseen.size();
+        for (int i = 0, j = 0; i < read.length; i++) {
+            if (read[i] == MISSING) {
+                out[i] = versions[j++];
+            }
+        }
+        return out;
     }
 
     private void putVersions(Map<ByteBuffer, Long> versions) throws IOException {
@@ -364,10 +485,19 @@ final class DvReplay implements ChangeConsumer, DerivedDvHeapBudget.Owner {
         buffered.clear();
         m.maskState.installTail(tail, next);
         installed = true;
+        Runnable hook = onInstall;
+        if (hook != null) {
+            hook.run();
+        }
     }
 
     /** Ends the replay: drops its change list unless installed, and its map of versions. */
     void finish() {
+        Runnable finished = onFinish;
+        onFinish = null;
+        if (finished != null) {
+            finished.run();
+        }
         m.metrics.replayBacklogChanged(-reportedBacklog);
         reportedBacklog = 0;
         m.heapBudget.remove(this);

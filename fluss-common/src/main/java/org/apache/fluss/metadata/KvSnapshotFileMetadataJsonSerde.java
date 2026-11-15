@@ -63,14 +63,23 @@ public final class KvSnapshotFileMetadataJsonSerde
     private static final String AUTO_INC_COLUMN_ID = "column_id";
     private static final String AUTO_INC_ID_START = "start";
     private static final String AUTO_INC_ID_END = "end";
-    // With deletion vectors and row TTL, what the leader saved of its TTL filter: optional. Readers
-    // that do not know it ignore it, as they read named fields only, so the metadata stays at
-    // version 1.
+    // The change list of derived deletion vectors: optional, with its own version. Readers that do
+    // not know it ignore it, as they read named fields only, so the metadata stays at version 1.
+    private static final String DV_CHANGE_LIST = "dv_change_list";
+    // With deletion vectors and row TTL, what the leader saved of its TTL filter: optional, read
+    // by name like the change list.
     private static final String TTL_CAPPED_FROM = "ttl_capped_from";
     private static final String TTL_SLICES = "ttl_slices";
     private static final String TTL_SLICES_FROM = "from";
     private static final String TTL_SLICES_ENDS = "ends";
     private static final String TTL_SLICES_MINS = "mins";
+    private static final String DV_VERSION = "version";
+    private static final String DV_FROM = "from";
+    private static final String DV_END = "end";
+    private static final String DV_VALID_FROM = "valid_from";
+    private static final String DV_LAKE_SNAPSHOT_ID = "lake_snapshot_id";
+    private static final String DV_ENTRIES = "entries";
+    private static final String DV_SEGMENTS = "segments";
 
     private KvSnapshotFileMetadataJsonSerde() {}
 
@@ -115,6 +124,10 @@ public final class KvSnapshotFileMetadataJsonSerde
                 generator.writeEndObject();
             }
             generator.writeEndArray();
+        }
+        KvSnapshotFileMetadata.DvChangeList dvChangeList = metadata.getDvChangeList();
+        if (dvChangeList != null && dvChangeList.isSupported()) {
+            serializeDvChangeList(generator, dvChangeList);
         }
         KvSnapshotFileMetadata.RowTtl rowTtl = metadata.getRowTtl();
         if (rowTtl != null) {
@@ -176,6 +189,7 @@ public final class KvSnapshotFileMetadataJsonSerde
                 node.get(LOG_OFFSET).asLong(),
                 rowCount,
                 ranges,
+                node.has(DV_CHANGE_LIST) ? deserializeDvChangeList(node.get(DV_CHANGE_LIST)) : null,
                 deserializeRowTtl(node));
     }
 
@@ -220,32 +234,95 @@ public final class KvSnapshotFileMetadataJsonSerde
             throws IOException {
         for (KvSnapshotFileMetadata.FileHandle fileHandle : fileHandles) {
             generator.writeStartObject();
-            generator.writeObjectFieldStart(KV_FILE_HANDLE);
-            generator.writeStringField(KV_FILE_PATH, fileHandle.getPath());
-            generator.writeNumberField(KV_FILE_SIZE, fileHandle.getSize());
-            if (fileHandle.getSha256() != null) {
-                generator.writeStringField(KV_FILE_SHA256, fileHandle.getSha256());
-            }
-            generator.writeEndObject();
-            generator.writeStringField(KV_FILE_LOCAL_PATH, fileHandle.getLocalPath());
+            serializeFileHandleFields(generator, fileHandle);
             generator.writeEndObject();
         }
+    }
+
+    private static void serializeFileHandleFields(
+            JsonGenerator generator, KvSnapshotFileMetadata.FileHandle fileHandle)
+            throws IOException {
+        generator.writeObjectFieldStart(KV_FILE_HANDLE);
+        generator.writeStringField(KV_FILE_PATH, fileHandle.getPath());
+        generator.writeNumberField(KV_FILE_SIZE, fileHandle.getSize());
+        if (fileHandle.getSha256() != null) {
+            generator.writeStringField(KV_FILE_SHA256, fileHandle.getSha256());
+        }
+        generator.writeEndObject();
+        generator.writeStringField(KV_FILE_LOCAL_PATH, fileHandle.getLocalPath());
+    }
+
+    private static void serializeDvChangeList(
+            JsonGenerator generator, KvSnapshotFileMetadata.DvChangeList dvChangeList)
+            throws IOException {
+        generator.writeObjectFieldStart(DV_CHANGE_LIST);
+        generator.writeNumberField(DV_VERSION, dvChangeList.getVersion());
+        generator.writeNumberField(DV_FROM, dvChangeList.getFrom());
+        generator.writeNumberField(DV_END, dvChangeList.getEnd());
+        generator.writeNumberField(DV_VALID_FROM, dvChangeList.getValidFrom());
+        generator.writeNumberField(DV_LAKE_SNAPSHOT_ID, dvChangeList.getLakeSnapshotId());
+        generator.writeNumberField(DV_ENTRIES, dvChangeList.getEntries());
+        generator.writeArrayFieldStart(DV_SEGMENTS);
+        for (KvSnapshotFileMetadata.DvChangeListSegment segment : dvChangeList.getSegments()) {
+            generator.writeStartObject();
+            serializeFileHandleFields(generator, segment.getFile());
+            generator.writeNumberField(DV_FROM, segment.getFrom());
+            generator.writeNumberField(DV_END, segment.getEnd());
+            generator.writeNumberField(DV_ENTRIES, segment.getEntries());
+            generator.writeEndObject();
+        }
+        generator.writeEndArray();
+        generator.writeEndObject();
+    }
+
+    /**
+     * Reads the change list of derived deletion vectors. One of a version this build does not know
+     * is kept as unsupported, without its files: the snapshot stays readable.
+     */
+    private static KvSnapshotFileMetadata.DvChangeList deserializeDvChangeList(JsonNode node) {
+        JsonNode versionNode = node.get(DV_VERSION);
+        int version =
+                versionNode != null
+                                && versionNode.isIntegralNumber()
+                                && versionNode.canConvertToInt()
+                        ? versionNode.intValue()
+                        : -1;
+        if (version != KvSnapshotFileMetadata.DvChangeList.VERSION) {
+            return KvSnapshotFileMetadata.DvChangeList.unsupported(version);
+        }
+        List<KvSnapshotFileMetadata.DvChangeListSegment> segments = new ArrayList<>();
+        for (JsonNode segmentNode : node.get(DV_SEGMENTS)) {
+            segments.add(
+                    new KvSnapshotFileMetadata.DvChangeListSegment(
+                            deserializeFileHandle(segmentNode),
+                            segmentNode.get(DV_FROM).asLong(),
+                            segmentNode.get(DV_END).asLong(),
+                            segmentNode.get(DV_ENTRIES).asLong()));
+        }
+        return new KvSnapshotFileMetadata.DvChangeList(
+                node.get(DV_FROM).asLong(),
+                node.get(DV_END).asLong(),
+                node.get(DV_VALID_FROM).asLong(),
+                node.get(DV_LAKE_SNAPSHOT_ID).asLong(),
+                node.get(DV_ENTRIES).asLong(),
+                segments);
     }
 
     private static List<KvSnapshotFileMetadata.FileHandle> deserializeFileHandles(
             JsonNode snapshotHandle, String fieldName) {
         List<KvSnapshotFileMetadata.FileHandle> fileHandles = new ArrayList<>();
         for (JsonNode fileNode : snapshotHandle.get(fieldName)) {
-            JsonNode handleNode = fileNode.get(KV_FILE_HANDLE);
-            fileHandles.add(
-                    new KvSnapshotFileMetadata.FileHandle(
-                            handleNode.get(KV_FILE_PATH).asText(),
-                            handleNode.get(KV_FILE_SIZE).asLong(),
-                            fileNode.get(KV_FILE_LOCAL_PATH).asText(),
-                            handleNode.has(KV_FILE_SHA256)
-                                    ? handleNode.get(KV_FILE_SHA256).asText()
-                                    : null));
+            fileHandles.add(deserializeFileHandle(fileNode));
         }
         return fileHandles;
+    }
+
+    private static KvSnapshotFileMetadata.FileHandle deserializeFileHandle(JsonNode fileNode) {
+        JsonNode handleNode = fileNode.get(KV_FILE_HANDLE);
+        return new KvSnapshotFileMetadata.FileHandle(
+                handleNode.get(KV_FILE_PATH).asText(),
+                handleNode.get(KV_FILE_SIZE).asLong(),
+                fileNode.get(KV_FILE_LOCAL_PATH).asText(),
+                handleNode.has(KV_FILE_SHA256) ? handleNode.get(KV_FILE_SHA256).asText() : null);
     }
 }

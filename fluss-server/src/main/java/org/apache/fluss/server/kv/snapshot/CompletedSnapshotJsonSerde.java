@@ -85,6 +85,7 @@ public class CompletedSnapshotJsonSerde
                 completedSnapshot.getLogOffset(),
                 completedSnapshot.getRowCount(),
                 ranges,
+                toFileMetadata(snapshotHandle.getDvChangeList()),
                 toFileMetadata(snapshotHandle.getRowTtl()));
     }
 
@@ -107,6 +108,7 @@ public class CompletedSnapshotJsonSerde
                         toServerFileHandles(metadata.getSharedFiles()),
                         toServerFileHandles(metadata.getPrivateFiles()),
                         metadata.getIncrementalSize(),
+                        toServerHandle(metadata.getDvChangeList()),
                         toServerState(metadata.getRowTtl())),
                 metadata.getLogOffset(),
                 metadata.getRowCount(),
@@ -117,29 +119,37 @@ public class CompletedSnapshotJsonSerde
             List<KvFileHandleAndLocalPath> serverHandles) {
         List<KvSnapshotFileMetadata.FileHandle> handles = new ArrayList<>(serverHandles.size());
         for (KvFileHandleAndLocalPath serverHandle : serverHandles) {
-            handles.add(
-                    new KvSnapshotFileMetadata.FileHandle(
-                            serverHandle.getKvFileHandle().getFilePath(),
-                            serverHandle.getKvFileHandle().getSize(),
-                            serverHandle.getLocalPath(),
-                            serverHandle.getKvFileHandle().getSha256()));
+            handles.add(toFileHandle(serverHandle));
         }
         return handles;
+    }
+
+    private static KvSnapshotFileMetadata.FileHandle toFileHandle(
+            KvFileHandleAndLocalPath serverHandle) {
+        return new KvSnapshotFileMetadata.FileHandle(
+                serverHandle.getKvFileHandle().getFilePath(),
+                serverHandle.getKvFileHandle().getSize(),
+                serverHandle.getLocalPath(),
+                serverHandle.getKvFileHandle().getSha256());
     }
 
     private static List<KvFileHandleAndLocalPath> toServerFileHandles(
             List<KvSnapshotFileMetadata.FileHandle> metadataHandles) {
         List<KvFileHandleAndLocalPath> handles = new ArrayList<>(metadataHandles.size());
         for (KvSnapshotFileMetadata.FileHandle metadataHandle : metadataHandles) {
-            handles.add(
-                    KvFileHandleAndLocalPath.of(
-                            new KvFileHandle(
-                                    metadataHandle.getPath(),
-                                    metadataHandle.getSize(),
-                                    metadataHandle.getSha256()),
-                            metadataHandle.getLocalPath()));
+            handles.add(toServerFileHandle(metadataHandle));
         }
         return handles;
+    }
+
+    private static KvFileHandleAndLocalPath toServerFileHandle(
+            KvSnapshotFileMetadata.FileHandle metadataHandle) {
+        return KvFileHandleAndLocalPath.of(
+                new KvFileHandle(
+                        metadataHandle.getPath(),
+                        metadataHandle.getSize(),
+                        metadataHandle.getSha256()),
+                metadataHandle.getLocalPath());
     }
 
     @Nullable
@@ -167,5 +177,57 @@ public class CompletedSnapshotJsonSerde
             slices.add(new long[] {rowTtl.getSliceEnds().get(i), rowTtl.getSliceMins().get(i)});
         }
         return new RowTtlFilterState(rowTtl.getCappedFrom(), rowTtl.getSlicesFrom(), slices);
+    }
+
+    /** The change list as metadata; an unsupported one is not written again. */
+    @Nullable
+    private static KvSnapshotFileMetadata.DvChangeList toFileMetadata(
+            @Nullable DvChangeListHandle dvChangeList) {
+        if (dvChangeList == null || !dvChangeList.isSupported()) {
+            return null;
+        }
+        List<KvSnapshotFileMetadata.DvChangeListSegment> segments = new ArrayList<>();
+        for (DvChangeListHandle.Segment segment : dvChangeList.segments()) {
+            segments.add(
+                    new KvSnapshotFileMetadata.DvChangeListSegment(
+                            toFileHandle(segment.file()),
+                            segment.from(),
+                            segment.end(),
+                            segment.entries()));
+        }
+        return new KvSnapshotFileMetadata.DvChangeList(
+                dvChangeList.from(),
+                dvChangeList.end(),
+                dvChangeList.validFrom(),
+                dvChangeList.lakeSnapshotId(),
+                dvChangeList.entries(),
+                segments);
+    }
+
+    @Nullable
+    private static DvChangeListHandle toServerHandle(
+            @Nullable KvSnapshotFileMetadata.DvChangeList dvChangeList) {
+        if (dvChangeList == null) {
+            return null;
+        }
+        if (!dvChangeList.isSupported()) {
+            return DvChangeListHandle.unsupported(dvChangeList.getVersion());
+        }
+        List<DvChangeListHandle.Segment> segments = new ArrayList<>();
+        for (KvSnapshotFileMetadata.DvChangeListSegment segment : dvChangeList.getSegments()) {
+            segments.add(
+                    new DvChangeListHandle.Segment(
+                            toServerFileHandle(segment.getFile()),
+                            segment.getFrom(),
+                            segment.getEnd(),
+                            segment.getEntries()));
+        }
+        return new DvChangeListHandle(
+                dvChangeList.getFrom(),
+                dvChangeList.getEnd(),
+                dvChangeList.getValidFrom(),
+                dvChangeList.getLakeSnapshotId(),
+                dvChangeList.getEntries(),
+                segments);
     }
 }

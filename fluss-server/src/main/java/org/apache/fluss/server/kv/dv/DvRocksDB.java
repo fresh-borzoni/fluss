@@ -91,6 +91,8 @@ public class DvRocksDB implements Closeable {
     private boolean closed;
     // the block cache of this RocksDB alone, when the tablet server has no shared one
     @Nullable private final Cache ownBlockCache;
+    // the tablet server's block cache, if it configures one
+    @Nullable private final Cache sharedBlockCache;
     // local scratch files of the RocksDB's owner, next to it: emptied when it opens
     private final File tmpDir;
 
@@ -103,8 +105,10 @@ public class DvRocksDB implements Closeable {
             BloomFilter bloomFilter,
             List<ColumnFamilyHandle> cfHandles,
             @Nullable Cache ownBlockCache,
+            @Nullable Cache sharedBlockCache,
             File tmpDir) {
         this.ownBlockCache = ownBlockCache;
+        this.sharedBlockCache = sharedBlockCache;
         this.tmpDir = tmpDir;
         this.db = db;
         this.dbOptions = dbOptions;
@@ -207,6 +211,7 @@ public class DvRocksDB implements Closeable {
                             bloomFilter,
                             cfHandles,
                             ownBlockCache,
+                            sharedBlockCache,
                             new File(dbPath + "-tmp"));
             try {
                 // change lists are rebuilt from the log
@@ -237,6 +242,12 @@ public class DvRocksDB implements Closeable {
      * exports. It is on the tablet's disk next to the RocksDB, not in the JVM's temporary
      * directory, and is emptied whenever the RocksDB opens.
      */
+    /** The tablet server's block cache this RocksDB uses, or null if it has its own. */
+    @Nullable
+    Cache sharedBlockCache() {
+        return sharedBlockCache;
+    }
+
     public File tmpDir() {
         return tmpDir;
     }

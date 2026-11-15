@@ -172,6 +172,11 @@ public class DefaultSnapshotContext implements SnapshotContext, ServerReconfigur
     }
 
     @Override
+    public boolean isDvChangeListCheckpointEnabled() {
+        return conf.get(ConfigOptions.KV_DELETION_VECTORS_CHANGE_LIST_CHECKPOINT_ENABLED);
+    }
+
+    @Override
     public ZooKeeperClient getZooKeeperClient() {
         return zooKeeperClient;
     }

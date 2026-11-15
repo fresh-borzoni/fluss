@@ -47,6 +47,15 @@ public class SnapshotResult implements Serializable {
         return kvSnapshotHandle;
     }
 
+    /**
+     * This result with the change list of derived deletion vectors attached to its handle, which
+     * the snapshot's async phase adds after the kv files are uploaded.
+     */
+    public SnapshotResult withDvChangeList(DvChangeListHandle dvChangeList) {
+        return new SnapshotResult(
+                kvSnapshotHandle.withDvChangeList(dvChangeList), snapshotPath, tabletState);
+    }
+
     /** This result with what the snapshot saved of the row TTL filter. */
     public SnapshotResult withRowTtl(RowTtlFilterState rowTtl) {
         return new SnapshotResult(kvSnapshotHandle.withRowTtl(rowTtl), snapshotPath, tabletState);

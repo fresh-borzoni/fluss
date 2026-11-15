@@ -75,6 +75,14 @@ public interface SnapshotContext {
     }
 
     /**
+     * Whether buckets with deletion vectors save their change list with each KV snapshot and use it
+     * when they become leader ({@code kv.deletion-vectors.change-list-checkpoint.enabled}).
+     */
+    default boolean isDvChangeListCheckpointEnabled() {
+        return ConfigOptions.KV_DELETION_VECTORS_CHANGE_LIST_CHECKPOINT_ENABLED.defaultValue();
+    }
+
+    /**
      * Get the provider of latest CompletedSnapshot for a table bucket. When no completed snapshot
      * exists, the CompletedSnapshot provided will be null.
      */

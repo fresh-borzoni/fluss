@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -47,6 +48,13 @@ public class KvSnapshotHandle {
     /** The size of the incremental snapshot. */
     private final long incrementalSize;
 
+    /**
+     * The change list of derived deletion vectors at the snapshot's log offset, or null. Its
+     * segments are shared files: registered and discarded with the snapshot's shared files, and
+     * never downloaded with the kv data.
+     */
+    @Nullable private final DvChangeListHandle dvChangeList;
+
     /** With row TTL and deletion vectors, what the snapshot saved of the TTL filter, or null. */
     @Nullable private final RowTtlFilterState rowTtl;
 
@@ -66,7 +74,7 @@ public class KvSnapshotHandle {
             List<KvFileHandleAndLocalPath> privateFileHandles,
             long incrementalSize,
             boolean ownsSharedFiles) {
-        this(sharedFileHandles, privateFileHandles, incrementalSize, ownsSharedFiles, null);
+        this(sharedFileHandles, privateFileHandles, incrementalSize, ownsSharedFiles, null, null);
     }
 
     private KvSnapshotHandle(
@@ -74,11 +82,13 @@ public class KvSnapshotHandle {
             List<KvFileHandleAndLocalPath> privateFileHandles,
             long incrementalSize,
             boolean ownsSharedFiles,
+            @Nullable DvChangeListHandle dvChangeList,
             @Nullable RowTtlFilterState rowTtl) {
         this.sharedFileHandles = sharedFileHandles;
         this.privateFileHandles = privateFileHandles;
         this.incrementalSize = incrementalSize;
         this.ownsSharedFiles = ownsSharedFiles;
+        this.dvChangeList = dvChangeList;
         this.rowTtl = rowTtl;
     }
 
@@ -105,16 +115,53 @@ public class KvSnapshotHandle {
         return restore(sharedFileHandles, privateFileHandles, incrementalSize, null);
     }
 
-    /**
-     * Restores a handle, with what it was saved with of row TTL on a table with deletion vectors.
-     */
+    /** Restores a handle, with the change list of derived deletion vectors it was saved with. */
     static KvSnapshotHandle restore(
             List<KvFileHandleAndLocalPath> sharedFileHandles,
             List<KvFileHandleAndLocalPath> privateFileHandles,
             long incrementalSize,
+            @Nullable DvChangeListHandle dvChangeList) {
+        return restore(sharedFileHandles, privateFileHandles, incrementalSize, dvChangeList, null);
+    }
+
+    /** Restores a handle, with what it was saved with of derived deletion vectors and row TTL. */
+    static KvSnapshotHandle restore(
+            List<KvFileHandleAndLocalPath> sharedFileHandles,
+            List<KvFileHandleAndLocalPath> privateFileHandles,
+            long incrementalSize,
+            @Nullable DvChangeListHandle dvChangeList,
             @Nullable RowTtlFilterState rowTtl) {
         return new KvSnapshotHandle(
-                sharedFileHandles, privateFileHandles, incrementalSize, false, rowTtl);
+                sharedFileHandles,
+                privateFileHandles,
+                incrementalSize,
+                false,
+                dvChangeList,
+                rowTtl);
+    }
+
+    /**
+     * This handle with {@code dvChangeList} attached, before it is registered. A new handle owns
+     * the change list's new segments as it owns its new shared files; segments a previous snapshot
+     * uploaded are attached as {@link DvChangeListHandle.Segment#asReference() references}.
+     */
+    public KvSnapshotHandle withDvChangeList(@Nullable DvChangeListHandle dvChangeList) {
+        checkState(
+                sharedKvFileRegistry == null,
+                "A change list is attached before the snapshot's files are registered.");
+        return new KvSnapshotHandle(
+                sharedFileHandles,
+                privateFileHandles,
+                incrementalSize,
+                ownsSharedFiles,
+                dvChangeList,
+                rowTtl);
+    }
+
+    /** The change list of derived deletion vectors saved with the snapshot, or null. */
+    @Nullable
+    public DvChangeListHandle getDvChangeList() {
+        return dvChangeList;
     }
 
     /** This handle with what the snapshot saved of the row TTL filter, before it is registered. */
@@ -124,7 +171,12 @@ public class KvSnapshotHandle {
                 "The row TTL filter's state is attached before the snapshot's files are"
                         + " registered.");
         return new KvSnapshotHandle(
-                sharedFileHandles, privateFileHandles, incrementalSize, ownsSharedFiles, rowTtl);
+                sharedFileHandles,
+                privateFileHandles,
+                incrementalSize,
+                ownsSharedFiles,
+                dvChangeList,
+                rowTtl);
     }
 
     /** What the snapshot saved of the row TTL filter, or null. */
@@ -185,7 +237,24 @@ public class KvSnapshotHandle {
             } catch (Exception e) {
                 LOG.warn("Could not properly discard new sst file states.", e);
             }
+            try {
+                // segments a previous snapshot uploaded are references, whose discard does nothing
+                SnapshotUtil.bestEffortDiscardAllKvFiles(dvChangeListFiles());
+            } catch (Exception e) {
+                LOG.warn("Could not properly discard new change list segments.", e);
+            }
         }
+    }
+
+    /** The segment files of the change list, none if there is no change list. */
+    private List<KvFileHandle> dvChangeListFiles() {
+        List<KvFileHandle> files = new ArrayList<>();
+        if (dvChangeList != null) {
+            for (DvChangeListHandle.Segment segment : dvChangeList.segments()) {
+                files.add(segment.file().getKvFileHandle());
+            }
+        }
+        return files;
     }
 
     public void registerKvFileHandles(SharedKvFileRegistry registry, long snapshotID) {
@@ -202,6 +271,11 @@ public class KvSnapshotHandle {
                     handleAndLocalPath.getKvFileHandle(),
                     snapshotID);
         }
+        // the change list's segments are shared across snapshots like the sst files
+        for (KvFileHandle segment : dvChangeListFiles()) {
+            registry.registerReference(
+                    SharedKvFileRegistryKey.fromKvFileHandle(segment), segment, snapshotID);
+        }
     }
 
     @Override
@@ -216,11 +290,13 @@ public class KvSnapshotHandle {
         return incrementalSize == that.incrementalSize
                 && Objects.equals(sharedFileHandles, that.sharedFileHandles)
                 && Objects.equals(privateFileHandles, that.privateFileHandles)
+                && Objects.equals(dvChangeList, that.dvChangeList)
                 && Objects.equals(rowTtl, that.rowTtl);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(sharedFileHandles, privateFileHandles, incrementalSize, rowTtl);
+        return Objects.hash(
+                sharedFileHandles, privateFileHandles, incrementalSize, dvChangeList, rowTtl);
     }
 }

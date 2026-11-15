@@ -74,7 +74,7 @@ class CompletedSnapshotJsonSerdeTest extends JsonSerdeTestBase<CompletedSnapshot
                         1,
                         new FsPath("oss://bucket/snapshot"),
                         KvSnapshotHandle.restore(
-                                Collections.emptyList(), Collections.emptyList(), 0, rowTtl),
+                                Collections.emptyList(), Collections.emptyList(), 0, null, rowTtl),
                         10,
                         null,
                         null);

@@ -42,57 +42,183 @@ class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFi
                     + "\"snapshot_incremental_size\":3},\"log_offset\":10,\"row_count\":1234,"
                     + "\"auto_inc_id_range\":[{\"column_id\":2,\"start\":10000,\"end\":20000}]}";
 
+    // GOLDEN_JSON with the change list of derived deletion vectors, as a DV bucket's leader writes
+    static final String GOLDEN_DV_JSON =
+            GOLDEN_JSON.substring(0, GOLDEN_JSON.length() - 1)
+                    + ",\"dv_change_list\":{\"version\":1,\"from\":4,\"end\":10,"
+                    + "\"valid_from\":2,\"lake_snapshot_id\":42,\"entries\":5,\"segments\":["
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/dvcl-a\",\"size\":30},"
+                    + "\"local_path\":\"dvcl-a\",\"from\":4,\"end\":8,\"entries\":3},"
+                    + "{\"kv_file_handle\":{\"path\":\"oss://bucket/snapshot/shared/dvcl-b\",\"size\":20},"
+                    + "\"local_path\":\"dvcl-b\",\"from\":8,\"end\":10,\"entries\":2}]}}";
+
     KvSnapshotFileMetadataJsonSerdeTest() {
         super(KvSnapshotFileMetadataJsonSerde.INSTANCE);
     }
 
+    @Test
+    void testOldFormatHasNoDvChangeList() {
+        KvSnapshotFileMetadata metadata =
+                KvSnapshotFileMetadataJsonSerde.fromJson(
+                        GOLDEN_JSON.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(metadata.getDvChangeList()).isNull();
+        assertThat(metadata).isEqualTo(createObjects()[0]);
+    }
+
+    @Test
+    void testDvChangeListLeavesTheSnapshotAsItIs() {
+        // a reader that does not use the change list sees the same snapshot with or without it
+        KvSnapshotFileMetadata with =
+                KvSnapshotFileMetadataJsonSerde.fromJson(
+                        GOLDEN_DV_JSON.getBytes(StandardCharsets.UTF_8));
+        KvSnapshotFileMetadata without = createObjects()[0];
+
+        assertThat(withoutDvChangeList(with)).isEqualTo(without);
+        assertThat(with.getDvChangeList()).isEqualTo(dvChangeList());
+    }
+
+    @Test
+    void testDvChangeListRoundTrip() {
+        KvSnapshotFileMetadata metadata = withDvChangeList(createObjects()[0], dvChangeList());
+
+        String json =
+                new String(
+                        KvSnapshotFileMetadataJsonSerde.toJson(metadata), StandardCharsets.UTF_8);
+
+        assertThat(json).isEqualTo(GOLDEN_DV_JSON);
+        assertThat(KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8)))
+                .isEqualTo(metadata);
+    }
+
     /**
-     * With row TTL the bucket's leader saves its TTL filter's state at the top level: P and the
-     * slices below the snapshot's offset. A state that is not whole reads as none.
+     * With row TTL the bucket's leader saves its TTL filter's state at the top level, next to the
+     * change list or without one: P and the slices below the snapshot's offset. A state that is not
+     * whole reads as none.
      */
     @Test
     void testRowTtlRoundTrip() {
         KvSnapshotFileMetadata.RowTtl rowTtl =
                 new KvSnapshotFileMetadata.RowTtl(
                         7L, 5L, Arrays.asList(8L, 10L), Arrays.asList(-3L, 400L));
-        KvSnapshotFileMetadata m = createObjects()[0];
-        KvSnapshotFileMetadata metadata =
-                new KvSnapshotFileMetadata(
-                        m.getTableBucket(),
-                        m.getSnapshotId(),
-                        m.getSnapshotLocation(),
-                        m.getSharedFiles(),
-                        m.getPrivateFiles(),
-                        m.getIncrementalSize(),
-                        m.getLogOffset(),
-                        m.getRowCount(),
-                        m.getAutoIncrementRanges(),
-                        rowTtl);
+        for (KvSnapshotFileMetadata.DvChangeList changeList : Arrays.asList(dvChangeList(), null)) {
+            KvSnapshotFileMetadata m = createObjects()[0];
+            KvSnapshotFileMetadata metadata =
+                    new KvSnapshotFileMetadata(
+                            m.getTableBucket(),
+                            m.getSnapshotId(),
+                            m.getSnapshotLocation(),
+                            m.getSharedFiles(),
+                            m.getPrivateFiles(),
+                            m.getIncrementalSize(),
+                            m.getLogOffset(),
+                            m.getRowCount(),
+                            m.getAutoIncrementRanges(),
+                            changeList,
+                            rowTtl);
 
+            String json =
+                    new String(
+                            KvSnapshotFileMetadataJsonSerde.toJson(metadata),
+                            StandardCharsets.UTF_8);
+
+            assertThat(json)
+                    .endsWith(
+                            "\"ttl_capped_from\":7,\"ttl_slices\":{\"from\":5,\"ends\":[8,10],"
+                                    + "\"mins\":[-3,400]}}");
+            KvSnapshotFileMetadata read =
+                    KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
+            assertThat(read).isEqualTo(metadata);
+            assertThat(read.getRowTtl()).isEqualTo(rowTtl);
+
+            String partial = json.replace("\"mins\":[-3,400]", "\"mins\":[-3]");
+            assertThat(
+                            KvSnapshotFileMetadataJsonSerde.fromJson(
+                                            partial.getBytes(StandardCharsets.UTF_8))
+                                    .getRowTtl())
+                    .isNull();
+        }
+        assertThat(
+                        KvSnapshotFileMetadataJsonSerde.fromJson(
+                                        GOLDEN_DV_JSON.getBytes(StandardCharsets.UTF_8))
+                                .getRowTtl())
+                .isNull();
+    }
+
+    @Test
+    void testUnknownDvChangeListVersionKeepsTheSnapshot() {
+        // a newer change list: the snapshot stays readable, the change list is not used or written
         String json =
-                new String(
-                        KvSnapshotFileMetadataJsonSerde.toJson(metadata), StandardCharsets.UTF_8);
+                GOLDEN_JSON.substring(0, GOLDEN_JSON.length() - 1)
+                        + ",\"dv_change_list\":{\"version\":2,\"something\":[1,2]}}";
 
-        assertThat(json)
-                .endsWith(
-                        "\"ttl_capped_from\":7,\"ttl_slices\":{\"from\":5,\"ends\":[8,10],"
-                                + "\"mins\":[-3,400]}}");
-        KvSnapshotFileMetadata read =
+        KvSnapshotFileMetadata metadata =
                 KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
-        assertThat(read).isEqualTo(metadata);
-        assertThat(read.getRowTtl()).isEqualTo(rowTtl);
 
-        String partial = json.replace("\"mins\":[-3,400]", "\"mins\":[-3]");
+        assertThat(withoutDvChangeList(metadata)).isEqualTo(createObjects()[0]);
+        assertThat(metadata.getDvChangeList()).isNotNull();
+        assertThat(metadata.getDvChangeList().isSupported()).isFalse();
+        assertThat(metadata.getDvChangeList().getVersion()).isEqualTo(2);
+        assertThat(metadata.getDvChangeList().getSegments()).isEmpty();
         assertThat(
-                        KvSnapshotFileMetadataJsonSerde.fromJson(
-                                        partial.getBytes(StandardCharsets.UTF_8))
-                                .getRowTtl())
-                .isNull();
-        assertThat(
-                        KvSnapshotFileMetadataJsonSerde.fromJson(
-                                        GOLDEN_JSON.getBytes(StandardCharsets.UTF_8))
-                                .getRowTtl())
-                .isNull();
+                        new String(
+                                KvSnapshotFileMetadataJsonSerde.toJson(metadata),
+                                StandardCharsets.UTF_8))
+                .isEqualTo(GOLDEN_JSON);
+    }
+
+    @Test
+    void testDvChangeListWithoutVersionIsUnsupported() {
+        String json =
+                GOLDEN_DV_JSON.replace(
+                        "\"dv_change_list\":{\"version\":1,", "\"dv_change_list\":{");
+
+        KvSnapshotFileMetadata metadata =
+                KvSnapshotFileMetadataJsonSerde.fromJson(json.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(metadata.getDvChangeList().isSupported()).isFalse();
+        assertThat(metadata.getDvChangeList().getVersion()).isEqualTo(-1);
+    }
+
+    static KvSnapshotFileMetadata.DvChangeList dvChangeList() {
+        return new KvSnapshotFileMetadata.DvChangeList(
+                4,
+                10,
+                2,
+                42,
+                5,
+                Arrays.asList(
+                        new KvSnapshotFileMetadata.DvChangeListSegment(
+                                new KvSnapshotFileMetadata.FileHandle(
+                                        "oss://bucket/snapshot/shared/dvcl-a", 30, "dvcl-a"),
+                                4,
+                                8,
+                                3),
+                        new KvSnapshotFileMetadata.DvChangeListSegment(
+                                new KvSnapshotFileMetadata.FileHandle(
+                                        "oss://bucket/snapshot/shared/dvcl-b", 20, "dvcl-b"),
+                                8,
+                                10,
+                                2)));
+    }
+
+    private static KvSnapshotFileMetadata withDvChangeList(
+            KvSnapshotFileMetadata m, KvSnapshotFileMetadata.DvChangeList dvChangeList) {
+        return new KvSnapshotFileMetadata(
+                m.getTableBucket(),
+                m.getSnapshotId(),
+                m.getSnapshotLocation(),
+                m.getSharedFiles(),
+                m.getPrivateFiles(),
+                m.getIncrementalSize(),
+                m.getLogOffset(),
+                m.getRowCount(),
+                m.getAutoIncrementRanges(),
+                dvChangeList);
+    }
+
+    private static KvSnapshotFileMetadata withoutDvChangeList(KvSnapshotFileMetadata m) {
+        return withDvChangeList(m, null);
     }
 
     @Test

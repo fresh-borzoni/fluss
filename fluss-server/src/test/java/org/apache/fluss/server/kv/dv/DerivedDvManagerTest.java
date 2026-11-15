@@ -2713,6 +2713,14 @@ class DerivedDvManagerTest {
         // the local file the manager uploaded
         @Nullable volatile String uploadedFrom;
         volatile Map<Integer, String> uploadedDict;
+        // the change list a new leader restored with its KV snapshot
+        @Nullable volatile DvRestoredChangeList restored;
+
+        @Nullable
+        @Override
+        public DvRestoredChangeList restoredChangeList() {
+            return restored;
+        }
 
         FakeSource(Path dir) {
             this.dir = dir;
