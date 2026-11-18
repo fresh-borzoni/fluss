@@ -31,6 +31,9 @@
     <suppress files="[\\/]CoordinatorEventProcessor\.java$" checks="FileLength"/>
     <suppress files="[\\/]CoordinatorEventProcessorTest\.java$" checks="FileLength"/>
     <suppress files="FlussAdminITCase.java" checks="FileLength"/>
+    <!-- TODO: Secondary indexes and ordered keys together grow Replica past the limit; split its
+         KV read paths out before both land. -->
+    <suppress files="[\\/]Replica\.java$" checks="FileLength"/>
 
     <!-- target directory is not relevant for checkstyle -->
     <suppress

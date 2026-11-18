@@ -376,6 +376,99 @@ public class ServerConnectionTest {
     }
 
     @Test
+    void testRejectRangeBoundsForOldServer() throws Exception {
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignore) -> {});
+        try {
+            org.apache.fluss.rpc.messages.ScanKvRequest request =
+                    new org.apache.fluss.rpc.messages.ScanKvRequest();
+            request.setBucketScanReq().setTableId(1).setBucketId(0);
+            connection.validateVersionCompatibility(ApiKeys.SCAN_KV, (short) 0, request);
+            for (boolean reverse : new boolean[] {false, true}) {
+                org.apache.fluss.rpc.messages.ScanKvRequest directed =
+                        new org.apache.fluss.rpc.messages.ScanKvRequest();
+                directed.setBucketScanReq().setTableId(1).setBucketId(0).setReverse(reverse);
+                assertThatThrownBy(
+                                () ->
+                                        connection.validateVersionCompatibility(
+                                                ApiKeys.SCAN_KV, (short) 0, directed))
+                        .isInstanceOf(UnsupportedVersionException.class);
+                connection.validateVersionCompatibility(ApiKeys.SCAN_KV, (short) 1, directed);
+            }
+
+            request.getBucketScanReq().setStartKey(new byte[] {1});
+            assertThatThrownBy(
+                            () ->
+                                    connection.validateVersionCompatibility(
+                                            ApiKeys.SCAN_KV, (short) 0, request))
+                    .isInstanceOf(UnsupportedVersionException.class)
+                    .hasMessageContaining("SCAN_KV version 1");
+            connection.validateVersionCompatibility(ApiKeys.SCAN_KV, (short) 1, request);
+            org.apache.fluss.rpc.messages.ScanKvRequest upperOnly =
+                    new org.apache.fluss.rpc.messages.ScanKvRequest();
+            upperOnly.setBucketScanReq().setTableId(1).setBucketId(0).setEndKey(new byte[] {2});
+            assertThatThrownBy(
+                            () ->
+                                    connection.validateVersionCompatibility(
+                                            ApiKeys.SCAN_KV, (short) 0, upperOnly))
+                    .isInstanceOf(UnsupportedVersionException.class);
+        } finally {
+            connection.close().get();
+        }
+    }
+
+    @Test
+    void testRejectBoundedPrefixLookupForOldServer() throws Exception {
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignore) -> {});
+        try {
+            org.apache.fluss.rpc.messages.PrefixLookupRequest request =
+                    new org.apache.fluss.rpc.messages.PrefixLookupRequest().setTableId(1);
+            org.apache.fluss.rpc.messages.PbPrefixLookupReqForBucket bucket =
+                    request.addBucketsReq().setBucketId(0);
+            bucket.addKey(new byte[] {1});
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 1, request);
+            for (boolean reverse : new boolean[] {false, true}) {
+                org.apache.fluss.rpc.messages.PrefixLookupRequest directed =
+                        new org.apache.fluss.rpc.messages.PrefixLookupRequest().setTableId(1);
+                directed.addBucketsReq()
+                        .setBucketId(0)
+                        .addLookup()
+                        .setPrefixKey(new byte[] {1})
+                        .setReverse(reverse);
+                assertThatThrownBy(
+                                () ->
+                                        connection.validateVersionCompatibility(
+                                                ApiKeys.PREFIX_LOOKUP, (short) 2, directed))
+                        .isInstanceOf(UnsupportedVersionException.class);
+                connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 3, directed);
+            }
+
+            bucket.clearKeys();
+            bucket.addLookup().setPrefixKey(new byte[] {1}).setStartKey(new byte[] {1, 2});
+            assertThatThrownBy(
+                            () ->
+                                    connection.validateVersionCompatibility(
+                                            ApiKeys.PREFIX_LOOKUP, (short) 2, request))
+                    .isInstanceOf(UnsupportedVersionException.class)
+                    .hasMessageContaining("PREFIX_LOOKUP version 3");
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 3, request);
+        } finally {
+            connection.close().get();
+        }
+    }
+
+    @Test
     void testRejectHistoricalWritesForOldServer() throws Exception {
         nettyServer.close();
         buildNettyServer(new OldWriteGatewayService());

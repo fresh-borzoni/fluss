@@ -35,6 +35,7 @@ import org.apache.fluss.rpc.messages.AuthenticateResponse;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.messages.ScanKvRequest;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.rpc.metrics.ConnectionMetrics;
 import org.apache.fluss.rpc.protocol.ApiKeys;
@@ -79,6 +80,7 @@ final class ServerConnection {
     private static final short HISTORICAL_PUT_KV_MIN_VERSION = 3;
     private static final short ALTER_BUCKET_COUNT_MIN_VERSION = 1;
     private static final short PREFIX_LOOKUP_LIMIT_MIN_VERSION = 2;
+    private static final short PREFIX_LOOKUP_RANGE_MIN_VERSION = 3;
 
     private final ServerNode node;
 
@@ -402,6 +404,26 @@ final class ServerConnection {
                             + '.');
         }
 
+        if (apiKey == ApiKeys.SCAN_KV && version < 1) {
+            ScanKvRequest scan = (ScanKvRequest) rawRequest;
+            if (scan.hasBucketScanReq()
+                    && (scan.getBucketScanReq().hasStartKey()
+                            || scan.getBucketScanReq().hasEndKey()
+                            || scan.getBucketScanReq().hasReverse())) {
+                throw new UnsupportedVersionException(
+                        "Ordered or bounded scans require SCAN_KV version 1 or newer.");
+            }
+        }
+        if (apiKey == ApiKeys.PREFIX_LOOKUP && version < PREFIX_LOOKUP_RANGE_MIN_VERSION) {
+            PrefixLookupRequest lookup = (PrefixLookupRequest) rawRequest;
+            if (lookup.getBucketsReqsList().stream()
+                    .anyMatch(bucket -> bucket.getLookupsCount() > 0)) {
+                throw new UnsupportedVersionException(
+                        "Ordered or bounded prefix lookups require PREFIX_LOOKUP version "
+                                + PREFIX_LOOKUP_RANGE_MIN_VERSION
+                                + " or newer.");
+            }
+        }
         if (apiKey == ApiKeys.PRODUCE_LOG && version < HISTORICAL_PRODUCE_LOG_MIN_VERSION) {
             ProduceLogRequest produceLogRequest = (ProduceLogRequest) rawRequest;
             if (hasHistoricalProduce(produceLogRequest)) {

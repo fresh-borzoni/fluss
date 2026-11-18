@@ -34,6 +34,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
+import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
@@ -288,6 +289,7 @@ class IndexLeaderRecoveryTest extends ReplicaTestBase {
                 Collections.singletonMap(sourceBucket, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)),
                 null,
                 MergeMode.DEFAULT,
+                ApiKeys.PUT_KV,
                 (short) 1,
                 putFuture::complete);
         assertThat(putFuture.get()).hasSize(1);

@@ -2047,12 +2047,20 @@ public final class Replica {
     }
 
     public List<ByteArraySlice> prefixLookup(byte[] prefixKey) {
-        return prefixLookup(prefixKey, 0, false);
+        return prefixLookup(prefixKey, 0, false, null, null, false);
     }
 
-    /** Reads a prefix with a candidate limit; zero preserves unlimited reads. */
+    /**
+     * Looks up a prefix intersected with inclusive start and exclusive end keys, with a candidate
+     * limit; zero preserves unlimited reads.
+     */
     public List<ByteArraySlice> prefixLookup(
-            byte[] prefixKey, int limit, boolean failOnLimitExceeded) {
+            byte[] prefixKey,
+            int limit,
+            boolean failOnLimitExceeded,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            boolean reverse) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "Try to do prefix lookup on a non primary key table: " + getTablePath());
@@ -2070,7 +2078,8 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.prefixLookup(prefixKey, limit, failOnLimitExceeded);
+                        return kvTablet.prefixLookup(
+                                prefixKey, limit, failOnLimitExceeded, startKey, endKey, reverse);
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(
@@ -2132,6 +2141,19 @@ public final class Replica {
     public OpenScanResult openScan(
             ScannerManager scannerManager, String scannerId, long limit, long initialAccessTimeMs)
             throws IOException {
+        return openScan(scannerManager, scannerId, limit, initialAccessTimeMs, null, null, false);
+    }
+
+    /** Opens and registers a fixed-view scan with optional physical key bounds. */
+    public OpenScanResult openScan(
+            ScannerManager scannerManager,
+            String scannerId,
+            long limit,
+            long initialAccessTimeMs,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            boolean reverse)
+            throws IOException {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "the primary key table not exists for " + tableBucket);
@@ -2149,7 +2171,13 @@ public final class Replica {
                     checkNotNull(
                             kvTablet, "KvTablet for the replica to open scan shouldn't be null.");
                     OpenScanResult result =
-                            kvTablet.openScan(scannerId, limit, initialAccessTimeMs);
+                            kvTablet.openScan(
+                                    scannerId,
+                                    limit,
+                                    initialAccessTimeMs,
+                                    startKey,
+                                    endKey,
+                                    reverse);
                     ScannerContext context = result.getContext();
                     if (context == null) {
                         return result;

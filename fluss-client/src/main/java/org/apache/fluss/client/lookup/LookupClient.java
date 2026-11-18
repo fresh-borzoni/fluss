@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.metadata.MetadataUpdater;
+import org.apache.fluss.client.table.ReadDirection;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
@@ -182,9 +183,61 @@ public class LookupClient {
             int bucketCount,
             int limit,
             boolean failOnLimitExceeded) {
+        return prefixLookup(
+                tablePath,
+                tableBucket,
+                keyBytes,
+                bucketCount,
+                limit,
+                failOnLimitExceeded,
+                null,
+                null,
+                null);
+    }
+
+    /** Adds an index prefix read with optional bounds and direction. */
+    public CompletableFuture<List<byte[]>> prefixLookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            @Nullable ReadDirection direction) {
+        return prefixLookup(
+                tablePath,
+                tableBucket,
+                keyBytes,
+                bucketCount,
+                0,
+                false,
+                startKey,
+                endKey,
+                direction);
+    }
+
+    /** Adds a prefix read with a candidate limit (0 for none) and optional bounds and direction. */
+    CompletableFuture<List<byte[]>> prefixLookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            int limit,
+            boolean failOnLimitExceeded,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            @Nullable ReadDirection direction) {
         PrefixLookupQuery prefixLookup =
                 new PrefixLookupQuery(
-                        tablePath, tableBucket, keyBytes, bucketCount, limit, failOnLimitExceeded);
+                        tablePath,
+                        tableBucket,
+                        keyBytes,
+                        bucketCount,
+                        limit,
+                        failOnLimitExceeded,
+                        startKey,
+                        endKey,
+                        direction);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
     }

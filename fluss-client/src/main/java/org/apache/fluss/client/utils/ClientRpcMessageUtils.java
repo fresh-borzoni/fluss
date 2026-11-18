@@ -31,6 +31,7 @@ import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.client.table.ReadDirection;
 import org.apache.fluss.client.write.KvWriteBatch;
 import org.apache.fluss.client.write.ReadyWriteBatch;
 import org.apache.fluss.cluster.Cluster;
@@ -97,6 +98,7 @@ import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbModifyBucketCount;
 import org.apache.fluss.rpc.messages.PbModifyColumn;
 import org.apache.fluss.rpc.messages.PbPartitionSpec;
+import org.apache.fluss.rpc.messages.PbPrefixLookupKey;
 import org.apache.fluss.rpc.messages.PbPrefixLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbProduceLogReqForBucket;
 import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
@@ -298,7 +300,36 @@ public class ClientRpcMessageUtils {
                     if (batch.getBucketCount() > 0) {
                         pbPrefixLookupReqForBucket.setRoutingBucketCount(batch.getBucketCount());
                     }
-                    batch.lookups().forEach(get -> pbPrefixLookupReqForBucket.addKey(get.key()));
+                    boolean useLookupEntries =
+                            batch.lookups().stream()
+                                    .anyMatch(
+                                            lookup ->
+                                                    lookup.startKey() != null
+                                                            || lookup.endKey() != null
+                                                            || lookup.direction() != null);
+                    batch.lookups()
+                            .forEach(
+                                    lookup -> {
+                                        if (useLookupEntries) {
+                                            PbPrefixLookupKey key =
+                                                    pbPrefixLookupReqForBucket
+                                                            .addLookup()
+                                                            .setPrefixKey(lookup.key());
+                                            if (lookup.direction() != null) {
+                                                key.setReverse(
+                                                        lookup.direction()
+                                                                == ReadDirection.REVERSE);
+                                            }
+                                            if (lookup.startKey() != null) {
+                                                key.setStartKey(lookup.startKey());
+                                            }
+                                            if (lookup.endKey() != null) {
+                                                key.setEndKey(lookup.endKey());
+                                            }
+                                        } else {
+                                            pbPrefixLookupReqForBucket.addKey(lookup.key());
+                                        }
+                                    });
                 });
         return request;
     }

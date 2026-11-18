@@ -483,7 +483,7 @@ pub struct LimitScanResponse {
 }
 /// Full KV scan request and response.
 /// A new scan is initiated with bucket_scan_req; subsequent batches use scanner_id.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PbScanReqForBucket {
     #[prost(int64, required, tag = "1")]
     pub table_id: i64,
@@ -496,6 +496,14 @@ pub struct PbScanReqForBucket {
     pub limit: ::core::option::Option<i64>,
     #[prost(int32, optional, tag = "5")]
     pub routing_bucket_count: ::core::option::Option<i32>,
+    /// SCAN_KV v1: inclusive start and exclusive end in the table's ordered key format.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub start_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "7")]
+    pub end_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Presence requests ordered reading, including explicit forward reads.
+    #[prost(bool, optional, tag = "8")]
+    pub reverse: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScanKvRequest {
@@ -1664,7 +1672,7 @@ pub struct PbValueList {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub values: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PbPrefixLookupReqForBucket {
     #[prost(int64, optional, tag = "1")]
     pub partition_id: ::core::option::Option<i64>,
@@ -1674,6 +1682,20 @@ pub struct PbPrefixLookupReqForBucket {
     pub keys: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
     #[prost(int32, optional, tag = "4")]
     pub routing_bucket_count: ::core::option::Option<i32>,
+    /// Used instead of keys when a lookup has bounds or direction.
+    #[prost(message, repeated, tag = "5")]
+    pub lookups: ::prost::alloc::vec::Vec<PbPrefixLookupKey>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PbPrefixLookupKey {
+    #[prost(bytes = "vec", required, tag = "1")]
+    pub prefix_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub start_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub end_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bool, optional, tag = "4")]
+    pub reverse: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PbPrefixLookupRespForBucket {
