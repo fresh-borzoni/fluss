@@ -390,6 +390,14 @@ public class RocksDBKv implements AutoCloseable {
             return readAll(0, false);
         }
 
+        /**
+         * Collects the values of at most {@code limit} rows (all if 0), the first ones in the
+         * direction of the read.
+         */
+        public List<byte[]> readAll(int limit) throws IOException {
+            return readAll(limit, false);
+        }
+
         /** Collects at most {@code limit} candidates; zero preserves unlimited reads. */
         public List<byte[]> readAll(int limit, boolean failOnLimitExceeded) throws IOException {
             if (closed) {

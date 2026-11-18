@@ -24,6 +24,8 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.adapter.LookupContextAdapter;
+import org.apache.fluss.flink.adapter.PagedLookupAdapter;
 import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter;
 import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter.InputDataPartitionerAdapter;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
@@ -712,7 +714,14 @@ public class FlinkTableSource
 
     @Override
     public LookupRuntimeProvider getLookupRuntimeProvider(LookupContext context) {
+        boolean requiresWriter = LookupContextAdapter.requiresReadYourWrites(context);
         if (lookupCacheType == LookupOptions.LookupCacheType.FULL) {
+            if (requiresWriter) {
+                throw new UnsupportedOperationException(
+                        "Lookups that read what a sink of their task wrote cannot use the full"
+                                + " lookup cache, which reloads the table periodically. Please set"
+                                + " 'lookup.cache' to 'NONE' or 'PARTIAL'.");
+            }
             this.lookupInputPartitioner = null;
             validateFullCacheLookup(context);
         }
@@ -746,16 +755,21 @@ public class FlinkTableSource
                             org.apache.flink.configuration.Configuration.fromMap(tableOptions)));
         }
         this.lookupInputPartitioner = createLookupInputPartitioner(lookupNormalizer);
-        if (lookupAsync) {
+        if (lookupAsync || requiresWriter) {
             AsyncLookupFunction asyncLookupFunction =
-                    new FlinkAsyncLookupFunction(
-                            flussConfig,
-                            tablePath,
-                            tableOutputType,
-                            lookupNormalizer,
-                            projectedFields,
-                            insertIfNotExists);
-            if (cache != null) {
+                    PagedLookupAdapter.wrap(
+                            new FlinkAsyncLookupFunction(
+                                    flussConfig,
+                                    tablePath,
+                                    tableOutputType,
+                                    lookupNormalizer,
+                                    projectedFields,
+                                    insertIfNotExists,
+                                    requiresWriter));
+            if (requiresWriter) {
+                // a cache would serve rows the writer of the task replaced since
+                return AsyncLookupFunctionProvider.of(asyncLookupFunction);
+            } else if (cache != null) {
                 return PartialCachingAsyncLookupProvider.of(asyncLookupFunction, cache);
             } else {
                 return AsyncLookupFunctionProvider.of(asyncLookupFunction);

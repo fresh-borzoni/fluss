@@ -192,10 +192,14 @@ public class LookupClient {
                 failOnLimitExceeded,
                 null,
                 null,
-                null);
+                null,
+                0);
     }
 
-    /** Adds an index prefix read with optional bounds and direction. */
+    /**
+     * Adds an index prefix read with optional bounds and direction, of at most {@code limit} rows
+     * (all if 0), the first ones in the direction of the read.
+     */
     public CompletableFuture<List<byte[]>> prefixLookup(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -205,6 +209,23 @@ public class LookupClient {
             @Nullable byte[] endKey,
             @Nullable ReadDirection direction) {
         return prefixLookup(
+                tablePath, tableBucket, keyBytes, bucketCount, startKey, endKey, direction, 0);
+    }
+
+    /**
+     * Adds an index prefix read with optional bounds and direction, of at most {@code keyLimit}
+     * rows (all if 0), the first ones in the direction of the read.
+     */
+    public CompletableFuture<List<byte[]>> prefixLookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            @Nullable ReadDirection direction,
+            int keyLimit) {
+        return prefixLookup(
                 tablePath,
                 tableBucket,
                 keyBytes,
@@ -213,10 +234,14 @@ public class LookupClient {
                 false,
                 startKey,
                 endKey,
-                direction);
+                direction,
+                keyLimit);
     }
 
-    /** Adds a prefix read with a candidate limit (0 for none) and optional bounds and direction. */
+    /**
+     * Adds a prefix read with a candidate limit of the request (0 for none), optional bounds and
+     * direction, and a limit of its own (0 for none).
+     */
     CompletableFuture<List<byte[]>> prefixLookup(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -226,7 +251,8 @@ public class LookupClient {
             boolean failOnLimitExceeded,
             @Nullable byte[] startKey,
             @Nullable byte[] endKey,
-            @Nullable ReadDirection direction) {
+            @Nullable ReadDirection direction,
+            int keyLimit) {
         PrefixLookupQuery prefixLookup =
                 new PrefixLookupQuery(
                         tablePath,
@@ -237,7 +263,8 @@ public class LookupClient {
                         failOnLimitExceeded,
                         startKey,
                         endKey,
-                        direction);
+                        direction,
+                        keyLimit);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
     }

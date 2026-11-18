@@ -1349,11 +1349,17 @@ public class ReplicaManager implements ServerReconfigurable {
                                     "Ordered or bounded prefix lookups require PREFIX_LOOKUP v3 and ordered keys.");
                         }
                     }
+                    if (key.hasLimit() && apiVersion < 4) {
+                        throw new UnsupportedVersionException(
+                                "Prefix lookups with a limit of their own require PREFIX_LOOKUP v4.");
+                    }
+                    // a limit of the lookup itself truncates; it replaces the candidate limit of
+                    // the request, which may fail instead
                     List<ByteArraySlice> resultForPerKey =
                             replica.prefixLookup(
                                     key.getPrefixKey(),
-                                    limit,
-                                    failOnLimitExceeded,
+                                    key.hasLimit() ? key.getLimit() : limit,
+                                    !key.hasLimit() && failOnLimitExceeded,
                                     key.hasStartKey() ? key.getStartKey() : null,
                                     key.hasEndKey() ? key.getEndKey() : null,
                                     key.hasReverse() && key.isReverse());

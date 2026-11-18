@@ -256,6 +256,40 @@ class FlussSinkBuilderTest {
     }
 
     @Test
+    void testReadYourWritesRejectsConfiguredShuffles() {
+        StreamExecutionEnvironment environment =
+                StreamExecutionEnvironment.getExecutionEnvironment();
+        DataStream<Order> input = environment.fromElements(new Order());
+        for (DistributionMode mode : DistributionMode.values()) {
+            FlinkSink.UpsertSinkWriterBuilder<Order> writerBuilder =
+                    new FlinkSink.UpsertSinkWriterBuilder<>(
+                                    TablePath.of(databaseName, tableName),
+                                    new Configuration(),
+                                    RowType.of(new IntType()),
+                                    null,
+                                    1,
+                                    Collections.emptyList(),
+                                    Collections.emptyList(),
+                                    null,
+                                    mode,
+                                    new OrderSerializationSchema(),
+                                    false,
+                                    null)
+                            .withReadYourWrites();
+            if (mode == DistributionMode.AUTO || mode == DistributionMode.NONE) {
+                assertThat(writerBuilder.addPreWriteTopology(input))
+                        .as("the writer stays in the task of the input")
+                        .isSameAs(input);
+            } else {
+                assertThatThrownBy(() -> writerBuilder.addPreWriteTopology(input))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessageContaining("'" + mode.name() + "'")
+                        .hasMessageContaining("Please use 'auto' (default) or 'none'");
+            }
+        }
+    }
+
+    @Test
     void testComputeTargetColumnIndexesFullUpdate() {
         int[] result =
                 FlussSinkBuilder.computeTargetColumnIndexes(

@@ -63,8 +63,12 @@ public interface Scan {
      * the order of the column names. Repeated calls replace the entire equality condition set. The
      * column names and values are copied before this method returns.
      *
-     * <p>Currently, batch range scans require both this configuration and {@link #range}, an
-     * order-preserving key format and a routable primary-key index path.
+     * <p>Without {@link #range}, a batch scan reads all rows whose primary key starts with the
+     * given values, in pages that keep the view the scan opened, from any primary-key table whose
+     * keys are not encoded for a lake format: such rows are adjacent there. The columns must form a
+     * physical primary-key prefix with all bucket fields, and include all partition fields. With
+     * {@link #range}, batch scans also require an order-preserving key format and a routable
+     * primary-key index path.
      */
     default Scan equalTo(List<String> columnNames, InternalRow values) {
         throw new UnsupportedOperationException("Equality range configuration is not supported.");

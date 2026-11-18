@@ -39,6 +39,7 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable private final byte[] startKey;
     @Nullable private final byte[] endKey;
     @Nullable private final ReadDirection direction;
+    private final int keyLimit;
 
     PrefixLookupQuery(
             TablePath tablePath, TableBucket tableBucket, byte[] prefixKey, int bucketCount) {
@@ -61,7 +62,8 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
                 failOnLimitExceeded,
                 null,
                 null,
-                null);
+                null,
+                0);
     }
 
     PrefixLookupQuery(
@@ -72,7 +74,29 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
             @Nullable byte[] startKey,
             @Nullable byte[] endKey,
             @Nullable ReadDirection direction) {
-        this(tablePath, tableBucket, prefixKey, bucketCount, 0, false, startKey, endKey, direction);
+        this(tablePath, tableBucket, prefixKey, bucketCount, startKey, endKey, direction, 0);
+    }
+
+    PrefixLookupQuery(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] prefixKey,
+            int bucketCount,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            @Nullable ReadDirection direction,
+            int keyLimit) {
+        this(
+                tablePath,
+                tableBucket,
+                prefixKey,
+                bucketCount,
+                0,
+                false,
+                startKey,
+                endKey,
+                direction,
+                keyLimit);
     }
 
     PrefixLookupQuery(
@@ -84,8 +108,10 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
             boolean failOnLimitExceeded,
             @Nullable byte[] startKey,
             @Nullable byte[] endKey,
-            @Nullable ReadDirection direction) {
+            @Nullable ReadDirection direction,
+            int keyLimit) {
         super(tablePath, tableBucket, prefixKey, null, bucketCount);
+        this.keyLimit = keyLimit;
         this.limit = limit;
         this.failOnLimitExceeded = failOnLimitExceeded;
         this.future = new CompletableFuture<>();
@@ -126,6 +152,14 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable
     public byte[] endKey() {
         return endKey;
+    }
+
+    /**
+     * Returns the most rows of this prefix to read, the first ones in key order, or 0 for all of
+     * them. Unlike the candidate limit of the request, it truncates without failing.
+     */
+    public int keyLimit() {
+        return keyLimit;
     }
 
     /** Returns the requested direction, or null for a legacy unordered read. */

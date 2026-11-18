@@ -175,7 +175,7 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
             assertThatThrownBy(() -> kvTablet.prefixLookup(new byte[] {1}))
                     .isInstanceOf(IOException.class)
                     .hasMessageContaining("closing");
-            assertThat(read.readAll()).isEmpty();
+            assertThat(read.readAll(0)).isEmpty();
         } finally {
             read.close();
             firstClose.get(10, TimeUnit.SECONDS);

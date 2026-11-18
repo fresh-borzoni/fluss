@@ -306,7 +306,8 @@ public class ClientRpcMessageUtils {
                                             lookup ->
                                                     lookup.startKey() != null
                                                             || lookup.endKey() != null
-                                                            || lookup.direction() != null);
+                                                            || lookup.direction() != null
+                                                            || lookup.keyLimit() > 0);
                     batch.lookups()
                             .forEach(
                                     lookup -> {
@@ -325,6 +326,9 @@ public class ClientRpcMessageUtils {
                                             }
                                             if (lookup.endKey() != null) {
                                                 key.setEndKey(lookup.endKey());
+                                            }
+                                            if (lookup.keyLimit() > 0) {
+                                                key.setLimit(lookup.keyLimit());
                                             }
                                         } else {
                                             pbPrefixLookupReqForBucket.addKey(lookup.key());

@@ -76,4 +76,17 @@ public interface Lookuper {
             InternalRow lookupKey, Range<? extends InternalRow> bounds) {
         throw new UnsupportedOperationException("This lookuper does not support range bounds.");
     }
+
+    /**
+     * Looks up the first rows with the given prefix key, at most {@code limit} of them, in the
+     * order of their primary keys as the table stores them. Only forward prefix key lookupers whose
+     * lookup columns are the prefix support it; it needs no ordered keys, but fails with an {@link
+     * org.apache.fluss.exception.UnsupportedVersionException} on servers older than PREFIX_LOOKUP
+     * version 3.
+     *
+     * @param limit the most rows to return, positive
+     */
+    default CompletableFuture<LookupResult> lookupFirst(InternalRow lookupKey, int limit) {
+        throw new UnsupportedOperationException("This lookuper does not support limits.");
+    }
 }

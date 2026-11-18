@@ -36,6 +36,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.DefaultValueRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.row.ordered.OrderedKeyCodec;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PrefixLookupResultForBucket;
@@ -144,6 +145,7 @@ import org.apache.fluss.shaded.guava32.com.google.common.primitives.UnsignedByte
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -620,6 +622,16 @@ public final class TabletService extends RpcServiceBase
         return response;
     }
 
+    /**
+     * Whether the bounds select exactly the keys that start with one prefix. Such keys are adjacent
+     * in any key format, so they can be read in pages without ordered keys.
+     */
+    private static boolean isPrefixRange(@Nullable byte[] startKey, @Nullable byte[] endKey) {
+        return startKey != null
+                && startKey.length > 0
+                && Arrays.equals(endKey, OrderedKeyCodec.prefixUpperBound(startKey));
+    }
+
     @Override
     public CompletableFuture<LimitScanResponse> limitScan(LimitScanRequest request) {
         authorizeTable(READ, request.getTableId());
@@ -1075,10 +1087,16 @@ public final class TabletService extends RpcServiceBase
                 byte[] startKey = bucketReq.hasStartKey() ? bucketReq.getStartKey() : null;
                 byte[] endKey = bucketReq.hasEndKey() ? bucketReq.getEndKey() : null;
                 if (startKey != null || endKey != null || bucketReq.hasReverse()) {
-                    if (currentSession().getApiVersion() < 1
-                            || !replica.getTableInfo().getTableConfig().isOrderedKeyEnabled()) {
+                    short version = currentSession().getApiVersion();
+                    boolean reverse = bucketReq.hasReverse() && bucketReq.isReverse();
+                    if (version < 1
+                            || (!replica.getTableInfo().getTableConfig().isOrderedKeyEnabled()
+                                    && (version < 2
+                                            || reverse
+                                            || !isPrefixRange(startKey, endKey)))) {
                         throw new InvalidScanRequestException(
-                                "Ordered or bounded reads require SCAN_KV v1 and table.kv.ordered-key.enabled=true.");
+                                "Ordered or bounded reads require SCAN_KV v1 and table.kv.ordered-key.enabled=true,"
+                                        + " except forward reads of all keys with one prefix, which require SCAN_KV v2.");
                     }
                     if (startKey != null
                             && endKey != null

@@ -41,6 +41,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -140,7 +141,7 @@ class RocksDBKvTest {
                                                                 prefix))
                                 .toArray(byte[][]::new);
                 try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
-                    assertThat(lookup.readAll())
+                    assertThat(lookup.readAll(0))
                             .as("prefix %s (flushed=%s)", Arrays.toString(prefix), flush)
                             .containsExactly(expected);
                 }
@@ -207,17 +208,17 @@ class RocksDBKvTest {
                 kv.delete(key2);
                 kv.put(key4, new byte[] {4});
                 try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
-                    assertThat(lookup.readAll())
+                    assertThat(lookup.readAll(0))
                             .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
                 }
                 kv.db.flush(options);
                 try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
-                    assertThat(lookup.readAll())
+                    assertThat(lookup.readAll(0))
                             .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
                 }
                 kv.db.compactRange();
                 try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
-                    assertThat(lookup.readAll())
+                    assertThat(lookup.readAll(0))
                             .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
                 }
             }
@@ -249,14 +250,14 @@ class RocksDBKvTest {
                 }
                 kv.db.compactRange();
                 // Seek has not run yet: the view must date from opening, not the first seek.
-                assertThat(lookup.readAll()).containsExactly(new byte[] {10}, new byte[] {11});
+                assertThat(lookup.readAll(0)).containsExactly(new byte[] {10}, new byte[] {11});
             }
             assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
             try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {1})) {
-                assertThat(lookup.readAll()).containsExactly(new byte[] {12}, new byte[] {13});
+                assertThat(lookup.readAll(0)).containsExactly(new byte[] {12}, new byte[] {13});
             }
             try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {3})) {
-                assertThat(lookup.readAll()).isEmpty();
+                assertThat(lookup.readAll(0)).isEmpty();
             }
             assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
         }
@@ -283,7 +284,7 @@ class RocksDBKvTest {
                     kv.db.flush(options);
                 }
                 kv.db.compactRange();
-                assertThat(lookup.readAll())
+                assertThat(lookup.readAll(0))
                         .containsExactly(
                                 new byte[] {(byte) (reverse ? 12 : 11)},
                                 new byte[] {(byte) (reverse ? 11 : 12)});
@@ -291,7 +292,7 @@ class RocksDBKvTest {
             assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
             try (RocksDBKv.PrefixLookup lookup =
                     kv.openPrefixLookup(new byte[] {1}, new byte[] {0}, new byte[] {3}, reverse)) {
-                assertThat(lookup.readAll())
+                assertThat(lookup.readAll(0))
                         .containsExactly(
                                 new byte[] {(byte) (reverse ? 13 : 10)},
                                 new byte[] {22},
@@ -302,12 +303,43 @@ class RocksDBKvTest {
             kv.put(new byte[] {(byte) 0xff, 1}, new byte[] {31});
             try (RocksDBKv.PrefixLookup lookup =
                     kv.openPrefixLookup(new byte[] {(byte) 0xff}, null, null, reverse)) {
-                assertThat(lookup.readAll())
+                assertThat(lookup.readAll(0))
                         .containsExactly(
                                 new byte[] {(byte) (reverse ? 31 : 30)},
                                 new byte[] {(byte) (reverse ? 30 : 31)});
             }
             assertThat(kv.db.getLongProperty("rocksdb.num-snapshots")).isZero();
+        }
+    }
+
+    /** A limit keeps the first rows in the direction of the read; 0 keeps all of them. */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testPrefixReadLimit(boolean reverse, @TempDir Path tempDir) throws Exception {
+        try (RocksDBKv kv = buildRocksDBKv(tempDir.toFile())) {
+            for (byte i = 0; i < 4; i++) {
+                kv.put(new byte[] {1, i}, new byte[] {(byte) (10 + i)});
+            }
+            kv.put(new byte[] {2}, new byte[] {20});
+            byte[][] all = {{10}, {11}, {12}, {13}};
+            if (reverse) {
+                Collections.reverse(Arrays.asList(all));
+            }
+            for (int limit : new int[] {0, 1, 3, 4, 5}) {
+                byte[][] expected = limit == 0 ? all : Arrays.copyOf(all, Math.min(limit, 4));
+                try (RocksDBKv.PrefixLookup lookup =
+                        kv.openPrefixLookup(new byte[] {1}, null, null, reverse)) {
+                    assertThat(lookup.readAll(limit))
+                            .as("limit %s", limit)
+                            .containsExactly(expected);
+                }
+            }
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookup(new byte[] {1}, new byte[] {1, 1}, null, reverse)) {
+                assertThat(lookup.readAll(1))
+                        .as("the first row within the bounds")
+                        .containsExactly(new byte[] {(byte) (reverse ? 13 : 11)});
+            }
         }
     }
 

@@ -32,6 +32,7 @@ import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.messages.AuthenticateRequest;
 import org.apache.fluss.rpc.messages.AuthenticateResponse;
+import org.apache.fluss.rpc.messages.PbPrefixLookupKey;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -81,6 +82,7 @@ final class ServerConnection {
     private static final short ALTER_BUCKET_COUNT_MIN_VERSION = 1;
     private static final short PREFIX_LOOKUP_LIMIT_MIN_VERSION = 2;
     private static final short PREFIX_LOOKUP_RANGE_MIN_VERSION = 3;
+    private static final short PREFIX_LOOKUP_KEY_LIMIT_MIN_VERSION = 4;
 
     private final ServerNode node;
 
@@ -421,6 +423,19 @@ final class ServerConnection {
                 throw new UnsupportedVersionException(
                         "Ordered or bounded prefix lookups require PREFIX_LOOKUP version "
                                 + PREFIX_LOOKUP_RANGE_MIN_VERSION
+                                + " or newer.");
+            }
+        }
+        if (apiKey == ApiKeys.PREFIX_LOOKUP && version < PREFIX_LOOKUP_KEY_LIMIT_MIN_VERSION) {
+            PrefixLookupRequest lookup = (PrefixLookupRequest) rawRequest;
+            if (lookup.getBucketsReqsList().stream()
+                    .anyMatch(
+                            bucket ->
+                                    bucket.getLookupsList().stream()
+                                            .anyMatch(PbPrefixLookupKey::hasLimit))) {
+                throw new UnsupportedVersionException(
+                        "Prefix lookups with a limit of their own require PREFIX_LOOKUP version "
+                                + PREFIX_LOOKUP_KEY_LIMIT_MIN_VERSION
                                 + " or newer.");
             }
         }

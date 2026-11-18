@@ -17,7 +17,9 @@
 
 package org.apache.fluss.flink.sink;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.adapter.SupportsReadYourWritesAdapter;
 import org.apache.fluss.flink.sink.serializer.RowDataSerializationSchema;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
@@ -49,6 +51,8 @@ import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -70,7 +74,10 @@ public class FlinkTableSink
                 SupportsPartitioning,
                 SupportsDeletePushDown,
                 SupportsRowLevelDelete,
-                SupportsRowLevelUpdate {
+                SupportsRowLevelUpdate,
+                SupportsReadYourWritesAdapter {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkTableSink.class);
 
     private final TablePath tablePath;
     private final Configuration flussConfig;
@@ -88,6 +95,7 @@ public class FlinkTableSink
     @Nullable private final String producerId;
 
     private boolean appliedUpdates = false;
+    private boolean readYourWrites = false;
     @Nullable private GenericRow deleteRow;
 
     public FlinkTableSink(
@@ -189,6 +197,15 @@ public class FlinkTableSink
             }
             // else, it's full update, ignore the given target columns as we don't care the order
         }
+        if (readYourWrites && targetColumnIndexes != null) {
+            throw new ValidationException(
+                    String.format(
+                            "Lookups of table %s cannot read what its sink writes: the sink writes"
+                                    + " only the columns %s, which the table merges into the rows"
+                                    + " it holds. Partial updates, which tables with auto-increment"
+                                    + " columns require, do not support read-your-writes.",
+                            tablePath, columns(targetColumnIndexes)));
+        }
 
         FlinkSink<RowData> flinkSink = getFlinkSink(targetColumnIndexes);
         // Use DataStreamSinkProvider rather than SinkV2Provider because later won't set default uid
@@ -232,6 +249,10 @@ public class FlinkTableSink
                                 distributionMode,
                                 new RowDataSerializationSchema(true, sinkIgnoreDelete));
 
+        if (readYourWrites) {
+            ((FlinkSink.UpsertSinkWriterBuilder<RowData>) flinkSinkWriterBuilder)
+                    .withReadYourWrites();
+        }
         return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
     }
 
@@ -263,7 +284,38 @@ public class FlinkTableSink
                         producerId);
         sink.appliedUpdates = appliedUpdates;
         sink.deleteRow = deleteRow;
+        sink.readYourWrites = readYourWrites;
         return sink;
+    }
+
+    @Override
+    public boolean applyReadYourWrites() {
+        // lookups need a primary key, and must return the rows as written: merge engines and
+        // ignored deletes change them, and so do partial updates, rejected with the target columns
+        if (primaryKeyIndexes.length == 0
+                || mergeEngineType != null
+                || sinkIgnoreDelete
+                || tableDeleteBehavior != DeleteBehavior.ALLOW) {
+            return false;
+        }
+        // the writer forgets a row once its write is acknowledged, so an acknowledged write must be
+        // visible to lookups, and the writes of one key must apply in order
+        String acks = flussConfig.get(ConfigOptions.CLIENT_WRITER_ACKS);
+        boolean idempotence = flussConfig.get(ConfigOptions.CLIENT_WRITER_ENABLE_IDEMPOTENCE);
+        if (!("all".equals(acks) || "-1".equals(acks)) || !idempotence) {
+            LOG.warn(
+                    "The sink of table {} cannot make its rows visible to the lookups of its task:"
+                            + " that requires '{}' = 'all' and '{}' = 'true', but they are '{}'"
+                            + " and '{}'.",
+                    tablePath,
+                    ConfigOptions.CLIENT_WRITER_ACKS.key(),
+                    ConfigOptions.CLIENT_WRITER_ENABLE_IDEMPOTENCE.key(),
+                    acks,
+                    idempotence);
+            return false;
+        }
+        readYourWrites = true;
+        return true;
     }
 
     @Override

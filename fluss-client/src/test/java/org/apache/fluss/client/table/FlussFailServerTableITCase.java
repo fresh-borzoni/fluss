@@ -18,11 +18,13 @@
 package org.apache.fluss.client.table;
 
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
+import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 
@@ -39,7 +41,10 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.InternalRowAssert.assertThatRow;
 import static org.apache.fluss.testutils.InternalRowListAssert.assertThatRows;
+import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT case for {@link FlussTable} in the case of one tablet server fails. */
 class FlussFailServerTableITCase extends ClientToServerITCaseBase {
@@ -101,6 +106,52 @@ class FlussFailServerTableITCase extends ClientToServerITCaseBase {
                 FLUSS_CLUSTER_EXTENSION.startTabletServer(SERVER);
             }
         }
+    }
+
+    /**
+     * An upsert whose write was acknowledged is visible to lookups also after the leader of its
+     * bucket changed: a lookup never reads a state without an acknowledged write. Lookups that read
+     * the rows a sink wrote rely on this.
+     */
+    @Test
+    void testAcknowledgedUpsertsAreVisibleAfterLeaderChange() throws Exception {
+        long tableId = createTable(DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK, false);
+        TableBucket bucket = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(bucket);
+        int leader = leaderOf(bucket);
+        try (Table table = conn.getTable(DATA1_TABLE_PATH_PK)) {
+            UpsertWriter upsertWriter = table.newUpsert().createWriter();
+            int rows = 30;
+            for (String version : new String[] {"v1", "v2"}) {
+                for (int i = 0; i < rows; i++) {
+                    // acknowledged one by one: every write is acknowledged before the next
+                    upsertWriter.upsert(row(i, version)).get();
+                }
+            }
+
+            FLUSS_CLUSTER_EXTENSION.stopTabletServer(leader);
+            try {
+                retry(
+                        Duration.ofMinutes(1),
+                        () -> assertThat(leaderOf(bucket)).isNotEqualTo(leader));
+                Lookuper lookuper = table.newLookup().createLookuper();
+                for (int i = 0; i < rows; i++) {
+                    assertThatRow(lookupRow(lookuper, row(i)))
+                            .withSchema(DATA1_ROW_TYPE)
+                            .isEqualTo(row(i, "v2"));
+                }
+            } finally {
+                FLUSS_CLUSTER_EXTENSION.startTabletServer(leader);
+            }
+        }
+    }
+
+    private static int leaderOf(TableBucket bucket) throws Exception {
+        return FLUSS_CLUSTER_EXTENSION
+                .getZooKeeperClient()
+                .getLeaderAndIsr(bucket)
+                .orElseThrow(() -> new IllegalStateException("No leader of " + bucket))
+                .leader();
     }
 
     @Test

@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.catalog;
 
+import org.apache.fluss.flink.adapter.PagedLookupAdapter;
+
 import org.apache.flink.table.connector.source.LookupTableSource;
 import org.apache.flink.table.runtime.connector.source.LookupRuntimeProviderContext;
 
@@ -36,5 +38,10 @@ public class Flink23TableFactoryTest extends FlinkTableFactoryTest {
     @Override
     protected boolean supportsLookupCustomShuffle() {
         return true;
+    }
+
+    @Override
+    protected Class<?> asyncLookupFunctionClass() {
+        return PagedLookupAdapter.PagedFunction.class;
     }
 }
