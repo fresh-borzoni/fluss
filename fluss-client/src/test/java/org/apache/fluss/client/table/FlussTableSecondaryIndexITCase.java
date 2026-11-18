@@ -22,6 +22,8 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.lookup.PrefixPages;
+import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
@@ -56,6 +58,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
@@ -129,6 +133,119 @@ class FlussTableSecondaryIndexITCase extends ClientToServerITCaseBase {
         assertThat(rows).hasSize(1);
         assertThat(rows.get(0).getInt(0)).isEqualTo(1);
         return rows.get(0);
+    }
+
+    /**
+     * Pages read a key with more matches than the candidate limit of a lookup, at most a page size
+     * of candidates each, and every current row once: rows deleted or moved to another key before
+     * their page are not returned, rows updated before their page in their latest version.
+     */
+    @Test
+    void testPagesReadMoreMatchesThanTheCandidateLimit() throws Exception {
+        TablePath path = TablePath.of(DB, "paged_index_lookup");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("tag", DataTypes.STRING())
+                        .column("v", DataTypes.INT())
+                        .primaryKey("id")
+                        .index("idx_tag", "tag")
+                        .build();
+        createTable(
+                path,
+                TableDescriptor.builder().schema(schema).distributedBy(2, "id").build(),
+                true);
+        int rows = 3000;
+        try (Table table = conn.getTable(path)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            for (int i = 0; i < rows; i++) {
+                writer.upsert(row(i, "many", 0));
+            }
+            writer.upsert(row(rows, "few", 0));
+            writer.flush();
+        }
+        Configuration config = new Configuration(clientConf);
+        config.set(ConfigOptions.CLIENT_LOOKUP_SECONDARY_INDEX_MAX_CANDIDATES, 600);
+        ExecutorService scans = Executors.newSingleThreadExecutor();
+        try (Connection limited = ConnectionFactory.createConnection(config);
+                Table table = limited.getTable(path)) {
+            SecondaryIndexLookuper index =
+                    (SecondaryIndexLookuper) table.getSecondaryIndexLookuper("idx_tag");
+            assertThatThrownBy(() -> index.lookup(row("many")).get())
+                    .hasRootCauseInstanceOf(LookupLimitExceededException.class);
+            assertThatThrownBy(() -> index.openPages(row("many"), 601, scans))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("at most 600");
+
+            // fewer matches than a page: one page
+            try (PrefixPages few = index.openPages(row("few"), 500, scans)) {
+                PrefixPages.Page page = few.next().get(30, TimeUnit.SECONDS);
+                assertThat(page.last).isTrue();
+                assertThat(ids(page.rows)).containsExactly(rows);
+            }
+
+            PrefixPages pages = index.openPages(row("many"), 500, scans);
+            PrefixPages.Page first = pages.next().get(30, TimeUnit.SECONDS);
+            assertThat(first.rows).hasSize(500);
+            assertThat(first.last).isFalse();
+            List<Integer> read = new ArrayList<>(ids(first.rows));
+
+            // rows not read yet are deleted, moved to another key and updated
+            List<Integer> unread = new ArrayList<>();
+            for (int i = 0; i < rows; i++) {
+                if (!read.contains(i)) {
+                    unread.add(i);
+                }
+            }
+            List<Integer> deleted = unread.subList(0, 10);
+            List<Integer> moved = unread.subList(10, 20);
+            List<Integer> updated = unread.subList(20, 30);
+            try (Table writable = conn.getTable(path)) {
+                UpsertWriter writer = writable.newUpsert().createWriter();
+                for (int id : deleted) {
+                    writer.delete(row(id, "many", 0));
+                }
+                for (int id : moved) {
+                    writer.upsert(row(id, "other", 0));
+                }
+                for (int id : updated) {
+                    writer.upsert(row(id, "many", 1));
+                }
+                writer.flush();
+            }
+
+            int pageCount = 1;
+            PrefixPages.Page page;
+            do {
+                page = pages.next().get(30, TimeUnit.SECONDS);
+                assertThat(page.rows.size()).isLessThanOrEqualTo(500);
+                for (InternalRow r : page.rows) {
+                    assertThat(r.getInt(2)).isEqualTo(updated.contains(r.getInt(0)) ? 1 : 0);
+                }
+                read.addAll(ids(page.rows));
+                pageCount++;
+            } while (!page.last);
+            pages.close();
+
+            List<Integer> expected = new ArrayList<>();
+            for (int i = 0; i < rows; i++) {
+                if (!deleted.contains(i) && !moved.contains(i)) {
+                    expected.add(i);
+                }
+            }
+            assertThat(read).doesNotHaveDuplicates().containsExactlyInAnyOrderElementsOf(expected);
+            assertThat(pageCount).isGreaterThanOrEqualTo(6);
+        } finally {
+            scans.shutdownNow();
+        }
+    }
+
+    private static List<Integer> ids(List<InternalRow> rows) {
+        List<Integer> ids = new ArrayList<>(rows.size());
+        for (InternalRow r : rows) {
+            ids.add(r.getInt(0));
+        }
+        return ids;
     }
 
     @ParameterizedTest

@@ -170,6 +170,25 @@ class LookupNormalizerTest {
                         GenericRowData.of(7, 2026, 42, 2)));
     }
 
+    /** Of the indexes the lookup keys cover, one with synchronous visibility is used. */
+    @Test
+    void testSecondaryLookupPrefersIndexWithSyncVisibility() {
+        LookupNormalizer normalizer =
+                LookupNormalizer.validateAndCreateLookupNormalizer(
+                        new int[][] {{0}, {1}, {3}},
+                        new int[] {0, 1, 3},
+                        new int[] {0},
+                        new int[] {3},
+                        SCHEMA,
+                        new int[] {2, 3, 0, 1},
+                        new int[][] {{2, 3}, {2}},
+                        new boolean[] {false, true});
+        assertThat(normalizer.getLookupType()).isEqualTo(LookupType.SECONDARY_INDEX_LOOKUP);
+        // the longer index has asynchronous visibility: the lookup uses the other one
+        assertThat(normalizer.normalizeLookupKey(GenericRowData.of(7, 2026, 1)))
+                .isEqualTo(GenericRowData.of(7));
+    }
+
     @Test
     void testUnsupportedLookupIsRejected() {
         assertThatThrownBy(() -> create(new int[] {1, 3}, new int[] {0}, null, new int[][] {{2}}))

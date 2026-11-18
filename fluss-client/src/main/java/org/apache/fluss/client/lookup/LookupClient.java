@@ -128,7 +128,8 @@ public class LookupClient {
                 new ExecutorThreadFactory(LOOKUP_CONTINUATION_THREAD_PREFIX));
     }
 
-    int secondaryIndexMaxCandidates() {
+    /** The most candidates a lookup of a secondary index may read. */
+    public int secondaryIndexMaxCandidates() {
         checkArgument(
                 secondaryIndexMaxCandidates > 0,
                 "%s must be positive.",

@@ -134,7 +134,8 @@ public class FlussTable implements Table {
                 index.getColumnNames(),
                 conn.getTable(indexTablePath),
                 this.newLookup().createLookuper(),
-                conn.getOrCreateLookupClient().getLookupContinuationExecutor());
+                conn.getOrCreateLookupClient().getLookupContinuationExecutor(),
+                conn.getOrCreateLookupClient().secondaryIndexMaxCandidates());
     }
 
     private static Schema.Index findIndexOrThrow(

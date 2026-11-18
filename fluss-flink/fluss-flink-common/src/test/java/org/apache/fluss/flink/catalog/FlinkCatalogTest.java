@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.catalog;
 
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.IllegalConfigurationException;
@@ -25,6 +27,10 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.flink.adapter.CatalogMaterializedTableAdapter;
 import org.apache.fluss.flink.lake.LakeFlinkCatalog;
 import org.apache.fluss.flink.utils.FlinkConversionsTest;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
+import org.apache.fluss.metadata.TableDescriptor;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.testutils.common.MultiVersionTest;
@@ -227,6 +233,56 @@ class FlinkCatalogTest {
                         .isPresent()) {
                     throw e;
                 }
+            }
+        }
+    }
+
+    /**
+     * Lookups by the primary key, its bucket-key prefix and the secondary indexes with synchronous
+     * visibility are declared as indexes; a lookup by an index with asynchronous visibility may
+     * miss rows that the job has already read, so it is not.
+     */
+    @Test
+    void testOnlySecondaryIndexesWithSyncVisibilityAreDeclared() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "table_with_secondary_indexes");
+        org.apache.fluss.metadata.Schema schema =
+                org.apache.fluss.metadata.Schema.newBuilder()
+                        .column("a", org.apache.fluss.types.DataTypes.INT())
+                        .column("b", org.apache.fluss.types.DataTypes.INT())
+                        .column("c", org.apache.fluss.types.DataTypes.BIGINT())
+                        .column("d", org.apache.fluss.types.DataTypes.BIGINT())
+                        .primaryKey("a", "b")
+                        .index(
+                                "idx_c",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("c"),
+                                IndexVisibility.SYNC,
+                                1)
+                        .index(
+                                "idx_d",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("d"),
+                                IndexVisibility.ASYNC,
+                                1)
+                        .build();
+        try (Connection connection =
+                ConnectionFactory.createConnection(FLUSS_CLUSTER_EXTENSION.getClientConfig())) {
+            connection
+                    .getAdmin()
+                    .createTable(
+                            tablePath,
+                            TableDescriptor.builder().schema(schema).distributedBy(1, "a").build(),
+                            false)
+                    .get();
+            try {
+                TableInfo tableInfo = connection.getAdmin().getTableInfo(tablePath).get();
+                assertThat(FlinkCatalog.lookupIndexes(Arrays.asList("a", "b"), tableInfo))
+                        .containsExactly(
+                                Arrays.asList("a", "b"),
+                                Collections.singletonList("a"),
+                                Collections.singletonList("c"));
+            } finally {
+                connection.getAdmin().dropTable(tablePath, true).get();
             }
         }
     }

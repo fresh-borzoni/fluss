@@ -296,10 +296,43 @@ public class LookupNormalizer implements Serializable {
             RowType schema,
             @Nullable int[] projectedFields,
             @Nullable int[][] secondaryIndexes) {
+        return validateAndCreateLookupNormalizer(
+                lookupKeyIndexes,
+                primaryKeys,
+                bucketKeys,
+                partitionKeys,
+                schema,
+                projectedFields,
+                secondaryIndexes,
+                null);
+    }
+
+    /**
+     * As {@link #validateAndCreateLookupNormalizer(int[][], int[], int[], int[], RowType, int[],
+     * int[][])}, with the visibility of every secondary index.
+     *
+     * @param syncIndexes per secondary index, whether it is sync; null if all are. A matching sync
+     *     index is preferred: delta join lookups rely on seeing every acknowledged write.
+     */
+    public static LookupNormalizer validateAndCreateLookupNormalizer(
+            int[][] lookupKeyIndexes,
+            int[] primaryKeys,
+            int[] bucketKeys,
+            int[] partitionKeys,
+            RowType schema,
+            @Nullable int[] projectedFields,
+            @Nullable int[][] secondaryIndexes,
+            @Nullable boolean[] syncIndexes) {
         validateTableStructure(primaryKeys, bucketKeys, partitionKeys);
         LookupKeyInfo lookupKeyInfo = resolveLookupKeys(lookupKeyIndexes, projectedFields, schema);
         return createNormalizerByLookupType(
-                lookupKeyInfo, primaryKeys, bucketKeys, partitionKeys, schema, secondaryIndexes);
+                lookupKeyInfo,
+                primaryKeys,
+                bucketKeys,
+                partitionKeys,
+                schema,
+                secondaryIndexes,
+                syncIndexes);
     }
 
     private static void validateTableStructure(
@@ -353,7 +386,8 @@ public class LookupNormalizer implements Serializable {
             int[] bucketKeys,
             int[] partitionKeys,
             RowType schema,
-            @Nullable int[][] secondaryIndexes) {
+            @Nullable int[][] secondaryIndexes,
+            @Nullable boolean[] syncIndexes) {
         List<String> lookupKeyNames = lookupKeyInfo.names;
         List<String> primaryKeyNames = fieldNames(primaryKeys, schema);
 
@@ -395,7 +429,8 @@ public class LookupNormalizer implements Serializable {
 
         // try secondary index lookup (supports remaining filters when lookup keys are superset)
         int[] matchedIndex =
-                findMatchingSecondaryIndex(lookupKeyInfo.beforeProjection, secondaryIndexes);
+                findMatchingSecondaryIndex(
+                        lookupKeyInfo.beforeProjection, secondaryIndexes, syncIndexes);
         if (matchedIndex != null) {
             List<String> indexKeyNames = fieldNames(matchedIndex, schema);
             return createLookupNormalizer(
@@ -412,12 +447,15 @@ public class LookupNormalizer implements Serializable {
     }
 
     /**
-     * Find a secondary index whose columns are a subset of (or equal to) the lookup keys. Returns
-     * the matched index columns, or null if no match.
+     * Find a secondary index whose columns are a subset of (or equal to) the lookup keys, one with
+     * synchronous visibility if any matches. Returns the matched index columns, or null if no
+     * match.
      */
     @Nullable
     private static int[] findMatchingSecondaryIndex(
-            int[] lookupKeyIndexes, @Nullable int[][] secondaryIndexes) {
+            int[] lookupKeyIndexes,
+            @Nullable int[][] secondaryIndexes,
+            @Nullable boolean[] syncIndexes) {
         if (secondaryIndexes == null) {
             return null;
         }
@@ -426,7 +464,9 @@ public class LookupNormalizer implements Serializable {
             lookupSet.add(idx);
         }
         int[] bestMatch = null;
-        for (int[] indexColumns : secondaryIndexes) {
+        boolean bestSync = false;
+        for (int i = 0; i < secondaryIndexes.length; i++) {
+            int[] indexColumns = secondaryIndexes[i];
             boolean allContained = true;
             for (int col : indexColumns) {
                 if (!lookupSet.contains(col)) {
@@ -434,8 +474,15 @@ public class LookupNormalizer implements Serializable {
                     break;
                 }
             }
-            if (allContained && isBetterIndexMatch(indexColumns, bestMatch)) {
+            if (!allContained) {
+                continue;
+            }
+            boolean sync = syncIndexes == null || syncIndexes[i];
+            if (bestMatch == null
+                    || (sync && !bestSync)
+                    || (sync == bestSync && isBetterIndexMatch(indexColumns, bestMatch))) {
                 bestMatch = indexColumns;
+                bestSync = sync;
             }
         }
         return bestMatch;

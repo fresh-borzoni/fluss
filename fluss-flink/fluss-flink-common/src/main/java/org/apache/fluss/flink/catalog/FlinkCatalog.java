@@ -44,6 +44,7 @@ import org.apache.fluss.flink.utils.CatalogExceptionUtils;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseDescriptor;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.TableChange;
@@ -1101,10 +1102,24 @@ public class FlinkCatalog extends AbstractCatalog {
         if (!pkOp.isPresent()) {
             return table;
         }
+        List<List<String>> indexes = lookupIndexes(pkOp.get().getColumnNames(), tableInfo);
+        return CatalogTableAdapter.toCatalogTable(
+                withIndex(table.getUnresolvedSchema(), indexes),
+                table.getComment(),
+                table.getPartitionKeys(),
+                table.getOptions());
+    }
 
+    /**
+     * The column lists that lookups of the table support, declared as indexes of its Flink schema:
+     * the primary key, the bucket key if it is a prefix of the primary key, and the secondary
+     * indexes with synchronous visibility.
+     */
+    @VisibleForTesting
+    static List<List<String>> lookupIndexes(List<String> primaryKey, TableInfo tableInfo) {
         List<List<String>> indexes = new ArrayList<>();
         // Pk is always an index.
-        indexes.add(pkOp.get().getColumnNames());
+        indexes.add(primaryKey);
 
         // Judge whether we can do prefix lookup.
         List<String> bucketKeys = tableInfo.getBucketKeys();
@@ -1124,16 +1139,13 @@ public class FlinkCatalog extends AbstractCatalog {
         }
 
         for (org.apache.fluss.metadata.Schema.Index index : tableInfo.getSchema().getIndexes()) {
-            indexes.add(index.getColumnNames());
+            // a delta join lookup must see every change already read: async indexes can lag
+            if (index.getVisibility() == IndexVisibility.SYNC) {
+                indexes.add(index.getColumnNames());
+            }
         }
 
-        return CatalogTableAdapter.toCatalogTable(
-                withIndex(
-                        table.getUnresolvedSchema(),
-                        indexes.stream().distinct().collect(Collectors.toList())),
-                table.getComment(),
-                table.getPartitionKeys(),
-                table.getOptions());
+        return indexes.stream().distinct().collect(Collectors.toList());
     }
 
     private static boolean isPrefixList(List<String> fullList, List<String> prefixList) {

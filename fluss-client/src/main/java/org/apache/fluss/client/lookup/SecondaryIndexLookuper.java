@@ -19,6 +19,7 @@ package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.table.Table;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.predicate.Equal;
 import org.apache.fluss.row.BinaryString;
@@ -29,6 +30,7 @@ import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
@@ -72,6 +74,12 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 @ThreadSafe
 public final class SecondaryIndexLookuper implements Lookuper {
 
+    /** The columns of the Index Table by which its data rows of one lookup key are read. */
+    private static final List<String> INDEX_LOOKUP_COLUMNS =
+            Arrays.asList(
+                    IndexTableUtils.RECORD_KIND_SYSTEM_COLUMN,
+                    IndexTableUtils.ROUTING_KEY_SYSTEM_COLUMN);
+
     private final Lookuper indexTablePrefixLookuper;
     private final Lookuper mainTablePointLookuper;
     private final Function<InternalRow, InternalRow> indexLookupKeyEncoder;
@@ -80,6 +88,12 @@ public final class SecondaryIndexLookuper implements Lookuper {
     private final DataType[] idxColumnTypes;
     private final Function<InternalRow, GenericRow> basePkExtractorFromIndexRow;
     private final Executor continuationExecutor;
+
+    /** The Index Table, which pages scan; null if the lookuper does not read in pages. */
+    private final @Nullable Table indexTable;
+
+    /** The most candidates a lookup of the Index Table may read, which bounds a page. */
+    private final int maxCandidates;
 
     /**
      * Assembles a lookuper for one secondary index of {@code mainSchema}.
@@ -93,15 +107,10 @@ public final class SecondaryIndexLookuper implements Lookuper {
             List<String> idxCols,
             Table indexTable,
             Lookuper mainTablePointLookuper,
-            Executor continuationExecutor) {
+            Executor continuationExecutor,
+            int maxCandidates) {
         Lookuper indexTablePrefixLookuper =
-                indexTable
-                        .newLookup()
-                        .lookupBy(
-                                Arrays.asList(
-                                        IndexTableUtils.RECORD_KIND_SYSTEM_COLUMN,
-                                        IndexTableUtils.ROUTING_KEY_SYSTEM_COLUMN))
-                        .createLookuper();
+                indexTable.newLookup().lookupBy(INDEX_LOOKUP_COLUMNS).createLookuper();
         CompactedKeyEncoder logicalIndexKeyEncoder =
                 new CompactedKeyEncoder(mainSchema.getRowType().project(idxCols));
         Function<InternalRow, InternalRow> indexLookupKeyEncoder =
@@ -155,7 +164,9 @@ public final class SecondaryIndexLookuper implements Lookuper {
                 idxColumnGettersInMainRow,
                 idxColumnTypes,
                 basePkExtractor,
-                continuationExecutor);
+                continuationExecutor,
+                indexTable,
+                maxCandidates);
     }
 
     SecondaryIndexLookuper(
@@ -167,6 +178,32 @@ public final class SecondaryIndexLookuper implements Lookuper {
             DataType[] idxColumnTypes,
             Function<InternalRow, GenericRow> basePkExtractorFromIndexRow,
             Executor continuationExecutor) {
+        this(
+                indexTablePrefixLookuper,
+                mainTablePointLookuper,
+                indexLookupKeyEncoder,
+                idxColumnGettersInLookupKey,
+                idxColumnGettersInMainRow,
+                idxColumnTypes,
+                basePkExtractorFromIndexRow,
+                continuationExecutor,
+                null,
+                0);
+    }
+
+    SecondaryIndexLookuper(
+            Lookuper indexTablePrefixLookuper,
+            Lookuper mainTablePointLookuper,
+            Function<InternalRow, InternalRow> indexLookupKeyEncoder,
+            InternalRow.FieldGetter[] idxColumnGettersInLookupKey,
+            InternalRow.FieldGetter[] idxColumnGettersInMainRow,
+            DataType[] idxColumnTypes,
+            Function<InternalRow, GenericRow> basePkExtractorFromIndexRow,
+            Executor continuationExecutor,
+            @Nullable Table indexTable,
+            int maxCandidates) {
+        this.indexTable = indexTable;
+        this.maxCandidates = maxCandidates;
         this.indexTablePrefixLookuper =
                 checkNotNull(indexTablePrefixLookuper, "indexTablePrefixLookuper");
         this.mainTablePointLookuper =
@@ -202,16 +239,22 @@ public final class SecondaryIndexLookuper implements Lookuper {
 
     private CompletableFuture<LookupResult> doHop2(
             LookupResult hop1Result, Object[] expectedIdxValues) {
-        List<InternalRow> candidateIndexRows = hop1Result.getRowList();
+        return mainRowsOf(hop1Result.getRowList(), expectedIdxValues, new HashSet<>())
+                .thenApply(LookupResult::new);
+    }
+
+    /** Hop 2 and the recheck, for candidates not in {@code seenBasePrimaryKeys} yet. */
+    private CompletableFuture<List<InternalRow>> mainRowsOf(
+            List<InternalRow> candidateIndexRows,
+            Object[] expectedIdxValues,
+            Set<GenericRow> seenBasePrimaryKeys) {
         if (candidateIndexRows.isEmpty()) {
-            return CompletableFuture.completedFuture(
-                    new LookupResult(Collections.<InternalRow>emptyList()));
+            return CompletableFuture.completedFuture(Collections.<InternalRow>emptyList());
         }
         List<CompletableFuture<LookupResult>> mainFutures =
                 new ArrayList<>(candidateIndexRows.size());
-        Set<GenericRow> seenBasePrimaryKeys = new HashSet<>();
         for (InternalRow indexRow : candidateIndexRows) {
-            GenericRow basePk = basePkExtractorFromIndexRow.apply(indexRow);
+            GenericRow basePk = copyRow(basePkExtractorFromIndexRow.apply(indexRow));
             if (seenBasePrimaryKeys.add(basePk)) {
                 mainFutures.add(mainTablePointLookuper.lookup(basePk));
             }
@@ -228,8 +271,78 @@ public final class SecondaryIndexLookuper implements Lookuper {
                                     }
                                 }
                             }
-                            return new LookupResult(aggregated);
+                            return aggregated;
                         });
+    }
+
+    /**
+     * Reads the rows matching a key in pages of at most {@code pageSize} index candidates, so any
+     * number of matches fits the candidate limit. Each page resolves and rechecks its candidates
+     * like {@link #lookup}; a main row comes at most once.
+     *
+     * @param pageSize the most candidates of a page, at most {@link
+     *     ConfigOptions#CLIENT_LOOKUP_SECONDARY_INDEX_MAX_CANDIDATES}
+     * @param scanExecutor runs the blocking reads of the scan of the Index Table
+     */
+    public PrefixPages openPages(InternalRow lookupKey, int pageSize, Executor scanExecutor) {
+        checkArgument(indexTable != null, "This lookuper does not read in pages.");
+        checkArgument(
+                pageSize > 0 && pageSize <= maxCandidates,
+                "The page size of a secondary index lookup must be positive and at most %s (%s),"
+                        + " but is %s.",
+                maxCandidates,
+                ConfigOptions.CLIENT_LOOKUP_SECONDARY_INDEX_MAX_CANDIDATES.key(),
+                pageSize);
+        // NULL never equals anything
+        boolean nullKey = hasNull(lookupKey);
+        // the pages keep the key, which they read later
+        InternalRow ownKey;
+        if (nullKey) {
+            ownKey = GenericRow.of(IndexTableUtils.DATA_RECORD_KIND, new byte[0]);
+        } else {
+            InternalRow indexKey = indexLookupKeyEncoder.apply(lookupKey);
+            ownKey = GenericRow.of(indexKey.getByte(0), indexKey.getBytes(1).clone());
+        }
+        Object[] expectedIdxValues = nullKey ? null : snapshotLookupKey(lookupKey);
+        Set<GenericRow> seenBasePrimaryKeys = new HashSet<>();
+        return new PrefixPages(
+                indexTable,
+                INDEX_LOOKUP_COLUMNS,
+                ownKey,
+                pageSize,
+                limit ->
+                        nullKey
+                                ? CompletableFuture.completedFuture(
+                                        new LookupResult(Collections.<InternalRow>emptyList()))
+                                : indexTablePrefixLookuper.lookupFirst(ownKey, limit),
+                scanExecutor,
+                candidates ->
+                        // not on the thread that completed the lookup, see the class comment
+                        CompletableFuture.supplyAsync(() -> candidates, continuationExecutor)
+                                .thenCompose(
+                                        c ->
+                                                mainRowsOf(
+                                                        c,
+                                                        expectedIdxValues,
+                                                        seenBasePrimaryKeys)));
+    }
+
+    private boolean hasNull(InternalRow lookupKey) {
+        for (int i = 0; i < idxColumnGettersInLookupKey.length; i++) {
+            if (lookupKey.isNullAt(i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A copy of a row whose values own their memory. */
+    private static GenericRow copyRow(GenericRow row) {
+        GenericRow copy = new GenericRow(row.getFieldCount());
+        for (int i = 0; i < row.getFieldCount(); i++) {
+            copy.setField(i, copyRecheckValue(row.getField(i)));
+        }
+        return copy;
     }
 
     private Object[] snapshotLookupKey(InternalRow lookupKey) {

@@ -22,6 +22,8 @@ import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.metadata.IndexType;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -49,6 +51,7 @@ import java.util.stream.Collectors;
 import static org.apache.fluss.flink.source.lookup.LookupNormalizer.createPrimaryKeyLookupNormalizer;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link FlinkLookupFunction} and {@link FlinkAsyncLookupFunction}. */
 class FlinkLookupFunctionTest extends FlinkTestBase {
@@ -338,6 +341,188 @@ class FlinkLookupFunctionTest extends FlinkTestBase {
             expected.add(id);
         }
         assertThat(ids).containsExactlyInAnyOrderElementsOf(expected);
+    }
+
+    /**
+     * A lookup by the columns of a secondary index with synchronous visibility returns the current
+     * rows with those values, also after rows moved to other values or were deleted.
+     */
+    @Test
+    void testAsyncLookupBySecondaryIndex() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "index-lookup-table");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.INT())
+                        .column("user_id", DataTypes.INT())
+                        .column("note", DataTypes.STRING())
+                        .primaryKey("order_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("user_id"),
+                                IndexVisibility.SYNC,
+                                2)
+                        .build();
+        createTable(
+                tablePath,
+                TableDescriptor.builder().schema(schema).distributedBy(2, "order_id").build());
+        RowType flinkRowType = FlinkConversions.toFlinkRowType(schema.getRowType());
+        FlinkAsyncLookupFunction function =
+                new FlinkAsyncLookupFunction(
+                        clientConf,
+                        tablePath,
+                        flinkRowType,
+                        indexLookupNormalizer(flinkRowType),
+                        null,
+                        false);
+        function.open(null);
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            writer.upsert(row(1001, 1, "a"));
+            writer.upsert(row(1002, 2, "b"));
+            writer.upsert(row(1003, 1, "c"));
+            writer.flush();
+            assertThat(lookupOrders(function, 1)).containsExactly(1001, 1003);
+            assertThat(lookupOrders(function, 2)).containsExactly(1002);
+
+            // 1003 moves to user 2, and 1002 is deleted
+            writer.upsert(row(1003, 2, "c"));
+            writer.delete(row(1002, 2, "b"));
+            writer.flush();
+            assertThat(lookupOrders(function, 1)).containsExactly(1001);
+            assertThat(lookupOrders(function, 2)).containsExactly(1003);
+            assertThat(lookupOrders(function, 3)).isEmpty();
+        } finally {
+            function.close();
+        }
+    }
+
+    /** A lookup by a secondary index reads its rows in pages too, every row once. */
+    @Test
+    void testPagesOfSecondaryIndexLookup() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "paged-index-lookup-table");
+        Schema schema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.INT())
+                        .column("user_id", DataTypes.INT())
+                        .column("note", DataTypes.STRING())
+                        .primaryKey("order_id")
+                        .index(
+                                "idx_user",
+                                IndexType.SECONDARY,
+                                Collections.singletonList("user_id"),
+                                IndexVisibility.SYNC,
+                                2)
+                        .build();
+        createTable(
+                tablePath,
+                TableDescriptor.builder().schema(schema).distributedBy(2, "order_id").build());
+        try (Table table = conn.getTable(tablePath)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            for (int i = 0; i < 25; i++) {
+                writer.upsert(row(i, 1, "n" + i));
+            }
+            for (int i = 100; i < 104; i++) {
+                writer.upsert(row(i, 3, "n" + i));
+            }
+            writer.flush();
+        }
+        RowType flinkRowType = FlinkConversions.toFlinkRowType(schema.getRowType());
+        FlinkAsyncLookupFunction function =
+                new FlinkAsyncLookupFunction(
+                        clientConf,
+                        tablePath,
+                        flinkRowType,
+                        indexLookupNormalizer(flinkRowType),
+                        null,
+                        false);
+        function.open(null);
+        try {
+            FlinkAsyncLookupFunction.LookupPages pages =
+                    function.openPages(GenericRowData.of(1), 10);
+            List<Integer> ids = new ArrayList<>();
+            int count = 0;
+            FlinkAsyncLookupFunction.Page page;
+            do {
+                page = pages.next().get(30, TimeUnit.SECONDS);
+                assertThat(page.rows.size()).isLessThanOrEqualTo(10);
+                for (RowData row : page.rows) {
+                    assertThat(row.getInt(1)).isEqualTo(1);
+                    ids.add(row.getInt(0));
+                }
+                count++;
+            } while (!page.last);
+            pages.close();
+            assertThat(count).isGreaterThanOrEqualTo(3);
+            List<Integer> expected = new ArrayList<>();
+            for (int i = 0; i < 25; i++) {
+                expected.add(i);
+            }
+            assertThat(ids).doesNotHaveDuplicates().containsExactlyInAnyOrderElementsOf(expected);
+
+            // fewer rows than a page: one page, from the lookup alone
+            FlinkAsyncLookupFunction.Page small =
+                    function.openPages(GenericRowData.of(3), 10).next().get(30, TimeUnit.SECONDS);
+            assertThat(small.last).isTrue();
+            assertThat(small.rows).hasSize(4);
+
+            // a page size beyond the candidate limit of the index reads pages of that limit
+            FlinkAsyncLookupFunction.Page whole =
+                    function.openPages(GenericRowData.of(1), 100_000)
+                            .next()
+                            .get(30, TimeUnit.SECONDS);
+            assertThat(whole.last).isTrue();
+            assertThat(whole.rows).hasSize(25);
+        } finally {
+            function.close();
+        }
+    }
+
+    /** The rows a sink writer of the task has not flushed are found by primary key only. */
+    @Test
+    void testReadYourWritesRefusesSecondaryIndexLookups() {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("order_id", DataTypes.INT())
+                        .column("user_id", DataTypes.INT())
+                        .column("note", DataTypes.STRING())
+                        .primaryKey("order_id")
+                        .build();
+        RowType flinkRowType = FlinkConversions.toFlinkRowType(schema.getRowType());
+        assertThatThrownBy(
+                        () ->
+                                new FlinkAsyncLookupFunction(
+                                        clientConf,
+                                        TablePath.of(DEFAULT_DB, "index-lookup-table"),
+                                        flinkRowType,
+                                        indexLookupNormalizer(flinkRowType),
+                                        null,
+                                        false,
+                                        true))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("secondary index");
+    }
+
+    /** Lookups by user_id (field 1) of a table keyed by order_id with an index on user_id. */
+    private static LookupNormalizer indexLookupNormalizer(RowType flinkRowType) {
+        return LookupNormalizer.validateAndCreateLookupNormalizer(
+                new int[][] {{1}},
+                new int[] {0},
+                new int[] {0},
+                new int[0],
+                flinkRowType,
+                null,
+                new int[][] {{1}},
+                new boolean[] {true});
+    }
+
+    /** The order ids of the rows the function finds for a user, sorted. */
+    private static List<Integer> lookupOrders(FlinkAsyncLookupFunction function, int userId)
+            throws Exception {
+        return function.asyncLookup(GenericRowData.of(userId)).get(30, TimeUnit.SECONDS).stream()
+                .map(row -> row.getInt(0))
+                .sorted()
+                .collect(Collectors.toList());
     }
 
     private void prepareData(TablePath tablePath, int rows, boolean schemaNotMatch)

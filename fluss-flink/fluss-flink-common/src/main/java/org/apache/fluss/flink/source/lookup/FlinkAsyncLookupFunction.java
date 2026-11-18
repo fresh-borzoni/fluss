@@ -22,8 +22,10 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.lookup.PrefixPages;
+import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.table.Table;
-import org.apache.fluss.client.table.scanner.batch.BatchScanner;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
@@ -32,12 +34,9 @@ import org.apache.fluss.flink.source.lookup.LookupNormalizer.RemainingFilter;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
-import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
-import org.apache.fluss.row.encode.KeyEncoder;
-import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.ExceptionUtils;
 
 import org.apache.flink.table.data.GenericRowData;
@@ -51,16 +50,12 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -76,9 +71,6 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
 
     /** The most scans that the pages of one lookup function keep open at once. */
     private static final int MAX_OPEN_SCANS = 2;
-
-    /** How long a page waits for a batch of a scan before it asks again. */
-    private static final Duration PAGE_POLL_TIMEOUT = Duration.ofMillis(100);
 
     private final Configuration flussConfig;
     private final TablePath tablePath;
@@ -136,6 +128,17 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
             @Nullable int[] projection,
             boolean insertIfNotExists,
             boolean requiresWriter) {
+        if (requiresWriter
+                && lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
+            // the rows a writer has not flushed yet are found by their primary key, not by the
+            // columns of a secondary index
+            throw new UnsupportedOperationException(
+                    "Lookups of Fluss table '"
+                            + tablePath
+                            + "' that must read what the sink writer of the same task wrote"
+                            + " support only primary-key and prefix lookups, not lookups by a"
+                            + " secondary index.");
+        }
         this.requiresWriter = requiresWriter;
         this.flussConfig = flussConfig;
         this.tablePath = tablePath;
@@ -176,9 +179,10 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
             for (int i = 0; i < lookupKeyGetters.length; i++) {
                 lookupKeyGetters[i] = RowData.createFieldGetter(lookupKeyRowType.getTypeAt(i), i);
             }
-            scanPermits = new ScanPermits(MAX_OPEN_SCANS);
-            openScans = ConcurrentHashMap.newKeySet();
         }
+        // the pages of prefix and index lookups scan
+        scanPermits = new ScanPermits(MAX_OPEN_SCANS);
+        openScans = ConcurrentHashMap.newKeySet();
 
         LOG.info("end open.");
     }
@@ -296,13 +300,29 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     }
 
     /**
-     * Opens the pages of the rows that {@link #asyncLookup} would return at once, with the rows a
-     * sink writer of this task has not acknowledged yet in their place. A prefix lookup reads the
-     * first page with a lookup and the rest with a scan opened later, after the last key of the
-     * first page: each primary key comes at most once, and each row that did not change meanwhile
-     * exactly once. Called in the thread that issues the lookups.
+     * Opens pages of what {@link #asyncLookup} returns, with unacknowledged writes of this task in
+     * place. Prefix and index lookups page through {@link PrefixPages}, index pages capped at
+     * {@link ConfigOptions#CLIENT_LOOKUP_SECONDARY_INDEX_MAX_CANDIDATES}; others are one page.
+     * Called in the lookup thread.
      */
     public LookupPages openPages(RowData keyRow, int pageSize) {
+        if (lookuper instanceof SecondaryIndexLookuper) {
+            // at most as many candidates as one index lookup may read
+            int indexPageSize =
+                    Math.min(
+                            pageSize,
+                            flussConfig.get(
+                                    ConfigOptions.CLIENT_LOOKUP_SECONDARY_INDEX_MAX_CANDIDATES));
+            RowData normalizedKeyRow = lookupNormalizer.normalizeLookupKey(keyRow);
+            return new ScanPages(
+                    ((SecondaryIndexLookuper) lookuper)
+                            .openPages(
+                                    new FlinkAsFlussRow(normalizedKeyRow),
+                                    indexPageSize,
+                                    pageReader()),
+                    null,
+                    lookupNormalizer.createRemainingFilter(keyRow));
+        }
         if (lookupColumnNames == null) {
             CompletableFuture<Collection<RowData>> rows = asyncLookup(keyRow);
             return new LookupPages() {
@@ -328,11 +348,21 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
                             + " but no writer of the table runs in this task.");
         }
         // the key row of the lookup is reused: the pages keep their own
-        return new ScanPages(
-                new FlinkAsFlussRow().replace(copyKey(normalizedKeyRow)),
-                view,
-                remainingFilter,
-                pageSize);
+        InternalRow prefix = new FlinkAsFlussRow().replace(copyKey(normalizedKeyRow));
+        PrefixPages pages =
+                new PrefixPages(
+                        table,
+                        lookupColumnNames,
+                        prefix,
+                        pageSize,
+                        limit -> {
+                            synchronized (this) {
+                                return lookuper.lookupFirst(prefix, limit);
+                            }
+                        },
+                        pageReader(),
+                        null);
+        return new ScanPages(pages, view, remainingFilter);
     }
 
     /** A copy of a key row, for a lookup that outlives the call. */
@@ -389,47 +419,31 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     }
 
     /**
-     * Pages of the rows with one primary key prefix. The first page is a prefix lookup of one row
-     * more than a page, batched with other lookups; only if that finds more rows, a scan of the
-     * prefix reads the rest, skipping the keys up to the last one of the first page.
+     * Client pages as rows of this function: overlaid, filtered and converted. Pages after the
+     * first scan, and wait for a permit.
      */
     private final class ScanPages implements LookupPages {
 
-        private final InternalRow keyRow;
+        private final PrefixPages pages;
         private final @Nullable ReadYourWrites.View view;
         private final @Nullable RemainingFilter remainingFilter;
-        private final int pageSize;
-
-        /** Rows scanned but not handed over yet: a scan returns batches of bytes. */
-        private final ArrayDeque<InternalRow> buffer = new ArrayDeque<>();
-
-        /** Encodes primary keys as the table stores them; not shared, as encoders keep state. */
-        private @Nullable KeyEncoder keyEncoder;
-
-        /** The primary key of the last row of the first page, once the scan is needed. */
-        private @Nullable byte[] firstPageEnd;
 
         /** The permit of the scan, asked for with the second page. */
         private @Nullable CompletableFuture<Void> permit;
 
-        private @Nullable BatchScanner scanner;
+        /** The page being read after the first, which holds the permit until it completes. */
+        private @Nullable CompletableFuture<?> reading;
+
         private boolean firstPage = true;
-        private boolean exhausted;
-
-        /** Whether a page is being read, which then closes the scan if the pages closed. */
-        private boolean reading;
-
-        private volatile boolean closed;
+        private boolean closed;
 
         private ScanPages(
-                InternalRow keyRow,
+                PrefixPages pages,
                 @Nullable ReadYourWrites.View view,
-                @Nullable RemainingFilter remainingFilter,
-                int pageSize) {
-            this.keyRow = keyRow;
+                @Nullable RemainingFilter remainingFilter) {
+            this.pages = pages;
             this.view = view;
             this.remainingFilter = remainingFilter;
-            this.pageSize = pageSize;
         }
 
         @Override
@@ -439,153 +453,77 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
                 // in the flush mode, the writer of the task flushes first
                 CompletableFuture<Void> ready =
                         view == null ? CompletableFuture.completedFuture(null) : view.ready();
-                return ready.thenCompose(ignored -> lookupFirst())
-                        .thenApply(result -> firstPage(result.getRowList()));
+                return ready.thenCompose(ignored -> pages.next()).thenApply(this::toPage);
             }
-            if (permit == null) {
-                permit = scanPermits.acquire();
-                openScans.add(this);
-            }
-            return permit.thenApplyAsync(ignored -> scanPage(), pageReader());
-        }
-
-        private CompletableFuture<LookupResult> lookupFirst() {
-            synchronized (FlinkAsyncLookupFunction.this) {
-                return lookuper.lookupFirst(keyRow, pageSize + 1);
-            }
-        }
-
-        private Page firstPage(List<InternalRow> rows) {
-            if (rows.size() <= pageSize) {
-                close();
-                return toPage(rows, true, true);
-            }
-            List<InternalRow> page = new ArrayList<>(rows.subList(0, pageSize));
-            keyEncoder = newPrimaryKeyEncoder();
-            firstPageEnd = keyEncoder.encodeKey(page.get(pageSize - 1));
-            return toPage(page, true, false);
-        }
-
-        private Page scanPage() {
             synchronized (this) {
-                if (closed) {
-                    throw new CancellationException("The pages are closed.");
+                if (permit == null) {
+                    permit = scanPermits.acquire();
+                    openScans.add(this);
                 }
-                reading = true;
-            }
-            try {
-                if (scanner == null) {
-                    scanner =
-                            table.newScan().equalTo(lookupColumnNames, keyRow).createBatchScanner();
-                }
-                while (buffer.size() < pageSize && !exhausted && !closed) {
-                    CloseableIterator<InternalRow> batch = scanner.pollBatch(PAGE_POLL_TIMEOUT);
-                    if (batch == null) {
-                        exhausted = true;
-                        break;
-                    }
-                    try {
-                        while (batch.hasNext()) {
-                            InternalRow row = batch.next();
-                            // the rows come in key order: skip those of the first page
-                            if (firstPageEnd != null) {
-                                if (compare(keyEncoder.encodeKey(row), firstPageEnd) <= 0) {
-                                    continue;
-                                }
-                                firstPageEnd = null;
-                            }
-                            buffer.add(row);
-                        }
-                    } finally {
-                        batch.close();
-                    }
-                }
-                List<InternalRow> rows = new ArrayList<>(Math.min(pageSize, buffer.size()));
-                while (rows.size() < pageSize && !buffer.isEmpty()) {
-                    rows.add(buffer.poll());
-                }
-                boolean last = exhausted && buffer.isEmpty();
-                if (last) {
-                    close();
-                }
-                return toPage(rows, false, last);
-            } catch (IOException e) {
-                close();
-                throw new UncheckedIOException("Could not scan table " + tablePath, e);
-            } finally {
-                boolean closeScan;
-                synchronized (this) {
-                    reading = false;
-                    closeScan = closed;
-                }
-                if (closeScan) {
-                    closeScan();
-                }
+                CompletableFuture<Page> page =
+                        permit.thenCompose(ignored -> pages.next()).thenApply(this::toPage);
+                reading = page;
+                page.whenComplete((ignored, throwable) -> pageDone());
+                return page;
             }
         }
 
-        private Page toPage(List<InternalRow> rows, boolean first, boolean last) {
-            List<InternalRow> applied = view == null ? rows : view.applyToPage(rows, first);
-            List<RowData> page = new ArrayList<>(applied.size());
+        private Page toPage(PrefixPages.Page page) {
+            if (page.last) {
+                close();
+            }
+            List<InternalRow> applied =
+                    view == null ? page.rows : view.applyToPage(page.rows, page.first);
+            List<RowData> rows = new ArrayList<>(applied.size());
             for (InternalRow row : applied) {
                 RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(maybeProject(row));
                 if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
-                    page.add(flinkRow);
+                    rows.add(flinkRow);
                 }
             }
-            return new Page(page, last);
+            return new Page(rows, page.last);
         }
 
         @Override
         public void close() {
+            boolean release;
             synchronized (this) {
                 if (closed) {
                     return;
                 }
                 closed = true;
-                if (reading) {
-                    return;
-                }
+                // a permit not granted yet is withdrawn, which ends the page that waits for it
+                release = reading == null || (permit != null && !permit.isDone());
             }
-            closeScan();
+            pages.close();
+            if (release) {
+                releasePermit();
+            }
         }
 
-        /** Closes the scan and returns its permit, once the pages closed and no page is read. */
-        private void closeScan() {
+        /** A page after the first completed: the permit returns now if the pages closed. */
+        private void pageDone() {
+            boolean release;
+            synchronized (this) {
+                reading = null;
+                release = closed;
+            }
+            if (release) {
+                releasePermit();
+            }
+        }
+
+        private void releasePermit() {
+            CompletableFuture<Void> granted;
+            synchronized (this) {
+                granted = permit;
+                permit = null;
+            }
             openScans.remove(this);
-            if (scanner != null) {
-                try {
-                    scanner.close();
-                } catch (IOException e) {
-                    LOG.warn("Could not close a scan of table {}", tablePath, e);
-                }
-            }
-            if (permit != null) {
-                scanPermits.release(permit);
+            if (granted != null) {
+                scanPermits.release(granted);
             }
         }
-    }
-
-    /** Encodes primary keys as the table stores them. */
-    private KeyEncoder newPrimaryKeyEncoder() {
-        TableInfo tableInfo = table.getTableInfo();
-        return KeyEncoder.ofPrimaryKeyEncoder(
-                tableInfo.getRowType(),
-                tableInfo.getPhysicalPrimaryKeys(),
-                tableInfo.getTableConfig(),
-                tableInfo.isDefaultBucketKey());
-    }
-
-    /** Compares keys as the table orders them: unsigned bytes. */
-    private static int compare(byte[] a, byte[] b) {
-        int n = Math.min(a.length, b.length);
-        for (int i = 0; i < n; i++) {
-            int c = (a[i] & 0xff) - (b[i] & 0xff);
-            if (c != 0) {
-                return c;
-            }
-        }
-        return a.length - b.length;
     }
 
     /**

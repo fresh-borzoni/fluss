@@ -19,6 +19,7 @@ package org.apache.fluss.flink.sink;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.adapter.ChangelogModeAdapter;
 import org.apache.fluss.flink.adapter.SupportsReadYourWritesAdapter;
 import org.apache.fluss.flink.sink.serializer.RowDataSerializationSchema;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
@@ -140,6 +141,10 @@ public class FlinkTableSink
                 if (kind != RowKind.UPDATE_BEFORE) {
                     builder.addContainedKind(kind);
                 }
+            }
+            if (primaryKeyIndexes.length > 0) {
+                // deletes need only the key: merge engines apply them to the stored row
+                builder = ChangelogModeAdapter.keyOnlyDeletes(builder);
             }
             return builder.build();
         }

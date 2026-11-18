@@ -49,6 +49,7 @@ import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.TablePath;
@@ -107,6 +108,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -184,6 +186,9 @@ public class FlinkTableSource
     private final Map<String, String> tableOptions;
 
     @Nullable private final int[][] secondaryIndexes;
+
+    /** Per secondary index, whether it has synchronous visibility; null without indexes. */
+    @Nullable private final boolean[] syncSecondaryIndexes;
 
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private List<ResolvedExpression> deferredLakeFilters;
@@ -371,6 +376,7 @@ public class FlinkTableSource
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
         this.secondaryIndexes = parseSecondaryIndexes(tableOptions, tableOutputType);
+        this.syncSecondaryIndexes = parseSyncSecondaryIndexes(tableOptions);
         // A FULL lookup reads Fluss snapshots and logs, without requiring a lake reader plugin.
         // Defer creating the lake source until this instance is actually used for a full scan.
         if (isDataLakeEnabled && lookupCacheType != LookupOptions.LookupCacheType.FULL) {
@@ -412,6 +418,35 @@ public class FlinkTableSource
         return indexList.isEmpty() ? null : indexList.toArray(new int[0][]);
     }
 
+    /**
+     * Per secondary index, in the order of {@link #parseSecondaryIndexes}, whether it has
+     * synchronous visibility, the default; null without indexes.
+     */
+    private static @Nullable boolean[] parseSyncSecondaryIndexes(Map<String, String> tableOptions) {
+        Pattern pattern = Pattern.compile("secondary-index\\.([A-Za-z0-9_]+)\\.columns");
+        List<Boolean> sync = new ArrayList<>();
+        for (Map.Entry<String, String> entry : tableOptions.entrySet()) {
+            Matcher matcher = pattern.matcher(entry.getKey());
+            if (matcher.matches()) {
+                String visibility =
+                        tableOptions.get("secondary-index." + matcher.group(1) + ".visibility");
+                sync.add(
+                        visibility == null
+                                || IndexVisibility.valueOf(
+                                                visibility.trim().toUpperCase(Locale.ROOT))
+                                        == IndexVisibility.SYNC);
+            }
+        }
+        if (sync.isEmpty()) {
+            return null;
+        }
+        boolean[] result = new boolean[sync.size()];
+        for (int i = 0; i < result.length; i++) {
+            result[i] = sync.get(i);
+        }
+        return result;
+    }
+
     private FlinkTableSource(FlinkTableSource source) {
         this.tablePath = source.tablePath;
         this.flussConfig = new Configuration(source.flussConfig);
@@ -443,6 +478,7 @@ public class FlinkTableSource
         this.partitionFilters = source.partitionFilters;
         this.tableOptions = new HashMap<>(source.tableOptions);
         this.secondaryIndexes = source.secondaryIndexes;
+        this.syncSecondaryIndexes = source.syncSecondaryIndexes;
         this.lakeSource = source.lakeSource == null ? null : source.lakeSource.copy();
         this.deferredLakeFilters =
                 source.deferredLakeFilters == null
@@ -733,7 +769,8 @@ public class FlinkTableSource
                         partitionKeyIndexes,
                         tableOutputType,
                         projectedFields,
-                        secondaryIndexes);
+                        secondaryIndexes,
+                        syncSecondaryIndexes);
         if (lookupCacheType == LookupOptions.LookupCacheType.FULL) {
             if (lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
                 throw new UnsupportedOperationException(
