@@ -34,6 +34,7 @@ import org.apache.fluss.utils.Range;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -296,6 +297,61 @@ class PrefixRangeLookupITCase extends ClientToServerITCaseBase {
         }
     }
 
+    /**
+     * A limit applies to each lookup of a batch on its own and keeps its first rows in key order,
+     * with or without ordered keys.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testLookupFirstLimitsEachLookupOfABatch(boolean ordered) throws Exception {
+        TablePath path = TablePath.of("prefix_range", "first_" + ordered);
+        long tableId =
+                createTable(
+                        path,
+                        TableDescriptor.builder()
+                                .schema(SCHEMA)
+                                .distributedBy(1, "g")
+                                .property(ConfigOptions.TABLE_KV_ORDERED_KEY_ENABLED, ordered)
+                                .build(),
+                        true);
+        waitAllReplicasReady(tableId, 1);
+        try (Table table = conn.getTable(path)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            for (int g = 1; g <= 3; g++) {
+                for (long t = 0; t < 5; t++) {
+                    writer.upsert(row(g, t, 0));
+                }
+            }
+            writer.flush();
+            Lookuper lookuper = table.newLookup().lookupBy("g").createLookuper();
+            int[] limits = {1, 3, 10};
+            // issued together, so that one request of the bucket carries them
+            List<CompletableFuture<LookupResult>> first = new ArrayList<>();
+            for (int g = 1; g <= 3; g++) {
+                first.add(lookuper.lookupFirst(row(g), limits[g - 1]));
+            }
+            for (int g = 1; g <= 3; g++) {
+                List<InternalRow> all =
+                        lookuper.lookup(row(g)).get(30, TimeUnit.SECONDS).getRowList();
+                assertThat(times(first.get(g - 1).get(30, TimeUnit.SECONDS).getRowList()))
+                        .as("the first rows of %s", g)
+                        .containsExactlyElementsOf(
+                                times(all.subList(0, Math.min(limits[g - 1], all.size()))));
+            }
+            assertThatThrownBy(() -> lookuper.lookupFirst(row(1), 0))
+                    .isInstanceOf(IllegalArgumentException.class);
+            if (ordered) {
+                Lookuper reverse =
+                        table.newLookup()
+                                .lookupBy("g")
+                                .direction(ReadDirection.REVERSE)
+                                .createLookuper();
+                assertThatThrownBy(() -> reverse.lookupFirst(row(1), 1))
+                        .isInstanceOf(UnsupportedOperationException.class);
+            }
+        }
+    }
+
     @Test
     void testRejectUnsupportedConfigurationsAndCalls() throws Exception {
         try (Table table = create("validation", SCHEMA, true, false)) {
@@ -383,6 +439,10 @@ class PrefixRangeLookupITCase extends ClientToServerITCaseBase {
                 .containsExactlyElementsOf(
                         Arrays.stream(expected).boxed().collect(Collectors.toList()));
         assertThat(rows).allSatisfy(row -> assertThat(row.getInt(0)).isEqualTo(1));
+    }
+
+    private static List<Long> times(List<InternalRow> rows) {
+        return rows.stream().map(row -> row.getLong(1)).collect(Collectors.toList());
     }
 
     /** Equality key for a typed range lookup. */

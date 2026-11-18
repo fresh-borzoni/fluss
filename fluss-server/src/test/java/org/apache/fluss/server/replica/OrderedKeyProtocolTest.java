@@ -90,6 +90,36 @@ class OrderedKeyProtocolTest extends ReplicaTestBase {
     }
 
     @Test
+    void testPrefixLookupLimitAdmission() throws Exception {
+        TablePath path = TablePath.of("test_db", "prefix_limit_admission");
+        long tableId =
+                registerTableInZkClient(
+                        path,
+                        DATA1_SCHEMA_PK,
+                        2998235L,
+                        Collections.singletonList("a"),
+                        Collections.emptyMap());
+        TableBucket bucket = new TableBucket(tableId, 0);
+        makeKvTableAsLeader(tableId, path, 0);
+        PbPrefixLookupKey query = new PbPrefixLookupKey().setPrefixKey(new byte[] {1}).setLimit(2);
+        for (short version : new short[] {2, 3}) {
+            CompletableFuture<Map<TableBucket, PrefixLookupResultForBucket>> response =
+                    new CompletableFuture<>();
+            replicaManager.prefixLookups(
+                    Collections.singletonMap(bucket, Collections.singletonList(query)),
+                    version,
+                    response::complete);
+            PrefixLookupResultForBucket result = response.get(10, TimeUnit.SECONDS).get(bucket);
+            if (version == 3) {
+                assertThat(result.failed()).isFalse();
+                assertThat(result.prefixLookupValues()).hasSize(1);
+            } else {
+                assertThat(result.getError().error()).isEqualTo(Errors.UNSUPPORTED_VERSION);
+            }
+        }
+    }
+
+    @Test
     void testOrderedTableRejectsOldPutVersion() throws Exception {
         TablePath path = TablePath.of("test_db", "ordered_table");
         long tableId =

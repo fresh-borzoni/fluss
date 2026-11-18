@@ -1308,12 +1308,19 @@ public final class KvTablet {
     }
 
     public List<ByteArraySlice> prefixLookup(byte[] prefixKey) throws IOException {
-        return prefixLookup(prefixKey, null, null, false);
+        return prefixLookup(prefixKey, null, null, false, 0);
     }
 
-    /** Reads a bounded prefix using a request-local iterator view. */
+    /**
+     * Reads at most {@code limit} rows (all if 0) of a bounded prefix using a request-local
+     * iterator view, the first ones in the direction of the read.
+     */
     public List<ByteArraySlice> prefixLookup(
-            byte[] prefixKey, @Nullable byte[] startKey, @Nullable byte[] endKey, boolean reverse)
+            byte[] prefixKey,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            boolean reverse,
+            int limit)
             throws IOException {
         try (RocksDBKv.PrefixLookup lookup =
                 inReadLock(
@@ -1324,7 +1331,7 @@ public final class KvTablet {
                             }
                             return rocksDBKv.openPrefixLookup(prefixKey, startKey, endKey, reverse);
                         })) {
-            return toValueBodySlices(lookup.readAll());
+            return toValueBodySlices(lookup.readAll(limit));
         }
     }
 

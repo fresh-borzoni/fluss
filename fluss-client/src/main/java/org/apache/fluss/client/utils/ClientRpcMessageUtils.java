@@ -294,7 +294,8 @@ public class ClientRpcMessageUtils {
                                             lookup ->
                                                     lookup.startKey() != null
                                                             || lookup.endKey() != null
-                                                            || lookup.direction() != null);
+                                                            || lookup.direction() != null
+                                                            || lookup.limit() > 0);
                     batch.lookups()
                             .forEach(
                                     lookup -> {
@@ -313,6 +314,9 @@ public class ClientRpcMessageUtils {
                                             }
                                             if (lookup.endKey() != null) {
                                                 key.setEndKey(lookup.endKey());
+                                            }
+                                            if (lookup.limit() > 0) {
+                                                key.setLimit(lookup.limit());
                                             }
                                         } else {
                                             pbPrefixLookupReqForBucket.addKey(lookup.key());

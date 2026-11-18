@@ -250,4 +250,8 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
 
     @VisibleForTesting
     abstract TableWriter getTableWriter();
+
+    protected TablePath getTablePath() {
+        return tablePath;
+    }
 }

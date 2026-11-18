@@ -1332,6 +1332,49 @@ public class LookupSenderTest {
         assertThat(request.getBucketsReqAt(0).getRoutingBucketCount()).isEqualTo(4);
     }
 
+    /**
+     * With send-when-idle, the sender tells its queue whether requests are in flight: a drain
+     * returns at once while none is, and keeps batching until the one in flight completed.
+     */
+    @Test
+    void testSendWhenIdleWaitsForRequestsInFlight() throws Exception {
+        teardown();
+        Configuration conf = lookupQueueConf();
+        conf.set(ConfigOptions.CLIENT_LOOKUP_SEND_WHEN_IDLE, true);
+        conf.set(ConfigOptions.CLIENT_LOOKUP_BATCH_TIMEOUT, Duration.ofHours(1));
+        createLookupSender(
+                new LookupQueue(conf, SystemClock.getInstance()),
+                new ExponentialBackoff(10, 2, 100, 0.2));
+        CompletableFuture<Void> inFlight = new CompletableFuture<>();
+        gateway.setLookupHandler(
+                request ->
+                        inFlight.thenCompose(
+                                ignored -> createSuccessResponse(request, bytes("value"))));
+
+        LookupQuery first = new LookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("key1"));
+        lookupQueue.appendLookup(first);
+        List<AbstractLookupQuery<?>> batch = lookupQueue.drain();
+        assertThat(batch).as("nothing in flight").containsExactly(first);
+        lookupSender.sendLookups(batch);
+
+        LookupQuery second = new LookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("key2"));
+        lookupQueue.appendLookup(second);
+        CompletableFuture<List<AbstractLookupQuery<?>>> drained =
+                CompletableFuture.supplyAsync(
+                        () -> {
+                            try {
+                                return lookupQueue.drain();
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+        Thread.sleep(100);
+        assertThat(drained).as("the first request is in flight").isNotDone();
+        inFlight.complete(null);
+        assertThat(drained.get(10, TimeUnit.SECONDS)).containsExactly(second);
+        assertThat(first.future().get(10, TimeUnit.SECONDS)).isEqualTo(bytes("value"));
+    }
+
     // Helper methods
 
     private CompletableFuture<LookupResponse> createPartitionNameEchoResponse(
@@ -1475,7 +1518,8 @@ public class LookupSenderTest {
                         4,
                         null,
                         null,
-                        ReadDirection.FORWARD);
+                        ReadDirection.FORWARD,
+                        0);
         PrefixLookupQuery reverse =
                 new PrefixLookupQuery(
                         DATA1_TABLE_PATH_PK,
@@ -1484,7 +1528,8 @@ public class LookupSenderTest {
                         4,
                         null,
                         null,
-                        ReadDirection.REVERSE);
+                        ReadDirection.REVERSE,
+                        0);
         PrefixLookupQuery legacy =
                 new PrefixLookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("q"), 4);
         lookupSender.sendLookups(
@@ -1518,7 +1563,8 @@ public class LookupSenderTest {
                         4,
                         bytes("p1"),
                         bytes("p2"),
-                        null);
+                        null,
+                        0);
         PrefixLookupQuery second =
                 new PrefixLookupQuery(
                         DATA1_TABLE_PATH_PK,
@@ -1527,7 +1573,8 @@ public class LookupSenderTest {
                         4,
                         bytes("p3"),
                         bytes("p4"),
-                        null);
+                        null,
+                        0);
         PrefixLookupQuery ordinary =
                 new PrefixLookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("p"), 4);
         lookupSender.sendLookups(

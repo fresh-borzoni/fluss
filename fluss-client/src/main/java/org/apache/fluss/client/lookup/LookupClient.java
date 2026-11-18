@@ -149,10 +149,13 @@ public class LookupClient {
 
     public CompletableFuture<List<byte[]>> prefixLookup(
             TablePath tablePath, TableBucket tableBucket, byte[] keyBytes, int bucketCount) {
-        return prefixLookup(tablePath, tableBucket, keyBytes, bucketCount, null, null, null);
+        return prefixLookup(tablePath, tableBucket, keyBytes, bucketCount, null, null, null, 0);
     }
 
-    /** Adds an index prefix read with optional bounds and direction. */
+    /**
+     * Adds an index prefix read with optional bounds and direction, of at most {@code limit} rows
+     * (all if 0), the first ones in the direction of the read.
+     */
     public CompletableFuture<List<byte[]>> prefixLookup(
             TablePath tablePath,
             TableBucket tableBucket,
@@ -160,10 +163,18 @@ public class LookupClient {
             int bucketCount,
             @Nullable byte[] startKey,
             @Nullable byte[] endKey,
-            @Nullable ReadDirection direction) {
+            @Nullable ReadDirection direction,
+            int limit) {
         PrefixLookupQuery prefixLookup =
                 new PrefixLookupQuery(
-                        tablePath, tableBucket, keyBytes, bucketCount, startKey, endKey, direction);
+                        tablePath,
+                        tableBucket,
+                        keyBytes,
+                        bucketCount,
+                        startKey,
+                        endKey,
+                        direction,
+                        limit);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
     }

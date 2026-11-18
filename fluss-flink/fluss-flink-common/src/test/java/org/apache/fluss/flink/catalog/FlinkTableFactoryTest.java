@@ -55,6 +55,7 @@ import org.apache.flink.table.factories.Factory;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.functions.AsyncLookupFunction;
 import org.apache.flink.table.functions.LookupFunction;
+import org.apache.flink.table.runtime.connector.sink.SinkRuntimeProviderContext;
 import org.apache.flink.table.runtime.connector.source.LookupRuntimeProviderContext;
 import org.junit.jupiter.api.Test;
 
@@ -235,7 +236,7 @@ abstract class FlinkTableFactoryTest {
         assertThat(lookupProvider instanceof AsyncLookupFunctionProvider).isTrue();
         AsyncLookupFunction asyncLookupFunction =
                 ((AsyncLookupFunctionProvider) lookupProvider).createAsyncLookupFunction();
-        assertThat(asyncLookupFunction instanceof FlinkAsyncLookupFunction).isTrue();
+        assertThat(asyncLookupFunction).isInstanceOf(asyncLookupFunctionClass());
 
         // test sync
         properties.put(FlinkConnectorOptions.LOOKUP_ASYNC.key(), "false");
@@ -586,6 +587,45 @@ abstract class FlinkTableFactoryTest {
         createTableSink(schema, properties);
     }
 
+    /**
+     * Lookups can read what the sink writes only if an acknowledged write is visible to them, and
+     * the sink writes whole rows.
+     */
+    @Test
+    void testSinkReadYourWrites() {
+        ResolvedSchema schema = createBasicSchema();
+        assertThat(readYourWrites(schema, Collections.emptyMap())).isTrue();
+        assertThat(readYourWrites(schema, Collections.singletonMap("client.writer.acks", "-1")))
+                .isTrue();
+        Map<String, String> leaderAcks = new HashMap<>();
+        leaderAcks.put("client.writer.acks", "1");
+        leaderAcks.put("client.writer.enable-idempotence", "false");
+        assertThat(readYourWrites(schema, leaderAcks)).isFalse();
+        assertThat(
+                        readYourWrites(
+                                schema,
+                                Collections.singletonMap(
+                                        "client.writer.enable-idempotence", "false")))
+                .isFalse();
+
+        FlinkTableSink sink =
+                (FlinkTableSink) createTableSink(schema, getBasicOptionsWithBucketKey());
+        assertThat(sink.applyReadYourWrites()).isTrue();
+        assertThatThrownBy(
+                        () ->
+                                sink.getSinkRuntimeProvider(
+                                        new SinkRuntimeProviderContext(
+                                                false, new int[][] {{0}, {2}})))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("Partial updates");
+    }
+
+    private boolean readYourWrites(ResolvedSchema schema, Map<String, String> clientOptions) {
+        Map<String, String> properties = getBasicOptionsWithBucketKey();
+        properties.putAll(clientOptions);
+        return ((FlinkTableSink) createTableSink(schema, properties)).applyReadYourWrites();
+    }
+
     @Test
     void testSinkDistributionModeForMergeEngine() {
         ResolvedSchema schema = createBasicSchema();
@@ -812,6 +852,11 @@ abstract class FlinkTableFactoryTest {
     /** Whether this Flink version can report and apply lookup custom shuffle. */
     protected boolean supportsLookupCustomShuffle() {
         return false;
+    }
+
+    /** The class of the async lookup functions of the source in the tested Flink version. */
+    protected Class<?> asyncLookupFunctionClass() {
+        return FlinkAsyncLookupFunction.class;
     }
 
     public static FlinkTableFactory createFlinkTableFactory() {

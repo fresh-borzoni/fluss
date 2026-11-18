@@ -384,8 +384,11 @@ public class RocksDBKv implements AutoCloseable {
             this.lease = lease;
         }
 
-        /** Seeks and collects values from the view fixed when this lookup was opened. */
-        public List<byte[]> readAll() throws IOException {
+        /**
+         * Seeks and collects the values of at most {@code limit} rows (all if 0) from the view
+         * fixed when this lookup was opened, the first ones in the direction of the read.
+         */
+        public List<byte[]> readAll(int limit) throws IOException {
             if (closed) {
                 throw new IOException("Prefix lookup is closed.");
             }
@@ -403,7 +406,7 @@ public class RocksDBKv implements AutoCloseable {
                 } else {
                     iterator.seek(startKey);
                 }
-                while (iterator.isValid()) {
+                while (iterator.isValid() && (limit <= 0 || values.size() < limit)) {
                     values.add(iterator.value());
                     if (reverse) {
                         iterator.prev();

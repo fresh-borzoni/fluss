@@ -85,6 +85,7 @@ class LookupSender implements Runnable {
     private final LookupQueue lookupQueue;
 
     private final Semaphore maxInFlightReuqestsSemaphore;
+    private final int maxFlightRequests;
 
     private final int maxRetries;
 
@@ -115,6 +116,8 @@ class LookupSender implements Runnable {
         this.metadataUpdater = metadataUpdater;
         this.lookupQueue = lookupQueue;
         this.maxInFlightReuqestsSemaphore = new Semaphore(maxFlightRequests);
+        this.maxFlightRequests = maxFlightRequests;
+        lookupQueue.idleWhen(this::noRequestInFlight);
         this.maxRetries = maxRetries;
         this.retryBackoff = retryBackoff;
         this.running = true;
@@ -177,6 +180,10 @@ class LookupSender implements Runnable {
             releaseLookupsWaitingForLeader();
             sendLookups(lookupQueue.drain(), false);
         }
+    }
+
+    private boolean noRequestInFlight() {
+        return maxInFlightReuqestsSemaphore.availablePermits() == maxFlightRequests;
     }
 
     @VisibleForTesting

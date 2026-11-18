@@ -32,6 +32,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 /**
  * A queue that buffers the pending lookup operations and provides a list of {@link LookupQuery}
@@ -54,6 +55,13 @@ class LookupQueue {
     private final Clock clock;
     // The thread that drains the queue, i.e. the sender thread.
     private volatile Thread drainingThread;
+    private final boolean sendWhenIdle;
+
+    /** Whether no lookup request is in flight; the sender tells, see {@link #idleWhen}. */
+    private volatile BooleanSupplier idle = () -> false;
+
+    /** How often a drain that holds lookups checks whether the requests in flight completed. */
+    private static final long IDLE_CHECK_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
 
     LookupQueue(Configuration conf) {
         this(conf, SystemClock.getInstance());
@@ -67,6 +75,7 @@ class LookupQueue {
         this.maxBatchSize = conf.get(ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE);
         this.batchTimeoutNanos = conf.get(ConfigOptions.CLIENT_LOOKUP_BATCH_TIMEOUT).toNanos();
         this.clock = clock;
+        this.sendWhenIdle = conf.get(ConfigOptions.CLIENT_LOOKUP_SEND_WHEN_IDLE);
         this.closed = false;
     }
 
@@ -128,8 +137,25 @@ class LookupQueue {
         return !lookupQueue.isEmpty() || !reEnqueuedLookupQueue.isEmpty();
     }
 
+    /**
+     * Tells the queue how to know that no lookup request is in flight, for {@link
+     * ConfigOptions#CLIENT_LOOKUP_SEND_WHEN_IDLE}.
+     */
+    void idleWhen(BooleanSupplier idle) {
+        this.idle = idle;
+    }
+
     /** Drain a batch of {@link LookupQuery}s from the lookup queue. */
     List<AbstractLookupQuery<?>> drain() throws Exception {
+        return drain(idle);
+    }
+
+    /**
+     * Drain a batch of {@link LookupQuery}s from the lookup queue. With {@link
+     * ConfigOptions#CLIENT_LOOKUP_SEND_WHEN_IDLE}, the batch is returned as soon as it holds a
+     * lookup and {@code idle} says that no lookup request is in flight.
+     */
+    List<AbstractLookupQuery<?>> drain(BooleanSupplier idle) throws Exception {
         drainingThread = Thread.currentThread();
         final long startNanos = System.nanoTime();
         List<AbstractLookupQuery<?>> lookupOperations = new ArrayList<>(maxBatchSize);
@@ -161,12 +187,24 @@ class LookupQueue {
                 reEnqueuedToCheck--;
             }
 
+            boolean holdsLookups = count > 0 && sendWhenIdle;
+            if (holdsLookups && idle.getAsBoolean()) {
+                // nothing in flight: waiting would only add latency
+                break;
+            }
             long lookupWaitNanos = waitNanos;
             if (count == 0 && nextRetryDelayNanos != Long.MAX_VALUE) {
                 lookupWaitNanos = Math.min(waitNanos, Math.max(1L, nextRetryDelayNanos));
             }
+            if (holdsLookups) {
+                // requests are in flight: batch what arrives until they completed
+                lookupWaitNanos = Math.min(lookupWaitNanos, IDLE_CHECK_NANOS);
+            }
             AbstractLookupQuery<?> lookup = lookupQueue.poll(lookupWaitNanos, TimeUnit.NANOSECONDS);
             if (lookup == null) {
+                if (holdsLookups) {
+                    continue;
+                }
                 break;
             }
             lookupOperations.add(lookup);

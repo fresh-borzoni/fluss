@@ -240,7 +240,7 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
         if (rangeType != null) {
             throw new UnsupportedOperationException("This lookuper requires range bounds.");
         }
-        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null);
+        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null, 0);
         if (clientFilterKeyGetters.length == 0) {
             return result;
         }
@@ -259,6 +259,18 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                     }
                     return new LookupResult(rows);
                 });
+    }
+
+    @Override
+    public CompletableFuture<LookupResult> lookupFirst(InternalRow prefixKey, int limit) {
+        checkArgument(limit > 0, "The limit must be positive.");
+        if (rangeType != null
+                || direction == ReadDirection.REVERSE
+                || clientFilterKeyGetters.length > 0) {
+            throw new UnsupportedOperationException(
+                    "Only forward lookups by exactly the prefix support limits.");
+        }
+        return lookupPrefix(prefixKey, null, limit);
     }
 
     private boolean matches(InternalRow row, Object[] expected) {
@@ -286,11 +298,11 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
         for (int i = 0; i < prefixKey.getFieldCount(); i++) {
             checkArgument(!prefixKey.isNullAt(i), "Null equality keys are not supported.");
         }
-        return lookupPrefix(prefixKey, bounds);
+        return lookupPrefix(prefixKey, bounds, 0);
     }
 
     private CompletableFuture<LookupResult> lookupPrefix(
-            InternalRow prefixKey, @Nullable Range<? extends InternalRow> bounds) {
+            InternalRow prefixKey, @Nullable Range<? extends InternalRow> bounds, int limit) {
         byte[] prefixKeyBytes = prefixKeyEncoder.encodeKey(prefixKey);
         byte[] bucketKeyBytes =
                 prefixKeyEncoder == bucketKeyEncoder
@@ -332,7 +344,8 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                         bucketCount,
                         keyRange == null ? null : keyRange.getStartKey(),
                         keyRange == null ? null : keyRange.getEndKey(),
-                        direction)
+                        direction,
+                        limit)
                 .whenComplete(
                         (result, error) -> {
                             if (error != null) {

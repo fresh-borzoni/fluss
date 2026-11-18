@@ -45,6 +45,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.OrderedKeyEncoder;
@@ -296,14 +297,19 @@ public class TableScan implements Scan {
             checkArgument(scope.getBucket() >= 0, "Bucket ID must be nonnegative.");
         }
         checkArgument(
-                rangeBounds != null && equalityColumns != null && equalityKey != null,
-                "Configure equalTo and range before creating a range scanner.");
+                equalityColumns != null && equalityKey != null,
+                "Configure equalTo before creating a range scanner.");
         checkArgument(tableInfo.hasPrimaryKey(), "Range scans require a primary key table.");
+        // without a range, the scan reads all keys with one prefix, which are adjacent in any key
+        // format that keeps prefixes
+        boolean equalityOnly = rangeBounds == null;
         checkArgument(
-                tableInfo.getTableConfig().isOrderedKeyEnabled(),
+                equalityOnly || tableInfo.getTableConfig().isOrderedKeyEnabled(),
                 "Range scans require table.kv.ordered-key.enabled=true.");
         checkArgument(recordBatchFilter == null, "Range scans cannot be combined with filter.");
-        checkArgument(!equalityColumns.contains(rangeColumn), "Duplicate condition fields.");
+        checkArgument(
+                equalityOnly || !equalityColumns.contains(rangeColumn),
+                "Duplicate condition fields.");
         RowType equalityType = tableInfo.getRowType().project(equalityColumns);
         checkArgument(
                 equalityColumns.containsAll(tableInfo.getPartitionKeys()),
@@ -312,20 +318,47 @@ public class TableScan implements Scan {
         prefixColumns.removeAll(tableInfo.getPartitionKeys());
         List<String> primary = tableInfo.getPhysicalPrimaryKeys();
         int count = prefixColumns.size();
-        checkArgument(
-                count < primary.size()
-                        && new HashSet<>(primary.subList(0, count))
-                                .equals(new HashSet<>(prefixColumns))
-                        && primary.get(count).equals(rangeColumn),
-                "Equality fields must form a primary-key prefix followed by the range field.");
+        if (equalityOnly) {
+            checkArgument(
+                    count <= primary.size()
+                            && new HashSet<>(primary.subList(0, count))
+                                    .equals(new HashSet<>(prefixColumns)),
+                    "Equality fields must form a primary-key prefix.");
+        } else {
+            checkArgument(
+                    count < primary.size()
+                            && new HashSet<>(primary.subList(0, count))
+                                    .equals(new HashSet<>(prefixColumns))
+                            && primary.get(count).equals(rangeColumn),
+                    "Equality fields must form a primary-key prefix followed by the range field.");
+        }
         checkArgument(
                 prefixColumns.containsAll(tableInfo.getBucketKeys()),
                 "Equality fields must contain all bucket keys.");
         prefixColumns = primary.subList(0, count);
-        byte[] prefix =
-                OrderedKeyEncoder.createKeyEncoder(equalityType, prefixColumns)
-                        .encodeKey(equalityKey);
-        IndexKeyRange range = rangeBounds.withPrefix(prefix);
+        IndexKeyRange range;
+        if (equalityOnly) {
+            // encoded like the keys of prefix lookups, in the table's key format
+            KeyEncoder prefixEncoder =
+                    KeyEncoder.ofPrimaryKeyEncoder(
+                            equalityType,
+                            prefixColumns,
+                            tableInfo.getTableConfig(),
+                            tableInfo.isDefaultBucketKey());
+            checkArgument(
+                    prefixEncoder instanceof CompactedKeyEncoder
+                            || prefixEncoder instanceof OrderedKeyEncoder,
+                    "Equality scans without a range require a key format in which an encoded"
+                            + " primary-key prefix is a byte prefix of the encoded keys, but table %s"
+                            + " encodes its keys for a lake format.",
+                    tableInfo.getTablePath());
+            range = IndexKeyRange.ofPrefix(prefixEncoder.encodeKey(equalityKey));
+        } else {
+            byte[] prefix =
+                    OrderedKeyEncoder.createKeyEncoder(equalityType, prefixColumns)
+                            .encodeKey(equalityKey);
+            range = rangeBounds.withPrefix(prefix);
+        }
         byte[] start = range.getStartKey();
         byte[] end = range.getEndKey();
         Long partitionId = null;

@@ -46,6 +46,8 @@ import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.table.types.logical.RowType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -67,6 +69,8 @@ import static org.apache.fluss.utils.Preconditions.checkState;
 class FlinkSink<InputT> extends SinkAdapter<InputT> {
 
     private static final long serialVersionUID = 1L;
+
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkSink.class);
 
     protected final SinkWriterBuilder<? extends FlinkSinkWriter<InputT>, InputT> builder;
     private final TablePath tablePath;
@@ -286,6 +290,9 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
          */
         @Nullable private UndoRecoveryOperatorFactory<InputT> undoRecoveryOperatorFactory;
 
+        /** Whether lookups of the same task must see what the writers wrote. */
+        private boolean readYourWrites;
+
         UpsertSinkWriterBuilder(
                 TablePath tablePath,
                 Configuration flussConfig,
@@ -324,14 +331,29 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                             ? null
                             : undoRecoveryOperatorFactory.createProducerOffsetReporter(
                                     subtaskIndex);
-            return new UpsertSinkWriter<>(
-                    tablePath,
-                    flussConfig,
-                    tableRowType,
-                    targetColumnIndexes,
-                    mailboxExecutor,
-                    flussSerializationSchema,
-                    offsetReporter);
+            UpsertSinkWriter<InputT> writer =
+                    new UpsertSinkWriter<>(
+                            tablePath,
+                            flussConfig,
+                            tableRowType,
+                            targetColumnIndexes,
+                            mailboxExecutor,
+                            flussSerializationSchema,
+                            offsetReporter);
+            if (readYourWrites) {
+                writer.enableReadYourWrites();
+            }
+            return writer;
+        }
+
+        /**
+         * Lets the lookups of a task see what the writer of the task wrote. The rows are not
+         * redistributed before the writers, so that every row reaches the writer of the task that
+         * produced it.
+         */
+        UpsertSinkWriterBuilder<InputT> withReadYourWrites() {
+            this.readYourWrites = true;
+            return this;
         }
 
         @Override
@@ -342,7 +364,25 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             // re-validate the Undo Recovery constraint here.
             validateDistributionModeForUndoRecovery(enableUndoRecovery, distributionMode);
             DataStream<InputT> stream;
-            switch (distributionMode) {
+            if (readYourWrites
+                    && distributionMode != DistributionMode.AUTO
+                    && distributionMode != DistributionMode.NONE) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "'sink.distribution-mode' = '%s' is not supported when lookups of"
+                                        + " table %s read what its sink writes: the shuffle would"
+                                        + " move rows to the writers of other tasks. Please use"
+                                        + " 'auto' (default) or 'none' instead.",
+                                distributionMode, tablePath));
+            }
+            if (readYourWrites && distributionMode == DistributionMode.AUTO) {
+                // a shuffle would move the writer out of the task whose lookups read its rows
+                LOG.info(
+                        "The sink of table {} does not shuffle its rows: lookups in the task of"
+                                + " its writer read the rows it wrote.",
+                        tablePath);
+            }
+            switch (readYourWrites ? DistributionMode.NONE : distributionMode) {
                 case NONE:
                     stream = input;
                     break;

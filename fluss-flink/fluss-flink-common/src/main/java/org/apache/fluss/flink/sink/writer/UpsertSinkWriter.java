@@ -53,6 +53,11 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
      */
     @Nullable private final ProducerOffsetReporter offsetReporter;
 
+    /** Whether lookups of the same task must see what this writer wrote. */
+    private boolean readYourWrites;
+
+    private transient ReadYourWrites.Writer readYourWritesWriter;
+
     /**
      * Creates a new UpsertSinkWriter with ProducerOffsetReporter for UndoRecoveryOperator
      * integration.
@@ -91,13 +96,42 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             upsert = upsert.partialUpdate(targetColumnIndexes);
         }
         upsertWriter = upsert.createWriter();
+        if (readYourWrites) {
+            // in the thread of the task, so that its lookups find it
+            readYourWritesWriter =
+                    ReadYourWrites.register(
+                            getTablePath(),
+                            table.getTableInfo().getRowType(),
+                            table.getTableInfo().getSchema().getPrimaryKeyIndexes(),
+                            upsertWriter::flush);
+            LOG.info(
+                    "Lookups of table {} in this task read the rows this writer wrote.",
+                    getTablePath());
+        }
         LOG.info("Finished opening Fluss {}.", this.getClass().getSimpleName());
+    }
+
+    /** Lets the lookups of the same task see what this writer wrote, see {@link ReadYourWrites}. */
+    public void enableReadYourWrites() {
+        this.readYourWrites = true;
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (readYourWritesWriter != null) {
+            readYourWritesWriter.close();
+            readYourWritesWriter = null;
+        }
+        super.close();
     }
 
     @Override
     CompletableFuture<?> writeRow(OperationType opType, InternalRow internalRow) {
         if (opType == OperationType.UPSERT) {
             CompletableFuture<UpsertResult> future = upsertWriter.upsert(internalRow);
+            if (readYourWritesWriter != null) {
+                readYourWritesWriter.written(internalRow, false, future);
+            }
             // Report offset to upstream UndoRecoveryOperator if reporter provided
             if (offsetReporter != null) {
                 return future.thenAccept(
@@ -111,6 +145,9 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             return future;
         } else if (opType == OperationType.DELETE) {
             CompletableFuture<DeleteResult> future = upsertWriter.delete(internalRow);
+            if (readYourWritesWriter != null) {
+                readYourWritesWriter.written(internalRow, true, future);
+            }
             // Report offset to upstream UndoRecoveryOperator if reporter provided
             if (offsetReporter != null) {
                 return future.thenAccept(

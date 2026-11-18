@@ -70,6 +70,12 @@ public final class IndexKeyRange {
         return new IndexKeyRange(start, end);
     }
 
+    /** All keys that start with the prefix. */
+    public static IndexKeyRange ofPrefix(byte[] prefix) {
+        checkArgument(prefix.length > 0, "The prefix must not be empty.");
+        return new IndexKeyRange(prefix, OrderedKeyCodec.prefixUpperBound(prefix));
+    }
+
     /** Restricts this field interval to the supplied equality prefix. */
     public IndexKeyRange withPrefix(byte[] prefix) {
         return new IndexKeyRange(

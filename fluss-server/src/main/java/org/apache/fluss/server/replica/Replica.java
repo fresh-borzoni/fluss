@@ -1780,12 +1780,19 @@ public final class Replica {
     }
 
     public List<ByteArraySlice> prefixLookup(byte[] prefixKey) {
-        return prefixLookup(prefixKey, null, null, false);
+        return prefixLookup(prefixKey, null, null, false, 0);
     }
 
-    /** Looks up a prefix intersected with inclusive start and exclusive end keys. */
+    /**
+     * Looks up at most {@code limit} rows (all if 0) of a prefix intersected with inclusive start
+     * and exclusive end keys.
+     */
     public List<ByteArraySlice> prefixLookup(
-            byte[] prefixKey, @Nullable byte[] startKey, @Nullable byte[] endKey, boolean reverse) {
+            byte[] prefixKey,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            boolean reverse,
+            int limit) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "Try to do prefix lookup on a non primary key table: " + getTablePath());
@@ -1803,7 +1810,7 @@ public final class Replica {
                         }
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
-                        return kvTablet.prefixLookup(prefixKey, startKey, endKey, reverse);
+                        return kvTablet.prefixLookup(prefixKey, startKey, endKey, reverse, limit);
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(

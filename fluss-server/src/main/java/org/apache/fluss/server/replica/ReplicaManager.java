@@ -1254,12 +1254,17 @@ public class ReplicaManager implements ServerReconfigurable {
                                     "Ordered or bounded prefix lookups require PREFIX_LOOKUP v2 and ordered keys.");
                         }
                     }
+                    if (key.hasLimit() && apiVersion < 3) {
+                        throw new UnsupportedVersionException(
+                                "Prefix lookups with a limit require PREFIX_LOOKUP v3.");
+                    }
                     List<ByteArraySlice> resultForPerKey =
                             replica.prefixLookup(
                                     key.getPrefixKey(),
                                     key.hasStartKey() ? key.getStartKey() : null,
                                     key.hasEndKey() ? key.getEndKey() : null,
-                                    key.hasReverse() && key.isReverse());
+                                    key.hasReverse() && key.isReverse(),
+                                    key.hasLimit() ? key.getLimit() : 0);
                     resultForBucket.add(resultForPerKey);
                 }
                 result.put(tb, new PrefixLookupResultForBucket(tb, resultForBucket));

@@ -1835,6 +1835,17 @@ public class ConfigOptions {
                             "The maximum time to wait for the lookup batch to full, if this timeout is reached, "
                                     + "the lookup batch will be closed to send.");
 
+    public static final ConfigOption<Boolean> CLIENT_LOOKUP_SEND_WHEN_IDLE =
+            key("client.lookup.send-when-idle")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether waiting lookups are sent as soon as the client has no lookup request "
+                                    + "in flight to any server, instead of waiting until '"
+                                    + "client.lookup.max-batch-size' lookups wait or '"
+                                    + "client.lookup.batch-timeout' passed. Lookups that arrive while "
+                                    + "requests are in flight are still batched, at most until the batch timeout.");
+
     public static final ConfigOption<Integer> CLIENT_LOOKUP_MAX_RETRIES =
             key("client.lookup.max-retries")
                     .intType()

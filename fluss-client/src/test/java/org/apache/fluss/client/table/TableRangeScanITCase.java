@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.scanner.batch.BatchScanner;
 import org.apache.fluss.client.table.writer.UpsertResult;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.Schema;
@@ -33,6 +34,11 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.PbScanReqForBucket;
+import org.apache.fluss.rpc.messages.ScanKvRequest;
+import org.apache.fluss.rpc.messages.ScanKvResponse;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.Range;
@@ -40,6 +46,8 @@ import org.apache.fluss.utils.Range;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+
+import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -455,6 +463,176 @@ class TableRangeScanITCase extends ClientToServerITCaseBase {
         }
     }
 
+    /**
+     * Without a range, a scan reads all rows with one prefix in pages, also from a table without
+     * ordered keys: such rows are adjacent in any key format. The pages keep the view the scan
+     * opened, and rows of other prefixes in the same bucket stay out.
+     */
+    @Test
+    void testEqualityScanReadsOnePrefixOfAnyTableInPages() throws Exception {
+        TablePath path = TablePath.of("range_scan", "equality_pages");
+        long id =
+                createTable(
+                        path,
+                        TableDescriptor.builder().schema(SCHEMA).distributedBy(1, "g").build(),
+                        true);
+        waitAllReplicasReady(id, 1);
+        org.apache.fluss.config.Configuration config =
+                new org.apache.fluss.config.Configuration(clientConf);
+        config.set(
+                ConfigOptions.CLIENT_SCANNER_KV_FETCH_MAX_BYTES,
+                new org.apache.fluss.config.MemorySize(80));
+        try (org.apache.fluss.client.Connection small =
+                        org.apache.fluss.client.ConnectionFactory.createConnection(config);
+                Table table = small.getTable(path)) {
+            UpsertWriter writer = table.newUpsert().createWriter();
+            for (int g = 0; g < 3; g++) {
+                for (int i = 0; i < 30; i++) {
+                    writer.upsert(row(g, (long) i, i % 3, "payload"));
+                }
+            }
+            writer.flush();
+            List<InternalRow> result = new ArrayList<>();
+            int batches = 0;
+            try (BatchScanner scanner =
+                    table.newScan()
+                            .equalTo(Collections.singletonList("g"), GenericRow.of(1))
+                            .createBatchScanner()) {
+                while (result.isEmpty()) {
+                    try (CloseableIterator<InternalRow> first =
+                            scanner.pollBatch(Duration.ofSeconds(10))) {
+                        assertThat(first).isNotNull();
+                        first.forEachRemaining(result::add);
+                    }
+                    batches++;
+                }
+                assertThat(result.size()).as("the first page").isLessThan(30);
+                writer.upsert(row(1, 99L, 0, "late"));
+                writer.flush();
+                CloseableIterator<InternalRow> batch;
+                while ((batch = scanner.pollBatch(Duration.ofSeconds(10))) != null) {
+                    batch.forEachRemaining(result::add);
+                    batch.close();
+                    batches++;
+                }
+            }
+            assertThat(batches).isGreaterThan(1);
+            assertThat(result.stream().map(r -> r.getInt(0))).containsOnly(1);
+            assertThat(result.stream().map(r -> r.getLong(1)).collect(Collectors.toList()))
+                    .as("all rows of the prefix, in key order, without the late one")
+                    .containsExactlyElementsOf(
+                            java.util.stream.LongStream.range(0, 30)
+                                    .boxed()
+                                    .collect(Collectors.toList()));
+            try (BatchScanner scanner =
+                    table.newScan()
+                            .equalTo(Collections.singletonList("g"), GenericRow.of(1))
+                            .limit(5)
+                            .createBatchScanner()) {
+                assertThat(BatchScanUtils.collectRows(scanner)).hasSize(5);
+            }
+            // a prefix lookup with a limit returns the first rows in the order of the scan
+            List<InternalRow> first =
+                    table.newLookup()
+                            .lookupBy(Collections.singletonList("g"))
+                            .createLookuper()
+                            .lookupFirst(GenericRow.of(1), 5)
+                            .get(30, TimeUnit.SECONDS)
+                            .getRowList();
+            assertThat(first.stream().map(r -> r.getLong(1)).collect(Collectors.toList()))
+                    .containsExactlyElementsOf(
+                            result.subList(0, 5).stream()
+                                    .map(r -> r.getLong(1))
+                                    .collect(Collectors.toList()));
+            try (BatchScanner scanner =
+                    table.newScan()
+                            .equalTo(Collections.singletonList("g"), GenericRow.of(7))
+                            .createBatchScanner()) {
+                assertThat(BatchScanUtils.collectRows(scanner)).isEmpty();
+            }
+        }
+    }
+
+    /** Without ordered keys, a server accepts bounds only for a forward read of one prefix. */
+    @Test
+    void testUnorderedTableAcceptsOnlyForwardPrefixRanges() throws Exception {
+        TablePath path = TablePath.of("range_scan", "unordered_bounds");
+        long id =
+                createTable(
+                        path,
+                        TableDescriptor.builder().schema(SCHEMA).distributedBy(1, "g").build(),
+                        true);
+        waitAllReplicasReady(id, 1);
+        TableBucket bucket = new TableBucket(id, 0);
+        TabletServerGateway gateway =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(
+                        FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(bucket));
+        byte[] prefix = {1, 2};
+        byte[] prefixEnd = {1, 3};
+        assertThat(scanError(gateway, bucket, prefix, prefixEnd, false)).isEqualTo(Errors.NONE);
+        assertThat(scanError(gateway, bucket, prefix, prefixEnd, true))
+                .as("reverse")
+                .isEqualTo(Errors.INVALID_SCAN_REQUEST);
+        assertThat(scanError(gateway, bucket, prefix, new byte[] {1, 4}, false))
+                .as("past the prefix")
+                .isEqualTo(Errors.INVALID_SCAN_REQUEST);
+        assertThat(scanError(gateway, bucket, prefix, null, false))
+                .as("unbounded")
+                .isEqualTo(Errors.INVALID_SCAN_REQUEST);
+        assertThat(scanError(gateway, bucket, null, prefixEnd, false))
+                .as("without start")
+                .isEqualTo(Errors.INVALID_SCAN_REQUEST);
+    }
+
+    /** A lake format's key encoding does not keep a key prefix as a byte prefix. */
+    @Test
+    void testEqualityScanRejectsLakeKeyEncoding() throws Exception {
+        TablePath path = TablePath.of("range_scan", "lake_keys");
+        createTable(
+                path,
+                TableDescriptor.builder()
+                        .schema(SCHEMA)
+                        .distributedBy(1, "g")
+                        .property(ConfigOptions.TABLE_KV_FORMAT_VERSION, 1)
+                        .property(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON)
+                        .build(),
+                true);
+        try (Table table = conn.getTable(path)) {
+            assertThatThrownBy(
+                            () ->
+                                    table.newScan()
+                                            .equalTo(
+                                                    Collections.singletonList("g"),
+                                                    GenericRow.of(1))
+                                            .createBatchScanner())
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("byte prefix");
+        }
+    }
+
+    private static Errors scanError(
+            TabletServerGateway gateway,
+            TableBucket bucket,
+            @Nullable byte[] start,
+            @Nullable byte[] end,
+            boolean reverse)
+            throws Exception {
+        ScanKvRequest request = new ScanKvRequest().setBatchSizeBytes(1024).setCallSeqId(0);
+        PbScanReqForBucket bucketReq =
+                request.setBucketScanReq()
+                        .setTableId(bucket.getTableId())
+                        .setBucketId(bucket.getBucket())
+                        .setReverse(reverse);
+        if (start != null) {
+            bucketReq.setStartKey(start);
+        }
+        if (end != null) {
+            bucketReq.setEndKey(end);
+        }
+        ScanKvResponse response = gateway.scanKv(request).get(30, TimeUnit.SECONDS);
+        return response.hasErrorCode() ? Errors.forCode(response.getErrorCode()) : Errors.NONE;
+    }
+
     @Test
     void testRejectIncompatibleConfigurations() throws Exception {
         try (Table table = create("invalid", SCHEMA, false)) {
@@ -470,14 +648,12 @@ class TableRangeScanITCase extends ClientToServerITCaseBase {
                                             new TableBucket(table.getTableInfo().getTableId(), 0),
                                             1L))
                     .isInstanceOf(UnsupportedOperationException.class);
-            assertThatThrownBy(
-                            () ->
-                                    table.newScan()
-                                            .equalTo(
-                                                    Collections.singletonList("g"),
-                                                    GenericRow.of(1))
-                                            .createBatchScanner())
-                    .isInstanceOf(IllegalArgumentException.class);
+            try (BatchScanner scanner =
+                    table.newScan()
+                            .equalTo(Collections.singletonList("g"), GenericRow.of(1))
+                            .createBatchScanner()) {
+                assertThat(BatchScanUtils.collectRows(scanner)).as("equality only").isEmpty();
+            }
             assertThatThrownBy(
                             () ->
                                     table.newScan()

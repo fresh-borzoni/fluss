@@ -1206,6 +1206,9 @@ message PbPrefixLookupKey {
   optional bytes start_key = 2;
   optional bytes end_key = 3;
   optional bool reverse = 4;
+  // PREFIX_LOOKUP v3: the most rows to return, the first ones in key order; absent or 0 for all
+  // of them. Needs no ordered keys.
+  optional int32 limit = 5;
 }
 
 message PbPrefixLookupRespForBucket {

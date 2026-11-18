@@ -37,10 +37,11 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable private final byte[] startKey;
     @Nullable private final byte[] endKey;
     @Nullable private final ReadDirection direction;
+    private final int limit;
 
     PrefixLookupQuery(
             TablePath tablePath, TableBucket tableBucket, byte[] prefixKey, int bucketCount) {
-        this(tablePath, tableBucket, prefixKey, bucketCount, null, null, null);
+        this(tablePath, tableBucket, prefixKey, bucketCount, null, null, null, 0);
     }
 
     PrefixLookupQuery(
@@ -50,12 +51,14 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
             int bucketCount,
             @Nullable byte[] startKey,
             @Nullable byte[] endKey,
-            @Nullable ReadDirection direction) {
+            @Nullable ReadDirection direction,
+            int limit) {
         super(tablePath, tableBucket, prefixKey, null, bucketCount);
         this.future = new CompletableFuture<>();
         this.startKey = startKey;
         this.endKey = endKey;
         this.direction = direction;
+        this.limit = limit;
     }
 
     PrefixLookupQuery(TablePath tablePath, TableBucket tableBucket, byte[] prefixKey) {
@@ -82,6 +85,11 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable
     public byte[] endKey() {
         return endKey;
+    }
+
+    /** Returns the most rows to read, the first ones in key order, or 0 for all of them. */
+    public int limit() {
+        return limit;
     }
 
     /** Returns the requested direction, or null for a legacy unordered read. */

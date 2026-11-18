@@ -25,10 +25,12 @@ import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_BATCH_TIMEOUT;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_MAX_BATCH_SIZE;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_QUEUE_SIZE;
+import static org.apache.fluss.config.ConfigOptions.CLIENT_LOOKUP_SEND_WHEN_IDLE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -155,6 +157,63 @@ class LookupQueueTest {
         assertThat(queue.getLookupQueue()).hasSize(2);
         assertThat(queue.getReEnqueuedLookupQueue()).hasSize(1);
         assertThat(queue.drainAll()).hasSize(3);
+    }
+
+    @Test
+    void testSendWhenIdleReturnsAtOnce() throws Exception {
+        LookupQueue queue = new LookupQueue(sendWhenIdle(true));
+        appendLookups(queue, 3);
+
+        long start = System.nanoTime();
+        assertThat(queue.drain(() -> true)).hasSize(3);
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start))
+                .as("no request in flight, so nothing to wait for")
+                .isLessThan(5_000);
+    }
+
+    @Test
+    void testSendWhenIdleBatchesUntilRequestsComplete() throws Exception {
+        LookupQueue queue = new LookupQueue(sendWhenIdle(true));
+        AtomicBoolean idle = new AtomicBoolean(false);
+        appendLookups(queue, 1);
+        CompletableFuture<Integer> drained =
+                CompletableFuture.supplyAsync(
+                        () -> {
+                            try {
+                                return queue.drain(idle::get).size();
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+
+        Thread.sleep(100);
+        assertThat(drained).as("a request is in flight").isNotDone();
+        appendLookups(queue, 2);
+        idle.set(true);
+        assertThat(drained.get(5, TimeUnit.SECONDS))
+                .as("the lookups that arrived meanwhile join the batch")
+                .isEqualTo(3);
+    }
+
+    @Test
+    void testWithoutSendWhenIdleBatchesUntilTimeout() throws Exception {
+        Configuration conf = sendWhenIdle(false);
+        conf.setString(CLIENT_LOOKUP_BATCH_TIMEOUT.key(), "200ms");
+        LookupQueue queue = new LookupQueue(conf);
+        appendLookups(queue, 1);
+
+        long start = System.nanoTime();
+        assertThat(queue.drain(() -> true)).hasSize(1);
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start))
+                .isGreaterThanOrEqualTo(150);
+    }
+
+    private static Configuration sendWhenIdle(boolean enabled) {
+        Configuration conf = new Configuration();
+        conf.set(CLIENT_LOOKUP_SEND_WHEN_IDLE, enabled);
+        // long enough that a test that waits for it would time out
+        conf.setString(CLIENT_LOOKUP_BATCH_TIMEOUT.key(), "1h");
+        return conf;
     }
 
     private static void appendLookups(LookupQueue queue, int count) {
