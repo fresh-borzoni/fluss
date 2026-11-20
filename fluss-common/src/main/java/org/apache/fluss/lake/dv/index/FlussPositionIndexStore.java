@@ -139,10 +139,9 @@ public class FlussPositionIndexStore implements PositionIndexStore {
             long changeId,
             TableBucket bucket,
             BucketPart staged,
-            Map<Integer, Integer> newIds,
-            KeyConsumer keys)
+            Map<Integer, Integer> newIds)
             throws IOException {
-        return writer.publishStaged(stagingId, changeId, bucket, staged, newIds, keys);
+        return writer.publishStaged(stagingId, changeId, bucket, staged, newIds);
     }
 
     @Override

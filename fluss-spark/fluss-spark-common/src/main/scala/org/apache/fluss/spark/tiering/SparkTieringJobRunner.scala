@@ -276,7 +276,7 @@ class SparkTieringJobRunner(
       // since it does not declare it supports them; the round fails if one comes anyway.
       require(
         !tableInfo.getTableConfig.isDeletionVectorsEnabled,
-        s"Table $tablePath has '${ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()}' enabled;" +
+        s"Table $tablePath has '${ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()}' enabled;" +
           " the Spark tiering service does not tier tables with deletion vectors."
       )
       lakeTieringFactory match {

@@ -227,6 +227,13 @@ public class MetricNames {
     public static final String DV_ROW_TTL_FOLD_RATE = "dvRowTtlFoldPerSecond";
 
     /**
+     * Buckets of a table with deletion vectors and row TTL whose saved TTL state is corrupt:
+     * missing or out of order in a restored KV snapshot, or a lake snapshot covered below the
+     * offset the TTL filter was capped for, where its readable offset only moves forward.
+     */
+    public static final String DV_ROW_TTL_CORRUPT_RATE = "dvRowTtlCorruptPerSecond";
+
+    /**
      * How far the row TTL filter of a bucket with deletion vectors lags the clock: 0 while its cap
      * does not bind, now minus the cap while it does, and the time since it expires nothing while
      * it cannot cap.
@@ -468,8 +475,15 @@ public class MetricNames {
     // for lake tiering metrics - operator level
     public static final String TIERING_SERVICE_READ_BYTES = "readBytes";
     public static final String TIERING_SERVICE_READ_BYTES_RATE = "readBytesPerSecond";
+    // planned rounds whose leader's log mask did not match them, written in sort mode
+    public static final String TIERING_SERVICE_DV_ROUND_MASK_MISMATCHES = "dvRoundMaskMismatches";
+    // rounds of buckets whose writers failed to prepare their deletion vectors
+    public static final String TIERING_SERVICE_VECTORS_NOT_PREPARED = "vectorsNotPrepared";
 
     // for lake tiering metrics - enumerator level
     public static final String TIERING_SERVICE_READERS_AWAITING_SPLIT_RATIO =
             "readersAwaitingSplitRatio";
+    // the most rounds in a row a table tiered by the job failed
+    public static final String TIERING_SERVICE_MAX_CONSECUTIVE_FAILED_ROUNDS =
+            "maxConsecutiveFailedRounds";
 }

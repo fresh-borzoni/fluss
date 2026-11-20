@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -80,6 +81,8 @@ public class LakeSplitGenerator {
     // whether pinning waits for a leader that still switches to the planned snapshot
     private boolean waitForCatchUp =
             ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.defaultValue();
+    // how long pinning a bucket's cut waits for its leader's answer
+    private Duration requestTimeout = ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue();
 
     public LakeSplitGenerator(
             TableInfo tableInfo,
@@ -106,8 +109,9 @@ public class LakeSplitGenerator {
      *
      * <p>A bounded read of a primary key table with deletion vectors gets {@link DvBucketSplit}s,
      * planned on the coordinator's readable snapshot, or on the empty lake if nothing is tiered
-     * yet. Planning pins one cut per bucket on its leader, without masks; each split's reader
-     * fetches the masks of its part of the cut when the split starts.
+     * yet. Planning pins one cut, without masks, on the leader of each bucket read by several
+     * splits. Each split's reader fetches the masks of its part of the cut when the split starts;
+     * the split of a bucket read by one split pins its own cut first.
      */
     @Nullable
     public List<SourceSplitBase> generateHybridLakeFlussSplits() throws Exception {
@@ -232,12 +236,17 @@ public class LakeSplitGenerator {
         this.waitForCatchUp = waitForCatchUp;
     }
 
+    /** Sets how long pinning a bucket's cut waits for its leader's answer. */
+    public void setRequestTimeout(Duration requestTimeout) {
+        this.requestTimeout = requestTimeout;
+    }
+
     /**
-     * Pins one cut per bucket, so that several splits read the bucket with the same masks: groups
-     * of its lake files, and its log. The cut takes a hold per split, which the enumerator releases
-     * when the split's reader reports it finished, or when the read ends. A bucket whose leader
-     * cannot pin now keeps one split that pins its own cut when it starts; if the bucket has more
-     * lake files than one split reads, the split carries none of them and its reader plans them.
+     * Pins one cut per bucket with more lake files than one split reads, so that several splits
+     * read the bucket with the same masks: groups of its lake files, and its log. The leader keeps
+     * the cut while the splits' requests ask for it. Any other bucket keeps its one split, which
+     * pins its own cut when it starts. So does a bucket whose leader cannot pin now, with a split
+     * that carries none of its lake files: its reader plans them.
      */
     private List<SourceSplitBase> pinBuckets(List<SourceSplitBase> splits, long snapshotId)
             throws Exception {
@@ -251,6 +260,7 @@ public class LakeSplitGenerator {
                 new DvBucketPlanner(DvAdmin.of(flussAdmin), tableInfo.getTablePath(), lakeSource)
                         .withFileGroupRows(fileGroupRows)
                         .withWaitForCatchUp(waitForCatchUp)
+                        .withRequestTimeout(requestTimeout)
                         .pin(snapshotId, buckets);
         if (parts.isEmpty()) {
             return splits;

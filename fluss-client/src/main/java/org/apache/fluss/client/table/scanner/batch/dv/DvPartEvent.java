@@ -45,7 +45,7 @@ final class DvPartEvent {
         /** A leader with no masks yet named a cut to read the bucket by key up to. */
         REBUILDING,
         /**
-         * The leader covers another lake snapshot, or, for a request of a cut, no longer holds it.
+         * The leader covers another lake snapshot, or, for a request of a cut, no longer keeps it.
          */
         COVERED,
         /** The leader had no masks to serve within the fetch's wait. */

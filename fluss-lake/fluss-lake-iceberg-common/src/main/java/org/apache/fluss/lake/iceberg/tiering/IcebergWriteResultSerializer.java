@@ -42,10 +42,10 @@ import static org.apache.fluss.lake.iceberg.utils.IcebergJsonSerdeUtils.toJsonBy
  *       wrote them.
  *   <li><b>Version 2:</b> A JSON document written by {@link IcebergWriteResultJsonSerde}, so that
  *       the write result can be read across Iceberg versions.
- *   <li><b>Version 3 (Current):</b> The JSON document of version 2. For tables with derived
- *       deletion vectors, it carries a reference to the index part the writer staged in the
- *       position index store. A version 2 reader would ignore the reference and commit the round's
- *       rows without their deletes, hence the new version.
+ *   <li><b>Version 3 (Current):</b> The JSON document of version 2. For a table with deletion
+ *       vectors, it carries the index part the writer staged in the position index store, and the
+ *       deletion vectors the writer prepared for the bucket's round, if any. A version 2 reader
+ *       would ignore them and commit the round's rows without their deletes, hence the new version.
  * </ul>
  *
  * <p>This serializer can deserialize write results of all previous versions, but always produces
@@ -81,7 +81,7 @@ public class IcebergWriteResultSerializer implements SimpleVersionedSerializer<I
                 throw new IOException(
                         String.format(
                                 "Unsupported IcebergWriteResult serializer version %s, the supported versions are %s to %s.",
-                                version, VERSION_1, VERSION_3));
+                                version, VERSION_1, CURRENT_VERSION));
         }
     }
 

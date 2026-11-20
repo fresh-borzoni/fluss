@@ -271,7 +271,7 @@ public class TableDescriptorValidation {
      * of tables with deletion vectors reads. Other tables ignore them.
      */
     private static void checkAutoCompaction(Configuration tableConf) {
-        if (!tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED)) {
             return;
         }
         if (tableConf.get(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION_MIN_SMALL_FILES) < 2) {
@@ -293,18 +293,20 @@ public class TableDescriptorValidation {
             TableDescriptor tableDescriptor,
             Configuration tableConf,
             @Nullable DataLakeFormat clusterDataLakeFormat) {
-        if (!tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED)) {
             return;
         }
 
         if (!tableDescriptor.hasPrimaryKey()) {
             throw new InvalidConfigException(
-                    "'table.deletion-vectors.enabled' can only be enabled on primary key tables.");
+                    "'table.datalake.deletion-vectors.enabled' can only be enabled on "
+                            + "primary key tables.");
         }
 
         if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_ENABLED)) {
             throw new InvalidConfigException(
-                    "'table.deletion-vectors.enabled' requires 'table.datalake.enabled' = true.");
+                    "'table.datalake.deletion-vectors.enabled' requires "
+                            + "'table.datalake.enabled' = true.");
         }
 
         // The historical partition keys its local state by partition-scoped keys. The position
@@ -315,7 +317,7 @@ public class TableDescriptorValidation {
                     String.format(
                             "'%s' cannot be combined with '%s': deletion vectors do not cover the"
                                     + " historical partition yet.",
-                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                             ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key()));
         }
 
@@ -323,10 +325,10 @@ public class TableDescriptorValidation {
         // of the key's KV value, never by an UPDATE_BEFORE record.
 
         // Each KV value carries the log offset of its version, which names the version a change
-        // supersedes. Row TTL, by processing or event time, takes a value layout with a slot for
-        // each (see checkKvValueLayout); the write path looks up the lake row of a key it finds no
-        // value for, and the leader caps the TTL filter's clock so that no version expires before
-        // it is tiered.
+        // supersedes, in the versioned layout (see checkKvValueLayout). Row TTL, by processing or
+        // event time, keeps its time in the layout's other slot; the write path looks up the lake
+        // row of a key it finds no value for, and the leader caps the TTL filter's clock so that
+        // no version expires before it is tiered.
 
         // Iceberg tiering commits the deletes. Paimon merges by key itself, and the masks follow
         // its deletion-vector reads. Other formats implement neither.
@@ -339,8 +341,8 @@ public class TableDescriptorValidation {
                 && lakeFormat != DataLakeFormat.PAIMON) {
             throw new InvalidConfigException(
                     String.format(
-                            "'table.deletion-vectors.enabled' is only supported for the %s and %s "
-                                    + "lake formats, but the table uses %s.",
+                            "'table.datalake.deletion-vectors.enabled' is only supported for the "
+                                    + "%s and %s lake formats, but the table uses %s.",
                             DataLakeFormat.ICEBERG, DataLakeFormat.PAIMON, lakeFormat));
         }
     }
@@ -498,16 +500,21 @@ public class TableDescriptorValidation {
 
     private static void checkKvValueLayout(Configuration tableConf, boolean hasPrimaryKey) {
         boolean rowTtlEnabled = tableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent();
-        boolean deletionVectors = tableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
+        boolean deletionVectors =
+                tableConf.get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED);
         Optional<Integer> layoutVersion =
                 tableConf.getOptional(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION);
         if (!layoutVersion.isPresent()) {
-            if (rowTtlEnabled) {
+            // a server that reads the missing version as the plain layout must not lead the table
+            if (rowTtlEnabled || (deletionVectors && hasPrimaryKey)) {
                 throw new InvalidConfigException(
                         String.format(
                                 "'%s' must be set when '%s' is set.",
                                 ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
-                                ConfigOptions.TABLE_KV_TTL.key()));
+                                rowTtlEnabled
+                                        ? ConfigOptions.TABLE_KV_TTL.key()
+                                        : ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED
+                                                .key()));
             }
             return;
         }
@@ -540,30 +547,23 @@ public class TableDescriptorValidation {
     }
 
     /**
-     * The KV value layout of a primary key table. Deletion vectors keep the log offset of each
-     * value's version in the tag of the tagged layout, and row TTL keeps the value's time there.
-     * With both, the versioned layout has a slot for each.
+     * The KV value layout of a primary key table. Row TTL alone keeps the value's time in the tag
+     * of the tagged layout. Deletion vectors keep the log offset of each value's version in the
+     * versioned layout, with or without row TTL: servers that know only the tagged layout write a
+     * time into its tag, and they refuse the versioned one.
      */
     private static KvValueLayout expectedKvValueLayout(
             boolean rowTtlEnabled, boolean deletionVectors) {
-        if (rowTtlEnabled && deletionVectors) {
+        if (deletionVectors) {
             return KvValueLayout.VERSIONED;
         }
-        return rowTtlEnabled || deletionVectors ? KvValueLayout.TAGGED : KvValueLayout.PLAIN;
+        return rowTtlEnabled ? KvValueLayout.TAGGED : KvValueLayout.PLAIN;
     }
 
     private static String describeKvValueOptions(boolean rowTtlEnabled, boolean deletionVectors) {
-        if (rowTtlEnabled && deletionVectors) {
-            return String.format(
-                    "'%s' = true and '%s'",
-                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
-                    ConfigOptions.TABLE_KV_TTL.key());
-        }
         if (deletionVectors) {
             return String.format(
-                    "'%s' = true without '%s'",
-                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
-                    ConfigOptions.TABLE_KV_TTL.key());
+                    "'%s' = true", ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key());
         }
         return String.format(
                 "'%s' %s on a table without deletion vectors",

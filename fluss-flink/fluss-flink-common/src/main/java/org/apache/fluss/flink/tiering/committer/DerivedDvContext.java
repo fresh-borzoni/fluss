@@ -19,9 +19,11 @@ package org.apache.fluss.flink.tiering.committer;
 
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.DvRoundRequests;
 import org.apache.fluss.client.tiering.FlussTableLakeSnapshotCommitter;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringCommitterInitContext;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.FlussRuntimeException;
@@ -225,7 +227,7 @@ final class DerivedDvContext<WriteResult, Committable> {
     /**
      * Returns the round's results without those of partitions the Fluss table dropped, and deletes
      * their data files. A dropped partition's buckets are gone from the tablet servers, so a round
-     * with deletes cannot look up and delete the old versions of its rows there; committing the new
+     * with deletes cannot find and delete the old versions of its rows there; committing the new
      * ones would leave both live in the lake. A registration also leaves the partition's offsets
      * out, which the round's own offsets would put back. Its compactions are left out too, and its
      * staged index parts go with the round's staging change. Nothing reads the partition's log
@@ -306,6 +308,16 @@ final class DerivedDvContext<WriteResult, Committable> {
      */
     SupportsDeletionVectorTiering dvTiering(TablePath tablePath) {
         return DeletionVectorCapabilities.tiering(lakeTieringFactory, tablePath);
+    }
+
+    /** Fetches the deletes of the table's rounds, each request bounded by the request timeout. */
+    DvRoundRequests.Fetcher roundDeletes(TablePath tablePath) {
+        return new DvRoundRequests(
+                        admin,
+                        tablePath,
+                        Thread::sleep,
+                        flussConfig.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis())
+                ::fetch;
     }
 
     /** The lake source of the table's lake table, which may live under a custom lake path. */

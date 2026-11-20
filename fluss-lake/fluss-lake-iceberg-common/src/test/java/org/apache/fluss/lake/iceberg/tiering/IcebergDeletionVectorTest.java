@@ -95,7 +95,7 @@ class IcebergDeletionVectorTest {
                         .schema(flussSchema)
                         .distributedBy(BUCKET_NUM, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .build();
         try (IcebergLakeCatalog catalog = new IcebergLakeCatalog(configuration)) {
             catalog.createTable(tablePath, descriptor, new TestingLakeCatalogContext());
@@ -138,7 +138,8 @@ class IcebergDeletionVectorTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.singletonMap("round", "2"),
                     Collections.singletonMap(fileName, new long[] {0L}),
-                    baseSnapshotId);
+                    baseSnapshotId,
+                    Collections.emptyList());
         }
 
         table.refresh();
@@ -156,7 +157,8 @@ class IcebergDeletionVectorTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.singletonMap("round", "3"),
                     Collections.singletonMap(fileName, new long[] {1L}),
-                    secondBase);
+                    secondBase,
+                    Collections.emptyList());
         }
         table.refresh();
         assertThat(countRows(table)).isEqualTo(1);

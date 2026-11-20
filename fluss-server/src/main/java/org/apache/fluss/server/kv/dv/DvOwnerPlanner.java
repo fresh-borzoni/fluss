@@ -72,7 +72,6 @@ final class DvOwnerPlanner {
      * the chain listed.
      */
     static final class Plan {
-        static final Plan COVERED = new Plan(PlanKind.COVERED, null, null);
         static final Plan NOT_COVERED = new Plan(PlanKind.NOT_COVERED, null, null);
         static final Plan HELD = new Plan(PlanKind.HELD, null, null);
 

@@ -18,11 +18,15 @@
 package org.apache.fluss.lake.committer;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.metadata.TableBucket;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * A {@link LakeCommitter} of a lake that takes deletes by row position from Fluss: tiering a table
@@ -44,17 +48,22 @@ public interface SupportsPositionDeleteCommit<WriteResult, CommittableT>
 
     /**
      * Commits {@code committable} together with deletion vectors for the given row positions per
-     * data-file basename, atomically on top of {@code baseSnapshotId}. The committed snapshot's
-     * parent is the base, or a snapshot after it that changed no data file. Fails if a referenced
-     * file is gone or another commit happened since the base, because the deletes and the round's
-     * index change are relative to the base.
+     * data-file basename, atomically on top of {@code baseSnapshotId}, and with the deletion
+     * vectors of {@code prepared}, which {@link #holdingDeletionVectors} accepted on the same base
+     * (empty if the writers prepared none). The committed snapshot's parent is the base, or a
+     * snapshot after it that changed no data file. Fails if a referenced file is gone or another
+     * commit happened since the base, because the deletes and the round's index change are relative
+     * to the base. A data file must not have prepared deletion vectors of two buckets, nor of one
+     * bucket and {@code deletedPositionsByFile}.
      *
      * <p>Exceptions say whether the lake took the commit:
      *
      * <ul>
      *   <li>{@link LakeCommitRejectedException}: the lake definitely did not take the commit. The
      *       delete files written for it are already deleted, so the caller can delete the
-     *       committable's files too.
+     *       committable's files too. The prepared deletion vectors' files are left to the caller,
+     *       which may commit them in a later attempt or {@link #discardDeletionVectors discard}
+     *       them.
      *   <li>{@link LakeBaseChangedException}: the table moved past the base, so the commit was not
      *       taken; the caller plans it again on the new snapshot.
      *   <li>Any other exception: the outcome is unknown, as the commit may still land after the
@@ -72,8 +81,49 @@ public interface SupportsPositionDeleteCommit<WriteResult, CommittableT>
             CommittableT committable,
             Map<String, String> snapshotProperties,
             Map<String, long[]> deletedPositionsByFile,
-            long baseSnapshotId)
+            long baseSnapshotId,
+            Collection<WriteResult> prepared)
             throws IOException;
+
+    /**
+     * Returns the buckets of {@code prepared}, write results with deletion vectors their tiering
+     * writers prepared ({@link org.apache.fluss.lake.writer.DeletionVectorPreparer}), whose
+     * deletion vectors hold on lake snapshot {@code baseSnapshotId}: each data file they delete
+     * rows in is live there, with the deletion vector they replace as its current one. The other
+     * buckets' deletes are merged at the committer. A lake whose writers prepare deletion vectors
+     * overrides this and the other methods of prepared deletion vectors; by default none hold.
+     */
+    default Set<TableBucket> holdingDeletionVectors(
+            Map<TableBucket, WriteResult> prepared, long baseSnapshotId) throws IOException {
+        return Collections.emptySet();
+    }
+
+    /** The names of the data files whose deletion vectors the write result's writer prepared. */
+    default Set<String> preparedDataFiles(WriteResult prepared) {
+        return Collections.emptySet();
+    }
+
+    /**
+     * Deletes the prepared deletion vector files of write results never committed. A lake whose
+     * writers prepare deletion vectors must override it, or their files stay until the lake's
+     * orphan-file removal.
+     */
+    default void discardDeletionVectors(Collection<WriteResult> prepared) {}
+
+    /**
+     * The names of the data files, as the deletes of {@link #commitWithDeletes} name them, whose
+     * rows or deletes the lake snapshots after {@code fromSnapshotId} up to {@code toSnapshotId}
+     * changed: the data files they removed, and those whose delete files they added or removed.
+     * Deletes of a round on {@code fromSnapshotId} that name none of them hold on {@code
+     * toSnapshotId} as they are. Returns null if that is not known, e.g. {@code toSnapshotId} does
+     * not descend from {@code fromSnapshotId}, or a delete file in between applies to more than one
+     * data file.
+     */
+    @Nullable
+    default Set<String> changedDataFiles(long fromSnapshotId, long toSnapshotId)
+            throws IOException {
+        return null;
+    }
 
     /**
      * Commits this round's compaction rewrite, if any, before the round's deletes, so that it

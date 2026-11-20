@@ -152,7 +152,7 @@ class PaimonSplitPlannerTest extends PaimonSourceTestBase {
 
     /**
      * A table with Paimon deletion vectors only, without Fluss's {@code
-     * table.deletion-vectors.enabled}, keeps the splits Paimon packs by size.
+     * table.datalake.deletion-vectors.enabled}, keeps the splits Paimon packs by size.
      */
     @Test
     void testPlanWithPaimonDeletionVectorsOnlyKeepsPaimonSplits(@TempDir Path ioDir)
@@ -187,7 +187,7 @@ class PaimonSplitPlannerTest extends PaimonSourceTestBase {
             // as the Fluss table's options are mirrored into the Paimon table
             builder.option(
                     PaimonConversions.FLUSS_CONF_PREFIX
-                            + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                            + ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                     "true");
         }
         // the compaction rolls its output into several files

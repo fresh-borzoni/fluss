@@ -50,9 +50,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Function;
 
@@ -64,8 +66,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The setup and helpers of the integration tests of tables with deletion vectors ({@code
- * table.deletion-vectors.enabled = true}) on Iceberg v2 (file-scoped position deletes) and v3
- * (deletion vectors).
+ * table.datalake.deletion-vectors.enabled = true}) on Iceberg v2 (file-scoped position deletes) and
+ * v3 (deletion vectors).
  */
 abstract class FlinkDerivedDvTestBase extends FlinkUnionReadTestBase {
     protected static final int BUCKETS = 3;
@@ -250,7 +252,8 @@ abstract class FlinkDerivedDvTestBase extends FlinkUnionReadTestBase {
                         .distributedBy(BUCKETS)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .customProperty("iceberg.format-version", String.valueOf(formatVersion));
         properties.forEach(builder::property);
         if (partitioned) {
@@ -289,5 +292,68 @@ abstract class FlinkDerivedDvTestBase extends FlinkUnionReadTestBase {
         return partition == null
                 ? String.format("+I[%d, %s]", key, value)
                 : String.format("+I[%d, %s, %s]", key, value, partition);
+    }
+
+    /**
+     * Rewrites the live data files of one bucket of the unpartitioned lake table, as {@link
+     * #rewriteDataFilesExcept} does; returns the rewrite's snapshot.
+     */
+    protected long rewriteDataFilesOfBucket(TablePath tablePath, int bucket) throws Exception {
+        org.apache.iceberg.Table table = icebergCatalog.loadTable(toIceberg(tablePath));
+        Function<FileScanTask, Integer> bucketOf = IcebergSplitPlanner.createBucketExtractor(table);
+        Set<String> keep = new HashSet<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                if (bucketOf.apply(task) != bucket) {
+                    keep.add(task.file().location());
+                }
+            }
+        }
+        return rewriteDataFilesExcept(tablePath, keep);
+    }
+
+    /**
+     * Rewrites every live data file of the unpartitioned lake table except {@code keep} into one
+     * file per bucket, dropping their delete files, like another engine's compaction of those
+     * files; returns the rewrite's snapshot.
+     */
+    protected long rewriteDataFilesExcept(TablePath tablePath, Set<String> keep) throws Exception {
+        org.apache.iceberg.Table table = icebergCatalog.loadTable(toIceberg(tablePath));
+        long baseSnapshotId = table.currentSnapshot().snapshotId();
+        Function<FileScanTask, Integer> bucketOf = IcebergSplitPlanner.createBucketExtractor(table);
+        RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(baseSnapshotId);
+        Map<Integer, List<Record>> liveByBucket = new TreeMap<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                if (keep.contains(task.file().location())) {
+                    continue;
+                }
+                rewrite.deleteFile(task.file());
+                task.deletes().forEach(rewrite::deleteFile);
+                List<Record> live =
+                        liveByBucket.computeIfAbsent(bucketOf.apply(task), k -> new ArrayList<>());
+                // the reader applies the task's deletes
+                try (CloseableIterable<Record> records =
+                        new IcebergGenericReader(table.newScan(), true).open(task)) {
+                    for (Record record : records) {
+                        live.add(record.copy());
+                    }
+                }
+            }
+        }
+        assertThat(liveByBucket).isNotEmpty();
+        for (Map.Entry<Integer, List<Record>> e : liveByBucket.entrySet()) {
+            TaskWriter<Record> writer =
+                    TaskWriterFactory.createTaskWriter(table, null, e.getKey(), true);
+            for (Record record : e.getValue()) {
+                writer.write(record);
+            }
+            for (DataFile file : writer.complete().dataFiles()) {
+                rewrite.addFile(file);
+            }
+        }
+        rewrite.commit();
+        table.refresh();
+        return table.currentSnapshot().snapshotId();
     }
 }

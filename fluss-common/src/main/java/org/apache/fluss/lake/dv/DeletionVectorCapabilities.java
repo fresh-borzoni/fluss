@@ -136,7 +136,7 @@ public final class DeletionVectorCapabilities {
                         role,
                         object.getClass().getName(),
                         capability.getName(),
-                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                         tablePath == null ? "" : ", which table " + tablePath + " has enabled"));
     }
 }

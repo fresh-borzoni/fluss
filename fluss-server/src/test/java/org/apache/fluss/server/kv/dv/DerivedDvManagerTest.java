@@ -18,7 +18,6 @@
 package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.exception.DeletionVectorsNotReadyException;
-import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.fs.FsPath;
@@ -268,7 +267,6 @@ class DerivedDvManagerTest {
     @Test
     void testStaleSnapshotRequestsOnEmptyLake() throws Exception {
         manager.recover(src);
-        List<byte[]> keys = Collections.singletonList(key("k1"));
 
         // snapshot 5 is not registered: no catch-up, the reader is told to re-plan
         assertThatThrownBy(() -> unionRead(5))
@@ -278,8 +276,7 @@ class DerivedDvManagerTest {
                             assertThat(e.getCurrentSnapshotId()).isEqualTo(-1L);
                             assertThat(e.getRequestedSnapshotId()).isEqualTo(5L);
                         });
-        assertThatThrownBy(() -> lookupWhenReady(5, keys))
-                .isInstanceOf(StaleSnapshotException.class);
+        assertThatThrownBy(() -> roundWhenReady(5, 0)).isInstanceOf(StaleSnapshotException.class);
         assertThat(manager.getReadableSnapshotId()).isEqualTo(-1L);
     }
 
@@ -316,8 +313,8 @@ class DerivedDvManagerTest {
         src.replayFailure = new IllegalStateException("log gone");
         recoverAtSnapshot100();
 
-        // the index is in place, so lookups still work
-        assertThat(asStrings(lookupWhenReady(100, Collections.singletonList(key("k1")))))
+        // the index is in place
+        assertThat(asStrings(indexed(100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
         // masks without the tail would miss k1 and k2
         assertThatThrownBy(() -> unionRead(100))
@@ -429,16 +426,15 @@ class DerivedDvManagerTest {
     }
 
     @Test
-    void testLookupReturnsPositionsInCoveredSnapshot() throws Exception {
+    void testCoveredSnapshotIndexesItsKeys() throws Exception {
         recoverAtSnapshot100();
 
         List<Object[]> found =
-                lookupWhenReady(100, Arrays.asList(key("k1"), key("k2"), key("k3"), key("k9")));
+                indexed(100, Arrays.asList(key("k1"), key("k2"), key("k3"), key("k9")));
 
         assertThat(asStrings(found))
                 .containsExactly("k1@" + F1 + "#0", "k2@" + F1 + "#1", "k3@" + F1 + "#2");
-        assertThatThrownBy(() -> lookupWhenReady(99, Collections.singletonList(key("k1"))))
-                .isInstanceOf(StaleSnapshotException.class);
+        assertThatThrownBy(() -> roundWhenReady(99, 14)).isInstanceOf(StaleSnapshotException.class);
         assertThatThrownBy(() -> unionRead(-1)).isInstanceOf(StaleSnapshotException.class);
     }
 
@@ -476,14 +472,14 @@ class DerivedDvManagerTest {
 
         assertThat(
                         asStrings(
-                                lookupWhenReady(
+                                indexed(
                                         200,
                                         Arrays.asList(key("k1"), key("k2"), key("k3"), key("k4")))))
                 .containsExactly("k1@" + F2 + "#0", "k3@" + F1 + "#2", "k4@" + F2 + "#1");
 
         // the older snapshot is gone for good
         assertThatThrownBy(() -> unionRead(100)).isInstanceOf(StaleSnapshotException.class);
-        assertThatThrownBy(() -> lookupWhenReady(100, Collections.singletonList(key("k1"))))
+        assertThatThrownBy(() -> roundWhenReady(100, 14))
                 .isInstanceOf(StaleSnapshotException.class);
         assertThat(manager.ensureCovered(100)).isFalse();
         assertThat(manager.getReadableSnapshotId()).isEqualTo(200L);
@@ -592,7 +588,7 @@ class DerivedDvManagerTest {
 
         assertThat(src.downloadedCheckpoints).containsExactly(200L);
         assertThat(src.downloadedIndexIds).containsExactly(3L);
-        assertThat(asStrings(lookupWhenReady(300, Arrays.asList(key("k1"), key("k2"), key("k3")))))
+        assertThat(asStrings(indexed(300, Arrays.asList(key("k1"), key("k2"), key("k3")))))
                 .containsExactly("k2@" + F2 + "#0", "k3@" + F3 + "#0");
     }
 
@@ -823,20 +819,6 @@ class DerivedDvManagerTest {
         assertThat(closeMs).isLessThan(500L);
     }
 
-    /** A lookup of more than 100,000 keys is refused. The tiering service sends 50,000 at most. */
-    @Test
-    void testLookupOfTooManyKeysIsRefused() throws Exception {
-        recoverAtSnapshot100();
-        List<byte[]> keys = new ArrayList<>();
-        for (int i = 0; i <= 100_000; i++) {
-            keys.add(key("k" + i));
-        }
-        assertThatThrownBy(() -> manager.lookup(100, keys))
-                .isInstanceOf(InvalidRequestException.class)
-                .hasMessageContaining("100001 keys");
-        assertThat(asStrings(manager.lookup(100, keys.subList(0, 100_000)))).hasSize(3);
-    }
-
     /**
      * A union read waits for a background resolve at most a moment, then is answered as not ready
      * instead of holding its request thread until the resolve ends.
@@ -984,13 +966,13 @@ class DerivedDvManagerTest {
         DvSnapshot snapshot = unionRead(200);
         assertThat(manager.getReadableSnapshotId()).isEqualTo(200L);
         assertThat(snapshot.getSnapshotStartOffset()).isEqualTo(14L);
-        assertThat(asStrings(lookupWhenReady(200, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(200, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F2 + "#0");
     }
 
-    /** Neither does a tiering lookup catch up on the request thread. */
+    /** Neither does a tiering round catch up on the request thread. */
     @Test
-    void testLookupDoesNotCatchUpOnTheRequestThread() throws Exception {
+    void testRoundDoesNotCatchUpOnTheRequestThread() throws Exception {
         recoverEmptyLake();
         src.publish(100, 1, 10, dict(1, F1), new Index().put("k1", 1, 0).build());
         src.readable = new long[] {100, 10};
@@ -998,24 +980,24 @@ class DerivedDvManagerTest {
         highWatermark.set(11);
         CountDownLatch gate = pauseReplayAfter(0);
         try {
-            CompletableFuture<List<Object[]>> lookup =
+            CompletableFuture<DvRoundDeletes> round =
                     CompletableFuture.supplyAsync(
                             () -> {
                                 try {
-                                    return manager.lookup(
-                                            100, Collections.singletonList(key("k1")));
+                                    return manager.roundDeletes(100, null, 11);
                                 } catch (Exception e) {
                                     throw new CompletionException(e);
                                 }
                             },
                             async);
-            assertThatThrownBy(() -> lookup.get(3, TimeUnit.SECONDS))
+            assertThatThrownBy(() -> round.get(3, TimeUnit.SECONDS))
                     .hasCauseInstanceOf(RetriableException.class);
         } finally {
             gate.countDown();
         }
-        assertThat(asStrings(lookupWhenReady(100, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
+        assertThat(roundWhenReady(100, 11).deletes()).containsOnlyKeys(F1);
     }
 
     /**
@@ -1124,7 +1106,7 @@ class DerivedDvManagerTest {
         DvSnapshot snapshot = unionRead(200);
         assertThat(snapshot.getSnapshotStartOffset()).isEqualTo(11L);
         assertThat(lakeMasks(snapshot)).isEmpty();
-        assertThat(asStrings(lookupWhenReady(200, Arrays.asList(key("k1"), key("k2")))))
+        assertThat(asStrings(indexed(200, Arrays.asList(key("k1"), key("k2")))))
                 .containsExactly("k1@f2.parquet#0", "k2@f1.parquet#1");
     }
 
@@ -1137,7 +1119,7 @@ class DerivedDvManagerTest {
         assertThat(manager.ensureCovered(200)).isTrue();
 
         assertThat(db.fileDict().getFilePath(1)).isNull();
-        assertThat(lookupWhenReady(200, Arrays.asList(key("k1"), key("k3")))).isEmpty();
+        assertThat(indexed(200, Arrays.asList(key("k1"), key("k3")))).isEmpty();
     }
 
     /**
@@ -1160,7 +1142,7 @@ class DerivedDvManagerTest {
 
         assertThat(manager.ensureCovered(300)).isTrue();
 
-        assertThat(asStrings(lookupWhenReady(300, Arrays.asList(key("k1"), key("k3")))))
+        assertThat(asStrings(indexed(300, Arrays.asList(key("k1"), key("k3")))))
                 .containsExactly("k1@" + F3 + "#0", "k3@" + F2 + "#2");
     }
 
@@ -1194,7 +1176,7 @@ class DerivedDvManagerTest {
 
         assertThat(
                         asStrings(
-                                lookupWhenReady(
+                                indexed(
                                         300,
                                         Arrays.asList(key("k1"), key("k2"), key("k4"), key("k5")))))
                 .containsExactly(
@@ -1319,7 +1301,7 @@ class DerivedDvManagerTest {
         assertThatThrownBy(() -> DvTestReads.unionRead(manager, 100))
                 .isInstanceOf(DeletionVectorsNotReadyException.class);
         // the parts of a read that pins take one cut
-        DvPinnedCut pinned = manager.pinCut(100, false, null, 1);
+        DvPinnedCut pinned = manager.pinCut(100, false, null);
         assertThat(pinned.logEndOffset()).isEqualTo(11L);
         assertThat(manager.pinnedCut(100, 11L)).isSameAs(pinned);
 
@@ -1589,7 +1571,7 @@ class DerivedDvManagerTest {
         assertThat(manager.ensureCovered(102)).isTrue();
         handOver("k9", 11, false);
         highWatermark.set(12);
-        assertThat(asStrings(lookupWhenReady(102, Collections.singletonList(key("k9")))))
+        assertThat(asStrings(indexed(102, Collections.singletonList(key("k9")))))
                 .containsExactly("k9@" + F3 + "#9");
         assertThat(lakeMasks(unionRead(102))).isEqualTo(Collections.singletonMap(F3, positions(9)));
     }
@@ -1644,7 +1626,7 @@ class DerivedDvManagerTest {
             handOver("k" + i, 10 + i, false);
         }
         highWatermark.set(14);
-        DvPinnedCut pinned = manager.pinCut(100, true, null, 1);
+        DvPinnedCut pinned = manager.pinCut(100, true, null);
         Index tiered = new Index();
         for (int i = 0; i < 2; i++) {
             tiered.put("k" + i, 2, i);
@@ -1654,7 +1636,7 @@ class DerivedDvManagerTest {
         assertThat(manager.ensureCovered(101)).isTrue();
         // the pinned cut of 100 reads the log from 10
         assertThat(manager.logRetainOffset()).isEqualTo(10L);
-        manager.releaseCut(100, pinned.logEndOffset(), 1);
+        manager.dropPinnedCut(100, pinned.logEndOffset());
         assertThat(manager.logRetainOffset()).isEqualTo(12L);
     }
 
@@ -1868,7 +1850,7 @@ class DerivedDvManagerTest {
             highWatermark.set(15);
             assertThat(lakeMasks(unionReadAsync(100).get(5, TimeUnit.SECONDS)))
                     .isEqualTo(Collections.singletonMap(F1, positions(0, 1, 2, 3, 8)));
-            assertThat(asStrings(lookupWhenReady(100, Collections.singletonList(key("k8")))))
+            assertThat(asStrings(indexed(100, Collections.singletonList(key("k8")))))
                     .containsExactly("k8@" + F1 + "#8");
             assertThatThrownBy(() -> DvTestReads.unionRead(manager, 101, false))
                     .isInstanceOfSatisfying(
@@ -1929,7 +1911,7 @@ class DerivedDvManagerTest {
         highWatermark.set(13);
         assertThat(lakeMasks(unionRead(100)))
                 .isEqualTo(Collections.singletonMap(F1, positions(0, 1, 8)));
-        assertThat(asStrings(lookupWhenReady(100, Collections.singletonList(key("k8")))))
+        assertThat(asStrings(indexed(100, Collections.singletonList(key("k8")))))
                 .containsExactly("k8@" + F1 + "#8");
 
         hooks(manager).setAfterIngest(null);
@@ -1972,7 +1954,7 @@ class DerivedDvManagerTest {
                             });
             // a pin of a read that does not wait too, and both without the wait of a read that
             // waits, half a second
-            assertThatThrownBy(() -> manager.pinCut(100, false, null, 1))
+            assertThatThrownBy(() -> manager.pinCut(100, false, null))
                     .isInstanceOfSatisfying(
                             DeletionVectorsNotReadyException.class,
                             e -> assertThat(e.getRebuildingCut()).isEqualTo(logEnd));
@@ -2190,7 +2172,7 @@ class DerivedDvManagerTest {
 
         manager.recover(src);
 
-        assertThat(asStrings(lookupWhenReady(400, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(400, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
         assertThat(lakeMasks(unionRead(400))).containsOnly(entry(F1, set(0L)));
     }
@@ -2489,12 +2471,20 @@ class DerivedDvManagerTest {
         }
     }
 
-    /** A tiering lookup, retried while the bucket is not ready, as the tiering service retries. */
-    private List<Object[]> lookupWhenReady(long snapshotId, List<byte[]> keys) throws Exception {
+    /** The positions of {@code keys} in the index of {@code snapshotId}, once the bucket has it. */
+    private List<Object[]> indexed(long snapshotId, List<byte[]> keys) throws Exception {
+        return DvTestReads.indexed(manager, snapshotId, keys);
+    }
+
+    /**
+     * The first part of a round's deletes, retried while the bucket is not ready, as the tiering
+     * service retries.
+     */
+    private DvRoundDeletes roundWhenReady(long snapshotId, long end) throws Exception {
         long deadline = System.currentTimeMillis() + 30_000;
         while (true) {
             try {
-                return manager.lookup(snapshotId, keys);
+                return manager.roundDeletes(snapshotId, null, end);
             } catch (RetriableException e) {
                 if (System.currentTimeMillis() > deadline) {
                     throw e;
@@ -2567,9 +2557,9 @@ class DerivedDvManagerTest {
         return out;
     }
 
-    private static List<String> asStrings(List<Object[]> lookups) {
+    private static List<String> asStrings(List<Object[]> found) {
         List<String> out = new ArrayList<>();
-        for (Object[] r : lookups) {
+        for (Object[] r : found) {
             out.add(new String((byte[]) r[0], StandardCharsets.UTF_8) + "@" + r[1] + "#" + r[2]);
         }
         return out;
@@ -2649,11 +2639,6 @@ class DerivedDvManagerTest {
     }
 
     /** In-memory durable state of a bucket: the log, the published index chain, checkpoints. */
-    /** What the bucket holds of its change list and masks. */
-    private static String stateSummary(DerivedDvManager m) {
-        return m.inspect().toString();
-    }
-
     static final class FakeSource implements DerivedDvManager.RecoverySource {
         private final Path dir;
         private final AtomicInteger files = new AtomicInteger();

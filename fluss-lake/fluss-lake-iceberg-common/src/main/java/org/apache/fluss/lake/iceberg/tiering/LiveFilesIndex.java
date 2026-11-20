@@ -19,6 +19,7 @@ package org.apache.fluss.lake.iceberg.tiering;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.lake.iceberg.utils.IcebergConversions;
+import org.apache.fluss.lake.iceberg.utils.IcebergSnapshotLineage;
 
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -44,6 +45,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -70,6 +72,8 @@ final class LiveFilesIndex {
     private static final long MAX_CACHED_FILES = 2_000_000;
 
     private final long snapshotId;
+    // the snapshot's sequence number, which orders the snapshots of a table, also across a rollback
+    private final long sequenceNumber;
     // file name -> data file, without stats
     private final Map<String, DataFile> files;
     // data file location -> its position deletes
@@ -79,22 +83,71 @@ final class LiveFilesIndex {
 
     private LiveFilesIndex(
             long snapshotId,
+            long sequenceNumber,
             Map<String, DataFile> files,
             Map<String, List<DeleteFile>> deletes,
             boolean advanceable) {
         this.snapshotId = snapshotId;
+        this.sequenceNumber = sequenceNumber;
         this.files = files;
         this.deletes = deletes;
         this.advanceable = advanceable;
     }
 
     /**
-     * Returns the index of the table's snapshot, advancing the table's last one in {@code cache} if
-     * it can.
+     * Reads the index of the table's snapshot with {@code reader}, while no other reader of {@code
+     * cache} reads the table's index: the committer and the preparers of a TaskManager share it,
+     * and a reader of a later snapshot advances it in place.
      */
+    static <T> T read(Cache cache, Table table, long snapshotId, Reader<T> reader)
+            throws IOException {
+        synchronized (cache.lockOf(key(table))) {
+            return reader.read(of(cache, table, snapshotId));
+        }
+    }
+
+    /**
+     * Like {@link #read}, with an index that has a live data file of each of the given names if the
+     * snapshot has: a cached index that lacks one may lag behind the snapshot, so the snapshot is
+     * planned again then.
+     */
+    static <T> T readWithFiles(
+            Cache cache,
+            Table table,
+            long snapshotId,
+            Collection<String> fileNames,
+            Reader<T> reader)
+            throws IOException {
+        synchronized (cache.lockOf(key(table))) {
+            LiveFilesIndex live = of(cache, table, snapshotId);
+            if (!live.hasFiles(fileNames)) {
+                live = rescan(cache, table, snapshotId);
+            }
+            return reader.read(live);
+        }
+    }
+
+    /** Reads an index, which it must not keep: a later reader may advance it in place. */
+    @FunctionalInterface
+    interface Reader<T> {
+        T read(LiveFilesIndex index) throws IOException;
+    }
+
+    /**
+     * Returns the index of the table's snapshot, advancing the table's last one in {@code cache} if
+     * it can. The caller holds the table's lock in the cache (see {@link #read}). A cached index of
+     * a later snapshot stays: the snapshot is planned without caching it, so a reader of an older
+     * snapshot, e.g. a preparer's round on a base the committer committed past, never moves the
+     * cache back.
+     */
+    @VisibleForTesting
     static LiveFilesIndex of(Cache cache, Table table, long snapshotId) throws IOException {
         String key = key(table);
         LiveFilesIndex last = cache.take(key);
+        if (last != null && sequenceNumberOf(table, snapshotId) < last.sequenceNumber) {
+            cache.put(key, last);
+            return scanned(cache, table, snapshotId);
+        }
         LiveFilesIndex index = null;
         if (last != null) {
             try {
@@ -110,8 +163,7 @@ final class LiveFilesIndex {
             }
         }
         if (index == null) {
-            index = scan(table, snapshotId);
-            cache.scans.incrementAndGet();
+            index = scanned(cache, table, snapshotId);
         }
         if (index.advanceable) {
             cache.put(key, index);
@@ -120,11 +172,29 @@ final class LiveFilesIndex {
     }
 
     /**
-     * Plans the table's snapshot again, without the table's cached index, which may lag behind it.
+     * Plans the table's snapshot again, without the table's cached index of it, which may lag
+     * behind it. A cached index of another snapshot stays for {@link #of} to decide.
      */
-    static LiveFilesIndex rescan(Cache cache, Table table, long snapshotId) throws IOException {
-        cache.take(key(table));
+    private static LiveFilesIndex rescan(Cache cache, Table table, long snapshotId)
+            throws IOException {
+        String key = key(table);
+        LiveFilesIndex last = cache.take(key);
+        if (last != null && last.snapshotId != snapshotId) {
+            cache.put(key, last);
+        }
         return of(cache, table, snapshotId);
+    }
+
+    private static LiveFilesIndex scanned(Cache cache, Table table, long snapshotId)
+            throws IOException {
+        cache.scans.incrementAndGet();
+        return scan(table, snapshotId);
+    }
+
+    private static long sequenceNumberOf(Table table, long snapshotId) {
+        Snapshot snapshot = table.snapshot(snapshotId);
+        // not known to the table: planning it fails
+        return snapshot == null ? Long.MAX_VALUE : snapshot.sequenceNumber();
     }
 
     private static String key(Table table) {
@@ -151,10 +221,10 @@ final class LiveFilesIndex {
         return out;
     }
 
-    /** The position deletes of a live data file. */
+    /** The position deletes of a live data file, a copy: the index may advance in place later. */
     List<DeleteFile> deletesOf(String location) {
         List<DeleteFile> d = deletes.get(location);
-        return d == null ? Collections.emptyList() : d;
+        return d == null ? Collections.emptyList() : new ArrayList<>(d);
     }
 
     private static LiveFilesIndex scan(Table table, long snapshotId) throws IOException {
@@ -181,7 +251,8 @@ final class LiveFilesIndex {
                 }
             }
         }
-        return new LiveFilesIndex(snapshotId, files, deletes, advanceable);
+        return new LiveFilesIndex(
+                snapshotId, sequenceNumberOf(table, snapshotId), files, deletes, advanceable);
     }
 
     /**
@@ -193,19 +264,13 @@ final class LiveFilesIndex {
         if (target == snapshotId) {
             return this;
         }
-        List<Snapshot> replayed = new ArrayList<>();
-        Snapshot s = table.snapshot(target);
-        while (s != null && s.snapshotId() != snapshotId) {
-            if (replayed.size() == MAX_REPLAYED_SNAPSHOTS) {
-                return null;
-            }
-            replayed.add(s);
-            s = s.parentId() == null ? null : table.snapshot(s.parentId());
+        // null if not a descendant, a snapshot in between expired, or too many in between
+        List<Snapshot> replayed =
+                IcebergSnapshotLineage.snapshotsSince(
+                        table, snapshotId, table.snapshot(target), MAX_REPLAYED_SNAPSHOTS);
+        if (replayed == null) {
+            return null;
         }
-        if (s == null) {
-            return null; // not a descendant, or a snapshot in between expired
-        }
-        Collections.reverse(replayed);
         FileIO io = table.io();
         // In place: the index left the cache, and is dropped if it cannot be advanced.
         Map<String, DataFile> nextFiles = files;
@@ -244,13 +309,19 @@ final class LiveFilesIndex {
                         .add(added.copyWithoutStats());
             }
         }
-        return new LiveFilesIndex(target, nextFiles, nextDeletes, true);
+        return new LiveFilesIndex(
+                target,
+                replayed.get(replayed.size() - 1).sequenceNumber(),
+                nextFiles,
+                nextDeletes,
+                true);
     }
 
     /**
-     * The indexes a tiering committer keeps across rounds, by table. They hold at most a budget of
-     * files in all; the least recently used tables' indexes leave first, such as those of tables
-     * dropped or no longer tiered by this job.
+     * The indexes kept across rounds, by table, which the tiering committer and the deletion vector
+     * preparers of a TaskManager share. They hold at most a budget of files in all; the least
+     * recently used tables' indexes leave first, such as those of tables dropped or no longer
+     * tiered by this job.
      */
     static final class Cache {
         private final long maxCachedFiles;
@@ -260,6 +331,8 @@ final class LiveFilesIndex {
         // the files of the cached indexes; guarded by this
         private long cachedFiles;
         private final AtomicLong scans = new AtomicLong();
+        // by table, the lock its index's readers hold; one small object per table seen
+        private final Map<String, Object> locks = new ConcurrentHashMap<>();
 
         Cache() {
             this(MAX_CACHED_FILES);
@@ -268,6 +341,10 @@ final class LiveFilesIndex {
         @VisibleForTesting
         Cache(long maxCachedFiles) {
             this.maxCachedFiles = maxCachedFiles;
+        }
+
+        private Object lockOf(String key) {
+            return locks.computeIfAbsent(key, k -> new Object());
         }
 
         /** Removes and returns the table's index; a round advances it in place. */

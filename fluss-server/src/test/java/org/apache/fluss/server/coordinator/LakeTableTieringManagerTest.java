@@ -638,7 +638,9 @@ class LakeTableTieringManagerTest {
                         .schema(Schema.newBuilder().column("c1", DataTypes.INT()).build())
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, freshness)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, deletionVectors)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED,
+                                deletionVectors)
                         .distributedBy(1)
                         .build();
 

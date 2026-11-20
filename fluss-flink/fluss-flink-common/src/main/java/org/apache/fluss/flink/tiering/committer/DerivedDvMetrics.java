@@ -29,6 +29,10 @@ final class DerivedDvMetrics {
 
     final Counter rounds;
     final Counter changedKeys;
+    final Counter vectorsFromWriters;
+    final Counter vectorsRejected;
+    final Counter deletesFromReaders;
+    final Counter deletesFromLeaders;
     final Counter reindexes;
     final Counter reindexMs;
     final Counter compactionHandOffs;
@@ -39,7 +43,7 @@ final class DerivedDvMetrics {
     // per table, as of its last trim: the chain's length, and the buckets holding it back
     private final Map<Long, Integer> chainLengths = new ConcurrentHashMap<>();
     private final Map<Long, Integer> holdingBuckets = new ConcurrentHashMap<>();
-    volatile long lastLookupMs;
+    volatile long lastPublishMs;
     volatile long lastLakeCommitMs;
     volatile long lastReindexMs;
 
@@ -47,6 +51,10 @@ final class DerivedDvMetrics {
         MetricGroup dv = metricGroup.addGroup("derivedDeletionVectors");
         this.rounds = dv.counter("rounds", new ConcurrentCounter());
         this.changedKeys = dv.counter("changedKeys", new ConcurrentCounter());
+        this.vectorsFromWriters = dv.counter("vectorsFromWriters", new ConcurrentCounter());
+        this.vectorsRejected = dv.counter("vectorsRejected", new ConcurrentCounter());
+        this.deletesFromReaders = dv.counter("deletesFromReaders", new ConcurrentCounter());
+        this.deletesFromLeaders = dv.counter("deletesFromLeaders", new ConcurrentCounter());
         this.reindexes = dv.counter("reindexes", new ConcurrentCounter());
         this.reindexMs = dv.counter("reindexMs", new ConcurrentCounter());
         this.compactionHandOffs = dv.counter("compactionHandOffs", new ConcurrentCounter());
@@ -60,7 +68,7 @@ final class DerivedDvMetrics {
         dv.gauge(
                 "bucketsHoldingIndexChain",
                 (Gauge<Integer>) () -> holdingBuckets.values().stream().reduce(0, Integer::sum));
-        dv.gauge("lastLookupMs", (Gauge<Long>) () -> lastLookupMs);
+        dv.gauge("lastPublishMs", (Gauge<Long>) () -> lastPublishMs);
         dv.gauge("lastLakeCommitMs", (Gauge<Long>) () -> lastLakeCommitMs);
         dv.gauge("lastReindexMs", (Gauge<Long>) () -> lastReindexMs);
     }

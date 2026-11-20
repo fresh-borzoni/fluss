@@ -377,8 +377,7 @@ final class DvMaskReads {
             DerivedDvManager bucket,
             long requestedSnapshotId,
             boolean waitForCatchUp,
-            @Nullable Long pinRequestId,
-            int holds)
+            @Nullable Long pinRequestId)
             throws IOException, StaleSnapshotException {
         if (pinRequestId != null) {
             DvPinnedCut retried =
@@ -387,8 +386,9 @@ final class DvMaskReads {
                 return retried;
             }
         }
-        // Row TTL may have removed a version the masks would miss: the reader reads the bucket by
-        // key, and no masks are built or pinned for it, so no other reader's cut is evicted.
+        // On Paimon row TTL may have removed a version the masks would miss: the reader reads the
+        // bucket by key, and no masks are built or pinned for it, so no other reader's cut is
+        // evicted.
         DvState s = m.state;
         if (s.coveredSnapshotId == requestedSnapshotId) {
             long cut = DvReadPolicy.foldCut(m.highWatermark.getAsLong(), m.servedCuts.get());
@@ -408,7 +408,7 @@ final class DvMaskReads {
             try {
                 return m.heapBudget
                         .pinnedCuts()
-                        .pin(bucket, requestedSnapshotId, masks, m.metrics, pinRequestId, holds);
+                        .pin(bucket, requestedSnapshotId, masks, m.metrics, pinRequestId);
             } finally {
                 timing.pinNanos = System.nanoTime() - pinStart;
             }
@@ -434,7 +434,7 @@ final class DvMaskReads {
         }
         if (s.coveredSnapshotId != snapshotId || m.servableHighWatermark() != cut) {
             LOG.debug(
-                    "The deletion vector cut of snapshot {} at offset {} is not held; the"
+                    "The deletion vector cut of snapshot {} at offset {} is not kept; the"
                             + " bucket covers snapshot {} up to offset {}.",
                     snapshotId,
                     cut,
@@ -448,7 +448,7 @@ final class DvMaskReads {
             // and reads the bucket by key. The guard counts this answer as a fold, and the pin
             // after it again.
             LOG.debug(
-                    "The deletion vector cut of snapshot {} at offset {} is not held, and row TTL"
+                    "The deletion vector cut of snapshot {} at offset {} is not kept, and row TTL"
                             + " may have removed a version its masks miss.",
                     snapshotId,
                     cut);
@@ -465,7 +465,7 @@ final class DvMaskReads {
             }
             long pinStart = System.nanoTime();
             try {
-                return pinnedCuts.pin(bucket, snapshotId, masks, m.metrics, null, 1);
+                return pinnedCuts.pin(bucket, snapshotId, masks, m.metrics, null);
             } finally {
                 timing.pinNanos = System.nanoTime() - pinStart;
             }
@@ -681,6 +681,11 @@ final class DvMaskReads {
             return SERVABLE;
         }
         if (m.maskState.tailMissing()) {
+            String corruptRowTtl = m.rowTtlGuard.corruption(m.snapshotStartOffset);
+            if (corruptRowTtl != null) {
+                // no replay serves masks: the client reads the bucket by key once it gave up
+                throw new DeletionVectorsNotReadyException(corruptRowTtl);
+            }
             if (m.rebuild.overflowRetryPending()) {
                 // the owner fell behind its writes: replayed after a backoff
                 throw new DeletionVectorsNotReadyException(

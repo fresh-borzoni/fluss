@@ -58,9 +58,9 @@ import java.util.function.IntSupplier;
  *       step</td></tr>
  *   <tr><td>{@code kv-deletion-vectors-request}</td><td>{@link
  *       DerivedDvRequestExecutor#DEFAULT_THREADS} (half the cores, 2 to 16), 1,024
- *       queued</td><td>union read masks, pins, tiering's position lookups</td><td>yes: a read waits
- *       at most 500 ms for its bucket's owner, a lookup reads RocksDB; kept off the RPC
- *       threads</td></tr>
+ *       queued</td><td>union read masks, pins, tiering's round deletes</td><td>yes: a read or a
+ *       round's part waits at most 500 ms for its bucket's owner, a part reads RocksDB; kept off
+ *       the RPC threads</td></tr>
  *   <tr><td>{@code kv-deletion-vectors-key-lookup}</td><td>4</td><td>lookups of the lake
  *       positions of changed keys, 10,000 keys per task, and full-resolve chunks</td><td>briefly:
  *       one RocksDB multi-get per task</td></tr>
@@ -244,14 +244,6 @@ public final class DerivedDvRuntime {
      */
     Executor changeLists() {
         return changeLists;
-    }
-
-    /**
-     * Runs brief IO of the buckets on the server's IO pool, outside the checkpoint and change-list
-     * shares: the reads of a covered snapshot's write time under row TTL.
-     */
-    Executor io() {
-        return io;
     }
 
     /** Runs timers, which only post work to owners and pools. */

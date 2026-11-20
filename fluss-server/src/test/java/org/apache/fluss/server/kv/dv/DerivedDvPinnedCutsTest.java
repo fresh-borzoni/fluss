@@ -48,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.lakeMasks;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.offsets;
@@ -60,6 +61,8 @@ class DerivedDvPinnedCutsTest {
     private static final String F1 = "s3://lake/t/data/f1.parquet";
     private static final String F2 = "s3://lake/t/data/f2.parquet";
     private static final Duration IDLE = Duration.ofMinutes(30);
+    // how long a test waits for a bucket that is not ready yet
+    private static final Duration WAIT = Duration.ofMinutes(1);
 
     @TempDir Path tempDir;
 
@@ -96,67 +99,123 @@ class DerivedDvPinnedCutsTest {
     }
 
     /**
-     * A cut that stays held, as one of its holds is never released while other reads keep pinning
-     * it, remembers only its latest pin requests: a retry comes soon after its request. The ones it
-     * keeps count towards the memory of the cuts.
+     * A cut is dropped once no request asked for it within the idle timeout, which takes the cut
+     * and the pin requests it remembers out of the budget and the metrics.
      */
     @Test
-    void testPinRequestsOfALongHeldCutAreBounded() throws Exception {
+    void testIdleCutExpiresAndFreesItsMemory() throws Exception {
         DerivedDvPinnedCuts cuts = budget.pinnedCuts();
-        DvSnapshot masks = new DvSnapshot(Collections.emptyMap(), null, 10, 0);
-        // a read whose release is lost
-        cuts.pin(manager, 7, masks, metrics, 0L, 1);
+        long before = budget.totalBytes();
+        DvPinnedCut cut = cuts.pin(manager, 7, masksUpTo(10), metrics, 1L);
+        long pinned = cut.bytes() + DerivedDvPinnedCuts.PIN_REQUEST_BYTES;
+        assertThat(cuts.bytes()).isEqualTo(pinned);
+        assertThat(budget.totalBytes() - before).isEqualTo(pinned);
+        assertThat(metrics.pinnedCuts()).isEqualTo(1);
+        assertThat(metrics.pinnedCutBytes()).isEqualTo(pinned);
+
+        clock.addAndGet(IDLE.toNanos() - 1);
+        cuts.expireIdle();
+        assertThat(cuts.size()).isEqualTo(1);
+
+        clock.addAndGet(1);
+        cuts.expireIdle();
+        assertThat(cuts.size()).isZero();
+        assertThat(cuts.bytes()).isZero();
+        assertThat(cuts.pinRequestCount()).isZero();
+        assertThat(budget.totalBytes()).isEqualTo(before);
+        assertThat(metrics.pinnedCuts()).isZero();
+        assertThat(metrics.pinnedCutBytes()).isZero();
+        assertThat(metrics.pinnedCutExpirations()).isEqualTo(1);
+        assertThat(cuts.get(manager, 7, 10)).isNull();
+    }
+
+    /**
+     * A dashboard pins the same unchanged bucket again and again. Every pin shares the one cut and
+     * renews it, so the cut outlives its idle timeout while the pins go on, and expires after the
+     * last. It remembers only its latest pin requests, as a retry comes soon after its request.
+     */
+    @Test
+    void testRepeatedPinsOfAnUnchangedBucketKeepOneCut() throws Exception {
+        DerivedDvPinnedCuts cuts = budget.pinnedCuts();
+        DvSnapshot masks = masksUpTo(10);
+        DvPinnedCut first = cuts.pin(manager, 7, masks, metrics, 0L);
         long bytesOfOne = cuts.bytes();
-        int reads = 20_000;
+        long reads = 20_000;
         for (long id = 1; id <= reads; id++) {
-            cuts.pin(manager, 7, masks, metrics, id, 1);
-            cuts.release(manager, 7, 10, 1);
+            clock.addAndGet(IDLE.toNanos() / 2);
+            assertThat(cuts.pin(manager, 7, masks, metrics, id)).isSameAs(first);
+            cuts.expireIdle();
         }
         assertThat(cuts.size()).isEqualTo(1);
+        assertThat(metrics.pinnedCutExpirations()).isZero();
         assertThat(cuts.pinRequestCount()).isEqualTo(DerivedDvPinnedCuts.MAX_PIN_REQUESTS_PER_CUT);
         assertThat(cuts.bytes()).isGreaterThan(bytesOfOne);
 
-        // a retry of a recent pin request gets the cut without another hold
-        cuts.pin(manager, 7, masks, metrics, (long) reads, 1);
-        assertThat(cuts.release(manager, 7, 10, 1)).isTrue();
+        // a retry of a recent pin request gets the cut without another pin
+        assertThat(cuts.pin(manager, 7, masks, metrics, reads)).isSameAs(first);
+        assertThat(cuts.pinRequestCount()).isEqualTo(DerivedDvPinnedCuts.MAX_PIN_REQUESTS_PER_CUT);
+
+        clock.addAndGet(IDLE.toNanos());
+        cuts.expireIdle();
+        assertThat(cuts.size()).isZero();
         assertThat(cuts.pinRequestCount()).isZero();
         assertThat(cuts.bytes()).isZero();
+        assertThat(metrics.pinnedCutExpirations()).isEqualTo(1);
     }
 
     /** A pin request id that pinned a cut of one snapshot is no retry of a pin of another one. */
     @Test
     void testPinRequestOfAnotherSnapshotPinsItsOwnCut() throws Exception {
         DerivedDvPinnedCuts cuts = budget.pinnedCuts();
-        DvSnapshot s100 = new DvSnapshot(Collections.emptyMap(), null, 10, 0);
-        DvSnapshot s200 = new DvSnapshot(Collections.emptyMap(), null, 20, 10);
-        cuts.pin(manager, 100, s100, metrics, 7L, 1);
-        DvPinnedCut second = cuts.pin(manager, 200, s200, metrics, 7L, 1);
+        DvSnapshot s200 = masks(10, 20);
+        cuts.pin(manager, 100, masksUpTo(10), metrics, 7L);
+        DvPinnedCut second = cuts.pin(manager, 200, s200, metrics, 7L);
         assertThat(second.snapshotId()).isEqualTo(200L);
         assertThat(second.logEndOffset()).isEqualTo(20L);
         assertThat(cuts.count(manager)).isEqualTo(2);
 
-        // the first cut's release leaves the request to the second
-        assertThat(cuts.release(manager, 100, 10, 1)).isTrue();
+        // the first cut expires while the second is fetched: the request stays with the second
+        clock.addAndGet(IDLE.toNanos() - 1);
+        assertThat(cuts.get(manager, 200, 20)).isSameAs(second);
+        clock.addAndGet(1);
+        cuts.expireIdle();
+        assertThat(cuts.count(manager)).isEqualTo(1);
         assertThat(cuts.pinnedBy(manager, 7L, 200)).isSameAs(second);
         assertThat(cuts.pinnedBy(manager, 7L, 100)).isNull();
     }
 
-    /** A release of some holds counts as a use of the cut: its idle timeout starts again. */
+    /**
+     * Log retention keeps a bucket's log from the lowest snapshot start offset of its cuts. That
+     * offset follows the bucket's cuts as they are pinned, dropped, expire and as its leader
+     * closes, and is none once the bucket has no cut.
+     */
     @Test
-    void testReleaseRefreshesTheIdleTimeoutOfACutStillHeld() throws Exception {
+    void testLowestStartOffsetFollowsTheCutsOfEachBucket() throws Exception {
         DerivedDvPinnedCuts cuts = budget.pinnedCuts();
-        cuts.pin(
-                manager,
-                100,
-                new DvSnapshot(Collections.emptyMap(), null, 10, 0),
-                metrics,
-                null,
-                2);
-        clock.addAndGet(IDLE.toNanos() - 1);
-        assertThat(cuts.release(manager, 100, 10, 1)).isFalse();
+        DerivedDvManager other = newManager("other", budget, metrics);
+        assertThat(cuts.minStartOffset(manager)).isEqualTo(Long.MAX_VALUE);
+
+        cuts.pin(manager, 7, masks(10, 20), metrics, null);
+        cuts.pin(manager, 7, masks(10, 21), metrics, null);
+        clock.addAndGet(IDLE.toNanos() / 2);
+        cuts.pin(manager, 8, masks(30, 40), metrics, null);
+        cuts.pin(other, 7, masks(5, 20), metrics, null);
+        assertThat(cuts.minStartOffset(manager)).isEqualTo(10L);
+        assertThat(cuts.minStartOffset(other)).isEqualTo(5L);
+
+        // another cut starts at 10 too
+        cuts.drop(manager, 7, 20);
+        assertThat(cuts.minStartOffset(manager)).isEqualTo(10L);
+
         clock.addAndGet(IDLE.toNanos() / 2);
         cuts.expireIdle();
         assertThat(cuts.count(manager)).isEqualTo(1);
+        assertThat(cuts.minStartOffset(manager)).isEqualTo(30L);
+
+        cuts.dropAll(manager);
+        assertThat(cuts.count(manager)).isZero();
+        assertThat(cuts.minStartOffset(manager)).isEqualTo(Long.MAX_VALUE);
+        assertThat(cuts.minStartOffset(other)).isEqualTo(5L);
     }
 
     /**
@@ -273,33 +332,33 @@ class DerivedDvPinnedCutsTest {
     }
 
     /**
-     * A read that ends releases its pin of the cut. The cut is dropped once every read that pinned
-     * it released it; a release of a cut not held changes nothing.
+     * A second read that pins at the same high watermark shares the first read's cut and renews it:
+     * the cut lives until the idle timeout of the last of them. Once the high watermark moved past
+     * it, a request for it fails as stale.
      */
     @Test
-    void testCutIsDroppedOnceEveryPinIsReleased() throws Exception {
+    void testCutLivesUntilTheLastReadThatPinnedItIdles() throws Exception {
         recoverAtSnapshot100(manager);
         write(50);
         highWatermark.set(logEnd);
         DvPinnedCut first = pin(manager, 100);
-        // another read pins at the same high watermark: the same cut, pinned twice
+        clock.addAndGet(IDLE.toNanos() / 2);
         assertThat(pin(manager, 100)).isSameAs(first);
         long cut = first.logEndOffset();
 
-        assertThat(manager.releaseCut(100, cut, 1)).isFalse();
+        // past the first read's idle timeout, not the second's
+        clock.addAndGet(IDLE.toNanos() / 2);
+        budget.pinnedCuts().expireIdle();
         assertThat(manager.pinnedCutCount()).isEqualTo(1);
-        assertThat(manager.pinnedCut(100, cut)).isSameAs(first);
-        assertThat(manager.releaseCut(100, cut, 1)).isTrue();
+
+        clock.addAndGet(IDLE.toNanos() / 2);
+        budget.pinnedCuts().expireIdle();
         assertThat(manager.pinnedCutCount()).isZero();
-        assertThat(budget.pinnedCuts().size()).isZero();
-        assertThat(budget.pinnedCuts().bytes()).isZero();
         assertThat(metrics.pinnedCuts()).isZero();
         assertThat(metrics.pinnedCutBytes()).isZero();
         assertThat(metrics.pinnedCutEvictions()).isZero();
-        assertThat(metrics.pinnedCutExpirations()).isZero();
-        assertThat(manager.releaseCut(100, cut, 1)).isFalse();
+        assertThat(metrics.pinnedCutExpirations()).isEqualTo(1);
 
-        // the cut is gone once the high watermark moved on
         write(10);
         highWatermark.set(logEnd);
         assertThatThrownBy(() -> manager.pinnedCut(100, cut))
@@ -452,7 +511,7 @@ class DerivedDvPinnedCutsTest {
         assertThat(metrics.pinnedCuts()).isEqualTo(1);
         assertThatThrownBy(() -> manager.pinnedCut(100, cut.logEndOffset()))
                 .isInstanceOf(NotLeaderOrFollowerException.class);
-        assertThatThrownBy(() -> manager.pinCut(100, true, null, 1))
+        assertThatThrownBy(() -> manager.pinCut(100, true, null))
                 .isInstanceOf(NotLeaderOrFollowerException.class);
         assertThat(other.pinnedCut(100, kept.logEndOffset())).isSameAs(kept);
 
@@ -577,10 +636,10 @@ class DerivedDvPinnedCutsTest {
 
     /** Pins a cut, retried while the bucket is not ready, as clients retry. */
     private static DvPinnedCut pin(DerivedDvManager m, long snapshotId) throws Exception {
-        long deadline = System.currentTimeMillis() + 60_000;
+        long deadline = System.currentTimeMillis() + WAIT.toMillis();
         while (true) {
             try {
-                return m.pinCut(snapshotId, true, null, 1);
+                return m.pinCut(snapshotId, true, null);
             } catch (RetriableException e) {
                 if (System.currentTimeMillis() > deadline) {
                     throw e;
@@ -591,7 +650,7 @@ class DerivedDvPinnedCutsTest {
     }
 
     private static DvSnapshot unionRead(DerivedDvManager m, long snapshotId) throws Exception {
-        long deadline = System.currentTimeMillis() + 60_000;
+        long deadline = System.currentTimeMillis() + WAIT.toMillis();
         while (true) {
             try {
                 return DvTestReads.unionRead(m, snapshotId);
@@ -602,6 +661,16 @@ class DerivedDvPinnedCutsTest {
                 Thread.sleep(10);
             }
         }
+    }
+
+    /** The masks of an empty lake and log up to {@code cut}. */
+    private static DvSnapshot masksUpTo(long cut) {
+        return masks(0, cut);
+    }
+
+    /** The masks of an empty lake whose snapshot starts at {@code start}, up to {@code cut}. */
+    private static DvSnapshot masks(long start, long cut) {
+        return new DvSnapshot(Collections.emptyMap(), null, cut, start);
     }
 
     private static String describe(DvSnapshot s) throws IOException {
@@ -621,9 +690,8 @@ class DerivedDvPinnedCutsTest {
         return out;
     }
 
-    private static void waitUntil(java.util.function.BooleanSupplier condition)
-            throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 60_000;
+    private static void waitUntil(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + WAIT.toMillis();
         while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
             Thread.sleep(10);
         }

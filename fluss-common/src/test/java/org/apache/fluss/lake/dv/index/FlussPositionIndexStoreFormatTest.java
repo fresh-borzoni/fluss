@@ -122,33 +122,6 @@ class FlussPositionIndexStoreFormatTest {
                 .hasMessageContaining(NEWER);
     }
 
-    /**
-     * A table indexed by an older build of this store, whose layout this version does not read,
-     * fails loudly instead of being read as empty: the error names the directory to clear.
-     */
-    @Test
-    void testLayoutOfAnOlderBuildIsRefused() throws Exception {
-        commitEmpty(1);
-        store.register(-1, 100, 1);
-        Files.createDirectories(root.resolve("rowPos"));
-        write(root.resolve("rowPos/_next_file_id"), "v1\n3");
-
-        assertThatThrownBy(() -> store.allocateFileIds(1))
-                .hasMessageContaining("rowPos/_next_file_id")
-                .hasMessageContaining("Delete");
-        commitEmpty(2);
-        assertThatThrownBy(() -> store.checkRegistrable(100, 2))
-                .hasMessageContaining("rowPos/_next_file_id");
-        assertThatThrownBy(() -> store.trim(Collections.singletonList(B0), 0))
-                .hasMessageContaining("rowPos/_next_file_id");
-
-        Files.delete(root.resolve("rowPos/_next_file_id"));
-        Files.createDirectories(checkpointDir().resolve("100"));
-        assertThatThrownBy(() -> store.latestCheckpoint(B0, store.chain(), 0))
-                .hasMessageContaining("rowPos/_ckpt/0/100")
-                .hasMessageContaining("Delete");
-    }
-
     @Test
     void testChangeRoundTrip() throws Exception {
         PositionIndexStore.BucketPart part = store.writeBucket(1, B0, entries("k", 7, 3));
@@ -236,12 +209,7 @@ class FlussPositionIndexStoreFormatTest {
         assertThatThrownBy(
                         () ->
                                 store.publishStaged(
-                                        stagingId,
-                                        9,
-                                        B0,
-                                        staged,
-                                        Collections.singletonMap(0, 5),
-                                        k -> {}))
+                                        stagingId, 9, B0, staged, Collections.singletonMap(0, 5)))
                 .hasMessageContaining("rowPos/" + stagingId + "/_STARTED")
                 .hasMessageContaining(NEWER);
     }

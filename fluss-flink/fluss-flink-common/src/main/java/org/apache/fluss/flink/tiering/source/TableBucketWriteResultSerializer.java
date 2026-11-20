@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.tiering.source;
 
+import org.apache.fluss.client.tiering.RoundDeletes;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.lake.source.RowPosResult;
@@ -26,6 +27,8 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -46,17 +49,22 @@ import java.util.Map;
  *       can evolve their write result format independently.
  *   <li><b>Version 3 (Current):</b> Appends, after the number of write results and in the order
  *       they were added, the tiering epoch of the round ({@link
- *       TableBucketWriteResult#tieringEpoch()}), whether the bucket's round ended before the end of
- *       its split ({@link TableBucketWriteResult#endedEarly()}) and the optional deletion-vector
- *       {@link RowPosResult} (index change id, re-index split, new file dictionary entries, SST
- *       metas and the failure of the split, if any).
+ *       TableBucketWriteResult#tieringEpoch()}), whether the bucket's round ended below its high
+ *       watermark ({@link TableBucketWriteResult#endedEarly()}), the offset its log split started
+ *       at ({@link TableBucketWriteResult#logStartOffset()}), the optional deletion-vector {@link
+ *       RowPosResult} (index change id, re-index split, new file dictionary entries, SST metas and
+ *       the failure of the split, if any) and the optional {@link RoundDeletes} of the bucket's
+ *       round ({@link TableBucketWriteResult#roundDeletes()}): its snapshot id, start and end
+ *       offsets, and the serialized positions per data file.
  * </ul>
  */
 public class TableBucketWriteResultSerializer<WriteResult>
         implements SimpleVersionedSerializer<TableBucketWriteResult<WriteResult>> {
 
+    private static final int INITIAL_BUFFER_SIZE = 64;
+
     private static final ThreadLocal<DataOutputSerializer> SERIALIZER_CACHE =
-            ThreadLocal.withInitial(() -> new DataOutputSerializer(64));
+            ThreadLocal.withInitial(() -> new DataOutputSerializer(INITIAL_BUFFER_SIZE));
 
     private static final int VERSION_1 = 1;
     private static final int VERSION_2 = 2;
@@ -84,7 +92,16 @@ public class TableBucketWriteResultSerializer<WriteResult>
     @Override
     public byte[] serialize(TableBucketWriteResult<WriteResult> tableBucketWriteResult)
             throws IOException {
-        final DataOutputSerializer out = SERIALIZER_CACHE.get();
+        RoundDeletes roundDeletes = tableBucketWriteResult.roundDeletes();
+        // round deletes take up to megabytes, so they do not grow the buffer the thread keeps
+        final DataOutputSerializer out =
+                roundDeletes == null
+                        ? SERIALIZER_CACHE.get()
+                        : new DataOutputSerializer(
+                                (int)
+                                        Math.min(
+                                                Integer.MAX_VALUE,
+                                                INITIAL_BUFFER_SIZE + roundDeletes.bytes()));
         // serialize table path
         TablePath tablePath = tableBucketWriteResult.tablePath();
         out.writeUTF(tablePath.getDatabaseName());
@@ -128,6 +145,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
         // since VERSION_3
         out.writeLong(tableBucketWriteResult.tieringEpoch());
         out.writeBoolean(tableBucketWriteResult.endedEarly());
+        out.writeLong(tableBucketWriteResult.logStartOffset());
 
         // serialize the optional RowPosResult, since VERSION_3
         RowPosResult rowPosResult = tableBucketWriteResult.getRowPosResult();
@@ -161,6 +179,9 @@ public class TableBucketWriteResultSerializer<WriteResult>
             out.writeBoolean(false);
         }
 
+        // since VERSION_3
+        writeRoundDeletes(out, roundDeletes);
+
         final byte[] result = out.getCopyOfBuffer();
         out.clear();
         return result;
@@ -169,7 +190,7 @@ public class TableBucketWriteResultSerializer<WriteResult>
     @Override
     public TableBucketWriteResult<WriteResult> deserialize(int version, byte[] serialized)
             throws IOException {
-        if (version < VERSION_1 || version > VERSION_3) {
+        if (version < VERSION_1 || version > CURRENT_VERSION) {
             throw new IOException("Unknown version " + version);
         }
         final DataInputDeserializer in = new DataInputDeserializer(serialized);
@@ -213,6 +234,10 @@ public class TableBucketWriteResultSerializer<WriteResult>
         long tieringEpoch =
                 version >= VERSION_3 ? in.readLong() : TieringSplit.UNKNOWN_TIERING_EPOCH;
         boolean endedEarly = version >= VERSION_3 && in.readBoolean();
+        long logStartOffset =
+                version >= VERSION_3
+                        ? in.readLong()
+                        : TableBucketWriteResult.UNKNOWN_LOG_START_OFFSET;
 
         // deserialize the optional RowPosResult, present since VERSION_3
         RowPosResult rowPosResult = null;
@@ -239,16 +264,58 @@ public class TableBucketWriteResultSerializer<WriteResult>
             rowPosResult = new RowPosResult(changeId, split, newFileDictEntries, sstMetas, failure);
         }
 
+        RoundDeletes roundDeletes = version >= VERSION_3 ? readRoundDeletes(in) : null;
+
         return new TableBucketWriteResult<>(
                 tablePath,
                 tableBucket,
                 partitionName,
                 writeResult,
+                logStartOffset,
                 logEndOffset,
                 maxTimestamp,
                 numberOfWriteResults,
                 rowPosResult,
                 endedEarly,
-                tieringEpoch);
+                tieringEpoch,
+                roundDeletes);
+    }
+
+    private static void writeRoundDeletes(
+            DataOutputSerializer out, @Nullable RoundDeletes roundDeletes) throws IOException {
+        if (roundDeletes == null) {
+            out.writeBoolean(false);
+            return;
+        }
+        out.writeBoolean(true);
+        out.writeLong(roundDeletes.snapshotId());
+        out.writeLong(roundDeletes.startOffset());
+        out.writeLong(roundDeletes.endOffset());
+        List<RoundDeletes.File> files = roundDeletes.files();
+        out.writeInt(files.size());
+        for (RoundDeletes.File file : files) {
+            out.writeUTF(file.path());
+            out.writeInt(file.positions().length);
+            out.write(file.positions());
+        }
+    }
+
+    @Nullable
+    private static RoundDeletes readRoundDeletes(DataInputDeserializer in) throws IOException {
+        if (!in.readBoolean()) {
+            return null;
+        }
+        long snapshotId = in.readLong();
+        long startOffset = in.readLong();
+        long endOffset = in.readLong();
+        int count = in.readInt();
+        List<RoundDeletes.File> files = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            String path = in.readUTF();
+            byte[] positions = new byte[in.readInt()];
+            in.readFully(positions);
+            files.add(new RoundDeletes.File(path, positions));
+        }
+        return new RoundDeletes(snapshotId, startOffset, endOffset, files);
     }
 }

@@ -147,7 +147,7 @@ public class PaimonLakeCatalog implements LakeCatalog {
         // then, create the table
         Schema paimonSchema = toPaimonSchema(tableDescriptor);
         if (Configuration.fromMap(tableDescriptor.getProperties())
-                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+                .get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED)) {
             validateDeletionVectorsOptions(tablePath, paimonSchema);
         }
         try {

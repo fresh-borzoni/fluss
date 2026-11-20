@@ -17,6 +17,8 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
+import org.apache.fluss.annotation.Internal;
+
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.util.Iterator;
@@ -34,20 +36,21 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * table that keeps failing fails every round, so it is only evicted when more than {@code
  * maxTables} tables fail at the same time.
  */
+@Internal
 @NotThreadSafe
-final class ConsecutiveCommitFailureCounter {
+public final class ConsecutiveCommitFailureCounter {
 
     private final int maxTables;
     // Table ID -> consecutive failed rounds, ordered from the least to the most recent failure.
     private final LinkedHashMap<Long, Integer> failuresByTable = new LinkedHashMap<>();
 
-    ConsecutiveCommitFailureCounter(int maxTables) {
+    public ConsecutiveCommitFailureCounter(int maxTables) {
         checkArgument(maxTables > 0, "maxTables must be positive, but is %s.", maxTables);
         this.maxTables = maxTables;
     }
 
     /** Records a failed round of the table and returns its consecutive failed rounds. */
-    int recordFailure(long tableId) {
+    public int recordFailure(long tableId) {
         // Re-insert to move the table to the most recent end.
         Integer previous = failuresByTable.remove(tableId);
         int failures = previous == null ? 1 : previous + 1;
@@ -61,13 +64,22 @@ final class ConsecutiveCommitFailureCounter {
     }
 
     /** Records a committed round of the table, which resets its count. */
-    void recordSuccess(long tableId) {
+    public void recordSuccess(long tableId) {
         failuresByTable.remove(tableId);
     }
 
     /** Returns the consecutive failed rounds of the table, 0 if it is not failing. */
-    int getFailures(long tableId) {
+    public int getFailures(long tableId) {
         return failuresByTable.getOrDefault(tableId, 0);
+    }
+
+    /** Returns the most consecutive failed rounds of a table, 0 if none is failing. */
+    public int maxFailures() {
+        int max = 0;
+        for (int failures : failuresByTable.values()) {
+            max = Math.max(max, failures);
+        }
+        return max;
     }
 
     /** Returns the number of tables currently counted. */

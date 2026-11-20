@@ -111,11 +111,10 @@ public final class KvStateAccessor {
 
     /**
      * Looks up a key's value like {@link #lookup} without a fallback, together with its version
-     * offset, the log offset of the change that wrote it: the tag of the tagged layout, or the
-     * version offset slot of the versioned layout. Returns null if the key has no value.
+     * offset, the log offset of the change that wrote it. Returns null if the key has no value.
      */
     @Nullable
-    public TaggedValue lookupTagged(Key key, ValueDecoder valueDecoder) throws IOException {
+    public VersionedValue lookupVersioned(Key key, ValueDecoder valueDecoder) throws IOException {
         KvStateLookupResult result = lookupPreWriteBuffer(key);
         if (result.status() == KvStateLookupResult.Status.NOT_FOUND) {
             result = lookupRocksDB(key);
@@ -124,18 +123,18 @@ public final class KvStateAccessor {
             return null;
         }
         byte[] raw = result.value();
-        return new TaggedValue(
+        return new VersionedValue(
                 valueDecoder.decodeValue(raw), valueDecoder.decodeVersionOffset(raw));
     }
 
-    /** A value and the tag of its raw bytes. */
-    public static final class TaggedValue {
+    /** A value and the version offset of its raw bytes. */
+    public static final class VersionedValue {
         public final BinaryValue value;
-        public final long tag;
+        public final long versionOffset;
 
-        TaggedValue(BinaryValue value, long tag) {
+        VersionedValue(BinaryValue value, long versionOffset) {
             this.value = value;
-            this.tag = tag;
+            this.versionOffset = versionOffset;
         }
     }
 

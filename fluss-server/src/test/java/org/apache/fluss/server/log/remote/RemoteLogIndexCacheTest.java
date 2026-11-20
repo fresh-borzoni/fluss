@@ -204,6 +204,32 @@ class RemoteLogIndexCacheTest extends RemoteLogTestBase {
                 .containsKey(remoteLogSegment.remoteLogSegmentId());
     }
 
+    /** The first entry at or above an offset comes from the downloaded index as well. */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCeilingEntryFromRemoteStorage(boolean partitionTable) throws Exception {
+        LogTablet logTablet = makeLogTabletAndAddSegments(partitionTable);
+        RemoteLogSegment remoteLogSegment = copyLogSegmentToRemote(logTablet, remoteLogStorage, 0);
+        OffsetIndex offsetIndex =
+                rlIndexCache
+                        .getIndexEntry(FlussPaths.remoteLogDir(conf), remoteLogSegment)
+                        .offsetIndex();
+        assertThat(offsetIndex.entries()).isGreaterThan(1);
+        for (long offset = offsetIndex.baseOffset(); offset <= offsetIndex.lastOffset(); offset++) {
+            assertThat(
+                            rlIndexCache.lookupIndexCeiling(
+                                    FlussPaths.remoteLogDir(conf), remoteLogSegment, offset))
+                    .isEqualTo(offsetIndex.lookupCeiling(offset))
+                    .isNotNull();
+        }
+        assertThat(
+                        rlIndexCache.lookupIndexCeiling(
+                                FlussPaths.remoteLogDir(conf),
+                                remoteLogSegment,
+                                offsetIndex.lastOffset() + 1))
+                .isNull();
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void testPositionForNonExistingIndexFromRemoteStorage(boolean partitionTable) throws Exception {

@@ -52,13 +52,13 @@ class KvValueLayoutTest {
     }
 
     /**
-     * A table with deletion vectors that does not persist a layout version takes the tagged layout,
-     * or the versioned one with row TTL; a persisted version wins.
+     * A table with deletion vectors that does not persist a layout version takes the versioned
+     * layout, with or without row TTL; a persisted version wins.
      */
     @Test
     void testLayoutOfTablesWithDeletionVectors() {
         assertThat(KvValueLayout.fromTableConfig(dvTableConfig(false, null)))
-                .isSameAs(KvValueLayout.TAGGED);
+                .isSameAs(KvValueLayout.VERSIONED);
         assertThat(KvValueLayout.fromTableConfig(dvTableConfig(true, null)))
                 .isSameAs(KvValueLayout.VERSIONED);
         assertThat(KvValueLayout.fromTableConfig(dvTableConfig(true, 3)))
@@ -71,7 +71,7 @@ class KvValueLayoutTest {
 
     private static TableConfig dvTableConfig(boolean rowTtl, Integer layoutVersion) {
         Configuration conf = new Configuration();
-        conf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        conf.set(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true);
         if (rowTtl) {
             conf.set(ConfigOptions.TABLE_KV_TTL, Duration.ofHours(1));
         }
@@ -115,11 +115,17 @@ class KvValueLayoutTest {
         ValueDecoder decoder = new ValueDecoder(schemaGetter, KvFormat.COMPACTED, layout);
         assertThat(decoder.decodeValue(value)).isEqualTo(binaryValue);
         assertThat(decoder.decodeVersionOffset(value)).isEqualTo(42L);
+        // the tag of a tagged value is no version offset: other servers write a time there
         byte[] tagged = ValueEncoder.forLayout(KvValueLayout.TAGGED).encodeValue(binaryValue, 7L);
-        assertThat(
-                        new ValueDecoder(schemaGetter, KvFormat.COMPACTED, KvValueLayout.TAGGED)
-                                .decodeVersionOffset(tagged))
-                .isEqualTo(7L);
+        assertThatThrownBy(
+                        () ->
+                                new ValueDecoder(
+                                                schemaGetter,
+                                                KvFormat.COMPACTED,
+                                                KvValueLayout.TAGGED)
+                                        .decodeVersionOffset(tagged))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("version offset slot");
 
         // without row TTL the value never expires
         byte[] noTtl = ValueEncoder.forLayout(layout).encodeValue(binaryValue, 43L);

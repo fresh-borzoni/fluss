@@ -510,7 +510,7 @@ class PaimonDerivedDvReadableTest {
                                         .build())
                         .distributedBy(2)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(100))
                         .build();
         admin.createTable(tablePath, descriptor, false).get();

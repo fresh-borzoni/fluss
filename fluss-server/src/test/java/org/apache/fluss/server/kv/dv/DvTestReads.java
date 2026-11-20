@@ -18,10 +18,13 @@
 package org.apache.fluss.server.kv.dv;
 
 import org.apache.fluss.exception.StaleSnapshotException;
+import org.apache.fluss.lake.dv.FilePos;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
-/** Reads all masks of a union read at once, as tests compare them. */
+/** Reads all masks of a union read at once, and the index of a bucket, as tests compare them. */
 public final class DvTestReads {
 
     private DvTestReads() {}
@@ -33,17 +36,51 @@ public final class DvTestReads {
     }
 
     /**
-     * All masks a union read of {@code snapshotId} reads: pins a cut, takes its masks and releases
-     * it, so the read leaves no pin behind.
+     * All masks a union read of {@code snapshotId} reads: pins a cut, takes its masks and drops it,
+     * as its idle timeout would, so the read leaves no pin behind.
      */
     public static DvSnapshot unionRead(
             DerivedDvManager manager, long snapshotId, boolean waitForCatchUp)
             throws IOException, StaleSnapshotException {
-        DvPinnedCut cut = manager.pinCut(snapshotId, waitForCatchUp, null, 1);
+        DvPinnedCut cut = manager.pinCut(snapshotId, waitForCatchUp, null);
         try {
             return cut.toDvSnapshot();
         } finally {
-            manager.releaseCut(cut.snapshotId(), cut.logEndOffset(), 1);
+            manager.dropPinnedCut(cut.snapshotId(), cut.logEndOffset());
+        }
+    }
+
+    /**
+     * {key, file path, row position} of each of {@code keys} the index of {@code snapshotId} holds,
+     * read from the version the bucket publishes, without a step of its owner. Waits for the bucket
+     * to publish the snapshot's version.
+     */
+    public static List<Object[]> indexed(
+            DerivedDvManager manager, long snapshotId, List<byte[]> keys) throws Exception {
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (true) {
+            DvVersion v = manager.state().version;
+            if (v != null && v.snapshotId == snapshotId && v.tryRetain()) {
+                try {
+                    List<FilePos> found = v.positions(keys);
+                    List<Object[]> out = new ArrayList<>();
+                    for (int i = 0; i < keys.size(); i++) {
+                        FilePos fp = found.get(i);
+                        String path = fp == null ? null : v.filePath(fp.fileId());
+                        if (path != null) {
+                            out.add(new Object[] {keys.get(i), path, fp.rowPosition()});
+                        }
+                    }
+                    return out;
+                } finally {
+                    v.release();
+                }
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new AssertionError(
+                        "The bucket publishes " + manager.state() + ", not snapshot " + snapshotId);
+            }
+            Thread.sleep(10);
         }
     }
 }

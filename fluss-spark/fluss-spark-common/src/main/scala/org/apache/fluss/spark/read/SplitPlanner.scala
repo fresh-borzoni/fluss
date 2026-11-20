@@ -1121,17 +1121,12 @@ class UpsertPlanner(
       (bucketParts(None, null, splitsByBucket), Seq.empty[InputPartition])
     }
 
-    // Spark tells the source nothing when a read ends. So only a bucket read in several parts is
-    // pinned here, for its parts to share one cut, with a hold for each part, which the part's
-    // task releases when it succeeds. A bucket read by one part pins its cut when the part's task
-    // starts, and releases it when the task ends. A plan that never runs leaves its cuts to idle
-    // out.
     val pinned = new DvBucketPlanner(DvAdmin.of(admin), tablePath, lakeSource)
       .withFileGroupRows(
         flussConfig.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS))
       .withWaitForCatchUp(
         flussConfig.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP))
-      .withPinSplitBucketsOnly(true)
+      .withRequestTimeout(flussConfig.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT))
       .pin(snapshotId, parts.asJava)
     val dvPartitions = parts.flatMap {
       part =>

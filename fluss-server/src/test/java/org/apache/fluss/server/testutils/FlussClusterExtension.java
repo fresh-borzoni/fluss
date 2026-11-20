@@ -407,6 +407,15 @@ public final class FlussClusterExtension
     }
 
     /**
+     * Pauses the background resolves of the tablet servers' leaders, also of servers started later,
+     * until called with false: they neither apply the changes handed over nor look up lake
+     * positions.
+     */
+    public void pauseDvResolves(boolean paused) {
+        dvTestHooks.setResolvesPaused(paused);
+    }
+
+    /**
      * Holds the switches of the tablet servers' leaders to newer lake snapshots, also of servers
      * started later, until {@code gate} counts down; none if null.
      */

@@ -17,12 +17,15 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.config.ConfigOptions;
+
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * What the committers of a tiering job keep across rounds: the live files of each table's last
- * base, and when each table's snapshots were expired last. The job's {@link
+ * base, which the deletion vector preparers of the TaskManager share, the deletion vectors they
+ * wrote, and when each table's snapshots were expired last. The job's {@link
  * IcebergLakeTieringFactory} owns it.
  */
 final class IcebergCommitterState {
@@ -30,13 +33,28 @@ final class IcebergCommitterState {
     /** How often a table's snapshots are expired at most. */
     static final long DEFAULT_EXPIRE_INTERVAL_MS = 10 * 60_000L;
 
-    final LiveFilesIndex.Cache liveFiles = new LiveFilesIndex.Cache();
+    // shared with the deletion vector preparers of the TaskManager
+    final LiveFilesIndex.Cache liveFiles;
+    final DeletionVectorCache deletionVectors;
     // when each table's snapshots were expired last, by table location
     private final Map<String, Long> lastExpiration = new ConcurrentHashMap<>();
     private final long expireIntervalMs;
 
     IcebergCommitterState(long expireIntervalMs) {
+        this(
+                expireIntervalMs,
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_CACHE_SIZE.defaultValue().getBytes());
+    }
+
+    IcebergCommitterState(long expireIntervalMs, long deletionVectorCacheBytes) {
+        this(expireIntervalMs, deletionVectorCacheBytes, new LiveFilesIndex.Cache());
+    }
+
+    IcebergCommitterState(
+            long expireIntervalMs, long deletionVectorCacheBytes, LiveFilesIndex.Cache liveFiles) {
         this.expireIntervalMs = expireIntervalMs;
+        this.deletionVectors = new DeletionVectorCache(deletionVectorCacheBytes);
+        this.liveFiles = liveFiles;
     }
 
     /** Whether the table's snapshots are due to expire at {@code now}; records it if so. */

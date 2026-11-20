@@ -287,7 +287,7 @@ final class DvOwnerChangeListExport {
             carry.clear();
             carryEnd = readable;
         }
-        return new Plan(list, o.coveredSnapshotId, carry, carryEnd, x);
+        return new Plan(list, o.coveredSnapshotId, carry, carryEnd);
     }
 
     /**
@@ -483,7 +483,6 @@ final class DvOwnerChangeListExport {
         final List<Carried> carry;
         // where the new segment starts: the end of the carried ones
         final long newFrom;
-        final long x;
         // The RocksDB snapshot, with a lease of the RocksDB, from when the job starts until it
         // releases both: a job waiting for a thread holds neither.
         @Nullable private Snapshot snapshot;
@@ -491,8 +490,7 @@ final class DvOwnerChangeListExport {
         private boolean startCancelled;
         @Nullable private String startFailure;
 
-        private Plan(
-                DvChangeList list, long lakeSnapshotId, List<Carried> carry, long newFrom, long x) {
+        private Plan(DvChangeList list, long lakeSnapshotId, List<Carried> carry, long newFrom) {
             this.skip = null;
             this.list = list;
             this.listId = list.id;
@@ -500,7 +498,6 @@ final class DvOwnerChangeListExport {
             this.lakeSnapshotId = lakeSnapshotId;
             this.carry = carry;
             this.newFrom = newFrom;
-            this.x = x;
         }
 
         private Plan(String skip) {
@@ -511,16 +508,10 @@ final class DvOwnerChangeListExport {
             this.lakeSnapshotId = -1;
             this.carry = Collections.emptyList();
             this.newFrom = -1;
-            this.x = -1;
         }
 
         static Plan skip(String reason) {
             return new Plan(reason);
-        }
-
-        /** Where the change list the plan saves starts. */
-        long from() {
-            return carry.isEmpty() ? newFrom : carry.get(0).segment.from();
         }
 
         /**

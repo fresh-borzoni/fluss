@@ -45,8 +45,8 @@ public interface DvTestHooks {
 
     /**
      * Whether the server's leaders serve masks under row TTL even once a version may have expired
-     * before it was tiered, as before reads folded such buckets by key; to show what the fold
-     * prevents.
+     * before it was tiered, instead of having such a read fold the bucket by key; to show what the
+     * fold prevents.
      */
     default boolean ignoresRowTtlExpiry() {
         return false;
@@ -54,16 +54,16 @@ public interface DvTestHooks {
 
     // ---- a bucket's ----
 
-    /** Whether the background resolves neither apply nor look up. */
+    /**
+     * Whether the background resolves neither apply nor look up. A tablet server's hooks pause
+     * those of all its leaders.
+     */
     default boolean pausesResolves() {
         return false;
     }
 
     /** Runs before each lookup of a resolve, on a key-lookup thread. */
     default void beforeResolveLookup() {}
-
-    /** Runs after a tiering lookup read the index, before it answers. */
-    default void afterLookupRead() {}
 
     /** Runs after a load ingested an index change, on the load's thread. */
     default void afterIngest() {}

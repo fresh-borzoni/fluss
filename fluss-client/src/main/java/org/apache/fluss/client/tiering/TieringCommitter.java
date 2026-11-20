@@ -236,7 +236,8 @@ public class TieringCommitter<WriteResult, Committable> {
                             "Table %s has '%s' enabled; this tiering committer does not tier"
                                     + " tables with deletion vectors. Tier it with the Flink"
                                     + " tiering service.",
-                            tablePath, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+                            tablePath,
+                            ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()));
         }
         return currentTableInfo;
     }

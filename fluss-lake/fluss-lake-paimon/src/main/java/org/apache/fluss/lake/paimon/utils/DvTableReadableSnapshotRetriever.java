@@ -73,7 +73,7 @@ public class DvTableReadableSnapshotRetriever implements AutoCloseable {
     private final Admin flussAdmin;
     private final Connection flussConnection;
     private final SnapshotManager snapshotManager;
-    // whether the Fluss table has table.deletion-vectors.enabled, not only Paimon's
+    // whether the Fluss table has table.datalake.deletion-vectors.enabled, not only Paimon's
     private final boolean flussDeletionVectors;
 
     public DvTableReadableSnapshotRetriever(

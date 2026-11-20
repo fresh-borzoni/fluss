@@ -53,6 +53,7 @@ import java.util.function.IntSupplier;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.dict;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.key;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.lakeMasks;
+import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.offsets;
 import static org.apache.fluss.server.kv.dv.DvTestManagers.hooks;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -97,13 +98,13 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         ownedDb.close();
     }
 
-    /** A new leader that has not taken over serves nothing: reads and lookups are not ready. */
+    /** A new leader that has not taken over serves nothing: reads and rounds are not ready. */
     @Test
     void testUnrecoveredServesNothing() throws Exception {
         assertThat(m.state().kind).isEqualTo(DvState.Kind.UNRECOVERED);
         assertNotReady(read(-1, true));
         assertNotReady(read(-1, false));
-        assertNotReady(async(() -> m.lookup(-1, Collections.singletonList(key("k1")))));
+        assertNotReady(async(() -> m.roundDeletes(-1, null, 0)));
         assertThat(m.getReadableSnapshotId()).isEqualTo(-1L);
     }
 
@@ -153,8 +154,8 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
 
         assertThat(m.state().kind).isEqualTo(DvState.Kind.SWITCHING);
         assertThat(m.state().version.snapshotId).isEqualTo(100L);
-        // a lookup of the covered version needs no step of the owner
-        assertThat(asStrings(m.lookup(100, Collections.singletonList(key("k1")))))
+        // the covered version is read without a step of the owner
+        assertThat(asStrings(DvTestReads.indexed(m, 100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
         assertThat(lakeMasks(pump(read(100, true)))).containsKey(F1);
 
@@ -163,16 +164,16 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         assertThat(pump(covered)).isTrue();
         assertThat(m.state().kind).isEqualTo(DvState.Kind.COVERING);
         assertThat(m.state().version.snapshotId).isEqualTo(101L);
-        assertThat(asStrings(m.lookup(101, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 101, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F2 + "#0");
     }
 
     /**
-     * A bucket whose change list is missing replays it: its lookups are served through its version
-     * meanwhile, and its masks once the replay is installed.
+     * A bucket whose change list is missing replays it: a round waits meanwhile, as a read that
+     * waits does, and both are answered once the replay is installed.
      */
     @Test
-    void testReplayServesLookupsThroughTheVersion() throws Exception {
+    void testRoundsWaitForAReplay() throws Exception {
         coverSnapshot100();
         m.handOffFailed(new IllegalStateException("hand-off failed"));
         CountDownLatch gate = pauseReplayAfter(0);
@@ -180,11 +181,13 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         pumpUntil(() -> src.replayPaused.getCount() == 0);
         assertThat(m.state().kind).isEqualTo(DvState.Kind.REPLAYING);
         assertThat(m.state().changeListPresent).isFalse();
-        assertThat(asStrings(m.lookup(100, Collections.singletonList(key("k2")))))
-                .containsExactly("k2@" + F1 + "#1");
+        assertNotReady(async(() -> m.roundDeletes(100, null, 12)));
         gate.countDown();
         pumpUntil(waiting::isDone);
         assertThat(lakeMasks(pump(read(100, true)))).containsKey(F1);
+        DvRoundDeletes round = pump(async(() -> m.roundDeletes(100, null, 12)));
+        assertThat(round.nextOffset()).isEqualTo(12L);
+        assertThat(offsets(round.deletes().get(F1))).containsExactly(0L, 1L);
         assertThat(m.state().kind).isEqualTo(DvState.Kind.COVERING);
     }
 
@@ -258,7 +261,7 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         DvSnapshot notWaited = read(100, false).get(10, TimeUnit.SECONDS);
         assertThat(notWaited.getLogEndOffset()).isEqualTo(built.getLogEndOffset());
         assertThat(lakeMasks(notWaited)).isEqualTo(lakeMasks(built));
-        assertThat(asStrings(m.lookup(100, Collections.singletonList(key("k3")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 100, Collections.singletonList(key("k3")))))
                 .containsExactly("k3@" + F1 + "#2");
 
         // a read whose floor is above the latest frontier needs new masks: it hops
@@ -324,7 +327,7 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         assertThat(m.state().version.snapshotId).isEqualTo(100L);
         assertThat(m.state().changeListPresent).isFalse();
         assertThat(m.leasesHeld()).isEqualTo(leasesCovering);
-        assertThat(asStrings(m.lookup(100, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
 
         hooks(m).setBeforeFileDrop(null);
@@ -707,9 +710,9 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         assertThatThrownBy(() -> pump(to101)).hasMessageContaining("injected");
         assertThat(pump(to102)).isTrue();
         assertThat(m.state().version.snapshotId).isEqualTo(102L);
-        assertThat(asStrings(m.lookup(102, Collections.singletonList(key("k2")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 102, Collections.singletonList(key("k2")))))
                 .containsExactly("k2@" + F3 + "#0");
-        assertThat(asStrings(m.lookup(102, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 102, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F2 + "#0");
         assertThat(m.leasesHeld()).isEqualTo(idleLeases);
     }
@@ -882,7 +885,7 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
 
         pumpUntil(() -> m.state().kind == DvState.Kind.COVERING);
         assertThat(m.getReadableSnapshotId()).isEqualTo(100L);
-        assertThat(asStrings(m.lookup(100, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(DvTestReads.indexed(m, 100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
         assertThat(metrics.ownerFaults()).isEqualTo(1L);
     }
@@ -906,32 +909,6 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         assertThat(m.state().kind).isEqualTo(DvState.Kind.CLOSED);
         assertThat(src.replayedFrom).isEmpty();
         assertThat(m.dbClosed()).isDone();
-    }
-
-    /**
-     * A lookup of a published version it cannot retain gives up at its deadline with NOT_READY,
-     * rather than spinning until the owner publishes another version.
-     */
-    @Test
-    void testALookupOfAVersionItCannotRetainGivesUp() throws Exception {
-        coverSnapshot100();
-        // as if the owner released the version and could not publish the next one
-        AtomicInteger refs = refs(m.state().version);
-        refs.set(0);
-        try {
-            CompletableFuture<List<Object[]>> lookup =
-                    async(() -> m.lookup(100, Collections.singletonList(key("k1"))));
-            assertThatThrownBy(() -> lookup.get(5, TimeUnit.SECONDS))
-                    .hasCauseInstanceOf(DeletionVectorsNotReadyException.class);
-        } finally {
-            refs.set(1);
-        }
-    }
-
-    private static AtomicInteger refs(DvVersion v) throws Exception {
-        Field f = DvVersion.class.getDeclaredField("refs");
-        f.setAccessible(true);
-        return (AtomicInteger) f.get(v);
     }
 
     /**
@@ -1181,7 +1158,7 @@ class DvOwnerTest extends DerivedDvManagerTestBase {
         assertThat(m.state().kind).isEqualTo(DvState.Kind.CLOSED);
         assertThatThrownBy(() -> pump(read(100, true)))
                 .isInstanceOf(NotLeaderOrFollowerException.class);
-        assertThatThrownBy(() -> m.lookup(100, Collections.singletonList(key("k1"))))
+        assertThatThrownBy(() -> pump(async(() -> m.roundDeletes(100, null, 12))))
                 .isInstanceOf(NotLeaderOrFollowerException.class);
 
         // the held load ends at its next unit and releases what it held

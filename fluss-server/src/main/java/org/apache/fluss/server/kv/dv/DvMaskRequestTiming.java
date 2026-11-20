@@ -54,7 +54,7 @@ final class DvMaskRequestTiming {
     static final int REPLAY = 2;
 
     final long startNanos = System.nanoTime();
-    // all: the masks in one response; pin: pinning a cut; cut: building a cut not held again
+    // all: the masks in one response; pin: pinning a cut; cut: building a cut not kept again
     final String kind;
     final long requestedSnapshotId;
     long coveredBefore = UNKNOWN;

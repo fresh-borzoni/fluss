@@ -666,12 +666,12 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
     <tr>
       <td>dvHandOffOverflowPerSecond</td>
-      <td>Batches of key changes per second that a bucket's deletion vectors dropped, as the bucket fell behind its writes for longer than a write waits: the batches queued, and those written until the bucket's change list is replayed from the log. Union reads of the bucket read by key, or wait, until then. Should stay at 0.</td>
+      <td>Batches of key changes per second that a bucket's deletion vectors dropped, as the bucket fell behind its writes for longer than a write waits: the batches queued, and those written until the bucket's change list is replayed from the log. Union reads of the bucket read by key, or wait, and tiering rounds of its table wait, until then. Should stay at 0.</td>
       <td>Meter</td>
     </tr>
     <tr>
       <td>dvOwnerFaultPerSecond</td>
-      <td>Steps of a bucket's deletion vector state that failed unexpectedly, per second. The bucket replays its change list from the log before it serves masks again; the tablet server logs each at ERROR. Should stay at 0.</td>
+      <td>Steps of a bucket's deletion vector state that failed unexpectedly, per second. The bucket replays its change list from the log before it serves masks again, and tiering rounds of its table wait until then; the tablet server logs each at ERROR. Should stay at 0.</td>
       <td>Meter</td>
     </tr>
     <tr>
@@ -726,7 +726,7 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
     <tr>
       <td>dvPinnedCutExpirationPerSecond</td>
-      <td>Pinned cuts dropped per second because no request asked for them, or released some of their holds, for <code>kv.deletion-vectors.pinned-cut-idle-timeout</code>.</td>
+      <td>Pinned cuts dropped per second because no request asked for them for <code>kv.deletion-vectors.pinned-cut-idle-timeout</code>, up to a quarter of it (at most a minute) later. The cuts of every read end this way, unless they are evicted or their bucket's leader closes first.</td>
       <td>Meter</td>
     </tr>
     <tr>
@@ -771,7 +771,12 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
     </tr>
     <tr>
       <td>dvRowTtlFoldPerSecond</td>
-      <td>Answers per second to union reads of tables with row TTL (<code>table.kv.ttl</code>) that have the reader read the bucket by key instead of with masks: the bucket's KV was compacted by a TTL filter not capped for its readable lake snapshot, after a restore from a KV snapshot that saved no state of the filter, or while the bucket covers an older lake snapshot, so a version written after that snapshot may have expired before it was tiered (see Row TTL with Deletion Vectors in the TTL page).</td>
+      <td>Answers per second to union reads of Paimon tables with row TTL (<code>table.kv.ttl</code>) that have the reader read the bucket by key instead of with masks: the bucket covers an older lake snapshot than its TTL filter was capped for, as Paimon's readable snapshot can move back, so a version written after that snapshot may have expired before it was tiered (see Row TTL with Deletion Vectors in the TTL page).</td>
+      <td>Meter</td>
+    </tr>
+    <tr>
+      <td>dvRowTtlCorruptPerSecond</td>
+      <td>Buckets per second of tables with row TTL whose saved TTL state is found corrupt: a KV snapshot restored without the state of the bucket's TTL filter, or with it out of order, or, on Iceberg, a lake snapshot covered below the offset the filter was capped for. An Iceberg bucket that covers such a snapshot serves no masks: union reads read it by key, and its tiering rounds wait. It should stay at 0; the leader logs each at ERROR.</td>
       <td>Meter</td>
     </tr>
     <tr>
@@ -1674,9 +1679,27 @@ All metrics are registered under the `fluss.tieringService` metric group, as a c
             <td>Meter</td>
         </tr>
         <tr>
+            <td>dvRoundMaskMismatches</td>
+            <td>Flink Source Operator</td>
+            <td>Rounds of Iceberg tables with deletion vectors whose leader's log mask did not match the round: a part of another round or of two leader epochs, a masked offset the round did not read as a version, changes in the round other than as many as its leader counted, or a key that came again after the writer wrote a row of it, a version the mask missed. Such a round is written in sort mode, read again if the reader had begun to write it through the mask, so nothing of the first read is committed; the reader logs each at WARN. Should stay at 0.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
+            <td>vectorsNotPrepared</td>
+            <td>Flink Source Operator</td>
+            <td>Rounds of buckets of Iceberg tables with deletion vectors whose deletion vectors the tiering reader failed to prepare (see <code>lake.tiering.deletion-vectors.writer-prepared.enabled</code>): the committer merges their deletes instead. The reader logs the first failure of a table's round at WARN.</td>
+            <td>Counter</td>
+        </tr>
+        <tr>
             <td>readersAwaitingSplitRatio</td>
             <td>Flink Source Enumerator</td>
             <td>The current ratio (0–1) of readers tracked by the enumerator as waiting for a split to the source parallelism.</td>
+            <td>Gauge</td>
+        </tr>
+        <tr>
+            <td>maxConsecutiveFailedRounds</td>
+            <td>Flink Source Enumerator</td>
+            <td>The most rounds in a row that a table tiered by the job failed: a failed commit, a failover of the job's readers, or splits that could not be generated. A table's finished round resets its count. From 10 failed rounds in a row on, the enumerator logs each failure of the table at ERROR, with its cause.</td>
             <td>Gauge</td>
         </tr>
     </tbody>
@@ -1699,7 +1722,11 @@ For tables with deletion vectors enabled, the tiering committer also reports the
     </thead>
     <tbody>
         <tr><td>rounds</td><td>Tiering rounds with a successful lake commit, on both lakes. On Iceberg, a round counts once its commit of data and deletes is registered in Fluss. On Paimon, a round counts once its lake commit succeeds, also a commit without data that makes another engine's compaction readable, and also if the round is then held for a re-index before it is registered. Rounds that commit nothing to the lake, and Fluss's own compaction commits, are not counted.</td><td>Counter</td></tr>
-        <tr><td>changedKeys</td><td>On Iceberg: the primary keys changed in the counted rounds, deleted keys included. Each is looked up at most once per round.</td><td>Counter</td></tr>
+        <tr><td>changedKeys</td><td>On Iceberg: the primary keys changed in the counted rounds, deleted keys included.</td><td>Counter</td></tr>
+        <tr><td>vectorsFromWriters</td><td>On Iceberg: buckets of the counted rounds whose deletion vectors their tiering writers prepared (see <code>lake.tiering.deletion-vectors.writer-prepared.enabled</code>) and the round committed as they were.</td><td>Counter</td></tr>
+        <tr><td>vectorsRejected</td><td>On Iceberg: buckets of the counted rounds whose writers prepared deletion vectors that the round did not commit, because they did not hold on the round's base or clashed with another commit; the committer took their deletes from the buckets' leaders instead.</td><td>Counter</td></tr>
+        <tr><td>deletesFromReaders</td><td>On Iceberg: buckets of the counted rounds whose deletes, the lake positions of the rows the round supersedes, came from their tiering readers with the round's write results.</td><td>Counter</td></tr>
+        <tr><td>deletesFromLeaders</td><td>On Iceberg: buckets of the counted rounds whose deletes the committer fetched from their leaders itself: the reader did not fetch them or not in time (see <code>lake.tiering.deletion-vectors.round-deletes.prefetch-timeout</code>), or a data file they name changed since they were fetched, for example by a compaction of that bucket.</td><td>Counter</td></tr>
         <tr><td>reindexes</td><td>Index changes published from a read of the lake files (a re-index) instead of from positions the tiering writers handed over. On Iceberg: files rewritten by another engine, or by a Fluss compaction whose positions could not be handed over. On Paimon: a newly readable snapshot whose files the round's compactions did not hand over, e.g. after another engine's compaction or a failed hand-off. A re-index that only drops removed files counts too.</td><td>Counter</td></tr>
         <tr><td>reindexMs</td><td>The sum of the times of the counted re-indexes, each from planning it to publishing its index change. Divide by <code>reindexes</code> for the mean.</td><td>Counter</td></tr>
         <tr><td>compactionHandOffs</td><td>Index changes published from the positions the compactions in the tiering writers handed over, without a re-index: on Iceberg, a Fluss compaction (<code>table.datalake.auto-compaction</code>); on Paimon, a newly readable snapshot made by the round's compactions.</td><td>Counter</td></tr>
@@ -1709,7 +1736,7 @@ For tables with deletion vectors enabled, the tiering committer also reports the
         <tr><td>bucketsHoldingIndexChain</td><td>Buckets, summed over the committer's tables as of each table's last trim, whose checkpoint the trim had to build because no tablet server checkpoints them, but did not: the build failed, or the trim ran out of builds or time. They hold the index history back.</td><td>Gauge</td></tr>
         <tr><td>checkpointBuildsFailed</td><td>Checkpoints the trim failed to build for buckets no tablet server checkpoints. A bucket whose build fails every time holds the index history back for good.</td><td>Counter</td></tr>
         <tr><td>indexTrimsFailed</td><td>Trims of the index history that failed or were stopped, e.g. for a bucket whose rows trimmed changes hold and which has no checkpoint, or a tiering service that lost the table.</td><td>Counter</td></tr>
-        <tr><td>lastLookupMs</td><td>On Iceberg: the time to publish the index change of the last round, with the lookups of the positions of its changed keys.</td><td>Gauge</td></tr>
+        <tr><td>lastPublishMs</td><td>On Iceberg: the time to publish the index change of the last round and take the positions of the rows it supersedes, from the readers' write results or from the buckets' leaders.</td><td>Gauge</td></tr>
         <tr><td>lastLakeCommitMs</td><td>The time of the lake commit in the last round (on Iceberg, data and deletes).</td><td>Gauge</td></tr>
         <tr><td>lastReindexMs</td><td>The time from planning to publishing the last re-index.</td><td>Gauge</td></tr>
     </tbody>

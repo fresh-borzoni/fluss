@@ -27,6 +27,7 @@ import org.apache.fluss.lake.iceberg.source.FlussRowAsIcebergRecord;
 import org.apache.fluss.lake.iceberg.tiering.RecordWriter;
 import org.apache.fluss.lake.iceberg.utils.IcebergConversions;
 import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
+import org.apache.fluss.lake.writer.RoundMaskMismatchException;
 import org.apache.fluss.lake.writer.SpillingKeySortBuffer;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.lake.writer.WriterMemoryPool;
@@ -60,7 +61,9 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -70,24 +73,36 @@ import java.util.concurrent.ThreadLocalRandom;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
- * The record writer of tables with deletion vectors. It writes only the last version of each
- * primary key changed in the round, as data files without deletes, and stages the bucket's index
- * part ({@link StagedIndexPart}): the data file and row position of every written row, and the keys
- * the round deleted. The committer publishes the part, looks up the rows the round supersedes on
- * the way, and commits their deletes with the data.
+ * The record writer of tables with deletion vectors. It writes one live row of each primary key
+ * changed in the round, its last version, and stages the bucket's index part ({@link
+ * StagedIndexPart}): the data file and row position of every key's row, and the keys the round
+ * deleted. The committer publishes the part, takes the rows the round supersedes from the buckets'
+ * leaders, and commits their deletes with the data.
  *
- * <p>The round's records go serialized into a {@link SpillingKeySortBuffer}, which spills sorted
- * runs to local disk when the memory the task's writers share is used up. Completing the round
- * merges the sorted runs and writes the last version of every key in key order. So the data files
- * are sorted by key, and the part's positions come in key order too: the part is written as it
- * goes, not held in memory. The writer holds at most its share of the task's memory, whatever the
- * size of the round.
+ * <p>A round read through its leader's log mask ({@link
+ * DeletionVectorWriterInitContext#roundMasked()}) comes as the versions still live at the round's
+ * end, in log order. The writer writes each row as it comes and buffers only its index entry: the
+ * key, the version's offset and the row's position, or a delete. Completing the round sorts the
+ * entries by key and offset. A row of a key that a later entry of the key follows is a version the
+ * mask missed: the writer fails the round with a {@link RoundMaskMismatchException}, and the round
+ * is written again in sort mode, so no row of the round is superseded within it.
+ *
+ * <p>In sort mode, for a round read without the mask, the writer gets every record of the round.
+ * They go serialized into the buffer, and completing the round writes the last version of every key
+ * in key order, so no row is superseded within the round.
+ *
+ * <p>The buffer is a {@link SpillingKeySortBuffer}, which spills sorted runs to local disk when the
+ * memory the task's writers share is used up, so the writer holds at most its share of the task's
+ * memory, whatever the size of the round. The part's entries come out in key order, so the part is
+ * written as it goes, not held in memory.
  *
  * <p>A table with deletion vectors is tiered from its log only, never from a KV snapshot.
  */
 public class DerivedDvRecordWriter extends RecordWriter {
 
     private static final Logger LOG = LoggerFactory.getLogger(DerivedDvRecordWriter.class);
+
+    private static final int ROW_POSITION_BYTES = Integer.BYTES + Long.BYTES;
 
     private final TableInfo tableInfo;
     private final TableBucket tableBucket;
@@ -101,6 +116,10 @@ public class DerivedDvRecordWriter extends RecordWriter {
     private final GenericRow mergedRow;
     private final FlussRowAsIcebergRecord icebergRecord;
     private final SpillingKeySortBuffer buffer;
+    // the round comes through its leader's log mask: rows are written as they come
+    private final boolean roundMasked;
+    // an index entry's position of its row: the data file's id and the row's position in it
+    private final byte[] rowPosition = new byte[ROW_POSITION_BYTES];
     @Nullable private final PositionIndexStore indexStore;
     private final long stagingId;
     private final String stagingPrefix;
@@ -113,6 +132,8 @@ public class DerivedDvRecordWriter extends RecordWriter {
     // the row position writeRow wrote its row at
     private long lastPosition;
     private long records;
+    // the round completed: its files are the write result's, not the writer's to drop
+    private boolean completed;
     @Nullable private StagedIndexPart stagedIndexPart;
 
     public DerivedDvRecordWriter(
@@ -162,6 +183,7 @@ public class DerivedDvRecordWriter extends RecordWriter {
                                     .defaultValue()
                                     .getBytes());
         }
+        this.roundMasked = dvContext != null && dvContext.roundMasked();
         String[] tmpDirs = writerInitContext.ioTmpDirs();
         this.buffer = new SpillingKeySortBuffer(pool, tmpDirs);
         this.localTmpDir = FileUtils.randomTmpDir(tmpDirs, "dv");
@@ -187,6 +209,10 @@ public class DerivedDvRecordWriter extends RecordWriter {
             return; // the following +U carries the key and the new version
         }
         byte[] key = keyEncoder.encodeKey(record.getRow());
+        if (roundMasked) {
+            writeIndexEntry(key, record);
+            return;
+        }
         if (changeType == ChangeType.DELETE) {
             buffer.add(key, 0, key.length, record.logOffset(), null, 0, 0);
             return;
@@ -208,6 +234,29 @@ public class DerivedDvRecordWriter extends RecordWriter {
                 encoded.getSizeInBytes());
     }
 
+    /**
+     * Writes a version of a masked round as it comes and buffers its index entry. The entry's key
+     * is the record's key and offset, so every version stays in the buffer, in key and offset
+     * order, and a key that comes again after a row shows when the round completes.
+     */
+    private void writeIndexEntry(byte[] key, LogRecord record) throws IOException {
+        byte[] entryKey = RoundIndexEntries.entryKey(key, record.logOffset());
+        if (record.getChangeType() == ChangeType.DELETE) {
+            buffer.add(entryKey, 0, entryKey.length, record.logOffset(), null, 0, 0);
+            return;
+        }
+        int fileId = writeRow(record.getRow());
+        ByteBuffer.wrap(rowPosition).putInt(fileId).putLong(lastPosition);
+        buffer.add(
+                entryKey,
+                0,
+                entryKey.length,
+                record.logOffset(),
+                rowPosition,
+                0,
+                ROW_POSITION_BYTES);
+    }
+
     /** Writes a row and returns the id of its data file; lastPosition is set to its position. */
     private int writeRow(InternalRow row) throws IOException {
         String path = dataWriter.currentPath().toString();
@@ -224,16 +273,6 @@ public class DerivedDvRecordWriter extends RecordWriter {
         return fileId;
     }
 
-    /** Returns an upper bound on the number of keys the round changed so far. */
-    public long bufferedKeys() {
-        return buffer.distinctKeysUpperBound();
-    }
-
-    /** The bytes of the round's records the writer holds in memory and on local disk. */
-    public long bufferedBytes() {
-        return buffer.bytes();
-    }
-
     @Override
     public WriteResult complete() throws Exception {
         long start = System.currentTimeMillis();
@@ -247,30 +286,48 @@ public class DerivedDvRecordWriter extends RecordWriter {
         WriteResult result;
         Map<Integer, String> files;
         try {
-            // the last version of every key, in key order, written in that order
-            try (CloseableIterator<SpillingKeySortBuffer.Entry> versions = buffer.lastVersions()) {
-                while (versions.hasNext()) {
-                    SpillingKeySortBuffer.Entry e = versions.next();
-                    keys++;
-                    if (e.isDelete()) {
-                        deletes++;
-                        if (staged != null) {
-                            staged.delete(e.key());
-                        }
-                        continue;
+            if (roundMasked) {
+                result = dataWriter.complete();
+                files = checkFiles(result);
+                MaskedRoundIndex index = new MaskedRoundIndex(staged);
+                try (CloseableIterator<SpillingKeySortBuffer.Entry> entries =
+                        buffer.lastVersions()) {
+                    while (entries.hasNext()) {
+                        index.add(entries.next());
                     }
-                    rowReader.pointTo(
-                            MemorySegment.wrap(e.valueArray()), e.valueOffset(), e.valueLength());
-                    rowDeserializer.deserialize(rowReader, mergedRow);
-                    int fileId = writeRow(mergedRow);
-                    if (staged != null) {
-                        staged.put(e.key(), new FilePos(fileId, lastPosition));
+                    index.finish();
+                }
+                keys = index.keys;
+                deletes = index.deletes;
+            } else {
+                // the last version of every key, in key order, written in that order
+                try (CloseableIterator<SpillingKeySortBuffer.Entry> versions =
+                        buffer.lastVersions()) {
+                    while (versions.hasNext()) {
+                        SpillingKeySortBuffer.Entry e = versions.next();
+                        keys++;
+                        if (e.isDelete()) {
+                            deletes++;
+                            if (staged != null) {
+                                staged.delete(e.key());
+                            }
+                            continue;
+                        }
+                        rowReader.pointTo(
+                                MemorySegment.wrap(e.valueArray()),
+                                e.valueOffset(),
+                                e.valueLength());
+                        rowDeserializer.deserialize(rowReader, mergedRow);
+                        int fileId = writeRow(mergedRow);
+                        if (staged != null) {
+                            staged.put(e.key(), new FilePos(fileId, lastPosition));
+                        }
                     }
                 }
+                result = dataWriter.complete();
+                // The staged part's SST writer, native options and local files go with a failure.
+                files = checkFiles(result);
             }
-            result = dataWriter.complete();
-            // The staged part's SST writer, native options and local files go with a failure.
-            files = checkFiles(result);
         } catch (UncheckedIOException e) {
             if (staged != null) {
                 staged.close();
@@ -291,10 +348,11 @@ public class DerivedDvRecordWriter extends RecordWriter {
                     tableBucket);
         }
         LOG.info(
-                "The deletion vector writer of {} wrote {} records, {} keys ({}"
-                        + " deleted) in {} data files; {} spills of {} bytes; completed in {} ms.",
+                "The deletion vector writer of {} wrote {} records{}, {} keys ({} deleted) in {}"
+                        + " data files; {} spills of {} bytes; completed in {} ms.",
                 tableBucket,
                 records,
+                roundMasked ? " through the round's log mask" : " in sort mode",
                 keys,
                 deletes,
                 files.size(),
@@ -302,6 +360,7 @@ public class DerivedDvRecordWriter extends RecordWriter {
                 buffer.bytes(),
                 System.currentTimeMillis() - start);
         buffer.close();
+        completed = true;
         return result;
     }
 
@@ -336,6 +395,74 @@ public class DerivedDvRecordWriter extends RecordWriter {
         return files;
     }
 
+    /**
+     * Stages the index entries of a masked round, which come in key order and, within a key, in
+     * offset order. A key that comes again after a delete was written again; one that comes again
+     * after a row is a mismatch, as a later record of the key superseded a version the mask kept.
+     */
+    private final class MaskedRoundIndex {
+        @Nullable private final PositionIndexStore.StagedPartWriter staged;
+        // the key's last entry so far: its offset, and its row's file id and position, or a delete
+        @Nullable private byte[] key;
+        private long offset;
+        private boolean delete;
+        private int fileId;
+        private long position;
+        long keys;
+        long deletes;
+
+        MaskedRoundIndex(@Nullable PositionIndexStore.StagedPartWriter staged) {
+            this.staged = staged;
+        }
+
+        void add(SpillingKeySortBuffer.Entry entry) throws IOException {
+            byte[] entryKey = RoundIndexEntries.keyOf(entry.key());
+            long entryOffset = RoundIndexEntries.offsetOf(entry.key());
+            if (key != null && Arrays.equals(key, entryKey)) {
+                if (!delete) {
+                    throw new RoundMaskMismatchException(
+                            String.format(
+                                    "The log mask of the round of bucket %s does not match the"
+                                            + " round: the key of the row at offset %d comes again"
+                                            + " at offset %d.",
+                                    tableBucket, offset, entryOffset));
+                }
+            } else {
+                stage();
+                key = entryKey;
+            }
+            offset = entryOffset;
+            delete = entry.isDelete();
+            if (!delete) {
+                ByteBuffer value =
+                        ByteBuffer.wrap(
+                                entry.valueArray(), entry.valueOffset(), entry.valueLength());
+                fileId = value.getInt();
+                position = value.getLong();
+            }
+        }
+
+        void finish() throws IOException {
+            stage();
+            key = null;
+        }
+
+        private void stage() throws IOException {
+            if (key == null) {
+                return;
+            }
+            keys++;
+            if (delete) {
+                deletes++;
+                if (staged != null) {
+                    staged.delete(key);
+                }
+            } else if (staged != null) {
+                staged.put(key, new FilePos(fileId, position));
+            }
+        }
+    }
+
     @Nullable
     public StagedIndexPart stagedIndexPart() {
         return stagedIndexPart;
@@ -345,6 +472,20 @@ public class DerivedDvRecordWriter extends RecordWriter {
     public void close() throws Exception {
         // deletes the spilled runs, also of a round that never completed
         buffer.close();
-        super.close();
+        if (completed) {
+            super.close();
+            return;
+        }
+        // A writer closed before its round completed, as the one of a round the reader reads
+        // again, never has its files committed: they go with it.
+        try {
+            dataWriter.abort();
+        } catch (IOException e) {
+            LOG.warn(
+                    "The deletion vector writer of {} could not delete the data files of a round"
+                            + " that did not complete.",
+                    tableBucket,
+                    e);
+        }
     }
 }

@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.PreparedDeletionVectors;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.utils.IcebergJsonSerdeUtils;
@@ -66,6 +67,11 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  *       vectors, as {@code {"staging_id": ..., "ssts": [{"name": ..., "size": ...}, ...], "files":
  *       [{"id": ..., "name": ...}, ...], "keys": ..., "deletes": ...}}. Absent if there is none;
  *       only version 3 documents have one.
+ *   <li>"prepared_deletion_vectors": optional, the deletion vectors the writer prepared for the
+ *       bucket's round, as {@code {"snapshot_id": ..., "start_offset": ..., "end_offset": ...,
+ *       "deletion_vectors": [delete files], "replaced": [{"data_file": ..., "location": ...,
+ *       "offset": ..., "size": ...}, ...]}}, "replaced" naming the deletion vector each data file
+ *       had before. Absent if there are none; only version 3 documents have them.
  * </ul>
  *
  * <p>Specs, files and rewrite results are written as described in {@link IcebergJsonSerdeUtils}.
@@ -89,6 +95,15 @@ public class IcebergWriteResultJsonSerde
     private static final String ID_FIELD = "id";
     private static final String KEYS_FIELD = "keys";
     private static final String DELETES_COUNT_FIELD = "deletes";
+    private static final String PREPARED_FIELD = "prepared_deletion_vectors";
+    private static final String SNAPSHOT_ID_FIELD = "snapshot_id";
+    private static final String START_OFFSET_FIELD = "start_offset";
+    private static final String END_OFFSET_FIELD = "end_offset";
+    private static final String DELETION_VECTORS_FIELD = "deletion_vectors";
+    private static final String REPLACED_FIELD = "replaced";
+    private static final String DATA_FILE_FIELD = "data_file";
+    private static final String LOCATION_FIELD = "location";
+    private static final String OFFSET_FIELD = "offset";
 
     @Override
     public void serialize(IcebergWriteResult icebergWriteResult, JsonGenerator generator)
@@ -133,6 +148,11 @@ public class IcebergWriteResultJsonSerde
             generator.writeFieldName(STAGED_INDEX_PART_FIELD);
             writeStagedIndexPart(generator, stagedIndexPart);
         }
+        PreparedDeletionVectorFiles prepared = icebergWriteResult.prepared();
+        if (prepared != null) {
+            generator.writeFieldName(PREPARED_FIELD);
+            writePrepared(generator, prepared, specs);
+        }
         generator.writeEndObject();
     }
 
@@ -164,7 +184,60 @@ public class IcebergWriteResultJsonSerde
         JsonNode partNode = node.get(STAGED_INDEX_PART_FIELD);
         StagedIndexPart stagedIndexPart =
                 partNode == null || partNode.isNull() ? null : readStagedIndexPart(partNode);
-        return new IcebergWriteResult(writeResult, specs, rewriteDataFileResult, stagedIndexPart);
+        JsonNode preparedNode = node.get(PREPARED_FIELD);
+        PreparedDeletionVectorFiles prepared =
+                preparedNode == null || preparedNode.isNull()
+                        ? null
+                        : readPrepared(preparedNode, specs);
+        return new IcebergWriteResult(
+                writeResult, specs, rewriteDataFileResult, stagedIndexPart, prepared);
+    }
+
+    private static void writePrepared(
+            JsonGenerator generator,
+            PreparedDeletionVectorFiles prepared,
+            Map<Integer, PartitionSpec> specs)
+            throws IOException {
+        generator.writeStartObject();
+        generator.writeNumberField(SNAPSHOT_ID_FIELD, prepared.round.snapshotId());
+        generator.writeNumberField(START_OFFSET_FIELD, prepared.round.startOffset());
+        generator.writeNumberField(END_OFFSET_FIELD, prepared.round.endOffset());
+        writeContentFiles(generator, DELETION_VECTORS_FIELD, prepared.deletionVectors, specs);
+        generator.writeArrayFieldStart(REPLACED_FIELD);
+        for (Map.Entry<String, DeletionVectorId> r : new TreeMap<>(prepared.replaced).entrySet()) {
+            generator.writeStartObject();
+            generator.writeStringField(DATA_FILE_FIELD, r.getKey());
+            generator.writeStringField(LOCATION_FIELD, r.getValue().location);
+            if (r.getValue().offset != null) {
+                generator.writeNumberField(OFFSET_FIELD, r.getValue().offset);
+            }
+            if (r.getValue().size != null) {
+                generator.writeNumberField(SIZE_FIELD, r.getValue().size);
+            }
+            generator.writeEndObject();
+        }
+        generator.writeEndArray();
+        generator.writeEndObject();
+    }
+
+    private static PreparedDeletionVectorFiles readPrepared(
+            JsonNode node, Map<Integer, PartitionSpec> specs) {
+        Map<String, DeletionVectorId> replaced = new HashMap<>();
+        for (JsonNode r : getArrayField(node, REPLACED_FIELD)) {
+            replaced.put(
+                    readText(r, DATA_FILE_FIELD),
+                    new DeletionVectorId(
+                            readText(r, LOCATION_FIELD),
+                            r.has(OFFSET_FIELD) ? readLong(r, OFFSET_FIELD) : null,
+                            r.has(SIZE_FIELD) ? readLong(r, SIZE_FIELD) : null));
+        }
+        return new PreparedDeletionVectorFiles(
+                new PreparedDeletionVectors(
+                        readLong(node, SNAPSHOT_ID_FIELD),
+                        readLong(node, START_OFFSET_FIELD),
+                        readLong(node, END_OFFSET_FIELD)),
+                readDeleteFiles(node, DELETION_VECTORS_FIELD, specs),
+                replaced);
     }
 
     private static void writeStagedIndexPart(JsonGenerator generator, StagedIndexPart part)

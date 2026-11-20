@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.tiering.source;
 
+import org.apache.fluss.client.tiering.RoundDeletes;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
@@ -188,6 +189,32 @@ class TableBucketWriteResultSerializerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(longs = {TableBucketWriteResult.UNKNOWN_LOG_START_OFFSET, -2, 0, 42})
+    void testLogStartOffsetRoundTrips(long logStartOffset) throws Exception {
+        TableBucketWriteResult<TestingWriteResult> result =
+                new TableBucketWriteResult<TestingWriteResult>(
+                                TablePath.of("db1", "tb1"),
+                                new TableBucket(1, 2),
+                                null,
+                                new TestingWriteResult(3),
+                                logStartOffset,
+                                70,
+                                30L,
+                                2,
+                                null,
+                                false,
+                                TieringSplit.UNKNOWN_TIERING_EPOCH)
+                        .withTieringEpoch(5);
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                tableBucketWriteResultSerializer.deserialize(
+                        tableBucketWriteResultSerializer.getVersion(),
+                        tableBucketWriteResultSerializer.serialize(result));
+        assertThat(deserialized.logStartOffset()).isEqualTo(logStartOffset);
+        assertThat(deserialized.logEndOffset()).isEqualTo(70);
+        assertThat(deserialized.tieringEpoch()).isEqualTo(5);
+    }
+
+    @ParameterizedTest
     @ValueSource(longs = {TieringSplit.UNKNOWN_TIERING_EPOCH, 0, 42})
     void testTieringEpochRoundTrips(long tieringEpoch) throws Exception {
         TableBucketWriteResult<TestingWriteResult> result =
@@ -258,7 +285,7 @@ class TableBucketWriteResultSerializerTest {
                 new TableBucketWriteResultSerializer<>(lakeSerializer);
 
         // the layout of VERSION_3: VERSION_2, then the fields in the order they were added: the
-        // tiering epoch, endedEarly and the RowPosResult
+        // tiering epoch, endedEarly, the log start offset, the RowPosResult and the round deletes
         DataOutputSerializer out = new DataOutputSerializer(64);
         out.writeUTF("db1");
         out.writeUTF("tb1");
@@ -274,9 +301,10 @@ class TableBucketWriteResultSerializerTest {
         out.writeLong(10L);
         out.writeLong(30L);
         out.writeInt(3);
-        // tiering epoch and endedEarly
+        // tiering epoch, endedEarly and the log start offset
         out.writeLong(42L);
         out.writeBoolean(true);
+        out.writeLong(8L);
         // RowPosResult
         out.writeBoolean(true);
         out.writeLong(77L);
@@ -288,6 +316,8 @@ class TableBucketWriteResultSerializerTest {
         out.writeUTF("sst_0.sst");
         out.writeLong(12345L);
         // the split did not fail
+        out.writeBoolean(false);
+        // no round deletes
         out.writeBoolean(false);
 
         TableBucketWriteResult<TestingWriteResult> deserialized =
@@ -312,10 +342,77 @@ class TableBucketWriteResultSerializerTest {
         assertThat(rowPosResult.getSstMetas().get(0).getFileSize()).isEqualTo(12345L);
         assertThat(deserialized.endedEarly()).isTrue();
         assertThat(deserialized.tieringEpoch()).isEqualTo(42L);
+        assertThat(deserialized.logStartOffset()).isEqualTo(8L);
+        assertThat(deserialized.roundDeletes()).isNull();
 
-        // and the current version writes exactly that layout
+        // and the current version writes that layout
         assertThat(serializer.getVersion()).isEqualTo(3);
         assertThat(serializer.serialize(deserialized)).isEqualTo(out.getCopyOfBuffer());
+    }
+
+    /** The deletes a reader fetched for the bucket's round round-trip, file by file in order. */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testRoundDeletesRoundTrip(boolean withRowPosResult) throws Exception {
+        RoundDeletes deletes =
+                new RoundDeletes(
+                        5L,
+                        100L,
+                        130L,
+                        Arrays.asList(
+                                new RoundDeletes.File("a.parquet", new byte[] {1, 2, 3}),
+                                new RoundDeletes.File("b.parquet", new byte[0]),
+                                new RoundDeletes.File("a.parquet", new byte[] {4})));
+        TableBucketWriteResult<TestingWriteResult> result =
+                new TableBucketWriteResult<>(
+                                TablePath.of("db1", "tb1"),
+                                new TableBucket(1L, 2),
+                                null,
+                                new TestingWriteResult(5),
+                                100L,
+                                130L,
+                                30L,
+                                3,
+                                withRowPosResult
+                                        ? new RowPosResult(
+                                                9L,
+                                                1,
+                                                Collections.emptyMap(),
+                                                Collections.emptyList(),
+                                                null)
+                                        : null,
+                                true,
+                                42L)
+                        .withRoundDeletes(deletes);
+
+        TableBucketWriteResult<TestingWriteResult> deserialized =
+                tableBucketWriteResultSerializer.deserialize(
+                        tableBucketWriteResultSerializer.getVersion(),
+                        tableBucketWriteResultSerializer.serialize(result));
+
+        RoundDeletes read = deserialized.roundDeletes();
+        assertThat(read).isNotNull();
+        assertThat(new long[] {read.snapshotId(), read.startOffset(), read.endOffset()})
+                .containsExactly(5L, 100L, 130L);
+        assertThat(read.files()).hasSize(3);
+        for (int i = 0; i < 3; i++) {
+            assertThat(read.files().get(i).path()).isEqualTo(deletes.files().get(i).path());
+            assertThat(read.files().get(i).positions())
+                    .isEqualTo(deletes.files().get(i).positions());
+        }
+        assertThat(deserialized.isRowPosResult()).isEqualTo(withRowPosResult);
+        assertThat(deserialized.tieringEpoch()).isEqualTo(42L);
+        assertThat(deserialized.logStartOffset()).isEqualTo(100L);
+        assertThat(deserialized.writeResult().getWriteResult()).isEqualTo(5);
+        // the committer stamps the round's epoch on the result, which keeps them
+        assertThat(
+                        tableBucketWriteResultSerializer
+                                .deserialize(
+                                        tableBucketWriteResultSerializer.getVersion(),
+                                        tableBucketWriteResultSerializer.serialize(
+                                                result.withTieringEpoch(43L)))
+                                .roundDeletes())
+                .isNotNull();
     }
 
     /** The failure of a re-index split round-trips. */
@@ -362,6 +459,8 @@ class TableBucketWriteResultSerializerTest {
         assertThat(deserialized.writeResult()).isNull();
         assertThat(deserialized.endedEarly()).isFalse();
         assertThat(deserialized.tieringEpoch()).isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
+        assertThat(deserialized.logStartOffset())
+                .isEqualTo(TableBucketWriteResult.UNKNOWN_LOG_START_OFFSET);
     }
 
     @Test

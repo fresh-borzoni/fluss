@@ -20,7 +20,6 @@ package org.apache.fluss.server.kv.dv;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.DeletionVectorsNotReadyException;
-import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
@@ -55,10 +54,10 @@ import java.util.function.LongSupplier;
  * <p>The state covers one registered lake snapshot, the covered snapshot. It holds the snapshot's
  * index (primary key to the file and row position of the key's live row), read through an immutable
  * version ({@link DvVersion}), and the change list after the snapshot's readable offset ({@link
- * DvChangeList}). Each change names the version it supersedes, the log offset its KV value is
- * tagged with. A read's log mask is the versions in the change list a later change superseded. Its
- * lake mask is the snapshot positions of the keys whose superseded version is in the snapshot. Both
- * go up to the high watermark.
+ * DvChangeList}). Each change names the version it supersedes, the log offset its KV value carries.
+ * A read's log mask is the versions in the change list a later change superseded. Its lake mask is
+ * the snapshot positions of the keys whose superseded version is in the snapshot. Both go up to the
+ * high watermark.
  *
  * <p>The change list keeps its updates and deletes in the bucket's RocksDB, so masks are served
  * however far tiering lags. The heap holds the changes waiting for the high watermark, the mask
@@ -71,8 +70,9 @@ import java.util.function.LongSupplier;
  * state then switches to newer snapshots on its own by applying their index changes ({@link
  * DvLoad.SwitchLoad}). A reader of a snapshot the bucket moved past gets a {@link
  * StaleSnapshotException} and plans again. This class is the bucket's facade: the write path hands
- * its changes over ({@link DvHandOff}), lookups read the published version, and union reads post
- * themselves to the owner ({@link DvMaskReads}).
+ * its changes over ({@link DvHandOff}), a tiering round's deletes and log mask read a view of the
+ * change list ({@link DvRoundReads}), and union reads post themselves to the owner ({@link
+ * DvMaskReads}).
  *
  * <p>Requests never catch up, rebuild or replay the log on their own thread. A request that needs
  * such work starts it in the background. Unless it is done within a short wait, the request is
@@ -82,7 +82,7 @@ import java.util.function.LongSupplier;
  * <p>A union read whose workers fetch a bucket's masks in parts first pins a cut ({@link #pinCut}):
  * the masks up to the high watermark, frozen in the tablet server's {@link DerivedDvPinnedCuts}.
  * Every worker then reads the lake and the log as of that one offset, while the bucket's own masks
- * move on with writes and newer snapshots. The read releases the cut when it ends.
+ * move on with writes and newer snapshots. The cut lives while requests keep asking for it.
  *
  * <p>Some field and method names call a switch a move, and the change list the tail.
  */
@@ -93,8 +93,8 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
     private final DvOwner owner;
     // the heap of the row TTL filter's tracker, in the budget; null without row TTL
     @Nullable private volatile DerivedDvHeapBudget.Owner rowTtlHeap;
-    // lookups of the published version, on the request thread
-    private final DvLookups lookups;
+    // the deletes and log masks of tiering rounds, on the request thread
+    private volatile DvRoundReads rounds;
 
     /**
      * Creates the manager of a bucket's state in {@code dvRocksDB}, which {@link #close} closes.
@@ -139,7 +139,7 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
                         runtime,
                         stateExecutor,
                         testHooks);
-        this.lookups = new DvLookups(owner);
+        this.rounds = new DvRoundReads(owner);
     }
 
     /** The most keys one lookup of lake positions takes. */
@@ -166,40 +166,50 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
         return owner.shedForBudget();
     }
 
-    /** The most keys a lookup request names; the tiering service sends 50,000 at most. */
-    public static final int MAX_LOOKUP_KEYS = 100_000;
-
     /**
      * Marks the table as one with row TTL. Its cleanup removes a key's value without a change in
      * the log, so an insert does not show that the key had no live version: it may follow an
      * expired one, in the lake or in the log. A replayed insert then supersedes the key's last
      * version, as the write path's insert into such a table does (see {@code KvWriteProcessor}).
      * And the bucket caps the time of its KV's TTL filter, {@code filterClock}, so that no version
-     * expires before it is tiered; a bucket whose KV may have lost one has union reads read it by
-     * key ({@link #foldsForRowTtl}). The filter's tracker counts towards the heap budget. Call it
-     * before the first recovery.
+     * expires before it is tiered ({@link DvRowTtlGuard}). On a lake whose readable offset can move
+     * back ({@code readableOffsetMovesBack}, Paimon), a bucket whose KV may have lost one has union
+     * reads read it by key ({@link #foldsForRowTtl}); on one where it only moves forward (Iceberg),
+     * such a bucket's TTL state is corrupt, and it serves no masks. The filter's tracker counts
+     * towards the heap budget. Call it before the first recovery.
      */
-    public void useRowTtl(Duration ttl, RowTtlFilterClock filterClock) {
+    public void useRowTtl(
+            Duration ttl, RowTtlFilterClock filterClock, boolean readableOffsetMovesBack) {
         filterClock.setLogName(owner.logName);
         // the tracker frees nothing on request: its slices are bounded
         DerivedDvHeapBudget.Owner tracker = () -> false;
         rowTtlHeap = tracker;
         filterClock.setHeapListener(bytes -> owner.heapBudget.update(tracker, bytes, 0));
-        owner.useRowTtl(ttl.toMillis(), filterClock);
-    }
-
-    /** As {@link #useRowTtl(Duration, RowTtlFilterClock)}, with a filter of its own. */
-    @VisibleForTesting
-    public void useRowTtl(Duration ttl, Clock clock) {
-        useRowTtl(ttl, new RowTtlFilterClock(clock, ttl.toMillis()));
+        owner.useRowTtl(ttl.toMillis(), filterClock, readableOffsetMovesBack);
     }
 
     /**
-     * As {@link #useRowTtl(Duration, Clock)} for the replay, without the fold for expired versions.
+     * As {@link #useRowTtl(Duration, RowTtlFilterClock, boolean)}, with a filter of its own, on a
+     * lake whose readable offset only moves forward.
+     */
+    @VisibleForTesting
+    public void useRowTtl(Duration ttl, Clock clock) {
+        useRowTtl(ttl, clock, false);
+    }
+
+    /** As {@link #useRowTtl(Duration, RowTtlFilterClock, boolean)}, with a filter of its own. */
+    @VisibleForTesting
+    public void useRowTtl(Duration ttl, Clock clock, boolean readableOffsetMovesBack) {
+        useRowTtl(ttl, new RowTtlFilterClock(clock, ttl.toMillis()), readableOffsetMovesBack);
+    }
+
+    /**
+     * As {@link #useRowTtl(Duration, Clock)} for the replay, without the guard for expired
+     * versions.
      */
     @VisibleForTesting
     void useRowTtl() {
-        owner.useRowTtl(-1, null);
+        owner.useRowTtl(-1, null, false);
     }
 
     /** The time of the KV's TTL filter, or null without row TTL. */
@@ -210,22 +220,20 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
 
     /**
      * Starts the TTL filter of a KV restored from a snapshot at {@code snapshotOffset} from what
-     * the snapshot saved of it, or from nothing ({@link RowTtlFilterClock#restored}). Before the
-     * bucket's recovery.
+     * the snapshot saved of it, or from nothing, which is corruption ({@link
+     * DvRowTtlGuard#restored}). Before the bucket's recovery.
      */
     public void restoredRowTtlFilter(long snapshotOffset, @Nullable RowTtlFilterState saved) {
-        RowTtlFilterClock filterClock = owner.rowTtlGuard.filterClock();
-        if (filterClock != null) {
-            filterClock.restored(snapshotOffset, saved);
-        }
+        owner.rowTtlGuard.restored(snapshotOffset, saved);
     }
 
     /**
      * Whether a union read of the cut {@code cut}, of the snapshot readable from {@code
-     * snapshotStartOffset}, reads the bucket by key instead of applying the cut's masks: row TTL
-     * may have removed a version of the log above the readable offset before it was tiered, which
-     * the masks then miss ({@link DvRowTtlGuard}). Never for a table without row TTL. Counts such
-     * answers. On a request thread.
+     * snapshotStartOffset}, reads the bucket by key instead of applying the cut's masks, on a lake
+     * whose readable offset can move back: row TTL may have removed a version of the log above the
+     * readable offset before it was tiered, which the masks then miss ({@link DvRowTtlGuard}).
+     * Never for a table without row TTL, nor on a lake whose readable offset only moves forward.
+     * Counts such answers. On a request thread.
      */
     public boolean foldsForRowTtl(long snapshotStartOffset, long cut) {
         return owner.rowTtlGuard.foldsByKey(snapshotStartOffset, cut);
@@ -383,9 +391,9 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
 
     /**
      * Rebuilds the derived state of a new leader in the background. {@code limiter} bounds how many
-     * buckets of the tablet server rebuild at once. The bucket takes writes meanwhile, and its
-     * union reads and lookups are answered as not ready until the rebuild is done. Returns once the
-     * bucket took the leadership over.
+     * buckets of the tablet server rebuild at once. The bucket takes writes meanwhile, and the
+     * requests of its union reads and tiering rounds are answered as not ready until the rebuild is
+     * done. Returns once the bucket took the leadership over.
      */
     public void recoverInBackground(RecoverySource src, DerivedDvRebuildLimiter limiter) {
         expireRestoredView(src);
@@ -504,9 +512,8 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
      * Pins the cut of a union read of {@code requestedSnapshotId}: its masks up to the high
      * watermark, frozen. The read's workers later fetch their parts of exactly these masks ({@link
      * #pinnedCut}) while the bucket's own masks move on. Pins at the same high watermark share one
-     * cut. The pin takes {@code holds} holds, which the read releases one by one, as its parts end
-     * ({@link #releaseCut}). A retry of a pin request ({@code pinRequestId}) the bucket took
-     * already gets the same cut without another pin.
+     * cut. The cut lives until no request asked for it for the idle timeout. A retry of a pin
+     * request ({@code pinRequestId}) the bucket took already gets the same cut without another pin.
      *
      * <p>Unless {@code waitForCatchUp}, a leader that covers the snapshot registered right before
      * {@code requestedSnapshotId} does not wait to switch to it: it fails at once with a {@link
@@ -519,10 +526,11 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
      * DeletionVectorsNotReadyException#isRebuilding() names a cut}, and the reader reads the
      * bucket's log by key up to it.
      *
-     * <p>A bucket with row TTL whose masks may miss a version that expired before it was tiered
-     * ({@link #foldsForRowTtl}) fails it with a {@link DvRowTtlFoldException}, whether the read
-     * waits or not, before it builds or pins masks; the reader reads the bucket by key up to its
-     * cut.
+     * <p>On a lake whose readable offset can move back, a bucket with row TTL whose masks may miss
+     * a version that expired before it was tiered ({@link #foldsForRowTtl}) fails it with a {@link
+     * DvRowTtlFoldException}, whether the read waits or not, before it builds or pins masks; the
+     * reader reads the bucket by key up to its cut. On one where it only moves forward, such a
+     * bucket's TTL state is corrupt, and it has nothing to serve, as when it rebuilds.
      *
      * @throws StaleSnapshotException if the bucket does not cover {@code requestedSnapshotId} and
      *     will not
@@ -530,38 +538,31 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
      *     its change list
      */
     public DvPinnedCut pinCut(
-            long requestedSnapshotId,
-            boolean waitForCatchUp,
-            @Nullable Long pinRequestId,
-            int holds)
+            long requestedSnapshotId, boolean waitForCatchUp, @Nullable Long pinRequestId)
             throws IOException, StaleSnapshotException {
-        return owner.maskReads.pin(this, requestedSnapshotId, waitForCatchUp, pinRequestId, holds);
+        return owner.maskReads.pin(this, requestedSnapshotId, waitForCatchUp, pinRequestId);
     }
 
     /**
      * Returns the cut of snapshot {@code snapshotId} at log offset {@code cut} that a union read
-     * pinned. A cut this bucket does not hold (dropped, or pinned on another leader) is built again
-     * only if {@code snapshotId} is the covered snapshot and {@code cut} the current high
-     * watermark, since that gives the same masks.
+     * pinned. A cut this bucket does not keep (expired, evicted, or pinned on another leader) is
+     * built again only if {@code snapshotId} is the covered snapshot and {@code cut} the current
+     * high watermark, since that gives the same masks.
      *
-     * @throws StaleSnapshotException if the cut is not held and cannot be built again
+     * @throws StaleSnapshotException if the cut is not kept and cannot be built again
      */
     public DvPinnedCut pinnedCut(long snapshotId, long cut)
             throws IOException, StaleSnapshotException {
         return owner.maskReads.pinned(this, snapshotId, cut);
     }
 
-    /**
-     * Releases {@code holds} holds of the cut of snapshot {@code snapshotId} at {@code cut}, as the
-     * union read that pinned it, or some of its parts, end. The cut is dropped once all its holds
-     * are released; otherwise, or if they never are, it is dropped when no request asked for it
-     * within the idle timeout. Returns whether the cut was dropped.
-     */
-    public boolean releaseCut(long snapshotId, long cut, int holds) {
-        return owner.heapBudget.pinnedCuts().release(this, snapshotId, cut, holds);
+    /** Drops the cut of snapshot {@code snapshotId} at {@code cut} at once. */
+    @VisibleForTesting
+    void dropPinnedCut(long snapshotId, long cut) {
+        owner.heapBudget.pinnedCuts().drop(this, snapshotId, cut);
     }
 
-    /** The cuts of union reads this bucket holds. */
+    /** The cuts union reads pinned on this bucket. */
     @VisibleForTesting
     public int pinnedCutCount() {
         return owner.heapBudget.pinnedCuts().count(this);
@@ -580,26 +581,51 @@ public class DerivedDvManager implements Closeable, DvChangeListCheckpoints {
     }
 
     /**
-     * Returns {key, file path, row position} of each key found in snapshot {@code snapshotId}.
-     * Meanwhile a newer registered snapshot is caught up to in the background.
+     * The part of the deletes of a tiering round on {@code snapshotId} that ends at {@code
+     * endOffset}, from {@code fromOffset} on, or from the snapshot's readable offset if null: per
+     * lake file of the snapshot, the positions of the rows whose keys changed in the log from the
+     * readable offset up to the round's end. A part is bounded; the next part starts at {@link
+     * DvRoundDeletes#nextOffset}. Meanwhile a newer registered snapshot is caught up to in the
+     * background.
      *
-     * @throws DeletionVectorsNotReadyException while the bucket catches up to the snapshot
+     * @throws DeletionVectorsNotReadyException while the bucket switches to the snapshot, replays
+     *     its change list, or has not applied the changes below the round's end
+     * @throws StaleSnapshotException if the bucket does not cover {@code snapshotId} and will not
      */
-    public List<Object[]> lookup(long snapshotId, List<byte[]> keys)
+    public DvRoundDeletes roundDeletes(long snapshotId, @Nullable Long fromOffset, long endOffset)
             throws IOException, StaleSnapshotException {
-        if (keys.size() > MAX_LOOKUP_KEYS) {
-            throw tooManyLookupKeys(keys.size());
-        }
-        return lookups.lookup(snapshotId, keys);
+        return rounds.deletes(snapshotId, fromOffset, endOffset);
     }
 
-    /** The error for a lookup of more than {@link #MAX_LOOKUP_KEYS} keys. */
-    public static InvalidRequestException tooManyLookupKeys(int keys) {
-        return new InvalidRequestException(
-                String.format(
-                        "A lookup of deletion vector positions names %d keys, more than the %d"
-                                + " a request may name.",
-                        keys, MAX_LOOKUP_KEYS));
+    /**
+     * The part of the log mask of a tiering round on {@code snapshotId} that ends at {@code
+     * endOffset}, from {@code fromOffset} on, or from the snapshot's readable offset if null: the
+     * offsets from the readable offset up to the round's end whose versions a change below the
+     * round's end supersedes, as far as the part's changes name them. A part is bounded; the next
+     * part starts at {@link DvRoundMask#nextOffset}. Waits and fails as {@link #roundDeletes}.
+     */
+    public DvRoundMask roundMask(long snapshotId, @Nullable Long fromOffset, long endOffset)
+            throws IOException, StaleSnapshotException {
+        return rounds.mask(snapshotId, fromOffset, endOffset);
+    }
+
+    /**
+     * Makes a part of a round's deletes look up at most {@code lakeKeys} keys, a part of a round
+     * read at most {@code changes} changes, and a part of a round's mask stop at about {@code
+     * maskBytes} serialized bytes.
+     */
+    @VisibleForTesting
+    void setRoundPartSize(int lakeKeys, int changes, int maskBytes) {
+        rounds = new DvRoundReads(owner, lakeKeys, changes, maskBytes);
+    }
+
+    /**
+     * Makes a part of a round's deletes look up at most {@code lakeKeys} keys and read at most
+     * {@code changes} changes.
+     */
+    @VisibleForTesting
+    void setRoundDeletePartSize(int lakeKeys, int changes) {
+        setRoundPartSize(lakeKeys, changes, DvRoundReads.PART_MASK_BYTES);
     }
 
     /** Returns the lake snapshot this bucket covers, or -1 for the empty lake. */

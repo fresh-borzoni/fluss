@@ -27,6 +27,9 @@ import org.apache.iceberg.Table;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.lake.writer.LakeTieringFactory.FLUSS_LAKE_TIERING_COMMIT_USER;
@@ -175,6 +178,31 @@ public final class IcebergSnapshotLineage {
             s = s.parentId() == null ? null : table.snapshot(s.parentId());
         }
         return false;
+    }
+
+    /**
+     * The snapshots after {@code fromSnapshotId} up to {@code to}, oldest first: the ones whose
+     * manifests list the files they added and removed since. Returns null if {@code to} is null, if
+     * {@code fromSnapshotId} is not in its history (not an ancestor, or a snapshot in between
+     * expired), or if there are more than {@code maxSnapshots}.
+     */
+    @Nullable
+    public static List<Snapshot> snapshotsSince(
+            Table table, long fromSnapshotId, @Nullable Snapshot to, int maxSnapshots) {
+        List<Snapshot> since = new ArrayList<>();
+        Snapshot s = to;
+        while (s != null && s.snapshotId() != fromSnapshotId) {
+            if (since.size() == maxSnapshots) {
+                return null;
+            }
+            since.add(s);
+            s = s.parentId() == null ? null : table.snapshot(s.parentId());
+        }
+        if (s == null) {
+            return null;
+        }
+        Collections.reverse(since);
+        return since;
     }
 
     /** Whether Fluss committed the snapshot: a tiering round or a Fluss compaction. */

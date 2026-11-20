@@ -285,6 +285,8 @@ public class FlinkSourceSplitReader implements SplitReader<RecordAndPos, SourceS
                             droppedPartitions,
                             flinkSourceReaderMetrics.getSourceReaderMetricGroup());
             lakeSplitReaderGenerator.setDvWaitForCatchUp(dvWaitForCatchUp);
+            lakeSplitReaderGenerator.setDvRequestTimeout(
+                    connection.getConfiguration().get(ConfigOptions.CLIENT_REQUEST_TIMEOUT));
         }
         return lakeSplitReaderGenerator;
     }

@@ -72,10 +72,6 @@ public class IcebergRecordReader implements RecordReader, SupportsRowPositions {
     private final @Nullable Catalog catalog;
     private boolean catalogClosed;
 
-    public IcebergRecordReader(FileScanTask fileScanTask, Table table, @Nullable int[][] project) {
-        this(fileScanTask, table, project, null);
-    }
-
     public IcebergRecordReader(
             FileScanTask fileScanTask,
             Table table,
@@ -188,11 +184,6 @@ public class IcebergRecordReader implements RecordReader, SupportsRowPositions {
 
         // releases what the reader holds, e.g. its catalog, once the iterator closes
         private final @Nullable Runnable onClose;
-
-        public IcebergRecordAsFlussRecordIterator(
-                CloseableIterable<Record> icebergRecordIterator, Types.StructType struct) {
-            this(icebergRecordIterator, struct, null);
-        }
 
         public IcebergRecordAsFlussRecordIterator(
                 CloseableIterable<Record> icebergRecordIterator,

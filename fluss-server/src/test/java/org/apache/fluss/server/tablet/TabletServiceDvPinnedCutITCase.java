@@ -60,6 +60,7 @@ import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -68,17 +69,24 @@ class TabletServiceDvPinnedCutITCase {
 
     // the row TTL of the tables that test it; its margin for clocks is half of it
     private static final Duration ROW_TTL = Duration.ofSeconds(2);
+    // short, so the tests see idle cuts expire, yet far longer than the requests of one read
+    private static final Duration IDLE = Duration.ofSeconds(3);
+    // the timeout and the sweep after it, with room for a slow machine
+    private static final Duration EXPIRY_WAIT = IDLE.multipliedBy(5);
 
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder()
                     .setNumOfTabletServers(1)
-                    .setClusterConf(
-                            Configuration.fromMap(
-                                    Collections.singletonMap(
-                                            ConfigOptions.DATALAKE_FORMAT.key(),
-                                            DataLakeFormat.PAIMON.toString())))
+                    .setClusterConf(clusterConf())
                     .build();
+
+    private static Configuration clusterConf() {
+        Configuration conf = new Configuration();
+        conf.setString(ConfigOptions.DATALAKE_FORMAT.key(), DataLakeFormat.PAIMON.toString());
+        conf.set(ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT, IDLE);
+        return conf;
+    }
 
     @Test
     void testWorkersFetchThePartsOfAPinnedCut() throws Exception {
@@ -87,14 +95,14 @@ class TabletServiceDvPinnedCutITCase {
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1, "a")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .build();
         long tableId =
                 createTable(
                         FLUSS_CLUSTER_EXTENSION,
                         TablePath.of("test_db_1", "dv_pinned_cut"),
                         descriptor);
-        // the values of a table with deletion vectors are tagged with their version's offset
+        // the values of a table with deletion vectors carry their version's offset in its slot
         assertThat(
                         FLUSS_CLUSTER_EXTENSION
                                 .getZooKeeperClient()
@@ -103,7 +111,7 @@ class TabletServiceDvPinnedCutITCase {
                                 .properties)
                 .containsEntry(
                         ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
-                        String.valueOf(KvValueLayout.TAGGED.version()));
+                        String.valueOf(KvValueLayout.VERSIONED.version()));
         TableBucket tb = new TableBucket(tableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
         TabletServerGateway leader =
@@ -164,21 +172,20 @@ class TabletServiceDvPinnedCutITCase {
 
     /**
      * A read that does not wait pins a cut and fetches its parts as one that waits does. A fetch of
-     * a cut the server no longer holds fails as stale, as for a read that waits: the leader still
+     * a cut the server no longer keeps fails as stale, as for a read that waits: the leader still
      * covers the snapshot, so it is not answered as covering another one.
      */
     @Test
     void testReadThatDoesNotWaitGetsAStaleErrorForALostCut() throws Exception {
         long tableId = createDvTable("dv_no_wait_lost_cut");
         TabletServerGateway leader = leaderOf(tableId);
+        DerivedDvManager dv = dvManager(tableId);
         put(leader, tableId, "v0");
         put(leader, tableId, "v1");
-        // a read that waits until the bucket replayed its log, and ends
-        long waited = getDv(leader, request(tableId)).getLogEndOffset();
-        leader.getDvSnapshot(request(tableId).setLogEndOffset(waited).setReleaseCut(true)).get();
+        // a read that waits until the bucket replayed its log
+        getDv(leader, request(tableId));
 
-        GetDvSnapshotResponse pin =
-                getDv(leader, request(tableId).setWaitForCatchUp(false).setHolds(2));
+        GetDvSnapshotResponse pin = getDv(leader, request(tableId).setWaitForCatchUp(false));
         assertThat(pin.hasFoldCut()).isFalse();
         assertThat(pin.hasCoveredSnapshotId()).isFalse();
         long cut = pin.getLogEndOffset();
@@ -192,9 +199,8 @@ class TabletServiceDvPinnedCutITCase {
         assertThat(part.getLogEndOffset()).isEqualTo(cut);
         assertThat(offsets(part.getLogDvBitmap())).hasSize(30);
 
-        // the read ends, and writes move the high watermark past the cut
-        leader.getDvSnapshot(request(tableId).setLogEndOffset(cut).setReleaseCut(true).setHolds(2))
-                .get();
+        // the reads end, their cut idles out, and writes move the high watermark past it
+        awaitNoPinnedCut(dv);
         put(leader, tableId, "v2");
         assertThatThrownBy(
                         () ->
@@ -215,10 +221,10 @@ class TabletServiceDvPinnedCutITCase {
     }
 
     /**
-     * A pin of a bucket with row TTL that is unsafe, as its TTL filter was capped for an offset
-     * above the readable one, gets a fold cut and no masks, whether the read waits or not: it reads
-     * the bucket by key. It takes no cut, and the cut another reader holds at the same high
-     * watermark keeps its holds.
+     * A pin of a bucket of a Paimon table with row TTL that is unsafe, as its TTL filter was capped
+     * for an offset above the readable one, gets a fold cut and no masks, whether the read waits or
+     * not: it reads the bucket by key. It takes no cut, and leaves the cut another reader pinned at
+     * the same high watermark as it is.
      */
     @Test
     void testPinOfAnUnsafeRowTtlBucketGetsAFoldCutAndNoMasks() throws Exception {
@@ -231,7 +237,7 @@ class TabletServiceDvPinnedCutITCase {
         long cut;
         FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(true);
         try {
-            GetDvSnapshotResponse other = getDv(leader, request(tableId).setHolds(2));
+            GetDvSnapshotResponse other = getDv(leader, request(tableId));
             assertThat(other.hasFoldCut()).isFalse();
             cut = other.getLogEndOffset();
         } finally {
@@ -250,23 +256,16 @@ class TabletServiceDvPinnedCutITCase {
                                     .setLogDvFromOffset(0));
             assertThat(pin.hasFoldCut()).as("a read that waits: %s", waits).isTrue();
             assertThat(pin.getFoldCut()).isEqualTo(cut);
-            assertThat(pin.hasTtlUnsafe() && pin.isTtlUnsafe()).isTrue();
             assertThat(pin.hasLogDvBitmap()).isFalse();
             assertThat(pin.getLakeDvEntriesCount()).isZero();
             assertThat(dv.pinnedCutCount()).isEqualTo(1);
         }
-
-        // the other reader's holds are untouched: its cut goes with the last of them
-        release(leader, tableId, cut);
-        assertThat(dv.pinnedCutCount()).isEqualTo(1);
-        release(leader, tableId, cut);
-        assertThat(dv.pinnedCutCount()).isZero();
     }
 
     /**
-     * A cut the bucket no longer holds, as on a new leader, is built again only while row TTL can
-     * have removed no version its masks need: once the bucket is unsafe, a fetch of the cut fails
-     * as stale, and the reader pins again and reads the bucket by key.
+     * A cut the bucket no longer keeps, as once it idled out or on a new leader, is built again
+     * only while row TTL can have removed no version its masks need: once the bucket is unsafe, a
+     * fetch of the cut fails as stale, and the reader pins again and reads the bucket by key.
      */
     @Test
     void testCutNotHeldOfAnUnsafeRowTtlBucketIsStale() throws Exception {
@@ -279,14 +278,12 @@ class TabletServiceDvPinnedCutITCase {
         FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(true);
         try {
             cut = getDv(leader, request(tableId)).getLogEndOffset();
-            release(leader, tableId, cut);
-            assertThat(dv.pinnedCutCount()).isZero();
+            awaitNoPinnedCut(dv);
             // while masks are served, the cut is built again at the high watermark
             GetDvSnapshotResponse part =
                     getDv(leader, request(tableId).setLogEndOffset(cut).setLogDvFromOffset(0));
             assertThat(part.getLogEndOffset()).isEqualTo(cut);
-            release(leader, tableId, cut);
-            assertThat(dv.pinnedCutCount()).isZero();
+            awaitNoPinnedCut(dv);
         } finally {
             FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(false);
         }
@@ -310,6 +307,44 @@ class TabletServiceDvPinnedCutITCase {
     }
 
     /**
+     * A round's leader plans its end within the round's caps, and serves the round's log mask up to
+     * that end, naming the snapshot, the range and its leader epoch. Every key is written three
+     * times: a round past the third writes masks the first two versions of every key, one ending
+     * within the second writes only the first versions of the keys written again below its end.
+     */
+    @Test
+    void testRoundPlanAndLogMask() throws Exception {
+        long tableId = createDvTable("dv_round_plan_mask");
+        TabletServerGateway leader = leaderOf(tableId);
+        // 30 inserts at 0..29, then two updates of each key, a -U and a +U each
+        for (int round = 0; round < 3; round++) {
+            put(leader, tableId, "v" + round);
+        }
+
+        GetDvSnapshotResponse whole = getDv(leader, plan(tableId, 0));
+        assertThat(whole.getRoundEndOffset()).isEqualTo(150L);
+        assertThat(whole.isRoundCapped()).isFalse();
+        GetDvSnapshotResponse capped = getDv(leader, plan(tableId, 10).setRoundMaxRecords(40));
+        assertThat(capped.getRoundEndOffset()).isEqualTo(50L);
+        assertThat(capped.isRoundCapped()).isTrue();
+        assertThat(getDv(leader, plan(tableId, 150)).getRoundEndOffset()).isEqualTo(150L);
+
+        assertThat(roundMask(leader, tableId, 150)).hasSize(60);
+        List<Long> firstVersions = new ArrayList<>();
+        for (long offset = 0; offset < 30; offset++) {
+            firstVersions.add(offset);
+        }
+        assertThat(roundMask(leader, tableId, 90)).isEqualTo(firstVersions);
+        // the +U of key i is at 31 + 2i: those below 61 are of keys 0..14
+        assertThat(roundMask(leader, tableId, 61)).isEqualTo(firstVersions.subList(0, 15));
+        assertThat(roundMask(leader, tableId, 30)).isEmpty();
+        // the changes the parts count are the +U records below the end
+        assertThat(roundChanges(leader, tableId, 150)).isEqualTo(60);
+        assertThat(roundChanges(leader, tableId, 61)).isEqualTo(15);
+        assertThat(roundChanges(leader, tableId, 30)).isZero();
+    }
+
+    /**
      * Requests the server cannot serve as asked are refused as invalid, and requests of a table
      * without deletion vectors as of an invalid table, never as an unknown server error.
      */
@@ -318,13 +353,7 @@ class TabletServiceDvPinnedCutITCase {
         long tableId = createDvTable("dv_invalid_requests");
         TabletServerGateway leader = leaderOf(tableId);
 
-        assertRefused(leader, request(tableId).setHolds(0), InvalidRequestException.class);
-        assertRefused(leader, request(tableId).setHolds(4097), InvalidRequestException.class);
-        assertRefused(
-                leader,
-                request(tableId).setReleaseCut(true).setHolds(-1),
-                InvalidRequestException.class);
-        assertRefused(leader, request(tableId).setReleaseCut(true), InvalidRequestException.class);
+        assertRefused(leader, request(tableId).setMaxLogDvBytes(0), InvalidRequestException.class);
         // a request that misses the table, the bucket or the snapshot it reads
         assertRefused(
                 leader,
@@ -338,11 +367,45 @@ class TabletServiceDvPinnedCutITCase {
                 leader,
                 new GetDvSnapshotRequest().setTableId(tableId).setBucketId(0),
                 InvalidRequestException.class);
-        GetDvSnapshotRequest lookup = request(tableId);
-        for (int i = 0; i <= 100_000; i++) {
-            lookup.addLookupKey(new byte[] {(byte) i, (byte) (i >> 8), (byte) (i >> 16)});
-        }
-        assertRefused(leader, lookup, InvalidRequestException.class);
+        // a round's request sets no field of a union read, and its part starts at or before the
+        // round's end
+        assertRefused(
+                leader,
+                request(tableId).setRoundEndOffset(0).setLogEndOffset(0),
+                InvalidRequestException.class);
+        assertRefused(
+                leader,
+                request(tableId).setRoundEndOffset(0).setPinRequestId(1),
+                InvalidRequestException.class);
+        assertRefused(
+                leader, request(tableId).setRoundFromOffset(0), InvalidRequestException.class);
+        assertRefused(
+                leader, request(tableId).setRoundEndOffset(-1), InvalidRequestException.class);
+        assertRefused(
+                leader,
+                request(tableId).setRoundEndOffset(1).setRoundFromOffset(2),
+                InvalidRequestException.class);
+        // a round's log mask is asked for with the round's end
+        assertRefused(
+                leader, request(tableId).setRoundLogMask(true), InvalidRequestException.class);
+        // a plan names its start and both caps, positive, and nothing of a part or a union read
+        assertRefused(
+                leader, plan(tableId, 0).setRoundEndOffset(10), InvalidRequestException.class);
+        assertRefused(
+                leader, plan(tableId, 0).setRoundLogMask(true), InvalidRequestException.class);
+        assertRefused(
+                leader, plan(tableId, 0).setLogDvFromOffset(0), InvalidRequestException.class);
+        assertRefused(leader, plan(tableId, -1), InvalidRequestException.class);
+        assertRefused(
+                leader, plan(tableId, 0).setRoundMaxRecords(0), InvalidRequestException.class);
+        assertRefused(
+                leader,
+                request(tableId).setRoundStartOffset(0).setRoundMaxRecords(10),
+                InvalidRequestException.class);
+        assertRefused(
+                leader,
+                request(tableId).setRoundMaxRecords(10).setRoundMaxBytes(10),
+                InvalidRequestException.class);
 
         TablePath plainPath = TablePath.of("test_db_1", "dv_plain_table");
         long plainId =
@@ -375,7 +438,8 @@ class TabletServiceDvPinnedCutITCase {
                                 .schema(DATA1_SCHEMA_PK)
                                 .distributedBy(1, "a")
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                 .build());
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(new TableBucket(tableId, 0));
         return tableId;
@@ -400,7 +464,8 @@ class TabletServiceDvPinnedCutITCase {
                                 .schema(DATA1_SCHEMA_PK)
                                 .distributedBy(1, "a")
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                 .property(ConfigOptions.TABLE_KV_TTL, ROW_TTL)
                                 .build());
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(new TableBucket(tableId, 0));
@@ -414,9 +479,9 @@ class TabletServiceDvPinnedCutITCase {
                 .getDvManager();
     }
 
-    private static void release(TabletServerGateway leader, long tableId, long cut)
-            throws Exception {
-        leader.getDvSnapshot(request(tableId).setLogEndOffset(cut).setReleaseCut(true)).get();
+    /** Waits until the bucket's leader dropped its idle cuts. */
+    private static void awaitNoPinnedCut(DerivedDvManager dv) {
+        waitUntil(() -> dv.pinnedCutCount() == 0, EXPIRY_WAIT, "the idle cuts were not dropped");
     }
 
     private static TabletServerGateway leaderOf(long tableId) {
@@ -429,6 +494,62 @@ class TabletServiceDvPinnedCutITCase {
                 .setTableId(tableId)
                 .setBucketId(0)
                 .setReadableSnapshotId(-1L);
+    }
+
+    /** The plan of a round of bucket 0 on the empty lake from {@code start}, with large caps. */
+    private static GetDvSnapshotRequest plan(long tableId, long start) {
+        return request(tableId)
+                .setRoundStartOffset(start)
+                .setRoundMaxRecords(1_000_000)
+                .setRoundMaxBytes(1L << 30);
+    }
+
+    /**
+     * All parts of the log mask of the round of bucket 0 on the empty lake ending at {@code end}.
+     */
+    private static List<Long> roundMask(TabletServerGateway gateway, long tableId, long end)
+            throws Exception {
+        List<Long> mask = new ArrayList<>();
+        Long from = null;
+        while (true) {
+            GetDvSnapshotRequest request =
+                    request(tableId).setRoundEndOffset(end).setRoundLogMask(true);
+            if (from != null) {
+                request.setRoundFromOffset(from);
+            }
+            GetDvSnapshotResponse part = getDv(gateway, request);
+            assertThat(part.getRoundSnapshotId()).isEqualTo(-1L);
+            assertThat(part.getRoundEndOffset()).isEqualTo(end);
+            assertThat(part.getSnapshotStartOffset()).isZero();
+            assertThat(part.hasLeaderEpoch()).isTrue();
+            assertThat(part.getLakeDvEntriesCount()).isZero();
+            mask.addAll(offsets(part.hasLogDvBitmap() ? part.getLogDvBitmap() : null));
+            if (part.getRoundNextOffset() == end) {
+                return mask;
+            }
+            from = part.getRoundNextOffset();
+        }
+    }
+
+    /** The changes the parts of the round's log mask count, all parts summed. */
+    private static long roundChanges(TabletServerGateway gateway, long tableId, long end)
+            throws Exception {
+        long changes = 0;
+        Long from = null;
+        while (true) {
+            GetDvSnapshotRequest request =
+                    request(tableId).setRoundEndOffset(end).setRoundLogMask(true);
+            if (from != null) {
+                request.setRoundFromOffset(from);
+            }
+            GetDvSnapshotResponse part = getDv(gateway, request);
+            assertThat(part.isRoundChangesWithInserts()).isFalse();
+            changes += part.getRoundChanges();
+            if (part.getRoundNextOffset() == end) {
+                return changes;
+            }
+            from = part.getRoundNextOffset();
+        }
     }
 
     /** Sends the request until the bucket has replayed its log for union reads. */

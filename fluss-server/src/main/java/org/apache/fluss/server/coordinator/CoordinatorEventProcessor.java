@@ -2416,7 +2416,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
                                 + " tiering epoch. It comes from a tiering service that does not"
                                 + " support deletion vectors, which would leave the old rows of"
                                 + " changed keys live in the lake.",
-                        tableId, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+                        tableId, ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()));
     }
 
     private void tryProcessCommitLakeTableSnapshot(

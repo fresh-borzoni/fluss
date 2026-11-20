@@ -19,10 +19,10 @@ package org.apache.fluss.client.table.scanner.batch.dv;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.admin.DvAdmin;
+import org.apache.fluss.client.admin.DvRequestRetries;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.DeletionVectorsNotReadyException;
-import org.apache.fluss.exception.InvalidMetadataException;
 import org.apache.fluss.exception.StaleSnapshotException;
-import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
@@ -33,7 +33,6 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 /**
@@ -44,9 +43,10 @@ import java.util.function.Supplier;
  *   <li>Not ready: the leader switches to the snapshot, rebuilds its masks or replays its change
  *       list in the background, which takes as long as replaying its log. The fetch waits that
  *       long.
- *   <li>Leader moved: the admin dropped the stale leader, so a retry reaches the new one. An
- *       election takes seconds, so it has a separate budget.
- *   <li>Stale: the leader covers another snapshot, or no longer holds the requested cut. The fetch
+ *   <li>Leader moved or unavailable ({@link DvRequestRetries#isLeaderUnavailable}): the admin
+ *       dropped the stale leader, so a retry reaches the new one. An election takes seconds, so it
+ *       has a separate budget.
+ *   <li>Stale: the leader covers another snapshot, or no longer keeps the requested cut. The fetch
  *       fails at once, and the caller plans the bucket again or derives the masks.
  *   <li>A read that does not wait gets the leader's answer at once, in the response: the snapshot
  *       it covers instead, as a {@link StaleSnapshotException}, or the cut to read by key up to, as
@@ -54,7 +54,12 @@ import java.util.function.Supplier;
  *       with either at once.
  * </ul>
  *
- * <p>Any other error fails the fetch at once.
+ * <p>Any other error fails the fetch at once, and so does a request the leader does not answer
+ * within the client's request timeout: the RPC layer has no timeout of its own, and a server that
+ * never reads the request leaves it unanswered until it closes the idle connection. The admin then
+ * drops its connection to the leader, so that the next request, also one of the read by key that
+ * follows, connects again instead of waiting behind it. The retries are those of {@link
+ * DvRequestRetries}, which tiering rounds share.
  */
 @Internal
 public class DvMaskFetcher {
@@ -76,11 +81,32 @@ public class DvMaskFetcher {
     private final DvAdmin admin;
     private final TablePath tablePath;
     private final Sleeper sleeper;
+    private final DvRequestRetries retries;
 
     public DvMaskFetcher(DvAdmin admin, TablePath tablePath, Sleeper sleeper) {
+        this(
+                admin,
+                tablePath,
+                sleeper,
+                ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue().toMillis());
+    }
+
+    public DvMaskFetcher(
+            DvAdmin admin, TablePath tablePath, Sleeper sleeper, long requestTimeoutMs) {
         this.admin = admin;
         this.tablePath = tablePath;
         this.sleeper = sleeper;
+        // an unanswered request fails the fetch at once: the part reads the bucket by key, on a
+        // new connection
+        this.retries =
+                new DvRequestRetries(
+                        requestTimeoutMs,
+                        MAX_LEADER_RETRIES,
+                        INITIAL_BACKOFF_MS,
+                        MAX_LEADER_BACKOFF_MS,
+                        INITIAL_BACKOFF_MS,
+                        MAX_NOT_READY_BACKOFF_MS,
+                        false);
     }
 
     /**
@@ -88,68 +114,40 @@ public class DvMaskFetcher {
      * retries run out. {@code request} is called once per attempt.
      */
     public GetDvSnapshotResponse fetch(Supplier<GetDvSnapshotRequest> request) throws Exception {
-        long leaderBackoffMs = INITIAL_BACKOFF_MS;
-        int leaderRetries = 0;
-        long notReadyBackoffMs = INITIAL_BACKOFF_MS;
-        long notReadyWaitedMs = 0;
-        while (true) {
-            GetDvSnapshotRequest req = request.get();
-            long snapshotId = req.getReadableSnapshotId();
-            GetDvSnapshotResponse response;
-            try {
-                response = admin.getDvSnapshot(tablePath, req).get();
-            } catch (Exception e) {
-                if (ExceptionUtils.findThrowable(e, DeletionVectorsNotReadyException.class)
-                                .isPresent()
-                        && notReadyWaitedMs < MAX_NOT_READY_WAIT_MS) {
-                    LOG.info(
-                            "Deletion vectors of bucket {} of {} not ready for snapshot {} ({}),"
-                                    + " retry in {} ms.",
-                            req.getBucketId(),
-                            tablePath,
-                            snapshotId,
-                            ExceptionUtils.stripExecutionException(e).getMessage(),
-                            notReadyBackoffMs);
-                    sleeper.sleep(notReadyBackoffMs);
-                    notReadyWaitedMs += notReadyBackoffMs;
-                    notReadyBackoffMs = Math.min(notReadyBackoffMs * 2, MAX_NOT_READY_BACKOFF_MS);
-                    continue;
-                }
-                if (ExceptionUtils.findThrowable(e, InvalidMetadataException.class).isPresent()
-                        && leaderRetries < MAX_LEADER_RETRIES) {
-                    leaderRetries++;
-                    LOG.info(
-                            "Leader of bucket {} of {} moved while fetching its masks ({}),"
-                                    + " retry {}/{}.",
-                            req.getBucketId(),
-                            tablePath,
-                            e.getMessage(),
-                            leaderRetries,
-                            MAX_LEADER_RETRIES);
-                    sleeper.sleep(leaderBackoffMs);
-                    leaderBackoffMs = Math.min(leaderBackoffMs * 2, MAX_LEADER_BACKOFF_MS);
-                    continue;
-                }
-                throw e;
-            }
-            throwIfNoMasks(response, snapshotId);
-            return response;
-        }
+        GetDvSnapshotRequest[] sent = new GetDvSnapshotRequest[1];
+        GetDvSnapshotResponse response =
+                retries.send(
+                        admin,
+                        tablePath,
+                        () -> sent[0] = request.get(),
+                        MAX_NOT_READY_WAIT_MS,
+                        this::retry);
+        throwIfNoMasks(response, sent[0].getReadableSnapshotId());
+        return response;
+    }
+
+    private void retry(GetDvSnapshotRequest request, Throwable cause, long backoffMs)
+            throws InterruptedException {
+        LOG.info(
+                "The leader of bucket {} of {} {} for snapshot {} ({}); retry in {} ms.",
+                request.getBucketId(),
+                tablePath,
+                DvRequestRetries.isNotReady(cause) ? "is not ready" : "moved or is unavailable",
+                request.getReadableSnapshotId(),
+                cause.getMessage(),
+                backoffMs);
+        sleeper.sleep(backoffMs);
     }
 
     /**
      * Fails with the answer of a leader that served no masks: the snapshot it covers instead, or
-     * the cut to read the bucket by key up to, as the leader rebuilds them, or as row TTL may have
-     * removed a version they miss.
+     * the cut to read the bucket by key up to.
      */
     private static void throwIfNoMasks(GetDvSnapshotResponse response, long requested) {
         if (response.hasFoldCut()) {
-            boolean rowTtl = response.hasTtlUnsafe() && response.isTtlUnsafe();
             throw DeletionVectorsNotReadyException.rebuilding(
                     String.format("No masks of lake snapshot %d", requested),
-                    rowTtl
-                            ? "row TTL may have removed a version of the log before it was tiered"
-                            : "the leader rebuilds or replays them",
+                    "it answered with a cut",
                     response.getFoldCut());
         }
         if (response.hasCoveredSnapshotId()) {
@@ -159,84 +157,6 @@ public class DvMaskFetcher {
                     response.hasBehind() && response.isBehind(),
                     response.hasSnapshotStartOffset() ? response.getSnapshotStartOffset() : -1L);
         }
-    }
-
-    /**
-     * Sends {@code request}, a release of a pinned cut, without waiting for it, and sends it once
-     * more if it fails, as when the leader moved. A cut that is not released is dropped once no
-     * request asks for it within the idle timeout. The returned future completes with the answer to
-     * the last attempt.
-     */
-    public CompletableFuture<GetDvSnapshotResponse> release(GetDvSnapshotRequest request) {
-        CompletableFuture<GetDvSnapshotResponse> released = new CompletableFuture<>();
-        send(request)
-                .whenComplete(
-                        (response, e) -> {
-                            if (e == null) {
-                                released.complete(response);
-                                return;
-                            }
-                            LOG.debug(
-                                    "Could not release the mask cut {} of bucket {} of {}; sending"
-                                            + " the release again.",
-                                    request.getLogEndOffset(),
-                                    request.getBucketId(),
-                                    tablePath,
-                                    e);
-                            send(new GetDvSnapshotRequest().copyFrom(request))
-                                    .whenComplete(
-                                            (retried, again) -> {
-                                                if (again == null) {
-                                                    released.complete(retried);
-                                                    return;
-                                                }
-                                                LOG.warn(
-                                                        "Could not release the mask cut {} of"
-                                                                + " bucket {} of {} ({}); the"
-                                                                + " leader drops it once it"
-                                                                + " idles.",
-                                                        request.getLogEndOffset(),
-                                                        request.getBucketId(),
-                                                        tablePath,
-                                                        ExceptionUtils.stripExecutionException(
-                                                                        again)
-                                                                .toString());
-                                                released.completeExceptionally(again);
-                                            });
-                        });
-        return released;
-    }
-
-    private CompletableFuture<GetDvSnapshotResponse> send(GetDvSnapshotRequest request) {
-        try {
-            return admin.getDvSnapshot(tablePath, request);
-        } catch (RuntimeException e) {
-            CompletableFuture<GetDvSnapshotResponse> failed = new CompletableFuture<>();
-            failed.completeExceptionally(e);
-            return failed;
-        }
-    }
-
-    /**
-     * The release of {@code holds} holds of the cut {@code cut} of lake snapshot {@code snapshotId}
-     * on the leader of {@code bucket}.
-     */
-    public static GetDvSnapshotRequest releaseRequest(
-            TableBucket bucket, long snapshotId, long cut, int holds) {
-        GetDvSnapshotRequest release =
-                new GetDvSnapshotRequest()
-                        .setTableId(bucket.getTableId())
-                        .setBucketId(bucket.getBucket())
-                        .setReadableSnapshotId(snapshotId)
-                        .setLogEndOffset(cut)
-                        .setReleaseCut(true);
-        if (bucket.getPartitionId() != null) {
-            release.setPartitionId(bucket.getPartitionId());
-        }
-        if (holds > 1) {
-            release.setHolds(holds);
-        }
-        return release;
     }
 
     /** Returns the {@link StaleSnapshotException} in {@code e}, or null. */

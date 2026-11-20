@@ -119,6 +119,8 @@ public final class ValueEncoder {
         if (kvValueLayout.hasVersionOffsetSlot()) {
             byte[] values = encodeValueBody(value);
             kvValueLayout.writeVersionOffset(values, 0, valueTag);
+            // Without row TTL the slot holds the time that never expires rather than 0, so a
+            // filter that read it would keep the value, not drop it.
             kvValueLayout.writeTtlTimestamp(
                     values,
                     0,

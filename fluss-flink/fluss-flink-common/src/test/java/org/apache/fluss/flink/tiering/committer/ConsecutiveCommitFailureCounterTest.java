@@ -66,6 +66,20 @@ class ConsecutiveCommitFailureCounterTest {
     }
 
     @Test
+    void testMaxFailuresIsOfTheTableFailingLongest() {
+        ConsecutiveCommitFailureCounter counter = new ConsecutiveCommitFailureCounter(10);
+        assertThat(counter.maxFailures()).isZero();
+
+        counter.recordFailure(1L);
+        counter.recordFailure(2L);
+        counter.recordFailure(2L);
+        assertThat(counter.maxFailures()).isEqualTo(2);
+
+        counter.recordSuccess(2L);
+        assertThat(counter.maxFailures()).isEqualTo(1);
+    }
+
+    @Test
     void testRejectsNonPositiveMaxTables() {
         assertThatThrownBy(() -> new ConsecutiveCommitFailureCounter(0))
                 .isInstanceOf(IllegalArgumentException.class)

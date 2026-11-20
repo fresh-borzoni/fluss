@@ -200,28 +200,6 @@ final class DvOwnerWork {
         return done;
     }
 
-    /**
-     * Reaches {@code snapshotId} for a lookup: starts the catch-up unless it failed less than a
-     * backoff ago, in which case the future fails at once.
-     */
-    CompletableFuture<Boolean> reachForLookup(long snapshotId) {
-        CompletableFuture<Boolean> done = new CompletableFuture<>();
-        o.post(
-                () -> {
-                    if (o.closed) {
-                        done.complete(false);
-                        return;
-                    }
-                    long attempt = o.planner.scheduleAdvance(snapshotId);
-                    if (attempt < 0) {
-                        done.completeExceptionally(o.planner.advanceFailed(snapshotId));
-                        return;
-                    }
-                    want(snapshotId, attempt, done);
-                });
-        return done;
-    }
-
     /** Replays the change list of {@code snapshotId} if it is missing; numbered {@code replay}. */
     void replay(long snapshotId, long replay) {
         enqueue(new Replay(snapshotId, replay));

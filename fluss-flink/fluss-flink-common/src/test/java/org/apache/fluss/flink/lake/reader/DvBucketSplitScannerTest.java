@@ -352,13 +352,12 @@ class DvBucketSplitScannerTest {
     }
 
     /**
-     * A split pinned at planning whose cut is gone resolves afresh on the snapshot its leader
-     * covers now, which reads the bucket's log from another offset. Checkpointed before it emitted
-     * a row and restored, it reads the log from that offset again, not from the one planning
-     * pinned.
+     * A split whose leader covers a newer snapshot than planned resolves on that one, which reads
+     * the bucket's log from another offset. Checkpointed before it emitted a row and restored, it
+     * reads the log from that offset again, not from the planned one.
      */
     @Test
-    void testRestoreOfASplitPinnedAgainReadsTheLogFromItsNewStart() throws Exception {
+    void testRestoreOfAReplannedSplitReadsTheLogFromItsNewStart() throws Exception {
         bucket.standardBucket();
         // snapshot 6 holds none of the bucket's files: key 1 was tiered into it up to offset 102
         long newer = SNAPSHOT + 1;
@@ -386,24 +385,14 @@ class DvBucketSplitScannerTest {
                             .setLogDvBitmap(bitmap(103));
                 };
         context.waitForCatchUp = false;
-        DvBucketSplit planned =
-                DvBucketSplit.pinned(
-                        BUCKET,
-                        null,
-                        SNAPSHOT,
-                        100L,
-                        106L,
-                        null,
-                        DvBucketSplit.WHOLE_BUCKET,
-                        106L,
-                        100L);
+        DvBucketSplit planned = new DvBucketSplit(BUCKET, null, SNAPSHOT, 100L, 106L, null);
 
         DvBucketSplit checkpointed =
                 roundTrip((DvBucketSplit) resolveOnly(planned).toSourceSplit());
 
         assertThat(checkpointed.getSnapshotId()).isEqualTo(newer);
         assertThat(checkpointed.getMaskState()).isNull();
-        // the leader holds cut 106 of snapshot 6 still, for the split that is restored
+        // the leader keeps cut 106 of snapshot 6 still, for the split that is restored
         server.clearRequests();
         Read restored = read(checkpointed, Integer.MAX_VALUE);
 

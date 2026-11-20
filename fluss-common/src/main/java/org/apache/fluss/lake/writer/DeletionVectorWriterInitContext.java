@@ -51,4 +51,19 @@ public interface DeletionVectorWriterInitContext extends WriterInitContext {
      */
     @Nullable
     WriterMemoryPool writerMemoryPool();
+
+    /**
+     * Returns whether the round's records come through its leader's log mask: the tiering service
+     * skips the versions a later change of the round supersedes, and the -U records, and hands the
+     * writer the rest in log order. The writer then gets at most the last version of each key; a
+     * row of a key that a later record of the key follows is a version the mask missed, for which
+     * the writer may throw a {@link RoundMaskMismatchException} from {@link LakeWriter#complete()},
+     * and the round is written again in sort mode. Otherwise the writer gets every record of the
+     * round and keeps the last version of each key itself.
+     *
+     * @return whether the round's superseded versions are skipped
+     */
+    default boolean roundMasked() {
+        return false;
+    }
 }

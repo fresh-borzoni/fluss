@@ -353,7 +353,6 @@ class SourceSplitSerializerTest {
             assertThat(deserialized.getRecordsToSkip()).isEqualTo(split.getRecordsToSkip());
             assertThat(deserialized.getNextLogOffset()).isEqualTo(split.getNextLogOffset());
             assertThat(deserialized.isPinned()).isEqualTo(split.isPinned());
-            assertThat(deserialized.sharesBucket()).isEqualTo(split.sharesBucket());
             assertThat(deserialized.getFileGroup()).isEqualTo(split.getFileGroup());
             assertThat(deserialized.getPinnedLogStartOffset())
                     .isEqualTo(split.getPinnedLogStartOffset());

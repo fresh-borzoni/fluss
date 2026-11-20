@@ -230,6 +230,14 @@ public class LogFetchBuffer implements AutoCloseable {
     }
 
     /**
+     * Wakes a poll that waits for fetched data although none came: a fetch request ended, so the
+     * poll may send the next one, as for a bucket subscribed while the request was out.
+     */
+    void fetchRequestEnded() {
+        inLock(lock, notEmptyCondition::signalAll);
+    }
+
+    /**
      * Updates the buffer to retain only the fetch data that corresponds to the given buckets. Any
      * previously {@link CompletedFetch fetched data} and {@link PendingFetch pending fetch} is
      * removed if its bucket is not in the given set of buckets.

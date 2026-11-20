@@ -73,6 +73,8 @@ public abstract class CompletedFetch {
     protected final LogRecordReadContext readContext;
 
     private LogRecordBatch currentBatch;
+    // offset ranges [from, to) of the batches without records read since last taken
+    private final List<long[]> offsetsWithoutRecords = new ArrayList<>();
     private int currentBatchSchemaId = -1;
     private LogRecord lastRecord;
     private CloseableIterator<LogRecord> records;
@@ -396,7 +398,27 @@ public abstract class CompletedFetch {
         currentBatch = batches.next();
         // TODO get last epoch.
         maybeEnsureValid(currentBatch);
+        if (currentBatch.getRecordCount() == 0) {
+            // a batch without records, as one of deletes of absent keys, still takes its offsets
+            long from = Math.max(currentBatch.baseLogOffset(), nextFetchOffset);
+            if (from < currentBatch.nextLogOffset()) {
+                offsetsWithoutRecords.add(new long[] {from, currentBatch.nextLogOffset()});
+            }
+        }
         return currentBatch;
+    }
+
+    /**
+     * Takes the offset ranges [from, to) of the batches without records read since last taken. A
+     * reader that checks it read every offset of a range counts them with the records.
+     */
+    List<long[]> takeOffsetsWithoutRecords() {
+        if (offsetsWithoutRecords.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<long[]> taken = new ArrayList<>(offsetsWithoutRecords);
+        offsetsWithoutRecords.clear();
+        return taken;
     }
 
     private void finishFetchedBatches() {

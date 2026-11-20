@@ -1308,13 +1308,4 @@ class DerivedDvChangeListTest {
         }
         return bean.getHeapMemoryUsage().getUsed();
     }
-
-    private static void waitUntil(java.util.function.BooleanSupplier condition)
-            throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 30_000;
-        while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10);
-        }
-        assertThat(condition.getAsBoolean()).isTrue();
-    }
 }

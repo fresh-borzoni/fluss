@@ -627,7 +627,7 @@ class KvTabletTest {
         schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
         logTablet = createLogTablet(tempLogDir, 0L, path);
         Map<String, String> conf = new HashMap<>();
-        conf.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        conf.put(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true");
         if (rowTtl) {
             conf.put(ConfigOptions.TABLE_KV_TTL.key(), "1 d");
         }

@@ -56,7 +56,7 @@ class SnapshotFilesReaderTest {
         RocksDB.loadLibrary();
         Path dbPath = dir.resolve("db");
         Configuration tableConf = new Configuration();
-        tableConf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        tableConf.set(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true);
         tableConf.set(
                 ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION, KvValueLayout.VERSIONED.version());
         tableConf.setString(ConfigOptions.TABLE_KV_TTL.key(), "1 h");

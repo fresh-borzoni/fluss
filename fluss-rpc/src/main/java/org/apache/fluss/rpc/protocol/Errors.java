@@ -337,7 +337,7 @@ public enum Errors {
     STALE_SNAPSHOT(
             82,
             "The bucket's deletion vectors cover another lake snapshot than the requested one, or"
-                    + " no longer hold the requested mask cut.",
+                    + " no longer keep the requested mask cut.",
             StaleSnapshotException::new),
     INVALID_REQUEST(
             83,

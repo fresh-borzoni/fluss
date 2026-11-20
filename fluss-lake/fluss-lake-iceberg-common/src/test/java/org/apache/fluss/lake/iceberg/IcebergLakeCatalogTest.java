@@ -189,7 +189,8 @@ class IcebergLakeCatalogTest {
                         .schema(flussSchema)
                         .distributedBy(4, "id")
                         .partitionedBy("dt")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .build();
 
         TablePath tablePath = TablePath.of(database, tableName);
@@ -247,14 +248,15 @@ class IcebergLakeCatalogTest {
         TableDescriptor withDv =
                 plain.withProperties(
                         Collections.singletonMap(
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"));
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                "true"));
         assertThatThrownBy(
                         () ->
                                 flussIcebergCatalog.createTable(
                                         tablePath, withDv, new TestingLakeCatalogContext()))
                 .isInstanceOf(TableAlreadyExistException.class)
                 .hasMessageContaining("legacy layout")
-                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+                .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key());
     }
 
     /**
@@ -280,14 +282,15 @@ class IcebergLakeCatalogTest {
         TableDescriptor dvV1 =
                 plainV1.withProperties(
                         Collections.singletonMap(
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"));
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                "true"));
         assertThatThrownBy(
                         () ->
                                 flussIcebergCatalog.createTable(
                                         tablePath, dvV1, new TestingLakeCatalogContext()))
                 .isInstanceOf(InvalidTableException.class)
                 .hasMessageContaining("iceberg.format-version")
-                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+                .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key());
         assertThat(
                         flussIcebergCatalog
                                 .getIcebergCatalog()
@@ -300,7 +303,8 @@ class IcebergLakeCatalogTest {
                 TableDescriptor.builder()
                         .schema(flussSchema)
                         .distributedBy(4, "id")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .build();
         assertThatThrownBy(
                         () ->
@@ -314,7 +318,8 @@ class IcebergLakeCatalogTest {
                 v2Path,
                 plainV1.withProperties(
                         Collections.singletonMap(
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"),
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                "true"),
                         Collections.singletonMap("iceberg.format-version", "2")),
                 new TestingLakeCatalogContext());
     }

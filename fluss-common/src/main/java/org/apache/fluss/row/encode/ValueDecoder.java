@@ -51,14 +51,12 @@ public class ValueDecoder {
 
     /**
      * Returns the version offset of the value bytes of a table with deletion vectors, the log
-     * offset of the change that wrote them: the version offset slot of the versioned layout, or the
-     * tag of the tagged layout, which such a table tags its values with.
+     * offset of the change that wrote them, from the version offset slot of the versioned layout.
+     *
+     * @throws IllegalStateException if the layout has no version offset slot
      */
     public long decodeVersionOffset(byte[] valueBytes) {
-        MemorySegment segment = MemorySegment.wrap(valueBytes);
-        return kvValueLayout.hasVersionOffsetSlot()
-                ? kvValueLayout.readVersionOffset(segment, 0)
-                : kvValueLayout.readValueTag(segment);
+        return kvValueLayout.readVersionOffset(MemorySegment.wrap(valueBytes), 0);
     }
 
     /** Decode the value bytes and return the schema id and the row encoded in the value bytes. */

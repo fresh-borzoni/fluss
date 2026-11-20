@@ -17,7 +17,6 @@
 
 package org.apache.fluss.server.kv;
 
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.kv.snapshot.RowTtlFilterState;
 import org.apache.fluss.utils.clock.Clock;
@@ -48,8 +47,8 @@ import java.util.function.LongSupplier;
  * <p>P is the highest o the filter was capped for. It only moves forward, so every version at or
  * after P was protected since it was written, and a bucket is safe while its o is at least P. A KV
  * restored from a snapshot takes P and the tracked times below the snapshot's offset X from the
- * snapshot; without them, P is X, as a filter this leader did not cap compacted the files below it,
- * and the filter expires nothing until o passes X.
+ * snapshot; without them, which only a corrupt snapshot lacks, P is X, as a filter this leader did
+ * not cap compacted the files below it, and the filter expires nothing until o passes X.
  *
  * <p>The filter calls {@link #getAsLong} on compaction threads, at a compaction's first entry and
  * every 1,000 entries, never on a flush; the write path calls {@link #track}; the bucket's owner
@@ -86,10 +85,6 @@ public final class RowTtlFilterClock implements LongSupplier {
         this.ttlMs = ttlMs;
         this.times = new RowTtlEventTimes(clock, 0);
         this.expiresNothingSince = clock.milliseconds();
-    }
-
-    public long ttlMs() {
-        return ttlMs;
     }
 
     /** Names the bucket in the log lines. */
@@ -159,18 +154,11 @@ public final class RowTtlFilterClock implements LongSupplier {
     /**
      * Starts a KV restored from a snapshot at {@code snapshotOffset}: P and the tracked times its
      * leader saved, or without them P = {@code snapshotOffset} and nothing tracked below it. Saved
-     * times whose slices do not follow each other are not used.
+     * times whose slices do not follow each other are not used. Every KV snapshot of a table with
+     * row TTL saves them, so their lack is corruption, which the caller reports.
      */
     public synchronized void restored(long snapshotOffset, @Nullable RowTtlFilterState saved) {
         if (saved == null || !saved.slicesFollowEachOther()) {
-            if (saved != null) {
-                LOG.warn(
-                        "Not using the saved row TTL times of {}, whose slices do not follow each"
-                                + " other: the filter expires nothing below offset {}. {}",
-                        logName,
-                        snapshotOffset,
-                        saved);
-            }
             cappedFrom = Math.max(cappedFrom, snapshotOffset);
             times.restore(snapshotOffset, Collections.emptyList());
         } else {
@@ -208,16 +196,6 @@ public final class RowTtlFilterClock implements LongSupplier {
     public synchronized long capLagMs() {
         long now = clock.milliseconds();
         return lag(now, time(now));
-    }
-
-    @VisibleForTesting
-    synchronized long trackedFrom() {
-        return times.from();
-    }
-
-    @VisibleForTesting
-    synchronized long oldestTracked() {
-        return times.min();
     }
 
     @Override

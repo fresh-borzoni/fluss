@@ -38,6 +38,8 @@ import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
@@ -50,10 +52,13 @@ import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -69,17 +74,18 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsIgnoreOrder;
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Tests for the tiering of tables with deletion vectors ({@code table.deletion-vectors.enabled =
- * true}) to Iceberg v2 (file-scoped position deletes) and v3 (deletion vectors). They check the
- * lake through Iceberg: every lake snapshot Fluss commits has one live row per key, also after
- * rewrites, rollbacks and writes by other engines, dropped partitions, failed rounds, trims and
- * snapshot expiry. The union reads of these tables are tested in {@link
- * FlinkUnionReadDerivedDvITCase}.
+ * Tests for the tiering of tables with deletion vectors ({@code
+ * table.datalake.deletion-vectors.enabled = true}) to Iceberg v2 (file-scoped position deletes) and
+ * v3 (deletion vectors). They check the lake through Iceberg: every lake snapshot Fluss commits has
+ * one live row per key, also after rewrites, rollbacks and writes by other engines, dropped
+ * partitions, failed rounds, trims and snapshot expiry. The union reads of these tables are tested
+ * in {@link FlinkUnionReadDerivedDvITCase}.
  */
 class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
     // how long the trim tests keep writing rounds until a trim has seen the leaders' checkpoints
@@ -1023,8 +1029,8 @@ class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
 
     /**
      * A backlog larger than a round may hold, as after the tiering service was down, is tiered in
-     * several bounded rounds whose snapshots are each exact. A bucket's round ends once its writer
-     * holds the configured number of keys, and the next round starts at once from there.
+     * several bounded rounds whose snapshots are each exact. A bucket's leader plans its round to
+     * end after the configured number of records, and the next round starts at once from there.
      */
     @Test
     void testBacklogIsTieredInBoundedRounds() throws Exception {
@@ -1039,7 +1045,7 @@ class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
         org.apache.fluss.config.Configuration smallRounds =
                 new org.apache.fluss.config.Configuration();
         smallRounds.set(
-                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET,
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET,
                 keysPerBucket);
         JobClient jobClient = buildTieringJob(execEnv, getIcebergCatalogConf(), smallRounds);
         try {
@@ -1064,6 +1070,69 @@ class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
         } finally {
             jobClient.cancel().get();
         }
+    }
+
+    /**
+     * Rounds their leaders plan to end at the record cap, below the end of the log, delete exactly
+     * the rows their base holds of the keys they changed, and write only the versions still live at
+     * their end, through the leaders' masks or in sort mode. After several such rounds of updates,
+     * deletes and re-inserts, the lake table has one live row per live key, and union reads are
+     * exact, also before the changes are tiered.
+     */
+    @ParameterizedTest
+    @CsvSource({"2, true", "3, true", "3, false"})
+    void testCappedRoundsDeleteWhatTheySupersede(int formatVersion, boolean roundMasks)
+            throws Exception {
+        String tableName =
+                "derived_capped_rounds_v" + formatVersion + (roundMasks ? "" : "_sort_mode");
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        long tableId = createDerivedTable(tablePath, formatVersion, false);
+        Map<Integer, String> expected = new TreeMap<>();
+        int keys = 40;
+        int keysPerBucket = 3;
+        org.apache.fluss.config.Configuration smallRounds =
+                new org.apache.fluss.config.Configuration();
+        smallRounds.set(
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET,
+                keysPerBucket);
+        smallRounds.set(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_ROUND_MASK_ENABLED, roundMasks);
+        JobClient jobClient = buildTieringJob(execEnv, getIcebergCatalogConf(), smallRounds);
+        try {
+            for (int phase = 0; phase < 4; phase++) {
+                // every key is written: an insert, an update, or the re-insert of a deleted key
+                upsert(tablePath, expected, 0, keys, "v" + phase);
+                try (Table table = conn.getTable(tablePath)) {
+                    UpsertWriter writer = table.newUpsert().createWriter();
+                    for (int key = 0; key < keys; key++) {
+                        if (key % (phase + 2) == 0) {
+                            writer.delete(rowOf(key, expected.remove(key), null));
+                        } else if (key % (phase + 3) == 1) {
+                            writer.upsert(rowOf(key, "u" + phase + "_" + key, null));
+                            expected.put(key, "u" + phase + "_" + key);
+                        }
+                    }
+                    writer.flush();
+                }
+                List<String> expectedRows = new ArrayList<>();
+                expected.forEach((key, value) -> expectedRows.add(rowString(key, value, null)));
+                assertUnionRead(tableName, expectedRows);
+
+                waitUntilAllTiered(tablePath, tableId);
+                assertLakeRead(tableName, "c1, c2", expectedRows);
+                assertUnionRead(tableName, expectedRows);
+            }
+            org.apache.iceberg.Table lakeTable = icebergCatalog.loadTable(toIceberg(tablePath));
+            List<Long> addedPerRound = addedRecordsPerSnapshot(lakeTable);
+            assertThat(addedPerRound).allMatch(added -> added <= (long) keysPerBucket * BUCKETS);
+            assertThat(addedPerRound.size()).isGreaterThan(keys / (keysPerBucket * BUCKETS));
+        } finally {
+            jobClient.cancel().get();
+        }
+    }
+
+    private void assertUnionRead(String tableName, List<String> expected) throws Exception {
+        CloseableIterator<Row> rows = batchTEnv.executeSql("select * from " + tableName).collect();
+        assertResultsIgnoreOrder(rows, expected, true);
     }
 
     /** The change directories under rowPos that no chain marker registers. */
@@ -1219,14 +1288,21 @@ class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
     /** The files under a directory, without checksum files. */
     private static Set<String> filesUnder(String dir) throws Exception {
         java.nio.file.Path path = Paths.get(new URI(dir.startsWith("/") ? "file://" + dir : dir));
-        if (!Files.exists(path)) {
-            return Collections.emptySet();
-        }
-        try (Stream<java.nio.file.Path> files = Files.walk(path)) {
-            return files.filter(Files::isRegularFile)
-                    .map(java.nio.file.Path::toString)
-                    .filter(f -> !f.endsWith(".crc"))
-                    .collect(Collectors.toSet());
+        // a trim or a failed round's clean-up can delete a directory while it is walked
+        for (int attempt = 1; ; attempt++) {
+            if (!Files.exists(path)) {
+                return Collections.emptySet();
+            }
+            try (Stream<java.nio.file.Path> files = Files.walk(path)) {
+                return files.filter(Files::isRegularFile)
+                        .map(java.nio.file.Path::toString)
+                        .filter(f -> !f.endsWith(".crc"))
+                        .collect(Collectors.toSet());
+            } catch (UncheckedIOException e) {
+                if (!(e.getCause() instanceof NoSuchFileException) || attempt == 3) {
+                    throw e;
+                }
+            }
         }
     }
 
@@ -1271,51 +1347,6 @@ class FlinkDerivedDvTieringITCase extends FlinkDerivedDvTestBase {
                 for (DataFile file : writer.complete().dataFiles()) {
                     rewrite.addFile(file);
                 }
-            }
-        }
-        rewrite.commit();
-        table.refresh();
-        return table.currentSnapshot().snapshotId();
-    }
-
-    /**
-     * Rewrites every live data file of the unpartitioned lake table except {@code keep} into one
-     * file per bucket, dropping their delete files, like another engine's compaction of those
-     * files; returns the rewrite's snapshot.
-     */
-    private long rewriteDataFilesExcept(TablePath tablePath, Set<String> keep) throws Exception {
-        org.apache.iceberg.Table table = icebergCatalog.loadTable(toIceberg(tablePath));
-        long baseSnapshotId = table.currentSnapshot().snapshotId();
-        Function<FileScanTask, Integer> bucketOf = IcebergSplitPlanner.createBucketExtractor(table);
-        RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(baseSnapshotId);
-        Map<Integer, List<Record>> liveByBucket = new TreeMap<>();
-        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
-            for (FileScanTask task : tasks) {
-                if (keep.contains(task.file().location())) {
-                    continue;
-                }
-                rewrite.deleteFile(task.file());
-                task.deletes().forEach(rewrite::deleteFile);
-                List<Record> live =
-                        liveByBucket.computeIfAbsent(bucketOf.apply(task), k -> new ArrayList<>());
-                // the reader applies the task's deletes
-                try (CloseableIterable<Record> records =
-                        new IcebergGenericReader(table.newScan(), true).open(task)) {
-                    for (Record record : records) {
-                        live.add(record.copy());
-                    }
-                }
-            }
-        }
-        assertThat(liveByBucket).isNotEmpty();
-        for (Map.Entry<Integer, List<Record>> e : liveByBucket.entrySet()) {
-            TaskWriter<Record> writer =
-                    TaskWriterFactory.createTaskWriter(table, null, e.getKey(), true);
-            for (Record record : e.getValue()) {
-                writer.write(record);
-            }
-            for (DataFile file : writer.complete().dataFiles()) {
-                rewrite.addFile(file);
             }
         }
         rewrite.commit();

@@ -31,6 +31,7 @@ import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
 import org.apache.fluss.lake.lakestorage.TestingLakeCatalogContext;
 import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.RoundMaskMismatchException;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.Schema;
@@ -72,9 +73,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
@@ -104,6 +107,7 @@ class DerivedDvRecordWriterTest {
     private FlussPositionIndexStore store;
     private TablePath tablePath;
     private TableInfo tableInfo;
+    private int indexDirs;
 
     @BeforeEach
     void beforeEach() {
@@ -196,7 +200,7 @@ class DerivedDvRecordWriterTest {
                                 .map(DerivedDvRecordWriterTest::fileName)
                                 .collect(Collectors.toList()));
         Published published = publish(part);
-        assertThat(published.keys).hasSize(expected.size());
+        assertThat(published.index.size() + published.deletions).isEqualTo(expected.size());
         assertThat(published.index).isEqualTo(positions);
         assertThat(published.deletions).isEqualTo(part.deletes());
     }
@@ -243,6 +247,36 @@ class DerivedDvRecordWriterTest {
         // the closed writer staged nothing, so the part is the new writer's alone
         Published published = publish(result.stagedIndexPart());
         assertThat(published.index).isEqualTo(positions);
+    }
+
+    /**
+     * A writer closed before its round completes, as the masked writer of a round the reader reads
+     * again, drops the data files it wrote: they are never committed.
+     */
+    @Test
+    void testAWriterClosedBeforeItsRoundCompletesDropsItsDataFiles() throws Exception {
+        Table table = createTable("dropped_files", 3);
+        WriterMemoryPool pool = new WriterMemoryPool(1 << 20);
+        LakeWriter<IcebergWriteResult> dropped =
+                tieringFactory.createLakeWriter(initContext(pool, true));
+        for (int i = 0; i < 1_000; i++) {
+            dropped.write(record(i, ChangeType.INSERT, i, "v" + i));
+        }
+        dropped.close();
+        assertThat(dataFiles(table)).isEmpty();
+        assertThat(pool.used()).isZero();
+
+        // the same round completed keeps its files: they are the write result's
+        IcebergWriteResult result;
+        try (LakeWriter<IcebergWriteResult> completed =
+                tieringFactory.createLakeWriter(initContext(pool, true))) {
+            for (int i = 0; i < 1_000; i++) {
+                completed.write(record(i, ChangeType.INSERT, i, "v" + i));
+            }
+            result = completed.complete();
+        }
+        assertThat(dataFiles(table)).hasSize(result.getWriteResult().dataFiles().length);
+        assertThat(pool.used()).isZero();
     }
 
     /**
@@ -302,7 +336,154 @@ class DerivedDvRecordWriterTest {
         assertThat(stagedPartDirs()).isEmpty();
     }
 
+    /**
+     * A round read through its leader's mask is written as it comes and gives the same lake table
+     * and the same index part as the round read whole in sort mode: one live row per key, the last
+     * version, and every key the round changed, at its row or deleted. A mask that misses versions
+     * leaves a key written twice in the round: the writer finds it as it completes, fails with a
+     * mismatch and drops its files, and the round written again in sort mode gives the same lake
+     * table. Random rounds of inserts, updates, deletes and re-inserts of hot and cold keys, at
+     * churns from none to almost all, with the exact mask and with masks that miss versions; narrow
+     * and wide rows; buffers that spill or not.
+     */
+    @ParameterizedTest(name = "seed {0}")
+    @ValueSource(longs = {1, 2, 3, 4, 5, 6, 7, 8})
+    void testMaskedRoundsWriteWhatSortedRoundsWrite(long seed) throws Exception {
+        Random random = new Random(seed);
+        Table table = createTable("masked_v" + (2 + seed % 2) + "_" + seed, (int) (2 + seed % 2));
+        for (int trial = 0; trial < 6; trial++) {
+            int churn = random.nextInt(100);
+            int keys = 1 + random.nextInt(random.nextBoolean() ? 50 : 3_000);
+            int changes = random.nextInt(4_000);
+            int valueLength = random.nextBoolean() ? 4 : 600;
+            WriterMemoryPool pool =
+                    new WriterMemoryPool(random.nextBoolean() ? 32 * 1024 : 64 << 20);
+            List<LogRecord> round = new ArrayList<>();
+            // the offset of each key's live version, and the versions a later change supersedes
+            Map<Integer, Long> live = new HashMap<>();
+            Set<Long> superseded = new HashSet<>();
+            long offset = 0;
+            for (int c = 0; c < changes; c++) {
+                boolean update = !live.isEmpty() && random.nextInt(100) < churn;
+                int key = update ? pickLive(live, random) : random.nextInt(keys);
+                Long previous = live.get(key);
+                String value = value(key, c, valueLength);
+                if (previous != null && random.nextInt(5) == 0) {
+                    round.add(record(offset++, ChangeType.DELETE, key, "gone"));
+                    superseded.add(previous);
+                    live.remove(key);
+                } else if (previous != null) {
+                    round.add(record(offset++, ChangeType.UPDATE_BEFORE, key, "before"));
+                    round.add(record(offset, ChangeType.UPDATE_AFTER, key, value));
+                    superseded.add(previous);
+                    live.put(key, offset++);
+                } else {
+                    round.add(record(offset, ChangeType.INSERT, key, value));
+                    live.put(key, offset++);
+                }
+            }
+            // in odd trials the mask misses some versions, which fails the masked write
+            Set<Long> mask = new HashSet<>(superseded);
+            if (trial % 2 == 1) {
+                mask.removeIf(v -> random.nextInt(3) == 0);
+            }
+
+            Written sorted = writeRound(table, pool, false, round, mask);
+            Written masked;
+            if (mask.equals(superseded)) {
+                masked = writeRound(table, pool, true, round, mask);
+            } else {
+                int files = dataFiles(table).size();
+                assertThatThrownBy(() -> writeRound(table, pool, true, round, mask))
+                        .as("trial %d", trial)
+                        .isInstanceOf(RoundMaskMismatchException.class)
+                        .hasMessageContaining("comes again");
+                assertThat(dataFiles(table)).hasSize(files);
+                // the round is written again in sort mode
+                masked = writeRound(table, pool, false, round, mask);
+            }
+            assertThat(masked.rows).as("trial %d", trial).isEqualTo(sorted.rows);
+            assertThat(masked.index).as("trial %d", trial).isEqualTo(sorted.index);
+            assertThat(masked.part.keys()).isEqualTo(sorted.part.keys());
+            assertThat(masked.part.deletes()).isEqualTo(sorted.part.deletes());
+            assertThat(pool.used()).isZero();
+        }
+    }
+
     // ------------------------------------------------------------------------------------------
+
+    /** What a round wrote: live rows by key, and its index part as "key -> value or deleted". */
+    private static final class Written {
+        final Map<Integer, String> rows = new HashMap<>();
+        final Map<String, String> index = new TreeMap<>();
+        StagedIndexPart part;
+    }
+
+    /**
+     * Writes a round, through the mask if {@code masked}: the records the mask keeps and no -U, as
+     * the tiering reader hands them over; else every record. Reads back the rows of its data files,
+     * one live row per key, and publishes its index part.
+     */
+    private Written writeRound(
+            Table table,
+            WriterMemoryPool pool,
+            boolean masked,
+            List<LogRecord> round,
+            Set<Long> mask)
+            throws Exception {
+        // a fresh index store, whose chain the part is published into alone
+        indexDir = new File(tmp, "index-" + indexDirs++);
+        store = new FlussPositionIndexStore(new FsPath(indexDir.toURI()));
+        IcebergWriteResult result;
+        try (LakeWriter<IcebergWriteResult> writer =
+                tieringFactory.createLakeWriter(initContext(pool, masked))) {
+            for (LogRecord record : round) {
+                if (masked
+                        && (record.getChangeType() == ChangeType.UPDATE_BEFORE
+                                || mask.contains(record.logOffset()))) {
+                    continue;
+                }
+                writer.write(record);
+            }
+            result = writer.complete();
+        }
+        Written written = new Written();
+        written.part = result.stagedIndexPart();
+        // file name -> rows by position
+        Map<String, List<Record>> files = new HashMap<>();
+        for (DataFile file : result.getWriteResult().dataFiles()) {
+            List<Record> rows = read(table, file);
+            files.put(fileName(file), rows);
+            for (Record row : rows) {
+                assertThat(
+                                written.rows.put(
+                                        (Integer) row.getField("id"), (String) row.getField("v")))
+                        .as("one live row per key")
+                        .isNull();
+            }
+        }
+        Published published = publish(written.part);
+        for (Map.Entry<String, String> e : published.index.entrySet()) {
+            String[] filePos = e.getValue().split("@");
+            Record row = files.get(filePos[0]).get(Integer.parseInt(filePos[1]));
+            written.index.put(e.getKey(), (String) row.getField("v"));
+        }
+        assertThat(published.deletions).isEqualTo(written.part.deletes());
+        return written;
+    }
+
+    private static int pickLive(Map<Integer, Long> live, Random random) {
+        List<Integer> keys = new ArrayList<>(live.keySet());
+        return keys.get(random.nextInt(keys.size()));
+    }
+
+    private static String value(int key, int change, int length) {
+        StringBuilder value = new StringBuilder("v" + key + "_" + change + "_");
+        while (value.length() < length) {
+            value.append((char) ('a' + (value.length() * 31 + change) % 26));
+        }
+        return value.toString();
+    }
 
     private Table createTable(String name, int formatVersion) throws Exception {
         tablePath = TablePath.of("iceberg", name);
@@ -316,7 +497,7 @@ class DerivedDvRecordWriterTest {
                                         .build())
                         .distributedBy(1, "id")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .customProperty("iceberg.format-version", String.valueOf(formatVersion))
                         .build();
         try (IcebergLakeCatalog catalog = new IcebergLakeCatalog(configuration)) {
@@ -331,8 +512,13 @@ class DerivedDvRecordWriterTest {
     }
 
     private WriterInitContext initContext(WriterMemoryPool pool) {
+        return initContext(pool, false);
+    }
+
+    private WriterInitContext initContext(WriterMemoryPool pool, boolean masked) {
         TablePath path = tablePath;
         TableInfo info = tableInfo;
+        File index = indexDir;
         return new DeletionVectorWriterInitContext() {
             @Override
             public TablePath tablePath() {
@@ -367,7 +553,7 @@ class DerivedDvRecordWriterTest {
 
             @Override
             public String positionIndexDir() {
-                return indexDir.toURI().toString();
+                return index.toURI().toString();
             }
 
             @Override
@@ -378,6 +564,11 @@ class DerivedDvRecordWriterTest {
             @Override
             public int bucketCount() {
                 return 1;
+            }
+
+            @Override
+            public boolean roundMasked() {
+                return masked;
             }
         };
     }
@@ -398,6 +589,23 @@ class DerivedDvRecordWriterTest {
         row.setField(0, key);
         row.setField(1, value == null ? null : BinaryString.fromString(value));
         return new GenericRecord(offset, 1_000L, type, row);
+    }
+
+    /** The data files under the table's location. */
+    private static List<java.nio.file.Path> dataFiles(Table table) throws Exception {
+        String path = table.location();
+        java.nio.file.Path location =
+                path.startsWith("file:")
+                        ? java.nio.file.Paths.get(new java.net.URI(path))
+                        : java.nio.file.Paths.get(path);
+        if (!java.nio.file.Files.exists(location)) {
+            return Collections.emptyList();
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> paths =
+                java.nio.file.Files.walk(location)) {
+            return paths.filter(p -> p.toString().endsWith(".parquet"))
+                    .collect(Collectors.toList());
+        }
     }
 
     private byte[] encode(int key) {
@@ -434,7 +642,6 @@ class DerivedDvRecordWriterTest {
     }
 
     private static final class Published {
-        final List<byte[]> keys = new ArrayList<>();
         final Map<String, String> index = new TreeMap<>();
         long deletions;
     }
@@ -449,13 +656,7 @@ class DerivedDvRecordWriterTest {
         Published published = new Published();
         long changeId = 4242L;
         PositionIndexStore.BucketPart publishedPart =
-                store.publishStaged(
-                        part.stagingId(),
-                        changeId,
-                        bucket,
-                        part.part(),
-                        newIds,
-                        published.keys::add);
+                store.publishStaged(part.stagingId(), changeId, bucket, part.part(), newIds);
         Map<Integer, String> added = new HashMap<>();
         for (Map.Entry<Integer, String> f : part.files().entrySet()) {
             added.put(100 + f.getKey(), f.getValue());

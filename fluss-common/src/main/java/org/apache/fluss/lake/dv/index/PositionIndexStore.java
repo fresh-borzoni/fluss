@@ -165,17 +165,16 @@ public interface PositionIndexStore {
 
     /**
      * Publishes a part staged under {@code stagingId} as the bucket's part of change {@code
-     * changeId}, with the file ids that {@code newIds} maps the part's ids to. Passes every key of
-     * the part to {@code keys}, in key order. The staged part is kept, so a round that runs again
-     * publishes it again. It is deleted with its staging change ({@link #abortChange}).
+     * changeId}, with the file ids that {@code newIds} maps the part's ids to. The staged part is
+     * kept, so a round that runs again publishes it again. It is deleted with its staging change
+     * ({@link #abortChange}).
      */
     BucketPart publishStaged(
             long stagingId,
             long changeId,
             TableBucket bucket,
             BucketPart staged,
-            Map<Integer, Integer> newIds,
-            KeyConsumer keys)
+            Map<Integer, Integer> newIds)
             throws IOException;
 
     /**
@@ -432,12 +431,6 @@ public interface PositionIndexStore {
         /** Deletes what is local of an unfinished part; stored SSTs go with the staging change. */
         @Override
         void close();
-    }
-
-    /** Takes the keys of a published part. */
-    @FunctionalInterface
-    interface KeyConsumer {
-        void accept(byte[] key) throws IOException;
     }
 
     /** One bucket's stored part of a change, as {@link #writeBucket} returns it. */

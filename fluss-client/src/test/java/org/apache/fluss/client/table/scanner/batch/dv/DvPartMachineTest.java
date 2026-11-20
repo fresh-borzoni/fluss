@@ -52,7 +52,6 @@ import java.util.List;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.client.table.scanner.batch.dv.DvPartState.CLOSED;
@@ -91,6 +90,9 @@ class DvPartMachineTest {
     // the rows of the standard bucket as of cut 107, after offset 106 updated key 0
     private static final List<String> AT_107 =
             Arrays.asList("0=late", "1=b", "2=a", "3=a", "5=a", "6=b");
+    // the live rows of the standard bucket's first and second lake file as of cut 107
+    private static final List<String> FIRST_FILE_AT_107 = Collections.singletonList("2=a");
+    private static final List<String> SECOND_FILE_AT_107 = Arrays.asList("3=a", "5=a");
     // the rows of the standard bucket's lake files, unmasked
     private static final List<String> LAKE_ROWS =
             Arrays.asList("0=a", "1=a", "2=a", "3=a", "4=a", "5=a");
@@ -100,8 +102,6 @@ class DvPartMachineTest {
     private final DvTestBucket.FileLakeSource lake = bucket.lake;
     private final DvTestBucket.Context context = bucket.context;
     private PinningServer pins;
-    // the cuts the leader pinned for parts that pinned their own
-    private final AtomicInteger takenPins = new AtomicInteger();
 
     @BeforeEach
     void setUp() {
@@ -136,11 +136,9 @@ class DvPartMachineTest {
         PLANNED(DvPartState.PLANNED, 0, 0),
         /** That part once pinned: the fetch of the masks of its second lake file. */
         PINNED(DvPartState.PINNED, 1, 1),
-        /** A whole-bucket part pinned at planning: its first fetch. */
-        PINNED_AT_PLANNING(DvPartState.PINNED_AT_PLANNING, 0, 0),
         /** A part of the first lake file of a bucket pinned at planning: its first fetch. */
-        PINNED_AT_PLANNING_SHARED(DvPartState.PINNED_AT_PLANNING, 0, 0),
-        /** A whole-bucket part pinned at planning, restored at its second lake file. */
+        PINNED_AT_PLANNING(DvPartState.PINNED_AT_PLANNING, 0, 0),
+        /** A part of both lake files of a bucket pinned at planning, restored at the second. */
         PINNED_AT_PLANNING_STARTED(DvPartState.PINNED_AT_PLANNING, 0, 0);
 
         final DvPartState state;
@@ -198,9 +196,7 @@ class DvPartMachineTest {
                     case INTERRUPTED:
                         return FAILED;
                     default:
-                        return where == Where.PINNED_AT_PLANNING
-                                ? PLANNED
-                                : where == Where.PINNED_AT_PLANNING_SHARED ? FOLDING : FAILED;
+                        return where == Where.PINNED_AT_PLANNING ? FOLDING : FAILED;
                 }
         }
     }
@@ -218,9 +214,6 @@ class DvPartMachineTest {
                 .as("states %s", outcome.history)
                 .isEqualTo(next);
         assertThat(outcome.history).last().isEqualTo(CLOSED);
-        // every pin of the part's own is released as its read ends, also if it failed
-        assertThat(outcome.releasesBeforeClose).isEqualTo(takenPins.get());
-        assertThat(bucket.releases()).hasSize(takenPins.get());
         if (next == FAILED) {
             assertThat(outcome.failure).isNotNull();
             assertThat(outcome.history).containsSubsequence(FAILED, CLOSED);
@@ -242,7 +235,6 @@ class DvPartMachineTest {
 
         assertThat(outcome.history).containsExactly(PLANNED, FOLDING, FAILED, CLOSED);
         assertThat(outcome.failure).hasMessageContaining("lake file gone");
-        assertThat(bucket.releases()).isEmpty();
     }
 
     /** A part that cannot plan the snapshot its leader covers fails, also when interrupted. */
@@ -341,7 +333,7 @@ class DvPartMachineTest {
     @Test
     void testPartitionDroppedSinceARestoredPartReadItsLogFails() throws Exception {
         Checkpoint checkpoint = checkpointIn(READING_LOG);
-        assertThat(checkpoint.part.sharesBucket()).isFalse();
+        assertThat(checkpoint.part.isPinned()).isFalse();
         assertThat(checkpoint.rows).isNotEmpty();
         bucket.log.subscribeFails = true;
 
@@ -390,25 +382,18 @@ class DvPartMachineTest {
     // ------------------------------------------------------------------------------------------
     // Close and restore in every state
 
-    /**
-     * A part closed in any state releases the pin of its own it holds, and asks its leader nothing
-     * more. It holds one exactly while it is PINNED, or reads with the masks of that pin.
-     */
+    /** A part closed in any state asks its leader nothing more. */
     @ParameterizedTest
     @EnumSource(DvPartState.class)
     void testCloseInEveryState(DvPartState state) throws Exception {
         DvBucketPartReader reader = readerIn(state);
         assertThat(reader.state()).isEqualTo(state);
-        boolean holdsOwnPin =
-                state == PINNED || state == READY || state == READING_LAKE || state == READING_LOG;
-        assertThat(takenPins.get() - bucket.releases().size()).isEqualTo(holdsOwnPin ? 1 : 0);
         int requests = server.requests().size();
 
         reader.close();
 
         assertThat(reader.state()).isEqualTo(CLOSED);
-        assertThat(bucket.releases()).hasSize(takenPins.get());
-        assertThat(server.requests()).hasSize(requests + (holdsOwnPin ? 1 : 0));
+        assertThat(server.requests()).hasSize(requests);
         assertThatThrownBy(() -> reader.pollBatch(Duration.ofMillis(10)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("closed");
@@ -435,8 +420,7 @@ class DvPartMachineTest {
         assertThat(outcome.failure).isNull();
         List<String> rows = new ArrayList<>(checkpoint.rows);
         rows.addAll(outcome.rows);
-        assertThat(rows).containsExactlyInAnyOrderElementsOf(AT_107);
-        assertThat(bucket.releases()).hasSize(takenPins.get());
+        assertThat(rows).containsExactlyInAnyOrderElementsOf(checkpoint.expected);
     }
 
     /** The state a part restored from its checkpoint in {@code state} starts in. */
@@ -472,7 +456,7 @@ class DvPartMachineTest {
         assertThat(initialState(bucket.bucketPart())).isEqualTo(PLANNED);
         assertThat(initialState(bucket.bucketPart().withLakeSplitsPlannedAtStart()))
                 .isEqualTo(REPLANNING);
-        assertThat(initialState(bucket.pinnedPart(files, DvBucketPart.WHOLE_BUCKET, CUT)))
+        assertThat(initialState(bucket.pinnedPart(files.subList(0, 1), 0, CUT)))
                 .isEqualTo(PINNED_AT_PLANNING);
         assertThat(initialState(masked.withMaskState(null))).isEqualTo(PLANNED);
         assertThat(initialState(checkpoint(masked, 1, -1L))).isEqualTo(RESUMING);
@@ -509,7 +493,7 @@ class DvPartMachineTest {
                 return reader;
             case PINNED_AT_PLANNING:
                 return new DvBucketPartReader(
-                        bucket.pinnedPart(files, DvBucketPart.WHOLE_BUCKET, CUT), context);
+                        bucket.pinnedPart(files.subList(0, 1), 0, CUT), context);
             case FOLDING:
                 answer(Answer.REBUILDING, 0);
                 reader = new DvBucketPartReader(bucket.bucketPart(), context);
@@ -518,7 +502,6 @@ class DvPartMachineTest {
             case RESUMING:
                 DvBucketPart resolved = read(bucket.bucketPart()).resolved;
                 server.clearRequests();
-                takenPins.set(0);
                 return new DvBucketPartReader(checkpoint(resolved, 1, -1L), context);
             case FAILED:
                 answer(Answer.ROLLED_BACK, 0);
@@ -550,14 +533,23 @@ class DvPartMachineTest {
         }
     }
 
-    /** What an engine checkpointed of a part, and the rows it emitted before. */
+    /**
+     * What an engine checkpointed of a part, the rows it emitted before, and those the part returns
+     * over its whole read.
+     */
     private static final class Checkpoint {
         final DvBucketPart part;
         final List<String> rows;
+        final List<String> expected;
 
         Checkpoint(DvBucketPart part, List<String> rows) {
+            this(part, rows, AT_107);
+        }
+
+        Checkpoint(DvBucketPart part, List<String> rows, List<String> expected) {
             this.part = part;
             this.rows = rows;
+            this.expected = expected;
         }
     }
 
@@ -579,21 +571,16 @@ class DvPartMachineTest {
                 return new Checkpoint(bucket.bucketPart(), Collections.emptyList());
             case PINNED_AT_PLANNING:
                 return new Checkpoint(
-                        bucket.pinnedPart(files, DvBucketPart.WHOLE_BUCKET, CUT),
-                        Collections.emptyList());
+                        bucket.pinnedPart(files.subList(0, 1), 0, CUT),
+                        Collections.emptyList(),
+                        FIRST_FILE_AT_107);
             case FOLDING:
                 // folded at planning
                 return new Checkpoint(
                         DvBucketPart.pinnedFolded(
-                                BUCKET,
-                                null,
-                                SNAPSHOT,
-                                100L,
-                                CUT,
-                                files,
-                                DvBucketPart.WHOLE_BUCKET,
-                                CUT),
-                        Collections.emptyList());
+                                BUCKET, null, SNAPSHOT, 100L, CUT, files.subList(0, 1), 0, CUT),
+                        Collections.emptyList(),
+                        FIRST_FILE_AT_107);
             case READY:
                 DvBucketPartReader ready = readerIn(READY);
                 DvBucketPart resolved = ready.resolve();
@@ -664,12 +651,9 @@ class DvPartMachineTest {
             case PINNED:
                 return bucket.bucketPart();
             case PINNED_AT_PLANNING:
-                return bucket.pinnedPart(files, DvBucketPart.WHOLE_BUCKET, CUT);
-            case PINNED_AT_PLANNING_SHARED:
                 return bucket.pinnedPart(files.subList(0, 1), 0, CUT);
             default:
-                return bucket.pinnedPart(files, DvBucketPart.WHOLE_BUCKET, CUT)
-                        .atPosition(1, 0, -1L);
+                return bucket.pinnedPart(files, 0, CUT).atPosition(1, 0, -1L);
         }
     }
 
@@ -680,12 +664,11 @@ class DvPartMachineTest {
         }
         List<String> rows = resolved.getMaskLogEndOffset() == CUT ? AT_107 : EXACT;
         switch (where) {
-            case PINNED_AT_PLANNING_SHARED:
-                // the live rows of the first lake file
-                return Collections.singletonList("2=a");
+            case PINNED_AT_PLANNING:
+                return FIRST_FILE_AT_107;
             case PINNED_AT_PLANNING_STARTED:
-                // all but those of the first lake file, read before
-                return rows.stream().filter(r -> !r.equals("2=a")).collect(Collectors.toList());
+                // the first lake file was read before
+                return SECOND_FILE_AT_107;
             default:
                 return rows;
         }
@@ -702,11 +685,7 @@ class DvPartMachineTest {
                 request -> {
                     int n = seen.getAndIncrement();
                     if (answer == Answer.MASKS || n < at || n >= at + attempts) {
-                        GetDvSnapshotResponse response = pins.answer(request);
-                        if (!request.hasLogEndOffset()) {
-                            takenPins.incrementAndGet();
-                        }
-                        return response;
+                        return pins.answer(request);
                     }
                     switch (answer) {
                         case REBUILDING:
@@ -761,7 +740,6 @@ class DvPartMachineTest {
         @Nullable DvBucketPart resolved;
         @Nullable Exception failure;
         List<DvPartState> history;
-        int releasesBeforeClose;
     }
 
     private Outcome read(DvBucketPart part) {
@@ -779,7 +757,6 @@ class DvPartMachineTest {
         } catch (Exception e) {
             outcome.failure = e;
         } finally {
-            outcome.releasesBeforeClose = bucket.releases().size();
             // a reader interrupted while it fetched masks interrupts its thread again
             Thread.interrupted();
             try {

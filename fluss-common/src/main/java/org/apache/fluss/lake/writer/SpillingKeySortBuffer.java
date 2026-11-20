@@ -165,14 +165,6 @@ public final class SpillingKeySortBuffer implements WriterMemoryPool.MemoryOwner
         return n;
     }
 
-    /**
-     * At least the number of distinct keys added. A key in several sorted runs, or added several
-     * times since the last spill, is counted that many times.
-     */
-    public long distinctKeysUpperBound() {
-        return records();
-    }
-
     /** The encoded bytes of the records in memory and on local disk. */
     public long bytes() {
         long n = recordLengths;

@@ -319,6 +319,11 @@ final class DvMaskState {
         }
     }
 
+    /** Whether the bucket's test hooks, or its tablet server's, pause the background resolves. */
+    private boolean resolvesPaused() {
+        return o.testHooks.pausesResolves() || o.rebuild.limiter.resolvesPaused();
+    }
+
     /**
      * Applies what the high watermark passed and starts a lookup of the next chunk of keys whose
      * lake positions the masks need. One chunk is looked up at a time, each in a task of its own on
@@ -329,7 +334,7 @@ final class DvMaskState {
         if (o.closed) {
             return;
         }
-        if (o.testHooks.pausesResolves()) {
+        if (resolvesPaused()) {
             scheduleResolve(RESOLVE_WAIT_HW_MS);
             return;
         }
@@ -676,7 +681,7 @@ final class DvMaskState {
             if (o.closed) {
                 return;
             }
-            if (o.testHooks.pausesResolves()) {
+            if (resolvesPaused()) {
                 paused = true;
                 return;
             }

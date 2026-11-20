@@ -24,12 +24,14 @@ import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FetchException;
+import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.MemoryLogRecordsIndexedBuilder;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -38,12 +40,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.fluss.record.LogRecordBatch.CURRENT_LOG_MAGIC_VALUE;
 import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
@@ -53,6 +58,7 @@ import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.record.TestData.TEST_SCHEMA_GETTER;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
+import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithBaseOffset;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -352,6 +358,73 @@ public class LogFetchCollectorTest {
                 .hasMessageContaining("INVALID_BUCKET_ROUTING");
     }
 
+    /**
+     * A batch without records, such as one of deletes of keys that do not exist, takes its offsets
+     * all the same: the poll that reads it reports them, so a reader can tell every offset it
+     * consumed was a record or one of those.
+     */
+    @Test
+    void testBatchesWithoutRecordsAreReportedWithTheirOffsets() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        logFetchCollector =
+                new LogFetchCollector(
+                        logScannerStatus,
+                        new Configuration()
+                                .set(ConfigOptions.CLIENT_SCANNER_LOG_MAX_POLL_RECORDS, 10),
+                        new TestingMetadataUpdater(
+                                Collections.singletonMap(DATA1_TABLE_PATH, DATA1_TABLE_INFO)));
+        // records at 0-9, a batch without records at 10, records at 11-20
+        ByteArrayOutputStream log = new ByteArrayOutputStream();
+        append(log, genMemoryLogRecordsWithBaseOffset(0, DATA1));
+        append(
+                log,
+                MemoryLogRecords.pointToBytesView(
+                        MemoryLogRecordsIndexedBuilder.builder(
+                                        10L,
+                                        DEFAULT_SCHEMA_ID,
+                                        Integer.MAX_VALUE,
+                                        CURRENT_LOG_MAGIC_VALUE,
+                                        new UnmanagedPagedOutputView(100))
+                                .build()));
+        append(log, genMemoryLogRecordsWithBaseOffset(11, DATA1));
+        logFetchBuffer.add(
+                makeCompletedFetch(
+                        tb,
+                        FetchLogResultForBucket.records(
+                                tb,
+                                MemoryLogRecords.pointToBytes(log.toByteArray()),
+                                21L,
+                                -1L,
+                                -1L),
+                        0L));
+
+        ScanRecords first = logFetchCollector.collectFetch(logFetchBuffer);
+        assertThat(first.records(tb)).hasSize(10);
+        assertThat(first.consumedUpToOffset(tb)).isEqualTo(10L);
+        assertThat(first.offsetsWithoutRecords(tb)).isEmpty();
+
+        ScanRecords second = logFetchCollector.collectFetch(logFetchBuffer);
+        assertThat(second.records(tb))
+                .extracting(ScanRecord::logOffset)
+                .containsExactlyElementsOf(offsets(11, 21));
+        assertThat(second.consumedUpToOffset(tb)).isEqualTo(21L);
+        assertThat(second.offsetsWithoutRecords(tb)).containsExactly(new long[] {10L, 11L});
+    }
+
+    private static void append(ByteArrayOutputStream log, MemoryLogRecords records) {
+        byte[] bytes = new byte[records.sizeInBytes()];
+        records.getMemorySegment().get(records.getPosition(), bytes, 0, bytes.length);
+        log.write(bytes, 0, bytes.length);
+    }
+
+    private static List<Long> offsets(long from, long to) {
+        List<Long> offsets = new ArrayList<>();
+        for (long offset = from; offset < to; offset++) {
+            offsets.add(offset);
+        }
+        return offsets;
+    }
+
     private DefaultCompletedFetch makeCompletedFetch(
             TableBucket tableBucket, FetchLogResultForBucket resultForBucket, long offset) {
         return new DefaultCompletedFetch(
@@ -363,6 +436,41 @@ public class LogFetchCollectorTest {
                 true,
                 offset,
                 null);
+    }
+
+    /**
+     * A fetch that a seek left behind is drained without a word on the bucket's progress: its next
+     * offset is that of the subscription before the seek, so reporting it would tell a reader the
+     * bucket was consumed past records it never got.
+     */
+    @Test
+    void testFetchLeftBehindBySeekReportsNoProgress() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
+        logFetchCollector =
+                new LogFetchCollector(
+                        logScannerStatus,
+                        new Configuration()
+                                .set(ConfigOptions.CLIENT_SCANNER_LOG_MAX_POLL_RECORDS, 3),
+                        new TestingMetadataUpdater(
+                                Collections.singletonMap(DATA1_TABLE_PATH, DATA1_TABLE_INFO)));
+        CompletedFetch fetch =
+                makeCompletedFetch(
+                        tb,
+                        FetchLogResultForBucket.records(
+                                tb, genMemoryLogRecordsByObject(DATA1), 10L, -1L, -1L),
+                        0L);
+        logFetchBuffer.add(fetch);
+        ScanRecords first = logFetchCollector.collectFetch(logFetchBuffer);
+        assertThat(first.records(tb)).extracting(ScanRecord::logOffset).containsExactly(0L, 1L, 2L);
+        assertThat(first.consumedUpToOffset(tb)).isEqualTo(3L);
+
+        // the bucket is read again from its start, while the rest of the fetch is in line
+        logScannerStatus.assignScanBuckets(Collections.singletonMap(tb, 0L));
+        ScanRecords second = logFetchCollector.collectFetch(logFetchBuffer);
+
+        assertThat(second.buckets()).doesNotContain(tb);
+        assertThat(fetch.isConsumed()).isTrue();
+        assertThat(logScannerStatus.getBucketOffset(tb)).isZero();
     }
 
     @Test

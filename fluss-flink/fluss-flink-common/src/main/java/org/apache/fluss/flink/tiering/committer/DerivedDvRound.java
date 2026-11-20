@@ -17,7 +17,9 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.RoundDeletes;
 import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringCommitResult;
 import org.apache.fluss.config.ConfigOptions;
@@ -25,7 +27,10 @@ import org.apache.fluss.lake.committer.LakeBaseChangedException;
 import org.apache.fluss.lake.committer.LakeCommitRejectedException;
 import org.apache.fluss.lake.committer.LakeCommitResult;
 import org.apache.fluss.lake.committer.LakeCommitter;
+import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
 import org.apache.fluss.lake.dv.FormatVersions;
+import org.apache.fluss.lake.dv.PreparedDeletionVectors;
+import org.apache.fluss.lake.dv.PreparedDeletionVectorsProvider;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.dv.index.StagedIndexPartProvider;
@@ -37,12 +42,15 @@ import org.slf4j.Logger;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
@@ -56,8 +64,8 @@ import static org.apache.fluss.flink.tiering.committer.DerivedDvContext.position
 import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY;
 
 /**
- * Runs a round of a lake that takes deletes (Iceberg): it looks up the lake positions of the rows
- * it supersedes in the base's index, publishes its index change, and commits data and deletes in
+ * Runs a round of a lake that takes deletes (Iceberg): it takes the lake positions of the rows it
+ * supersedes from the buckets' leaders, publishes its index change, and commits data and deletes in
  * one lake commit, which is the round's commit point.
  *
  * <p>B is the snapshot registered in Fluss when the round starts, its base. An attempt of the round
@@ -79,8 +87,8 @@ import static org.apache.fluss.lake.committer.LakeCommitter.FLUSS_LAKE_SNAP_BUCK
  *       runs again at once if the re-index is already published.
  *   <li>{@link Phase#OFFSETS_WRITTEN}: the offsets file of the snapshot.
  *   <li>{@link Phase#INDEX_PUBLISHED}: the writers' staged parts are published as index change I,
- *       committed in the store and not registered, with the base positions of the changed keys
- *       looked up on the leaders; the chain would take I from B.
+ *       committed in the store and not registered, with the base positions the round deletes from
+ *       the leaders; the chain would take I from B.
  *   <li>{@link Phase#LAKE_COMMITTING}: after another epoch check, one lake commit of data and
  *       deletes, fenced on B, whose snapshot S records I, B and the offsets. {@link
  *       Phase#LAKE_REJECTED} if the lake surely refused it; {@link Phase#LAKE_COMMITTED} once it
@@ -230,10 +238,11 @@ final class DerivedDvRound<WriteResult, Committable> {
                 if (pending.reindex != null) {
                     return RoundOutcome.held(pending.reindex);
                 }
-                // Run the round again at once in two cases. Files were only removed: the
-                // re-index is published, and the lookups must not see the removed files. Or the
-                // lake table moved past the base during the round: the next attempt re-indexes
-                // the rewrite on the new snapshot.
+                // Run the round again at once in three cases. The round's own compaction is
+                // registered: the round runs on it. Files were only removed: the re-index is
+                // published, and the round's deletes must not name the removed files. Or the lake
+                // table moved past the base during the round: the next attempt re-indexes the
+                // rewrite on the new snapshot.
                 if (pending.baseChanged) {
                     baseChanges++;
                 }
@@ -254,7 +263,7 @@ final class DerivedDvRound<WriteResult, Committable> {
 
         // The base is read before the partitions. Every registration after a partition's drop
         // leaves out its buckets, so a partition the base lacks is not listed either. The round
-        // then commits nothing there that it cannot look up in the base.
+        // then commits nothing there whose old rows it cannot find in the base.
         LakeSnapshot flussCurrentLakeSnapshot = context.getLatestLakeSnapshot(tablePath);
         List<TableBucketWriteResult<WriteResult>> results =
                 context.withoutResultsOfDroppedPartitions(
@@ -283,6 +292,7 @@ final class DerivedDvRound<WriteResult, Committable> {
             // collect tiered offsets from all buckets, including those finished without writing
             // data, otherwise their splits would be regenerated forever; buckets with unknown
             // progress (e.g. splits skipped in this round) are excluded
+            Map<TableBucket, Long> logStartOffsets = new HashMap<>();
             Map<TableBucket, Long> logEndOffsets = new HashMap<>();
             Map<TableBucket, Long> logMaxTieredTimestamps = new HashMap<>();
             for (TableBucketWriteResult<WriteResult> writeResult : results) {
@@ -290,6 +300,7 @@ final class DerivedDvRound<WriteResult, Committable> {
                     continue;
                 }
                 TableBucket tableBucket = writeResult.tableBucket();
+                logStartOffsets.put(tableBucket, writeResult.logStartOffset());
                 logEndOffsets.put(tableBucket, writeResult.logEndOffset());
                 if (writeResult.maxTimestamp() >= 0) {
                     logMaxTieredTimestamps.put(tableBucket, writeResult.maxTimestamp());
@@ -327,6 +338,7 @@ final class DerivedDvRound<WriteResult, Committable> {
                         committable,
                         nonEmptyResults,
                         flussCurrentLakeSnapshot,
+                        logStartOffsets,
                         logEndOffsets,
                         logMaxTieredTimestamps,
                         resuming,
@@ -337,13 +349,16 @@ final class DerivedDvRound<WriteResult, Committable> {
                 throw pending;
             } catch (Exception e) {
                 recovery.cleanUpFailedRound(tableId, tablePath, lakeCommitter, committable, round);
+                if (!round.phase().lakeMayReferenceFiles) {
+                    discardPreparedDeletionVectors(lakeCommitter, nonEmptyResults);
+                }
                 throw e;
             }
         }
     }
 
     /**
-     * Resolves the changed keys' positions in the base snapshot and commits data and deletion
+     * Takes the positions the round deletes in the base snapshot and commits data and deletion
      * vectors in one lake commit, so every lake snapshot is consistent at its tiered offsets.
      */
     private TieringCommitResult<Committable> commitWithDeletes(
@@ -354,6 +369,7 @@ final class DerivedDvRound<WriteResult, Committable> {
             Committable committable,
             List<TableBucketWriteResult<WriteResult>> nonEmptyResults,
             @Nullable LakeSnapshot flussCurrentLakeSnapshot,
+            Map<TableBucket, Long> logStartOffsets,
             Map<TableBucket, Long> logEndOffsets,
             Map<TableBucket, Long> logMaxTieredTimestamps,
             boolean resuming,
@@ -405,9 +421,21 @@ final class DerivedDvRound<WriteResult, Committable> {
         snapshotProperties.put(FLUSS_LAKE_SNAP_BUCKET_OFFSET_PROPERTY, lakeBucketTieredOffsetsFile);
         // 3. Publish the writers' staged parts as the round's index change before the lake commit,
         //    under a new id the snapshot records. A crash after the lake commit is repaired by
-        //    repairSnapshot; one before it leaves an orphan. Publishing streams every changed key
-        //    and looks it up in the base on the way. The found positions are the rows the round
-        //    supersedes, kept as a bitmap per data file.
+        //    repairSnapshot; one before it leaves an orphan. The rows the round supersedes are
+        //    the base rows of the keys a bucket changed from the base's offset up to its end
+        //    offset: its leader derives them from its change list. They are kept as a bitmap per
+        //    data file.
+        //    A bucket's writer may have prepared its deletion vectors: they are committed if they
+        //    still hold on the base, and the others' go the central way.
+        Map<TableBucket, WriteResult> preparedByWriters =
+                preparedDeletionVectors(nonEmptyResults, logStartOffsets, logEndOffsets);
+        Map<TableBucket, WriteResult> prepared =
+                holdingDeletionVectors(lakeCommitter, preparedByWriters, base);
+        // one deletion vector per data file: a file in the prepared ones of two buckets goes
+        // central for both, e.g. after another engine changed the partitioning
+        for (TableBucket tb : clashing(lakeCommitter, prepared, Collections.emptySet())) {
+            prepared.remove(tb);
+        }
         long indexId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
         round.indexChangeId = indexId;
         PublishedParts published =
@@ -416,14 +444,28 @@ final class DerivedDvRound<WriteResult, Committable> {
                         indexId,
                         flussCurrentLakeSnapshot,
                         parts,
-                        (tb, snapshotId, keys) ->
-                                DerivedDvLookups.lookupWithRetry(
-                                        context.admin,
-                                        tablePath,
-                                        tb,
-                                        snapshotId,
-                                        keys,
-                                        Thread::sleep));
+                        logStartOffsets,
+                        logEndOffsets,
+                        prefetchedDeletes(nonEmptyResults),
+                        snapshotId ->
+                                positionDeletes(lakeCommitter).changedDataFiles(snapshotId, base),
+                        prepared.keySet(),
+                        context.roundDeletes(tablePath),
+                        PublishedParts.publishThreads(context.lakeTieringConfig));
+        // ... and a file in the prepared ones of a bucket and in the deletes merged here
+        Set<TableBucket> clashing;
+        while (!(clashing = clashing(lakeCommitter, prepared, published.deleted.keySet()))
+                .isEmpty()) {
+            for (TableBucket tb : clashing) {
+                prepared.remove(tb);
+                published.addCentrally(
+                        tb,
+                        base,
+                        logStartOffsets.get(tb),
+                        logEndOffsets.get(tb),
+                        context.roundDeletes(tablePath));
+            }
+        }
         // Only the buckets the round changed are part of the change. The buckets of idle
         // partitions get no manifest, and trimming can tell which changes touch which buckets.
         store.commitChange(indexId, published.changes);
@@ -447,7 +489,11 @@ final class DerivedDvRound<WriteResult, Committable> {
             result =
                     positionDeletes(lakeCommitter)
                             .commitWithDeletes(
-                                    committable, snapshotProperties, published.deleted, base);
+                                    committable,
+                                    snapshotProperties,
+                                    published.deleted,
+                                    base,
+                                    prepared.values());
         } catch (LakeCommitRejectedException e) {
             round.advance(Phase.LAKE_REJECTED);
             if (e instanceof LakeBaseChangedException && rerunOnBaseChange) {
@@ -468,6 +514,10 @@ final class DerivedDvRound<WriteResult, Committable> {
             throw e;
         }
         round.advance(Phase.LAKE_COMMITTED);
+        // the prepared deletion vectors that did not hold, or clashed, are of no attempt any more
+        int vectorsRejected = preparedByWriters.size() - prepared.size();
+        preparedByWriters.keySet().removeAll(prepared.keySet());
+        discardPreparedDeletionVectors(lakeCommitter, preparedByWriters.values());
         long snapshotId = result.getCommittedSnapshotId();
         // Links the base to snapshotId. The store refuses a chain that does not end at the base.
         // The base fence put the lake commit on the base or on snapshots after it that changed no
@@ -498,12 +548,19 @@ final class DerivedDvRound<WriteResult, Committable> {
         long t4 = System.currentTimeMillis();
         context.metrics.rounds.inc();
         context.metrics.changedKeys.inc(published.keys);
-        context.metrics.lastLookupMs = t2 - t1;
+        context.metrics.vectorsFromWriters.inc(published.vectorsFromWriters);
+        context.metrics.vectorsRejected.inc(vectorsRejected);
+        context.metrics.deletesFromReaders.inc(published.deletesFromReaders);
+        context.metrics.deletesFromLeaders.inc(published.deletesFromLeaders);
+        context.metrics.lastPublishMs = t2 - t1;
         context.metrics.lastLakeCommitMs = t3 - t2;
         LOG.info(
                 "Committed the round of {}: base {} -> snapshot {} (index {}); buckets {};"
-                        + " changed keys {} ({} deleted, {} in base); preparing {} ms; index publish"
-                        + " with lookups {} ms; lake commit (data+DV) {} ms; fluss report {} ms.",
+                        + " changed keys {} ({} deleted); base rows deleted at the committer {};"
+                        + " deletes of buckets {} prepared by their writers, {} from their readers"
+                        + " and {} from their leaders, {} prepared ones refused; preparing {} ms;"
+                        + " index publish with deletes {} ms; lake commit (data+DV) {} ms; fluss"
+                        + " report {} ms.",
                 tablePath,
                 base,
                 snapshotId,
@@ -511,12 +568,131 @@ final class DerivedDvRound<WriteResult, Committable> {
                 buckets.size(),
                 published.keys,
                 published.deletes,
-                published.found,
+                published.deletedRows,
+                published.vectorsFromWriters,
+                published.deletesFromReaders,
+                published.deletesFromLeaders,
+                vectorsRejected,
                 t1 - t0,
                 t2 - t1,
                 t3 - t2,
                 t4 - t3);
         return new TieringCommitResult<>(committable, result.getTieringStats());
+    }
+
+    /**
+     * The write results whose writers prepared their buckets' deletion vectors, by bucket: for the
+     * rounds from {@code roundStarts} to {@code roundEnds}, or for any round if those are empty.
+     */
+    private static <WriteResult> Map<TableBucket, WriteResult> preparedDeletionVectors(
+            List<TableBucketWriteResult<WriteResult>> nonEmptyResults,
+            Map<TableBucket, Long> roundStarts,
+            Map<TableBucket, Long> roundEnds) {
+        Map<TableBucket, WriteResult> prepared = new HashMap<>();
+        for (TableBucketWriteResult<WriteResult> r : nonEmptyResults) {
+            PreparedDeletionVectors round = preparedOf(r.writeResult());
+            if (round != null
+                    && (roundStarts.isEmpty()
+                            || Objects.equals(roundStarts.get(r.tableBucket()), round.startOffset())
+                                    && Objects.equals(
+                                            roundEnds.get(r.tableBucket()), round.endOffset()))) {
+                prepared.put(r.tableBucket(), r.writeResult());
+            }
+        }
+        return prepared;
+    }
+
+    /** The prepared deletion vectors that hold on the base, by bucket. */
+    private static <WriteResult, Committable> Map<TableBucket, WriteResult> holdingDeletionVectors(
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            Map<TableBucket, WriteResult> prepared,
+            long base)
+            throws IOException {
+        if (prepared.isEmpty() || base <= 0) {
+            return Collections.emptyMap();
+        }
+        Map<TableBucket, WriteResult> holding = new HashMap<>(prepared);
+        holding.keySet()
+                .retainAll(positionDeletes(lakeCommitter).holdingDeletionVectors(prepared, base));
+        return holding;
+    }
+
+    /**
+     * The buckets of {@code prepared} with a data file in {@code merged}, or in the prepared ones
+     * of another bucket.
+     */
+    @VisibleForTesting
+    static <WriteResult, Committable> Set<TableBucket> clashing(
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            Map<TableBucket, WriteResult> prepared,
+            Set<String> merged) {
+        Set<TableBucket> clashing = new HashSet<>();
+        Map<String, TableBucket> owners = new HashMap<>();
+        for (Map.Entry<TableBucket, WriteResult> e : prepared.entrySet()) {
+            for (String file : positionDeletes(lakeCommitter).preparedDataFiles(e.getValue())) {
+                TableBucket other = owners.put(file, e.getKey());
+                if (merged.contains(file)) {
+                    clashing.add(e.getKey());
+                }
+                if (other != null && !other.equals(e.getKey())) {
+                    clashing.add(e.getKey());
+                    clashing.add(other);
+                }
+            }
+        }
+        return clashing;
+    }
+
+    /** Deletes the deletion vectors the writers of a round that is not committed prepared. */
+    static <WriteResult, Committable> void discardPreparedDeletionVectors(
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            List<TableBucketWriteResult<WriteResult>> results) {
+        discardPreparedDeletionVectors(
+                lakeCommitter,
+                preparedDeletionVectors(results, Collections.emptyMap(), Collections.emptyMap())
+                        .values());
+    }
+
+    /** Deletes the files of deletion vectors writers prepared that are not committed. */
+    private static <WriteResult, Committable> void discardPreparedDeletionVectors(
+            LakeCommitter<WriteResult, Committable> lakeCommitter,
+            Collection<WriteResult> prepared) {
+        if (prepared.isEmpty()) {
+            return;
+        }
+        if (!(lakeCommitter instanceof SupportsPositionDeleteCommit)) {
+            // only a committer of deletes by position commits prepared deletion vectors
+            LOG.warn(
+                    "Cannot delete the deletion vectors the tiering writers prepared for {} write"
+                            + " results: lake committer {} commits none.",
+                    prepared.size(),
+                    lakeCommitter.getClass().getName());
+            return;
+        }
+        try {
+            positionDeletes(lakeCommitter).discardDeletionVectors(prepared);
+        } catch (Exception e) {
+            LOG.warn("Could not delete deletion vectors the tiering writers prepared.", e);
+        }
+    }
+
+    @Nullable
+    private static PreparedDeletionVectors preparedOf(@Nullable Object writeResult) {
+        return writeResult instanceof PreparedDeletionVectorsProvider
+                ? ((PreparedDeletionVectorsProvider) writeResult).preparedDeletionVectors()
+                : null;
+    }
+
+    /** The deletes the buckets' readers fetched for their rounds. */
+    private static <WriteResult> Map<TableBucket, RoundDeletes> prefetchedDeletes(
+            List<TableBucketWriteResult<WriteResult>> nonEmptyResults) {
+        Map<TableBucket, RoundDeletes> prefetched = new HashMap<>();
+        for (TableBucketWriteResult<WriteResult> r : nonEmptyResults) {
+            if (r.roundDeletes() != null) {
+                prefetched.put(r.tableBucket(), r.roundDeletes());
+            }
+        }
+        return prefetched;
     }
 
     /** Returns the index part each bucket's writer staged when it completed. */

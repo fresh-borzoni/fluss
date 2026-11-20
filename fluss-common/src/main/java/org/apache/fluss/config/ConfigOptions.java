@@ -2384,8 +2384,8 @@ public class ConfigOptions {
                     .withDescription(
                             "If true, snapshot expiration will be triggered automatically when tiering service commits to the datalake. It is disabled by default.");
 
-    public static final ConfigOption<Boolean> TABLE_DELETION_VECTORS_ENABLED =
-            key("table.deletion-vectors.enabled")
+    public static final ConfigOption<Boolean> TABLE_DATALAKE_DELETION_VECTORS_ENABLED =
+            key("table.datalake.deletion-vectors.enabled")
                     .booleanType()
                     .defaultValue(false)
                     .withDescription(
@@ -2633,24 +2633,33 @@ public class ConfigOptions {
     public static final ConfigOption<Duration> KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT =
             key("kv.deletion-vectors.pinned-cut-idle-timeout")
                     .durationType()
-                    .defaultValue(Duration.ofMinutes(30))
+                    .defaultValue(Duration.ofMinutes(5))
                     .withDescription(
                             "For tables with deletion vectors enabled: how long a "
                                     + "tablet server keeps the masks a union read pinned for a "
-                                    + "bucket after the last request for them, including a "
-                                    + "request that releases some of their holds. A union read pins "
-                                    + "the masks of one log offset per bucket, when it is planned "
-                                    + "or when a split that reads a whole bucket starts, and its "
-                                    + "readers fetch their parts of them, so all of them read the "
-                                    + "lake and the log as of the same offset. Pinned masks count "
-                                    + "towards 'kv.deletion-vectors.heap-memory' and take at most "
-                                    + "half of it, beyond which the least recently used are "
-                                    + "dropped. A split that reads a whole bucket and finds its "
-                                    + "pinned masks dropped before it started starts over with "
-                                    + "the masks of the current offset; a split that shares the "
-                                    + "offset with other splits of its bucket derives its masks "
-                                    + "from the keys of its lake files and the log. A split that "
-                                    + "started keeps the masks it fetched.");
+                                    + "bucket after the last request for them. A union read pins "
+                                    + "the masks of one log offset per bucket, at planning if "
+                                    + "several splits read the bucket, or else when the bucket's "
+                                    + "split starts, and its readers fetch their parts of them, "
+                                    + "so all of them read the lake and the log as of the same "
+                                    + "offset. Every pin and every fetch of the masks keeps them "
+                                    + "for this long again, so the masks of a finished, failed or "
+                                    + "cancelled read are dropped about this long after its last "
+                                    + "request: a sweep drops them up to a quarter of this, at "
+                                    + "most a minute, later. The masks of a bucket are also "
+                                    + "dropped when its leader closes. Pinned masks count towards "
+                                    + "'kv.deletion-vectors.heap-memory' and take at most half "
+                                    + "of it, beyond which the least recently used are dropped. "
+                                    + "As a server does not know when a read ends, these can be "
+                                    + "the masks of a running read while those of reads that "
+                                    + "finished stay. A split that reads a whole bucket and finds "
+                                    + "its pinned masks dropped before it started starts over "
+                                    + "with the masks of the current offset; a split that shares "
+                                    + "the offset with other splits of its bucket derives its "
+                                    + "masks from the keys of its lake files and the log, which "
+                                    + "is exact but slower. A split that started keeps the masks "
+                                    + "it fetched. Raise it if the splits of a read wait longer "
+                                    + "than this to start.");
 
     public static final ConfigOption<Boolean> KV_DELETION_VECTORS_CHANGE_LIST_CHECKPOINT_ENABLED =
             key("kv.deletion-vectors.change-list-checkpoint.enabled")
@@ -3360,29 +3369,42 @@ public class ConfigOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("128mb"))
                     .withDescription(
-                            "For tables with deletion vectors enabled: the heap memory the lake "
-                                    + "writers of one tiering source task share to sort the rows "
-                                    + "of their rounds by primary key. When it is full, the writer "
-                                    + "holding the most spills its sorted rows to the local "
-                                    + "directories of 'lake.tiering.io.tmp.dirs', so a round of any "
-                                    + "size is tiered within this memory. Must be positive.");
+                            "For tables with deletion vectors enabled. On Iceberg: the heap "
+                                    + "memory the lake writers of one tiering source task share to "
+                                    + "sort what they buffer of their rounds by primary key: the "
+                                    + "index entries of the rows of a round read through its "
+                                    + "leader's log mask, or the rows of a round in sort mode. When "
+                                    + "it is full, the writer holding the most spills its sorted "
+                                    + "entries to the local directories of "
+                                    + "'lake.tiering.io.tmp.dirs', so a round of any size is tiered "
+                                    + "within this memory. The log masks of the rounds being read "
+                                    + "are held besides it, in at most as much heap again: a "
+                                    + "round's mask takes at most one bit per log offset of the "
+                                    + "round, about 1.25 MB for a round of 10M records, and a round "
+                                    + "whose mask does not fit waits until rounds before it end. On "
+                                    + "Paimon: the write buffer the Paimon writers of one tiering "
+                                    + "source task share, instead of a buffer of Paimon's "
+                                    + "'write-buffer-size' per bucket being tiered. When it is full, "
+                                    + "Paimon flushes the writer holding the most. Must be "
+                                    + "positive.");
 
     public static final ConfigOption<Integer>
-            LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET =
-                    key("lake.tiering.deletion-vectors.max-round-keys-per-bucket")
+            LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET =
+                    key("lake.tiering.deletion-vectors.max-round-records-per-bucket")
                             .intType()
                             .defaultValue(10_000_000)
                             .withDescription(
-                                    "For tables with deletion vectors enabled: the most primary "
-                                            + "keys one tiering round changes in a bucket. The commit "
-                                            + "of a round looks up and deletes the superseded rows of "
-                                            + "all keys it changed. Once a bucket reaches this many "
-                                            + "keys, counted as the versions its writer holds with the "
-                                            + "versions of a key folded where they met in memory, or "
-                                            + "'lake.tiering.deletion-vectors.max-round-bytes-per-bucket', "
-                                            + "its round ends at the record just tiered and the next "
-                                            + "round, which starts at once, tiers the rest, so a backlog "
-                                            + "is tiered in several rounds of bounded size. Must be "
+                                    "For tables with deletion vectors enabled on a lake that "
+                                            + "takes deletes (Iceberg): the most log records one "
+                                            + "tiering round tiers in a bucket, so a round changes at "
+                                            + "most this many keys. The bucket's leader fixes the "
+                                            + "round's end when the round is planned, within this "
+                                            + "and 'lake.tiering.deletion-vectors.max-round-bytes-per-bucket'; "
+                                            + "the round is written up to that end, and the next round, "
+                                            + "which starts at once, tiers the rest, so a backlog is "
+                                            + "tiered in several rounds of bounded size. Such a round "
+                                            + "is not cut by the table's 'table.datalake.freshness': "
+                                            + "size the caps so that a round fits in it. Must be "
                                             + "positive.");
 
     public static final ConfigOption<MemorySize>
@@ -3391,12 +3413,144 @@ public class ConfigOptions {
                             .memoryType()
                             .defaultValue(MemorySize.parse("1gb"))
                             .withDescription(
-                                    "For tables with deletion vectors enabled: the most bytes of "
-                                            + "changed rows one tiering round holds for a bucket, in "
-                                            + "memory and spilled to local disk, in their encoded size. "
-                                            + "See "
-                                            + "'lake.tiering.deletion-vectors.max-round-keys-per-bucket'. "
+                                    "For tables with deletion vectors enabled on a lake that "
+                                            + "takes deletes (Iceberg): the most log bytes one tiering "
+                                            + "round tiers in a bucket, as the offset index of the "
+                                            + "bucket's log places its records; a round tiers at least "
+                                            + "one record batch. See "
+                                            + "'lake.tiering.deletion-vectors.max-round-records-per-bucket'. "
                                             + "Must be positive.");
+
+    public static final ConfigOption<Boolean> LAKE_TIERING_DELETION_VECTORS_ROUND_MASK_ENABLED =
+            key("lake.tiering.deletion-vectors.round-mask.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "For tables with deletion vectors enabled on a lake that takes "
+                                    + "deletes (Iceberg): whether the tiering readers read a "
+                                    + "bucket's round through its leader's log mask, the versions "
+                                    + "a later change of the round supersedes, so the round's "
+                                    + "writer writes the live versions as they come. If false, "
+                                    + "every round is written in sort mode: the writer keeps the "
+                                    + "last version of each key itself, sorting the round's rows "
+                                    + "by key within "
+                                    + "'lake.tiering.deletion-vectors.write-buffer-size'. A round "
+                                    + "whose mask does not match it is written in sort mode "
+                                    + "either way.");
+
+    public static final ConfigOption<Duration>
+            LAKE_TIERING_DELETION_VECTORS_ROUND_DELETES_PREFETCH_TIMEOUT =
+                    key("lake.tiering.deletion-vectors.round-deletes.prefetch-timeout")
+                            .durationType()
+                            .defaultValue(Duration.ofSeconds(30))
+                            .withDescription(
+                                    "For tables with deletion vectors enabled on a lake that "
+                                            + "takes deletes (Iceberg): the tiering readers fetch the "
+                                            + "deletes of a bucket's round, the lake positions of the "
+                                            + "rows the round supersedes, from the bucket's leader "
+                                            + "while they read the round, and hand them to the "
+                                            + "committer with the round's write result. A round whose "
+                                            + "deletes are not fetched when its writer completes waits "
+                                            + "for them at most this long, and a fetch waits at most "
+                                            + "this long for a leader that is not ready. Then, or if "
+                                            + "the fetch failed, its write result goes without them, "
+                                            + "and the committer fetches them from the leader itself, "
+                                            + "as it does when the round's base snapshot changed "
+                                            + "since. 0 turns the readers' fetches off.");
+
+    public static final ConfigOption<Integer>
+            LAKE_TIERING_DELETION_VECTORS_ROUND_DELETES_PREFETCH_THREADS =
+                    key("lake.tiering.deletion-vectors.round-deletes.prefetch-threads")
+                            .intType()
+                            .defaultValue(4)
+                            .withDescription(
+                                    "For tables with deletion vectors enabled on a lake that "
+                                            + "takes deletes (Iceberg): the threads a tiering reader "
+                                            + "fetches the deletes of the rounds it reads with (see "
+                                            + "'lake.tiering.deletion-vectors.round-deletes.prefetch-timeout'); "
+                                            + "more fetches wait for one. Must be positive.");
+
+    public static final ConfigOption<MemorySize>
+            LAKE_TIERING_DELETION_VECTORS_ROUND_DELETES_PREFETCH_MAX_BYTES =
+                    key("lake.tiering.deletion-vectors.round-deletes.prefetch-max-bytes")
+                            .memoryType()
+                            .defaultValue(MemorySize.parse("64mb"))
+                            .withDescription(
+                                    "For tables with deletion vectors enabled on a lake that "
+                                            + "takes deletes (Iceberg): the most bytes of round "
+                                            + "deletes a tiering reader holds at once, fetched for the "
+                                            + "rounds it reads and not yet handed to the committer "
+                                            + "(see "
+                                            + "'lake.tiering.deletion-vectors.round-deletes.prefetch-timeout'). "
+                                            + "The deletes of a round that do not fit are dropped, "
+                                            + "and the committer fetches them from the leader "
+                                            + "itself.");
+
+    public static final ConfigOption<Boolean>
+            LAKE_TIERING_DELETION_VECTORS_WRITER_PREPARED_ENABLED =
+                    key("lake.tiering.deletion-vectors.writer-prepared.enabled")
+                            .booleanType()
+                            .defaultValue(true)
+                            .withDescription(
+                                    "For tables with deletion vectors enabled on Iceberg (format "
+                                            + "version 3): whether the tiering readers prepare the "
+                                            + "deletion vectors of their buckets' rounds once the "
+                                            + "round's deletes arrive: merge them into the current "
+                                            + "deletion vectors of the data files they hit and write "
+                                            + "one Puffin file per bucket, so the committer only "
+                                            + "checks that they still hold on its base and commits "
+                                            + "them. A bucket whose preparation fails, or whose "
+                                            + "deletion vectors no longer hold, has its deletes "
+                                            + "merged at the committer, as they are if this is "
+                                            + "false.");
+
+    public static final ConfigOption<Integer> LAKE_TIERING_DELETION_VECTORS_PUBLISH_THREADS =
+            key("lake.tiering.deletion-vectors.publish-threads")
+                    .intType()
+                    .defaultValue(8)
+                    .withDescription(
+                            "For tables with deletion vectors enabled on a lake that takes "
+                                    + "deletes (Iceberg): the threads the tiering committer "
+                                    + "publishes the position index parts of a round's buckets "
+                                    + "with, buckets in parallel, and fetches the deletes of the "
+                                    + "buckets whose readers did not hand them over. Must be "
+                                    + "positive.");
+
+    public static final ConfigOption<Integer> LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS =
+            key("lake.tiering.deletion-vectors.load-threads")
+                    .intType()
+                    .defaultValue(8)
+                    .withDescription(
+                            "For tables with deletion vectors enabled on Iceberg: the threads "
+                                    + "the tiering committer reads the current deletion vectors "
+                                    + "with of the data files a round deletes rows in, before it "
+                                    + "merges the round's deletes into them. Must be positive.");
+
+    public static final ConfigOption<MemorySize> LAKE_TIERING_DELETION_VECTORS_LOAD_MAX_BYTES =
+            key("lake.tiering.deletion-vectors.load-max-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("256mb"))
+                    .withDescription(
+                            "For tables with deletion vectors enabled on Iceberg: the most bytes "
+                                    + "of current deletion vectors, as their delete files give "
+                                    + "them, the tiering committer, or a tiering reader that "
+                                    + "prepares a bucket's deletion vectors, loads at once, with "
+                                    + "'lake.tiering.deletion-vectors.load-threads' threads, "
+                                    + "before it merges a round's deletes into them. The others "
+                                    + "are loaded one by one while it merges. 0 loads every one "
+                                    + "while it merges.");
+
+    public static final ConfigOption<MemorySize> LAKE_TIERING_DELETION_VECTORS_CACHE_SIZE =
+            key("lake.tiering.deletion-vectors.cache-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("64mb"))
+                    .withDescription(
+                            "For tables with deletion vectors enabled on Iceberg: the heap the "
+                                    + "tiering committer keeps the deletion vectors it wrote in, so "
+                                    + "a later round takes a data file's deletion vector from there "
+                                    + "instead of reading it, while the table's current snapshot "
+                                    + "has that deletion vector for the file. The least recently "
+                                    + "used go first. 0 turns the cache off.");
 
     // ------------------------------------------------------------------------
     //  ConfigOptions for fluss kafka

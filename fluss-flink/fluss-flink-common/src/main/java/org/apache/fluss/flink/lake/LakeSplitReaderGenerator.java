@@ -40,6 +40,7 @@ import org.apache.flink.metrics.MetricGroup;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Objects;
@@ -66,6 +67,7 @@ public class LakeSplitReaderGenerator {
     // whether a split waits for its bucket's leader to switch to its planned snapshot
     private boolean dvWaitForCatchUp =
             ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.defaultValue();
+    private Duration dvRequestTimeout = ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue();
 
     public LakeSplitReaderGenerator(
             Table table,
@@ -97,6 +99,11 @@ public class LakeSplitReaderGenerator {
      */
     public void setDvWaitForCatchUp(boolean waitForCatchUp) {
         this.dvWaitForCatchUp = waitForCatchUp;
+    }
+
+    /** Sets how long a split of a table with deletion vectors waits for one request's answer. */
+    public void setDvRequestTimeout(Duration requestTimeout) {
+        this.dvRequestTimeout = requestTimeout;
     }
 
     public void addSplit(SourceSplitBase split, Queue<SourceSplitBase> boundedSplits) {
@@ -148,7 +155,8 @@ public class LakeSplitReaderGenerator {
                                         Objects.requireNonNull(lakeSource),
                                         projectedFields,
                                         droppedPartitions)
-                                .withWaitForCatchUp(dvWaitForCatchUp);
+                                .withWaitForCatchUp(dvWaitForCatchUp)
+                                .withRequestTimeout(dvRequestTimeout);
                 if (sourceReaderMetrics != null) {
                     dvReadMetrics = new DvBucketSplitScanner.ReadMetrics(sourceReaderMetrics);
                 }

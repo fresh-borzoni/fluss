@@ -91,8 +91,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Union reads of Paimon tables with deletion vector masks ({@code table.deletion-vectors.enabled =
- * true}).
+ * Union reads of Paimon tables with deletion vector masks ({@code
+ * table.datalake.deletion-vectors.enabled = true}).
  *
  * <p>The Paimon table uses its own deletion vectors and the readable snapshot is the latest
  * compacted one. Rows updated or deleted after it must not surface through the union read.
@@ -1478,7 +1478,8 @@ class FlinkUnionReadDerivedDvITCase extends FlinkUnionReadTestBase {
                         .distributedBy(BUCKETS)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .property(
                                 ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(),
                                 String.valueOf(autoCompaction));

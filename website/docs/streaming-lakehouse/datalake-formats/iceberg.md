@@ -341,7 +341,7 @@ CREATE TABLE user_profiles (
 
 #### Primary Key Tables with Deletion Vectors
 
-A primary key table created with `'table.deletion-vectors.enabled' = 'true'` is tiered with positional deletes instead of equality deletes. Each tiering round looks up the previous row of every key it changed, and commits its new data files and the deletes of the superseded rows in one Iceberg commit. Every snapshot Fluss commits thus has at most one live row per key, and an engine that reads the table directly needs no merge by key.
+A primary key table created with `'table.datalake.deletion-vectors.enabled' = 'true'` is tiered with positional deletes instead of equality deletes. Each tiering round takes the previous row of every key it changed from the buckets' leaders, and commits its new data files and the deletes of the superseded rows in one Iceberg commit. Every snapshot Fluss commits thus has at most one live row per key, and an engine that reads the table directly needs no merge by key.
 
 - **Format version**: Fluss creates the Iceberg table with format version 3 and file-scoped deletes (`write.delete.granularity` = `file`), so each data file has at most one deletion vector. To write format version 2 position delete files instead, one per data file, set `'iceberg.format-version' = '2'` when creating the table. Format version 1 has no position deletes and is refused for tables with deletion vectors.
 - **Engines**: reading a format version 3 table requires an engine and Iceberg library with format version 3 support. Some engines and engine versions cannot read format version 3 tables yet; check the Iceberg support of each engine that reads the table. For such engines, create the table with format version 2: any engine that reads Iceberg position deletes reads it.
@@ -584,7 +584,7 @@ The table option `table.datalake.auto-compaction` (disabled by default) provides
 When enabled for a specific table, compaction is automatically triggered during write operations to that table by the tiering service.
 
 :::note
-Tiering-managed auto compaction is supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns) and for primary key tables with deletion vectors (`table.deletion-vectors.enabled`). Other newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
+Tiering-managed auto compaction is supported for legacy Iceberg lake tables (tables that still carry the `__bucket`/`__offset`/`__timestamp` system columns) and for primary key tables with deletion vectors (`table.datalake.deletion-vectors.enabled`). Other newly created ("clean") Iceberg lake tables contain only user columns and have no `__bucket` column to scope per-bucket compaction, so `table.datalake.auto-compaction` is a no-op for them (a warning is logged by the tiering service). Use external Iceberg compaction to maintain small files for such tables.
 :::
 
 #### Tables with deletion vectors
@@ -672,4 +672,4 @@ For partitioned tables, the metadata structure includes partition information:
 ## Current Limitations
 
 - **Multiple bucket keys**: Not supported until Iceberg implements multi-argument partition transforms
-- **Deletion vectors**: `table.deletion-vectors.enabled` can only be set when a table is created, not on an existing table, and only Fluss may write rows to the Iceberg table. See [Primary Key Tables with Deletion Vectors](#primary-key-tables-with-deletion-vectors).
+- **Deletion vectors**: `table.datalake.deletion-vectors.enabled` can only be set when a table is created, not on an existing table, and only Fluss may write rows to the Iceberg table. See [Primary Key Tables with Deletion Vectors](#primary-key-tables-with-deletion-vectors).

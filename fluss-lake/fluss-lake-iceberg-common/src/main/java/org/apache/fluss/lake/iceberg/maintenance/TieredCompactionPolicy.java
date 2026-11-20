@@ -85,10 +85,6 @@ public final class TieredCompactionPolicy {
             return path;
         }
 
-        public long sizeBytes() {
-            return sizeBytes;
-        }
-
         boolean mostlyDeleted() {
             return recordCount > 0 && deletedRecords > DELETED_ROWS_THRESHOLD * recordCount;
         }

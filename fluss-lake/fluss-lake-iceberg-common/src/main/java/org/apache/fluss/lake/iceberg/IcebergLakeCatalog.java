@@ -127,7 +127,7 @@ public class IcebergLakeCatalog implements LakeCatalog {
                                 "Table %s with '%s' needs Iceberg format version 2 or 3, which"
                                         + " have deletes by position, but '%s%s' is %s.",
                                 tablePath,
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                                 ICEBERG_CONF_PREFIX,
                                 TableProperties.FORMAT_VERSION,
                                 formatVersion));
@@ -405,7 +405,8 @@ public class IcebergLakeCatalog implements LakeCatalog {
                                         + "layout (Fluss system columns), which does not support "
                                         + "'%s'. Please first drop the table in Iceberg catalog, "
                                         + "use a new table name, or disable deletion vectors.",
-                                tablePath, ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()),
+                                tablePath,
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()),
                         e);
             }
             if (isDeletionVectorsEnabled(tableDescriptor)
@@ -419,7 +420,7 @@ public class IcebergLakeCatalog implements LakeCatalog {
                                         + " vectors.",
                                 tablePath,
                                 TableUtil.formatVersion(existingTable),
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()),
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()),
                         e);
             }
             if (existingIsLegacy) {
@@ -689,7 +690,7 @@ public class IcebergLakeCatalog implements LakeCatalog {
     /** Returns whether the Fluss table has deletion vectors enabled. */
     static boolean isDeletionVectorsEnabled(TableDescriptor tableDescriptor) {
         return Configuration.fromMap(tableDescriptor.getProperties())
-                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
+                .get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED);
     }
 
     @Override

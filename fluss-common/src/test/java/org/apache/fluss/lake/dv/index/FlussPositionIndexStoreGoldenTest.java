@@ -111,23 +111,13 @@ class FlussPositionIndexStoreGoldenTest {
                 });
         String stagedTree = tree();
 
-        List<String> keys = new ArrayList<>();
         PositionIndexStore.BucketPart[] published = new PositionIndexStore.BucketPart[1];
         Map<Integer, Integer> newIds = new HashMap<>();
         newIds.put(0, 0);
         newIds.put(1, 1);
         step(
                 "publishStaged",
-                () ->
-                        published[0] =
-                                store.publishStaged(
-                                        stagingId,
-                                        10,
-                                        P7B1,
-                                        staged[0],
-                                        newIds,
-                                        k -> keys.add(new String(k, StandardCharsets.UTF_8))));
-        assertThat(keys).containsExactly("k1", "k2", "k3");
+                () -> published[0] = store.publishStaged(stagingId, 10, P7B1, staged[0], newIds));
 
         PositionIndexStore.BucketPart[] handedOff = new PositionIndexStore.BucketPart[1];
         step(

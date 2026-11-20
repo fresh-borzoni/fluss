@@ -198,6 +198,9 @@ import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.kv.dv.DvMaskRequest;
 import org.apache.fluss.server.kv.dv.DvPinnedCut;
+import org.apache.fluss.server.kv.dv.DvRoundDeletes;
+import org.apache.fluss.server.kv.dv.DvRoundEnd;
+import org.apache.fluss.server.kv.dv.DvRoundMask;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
@@ -2547,13 +2550,6 @@ public class ServerRpcMessageUtils {
      * it is handed to another thread.
      */
     public static DvMaskRequest toDvMaskRequest(GetDvSnapshotRequest request) {
-        if (request.hasReleaseCut() && request.isReleaseCut()) {
-            if (!request.hasLogEndOffset()) {
-                throw new InvalidRequestException(
-                        "A release of a pinned cut names no cut (log_end_offset).");
-            }
-            return DvMaskRequest.release(request.getLogEndOffset(), holdsOf(request));
-        }
         if (request.hasMaxLogDvBytes() && request.getMaxLogDvBytes() <= 0) {
             throw new InvalidRequestException(
                     String.format(
@@ -2572,19 +2568,7 @@ public class ServerRpcMessageUtils {
                         ? request.getMaxLogDvBytes()
                         : DvPinnedCut.DEFAULT_LOG_PAGE_BYTES,
                 !request.hasWaitForCatchUp() || request.isWaitForCatchUp(),
-                request.hasPinRequestId() ? request.getPinRequestId() : null,
-                holdsOf(request));
-    }
-
-    private static int holdsOf(GetDvSnapshotRequest request) {
-        int holds = request.hasHolds() ? request.getHolds() : 1;
-        if (holds <= 0 || holds > DvMaskRequest.MAX_HOLDS) {
-            throw new InvalidRequestException(
-                    String.format(
-                            "A pin or release of %d holds is requested, outside [1, %d].",
-                            holds, DvMaskRequest.MAX_HOLDS));
-        }
-        return holds;
+                request.hasPinRequestId() ? request.getPinRequestId() : null);
     }
 
     /**
@@ -2621,6 +2605,101 @@ public class ServerRpcMessageUtils {
             }
         }
         return resp;
+    }
+
+    /**
+     * Checks that a {@link GetDvSnapshotRequest} is of one kind: a union read's; the plan of a
+     * tiering round, from a valid offset with positive caps; or one for a part of a tiering round's
+     * deletes or log mask, which starts at or before the round's end. A request for a round sets
+     * none of a union read's fields.
+     */
+    public static void checkDvSnapshotRequest(GetDvSnapshotRequest request) {
+        boolean plan = request.hasRoundStartOffset();
+        boolean part = request.hasRoundEndOffset();
+        if (!plan && (request.hasRoundMaxRecords() || request.hasRoundMaxBytes())) {
+            throw new InvalidRequestException(
+                    "A request sets round_max_records or round_max_bytes without"
+                            + " round_start_offset.");
+        }
+        if (!part && (request.hasRoundFromOffset() || request.hasRoundLogMask())) {
+            throw new InvalidRequestException(
+                    "A request sets round_from_offset or round_log_mask without round_end_offset.");
+        }
+        if (!plan && !part) {
+            return;
+        }
+        if (request.hasLogEndOffset()
+                || request.getLakeDvFileNamesCount() > 0
+                || request.hasLogDvFromOffset()
+                || request.hasMaxLogDvBytes()
+                || request.hasWaitForCatchUp()
+                || request.hasPinRequestId()) {
+            throw new InvalidRequestException(
+                    "A request for a tiering round sets fields of a union read.");
+        }
+        if (plan) {
+            if (part) {
+                throw new InvalidRequestException(
+                        "A request plans a tiering round and asks for a part of one.");
+            }
+            long start = request.getRoundStartOffset();
+            if (start < 0
+                    || !request.hasRoundMaxRecords()
+                    || request.getRoundMaxRecords() <= 0
+                    || !request.hasRoundMaxBytes()
+                    || request.getRoundMaxBytes() <= 0) {
+                throw new InvalidRequestException(
+                        String.format(
+                                "A tiering round is planned from offset %d with at most %s records"
+                                        + " and %s bytes.",
+                                start,
+                                request.hasRoundMaxRecords() ? request.getRoundMaxRecords() : null,
+                                request.hasRoundMaxBytes() ? request.getRoundMaxBytes() : null));
+            }
+            return;
+        }
+        long end = request.getRoundEndOffset();
+        long from = request.hasRoundFromOffset() ? request.getRoundFromOffset() : 0;
+        if (end < 0 || from < 0 || from > end) {
+            throw new InvalidRequestException(
+                    String.format(
+                            "A part of a tiering round ending at offset %d is requested from offset"
+                                    + " %d.",
+                            end, from));
+        }
+    }
+
+    /** Builds the answer to a request for a part of a tiering round's deletes. */
+    public static GetDvSnapshotResponse buildDvRoundDeletesResponse(DvRoundDeletes part) {
+        GetDvSnapshotResponse resp =
+                new GetDvSnapshotResponse().setSnapshotStartOffset(part.startOffset());
+        for (Map.Entry<String, byte[]> entry : part.deletes().entrySet()) {
+            resp.addLakeDvEntry()
+                    .setFilePath(entry.getKey())
+                    .setDeletedPositionsBitmap(entry.getValue());
+        }
+        return resp.setRoundNextOffset(part.nextOffset());
+    }
+
+    /** Builds the answer to a request for a part of a tiering round's log mask. */
+    public static GetDvSnapshotResponse buildDvRoundMaskResponse(DvRoundMask part) {
+        GetDvSnapshotResponse resp =
+                new GetDvSnapshotResponse()
+                        .setSnapshotStartOffset(part.startOffset())
+                        .setRoundNextOffset(part.nextOffset())
+                        .setRoundChanges(part.changes())
+                        .setRoundChangesWithInserts(part.changesWithInserts());
+        if (part.bitmap() != null) {
+            resp.setLogDvBitmap(part.bitmap());
+        }
+        return resp;
+    }
+
+    /** Builds the answer to the plan of a tiering round. */
+    public static GetDvSnapshotResponse buildDvRoundEndResponse(DvRoundEnd end) {
+        return new GetDvSnapshotResponse()
+                .setRoundEndOffset(end.endOffset())
+                .setRoundCapped(end.capped());
     }
 
     /**

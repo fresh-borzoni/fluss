@@ -21,14 +21,14 @@ import org.apache.fluss.annotation.Internal;
 
 import javax.annotation.Nullable;
 
-import java.util.Collections;
 import java.util.List;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
  * Which masks of a cut a union read asks a bucket for. Without a cut the request pins one: the
- * bucket's masks up to the high watermark, frozen until the read releases them.
+ * bucket's masks up to the high watermark, frozen until no request asks for them for the idle
+ * timeout ({@link DerivedDvPinnedCuts}).
  *
  * <p>The response carries the masks of the named lake data files and the log mask from {@code
  * logFromOffset} on, at most {@code maxLogBytes} of it.
@@ -36,20 +36,12 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 @Internal
 public final class DvMaskRequest {
 
-    /**
-     * The most holds one request pins or releases. A read takes one per part of a bucket, and a
-     * bucket has a part per group of lake files plus one for its log.
-     */
-    public static final int MAX_HOLDS = 4096;
-
     @Nullable private final Long cut;
     private final List<String> lakeFileNames;
     @Nullable private final Long logFromOffset;
     private final int maxLogBytes;
     private final boolean waitForCatchUp;
     @Nullable private final Long pinRequestId;
-    private final int holds;
-    private final boolean releaseCut;
 
     public DvMaskRequest(
             @Nullable Long cut,
@@ -57,65 +49,20 @@ public final class DvMaskRequest {
             @Nullable Long logFromOffset,
             int maxLogBytes,
             boolean waitForCatchUp,
-            @Nullable Long pinRequestId,
-            int holds) {
-        this(
-                cut,
-                lakeFileNames,
-                logFromOffset,
-                maxLogBytes,
-                waitForCatchUp,
-                pinRequestId,
-                holds,
-                false);
-    }
-
-    private DvMaskRequest(
-            @Nullable Long cut,
-            List<String> lakeFileNames,
-            @Nullable Long logFromOffset,
-            int maxLogBytes,
-            boolean waitForCatchUp,
-            @Nullable Long pinRequestId,
-            int holds,
-            boolean releaseCut) {
+            @Nullable Long pinRequestId) {
         checkArgument(maxLogBytes > 0, "A log mask page of %s bytes is requested.", maxLogBytes);
-        checkArgument(
-                holds > 0 && holds <= MAX_HOLDS,
-                "A pin or release of %s holds is requested, outside [1, %s].",
-                holds,
-                MAX_HOLDS);
         this.cut = cut;
         this.lakeFileNames = lakeFileNames;
         this.logFromOffset = logFromOffset;
         this.maxLogBytes = maxLogBytes;
         this.waitForCatchUp = waitForCatchUp;
         this.pinRequestId = pinRequestId;
-        this.holds = holds;
-        this.releaseCut = releaseCut;
-    }
-
-    /**
-     * Releases {@code holds} holds of cut {@code cut}, as the parts of a read that pinned it end.
-     */
-    public static DvMaskRequest release(long cut, int holds) {
-        return new DvMaskRequest(cut, Collections.emptyList(), null, 1, true, null, holds, true);
-    }
-
-    /** The holds a pin takes, or a release drops. */
-    public int holds() {
-        return holds;
-    }
-
-    /** Whether the request releases holds of the cut instead of asking for masks. */
-    public boolean releasesCut() {
-        return releaseCut;
     }
 
     /**
      * Whether the read waits for its bucket's leader: to switch to the requested snapshot, to
      * rebuild or replay its masks, and to finish lake-position lookups. If not, the leader answers
-     * at once (see {@link DerivedDvManager#pinCut(long, boolean, Long, int)}).
+     * at once (see {@link DerivedDvManager#pinCut(long, boolean, Long)}).
      */
     public boolean waitForCatchUp() {
         return waitForCatchUp;
@@ -163,10 +110,6 @@ public final class DvMaskRequest {
                 + waitForCatchUp
                 + ", pinRequestId="
                 + pinRequestId
-                + ", holds="
-                + holds
-                + ", releaseCut="
-                + releaseCut
                 + '}';
     }
 }

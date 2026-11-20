@@ -160,12 +160,6 @@ class FlinkUnionReadDvAutoCompactionITCase extends FlinkUnionReadTestBase {
                         GetDvSnapshotResponse cut =
                                 DvAdmin.of(admin).getDvSnapshot(tablePath, pin).get();
                         assertThat(cut.getSnapshotStartOffset()).isGreaterThanOrEqualTo(0L);
-                        DvAdmin.of(admin)
-                                .getDvSnapshot(
-                                        tablePath,
-                                        pin.setLogEndOffset(cut.getLogEndOffset())
-                                                .setReleaseCut(true))
-                                .get();
                     });
 
             // Exact reads across the compaction show that the index covers the compacted files
@@ -350,7 +344,7 @@ class FlinkUnionReadDvAutoCompactionITCase extends FlinkUnionReadTestBase {
                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                 .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
                 .property(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true")
-                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                 .customProperty("iceberg.format-version", String.valueOf(formatVersion));
     }
 
@@ -369,7 +363,8 @@ class FlinkUnionReadDvAutoCompactionITCase extends FlinkUnionReadTestBase {
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
                         .property(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .customProperty("iceberg.format-version", String.valueOf(formatVersion))
                         .build();
         return createTable(tablePath, tableDescriptor);

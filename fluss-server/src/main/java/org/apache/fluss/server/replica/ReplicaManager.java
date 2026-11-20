@@ -103,6 +103,7 @@ import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRuntime;
 import org.apache.fluss.server.kv.dv.DvMaskRequest;
 import org.apache.fluss.server.kv.dv.DvPinnedCut;
+import org.apache.fluss.server.kv.dv.DvRoundEnd;
 import org.apache.fluss.server.kv.dv.DvRowTtlFoldException;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
@@ -1489,8 +1490,8 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
-     * Pins the cut of a union read of a bucket, or releases it, and answers with the requested
-     * parts of its masks.
+     * Pins the cut of a union read of a bucket, or renews one the read pinned, and answers with the
+     * requested parts of its masks.
      *
      * @param tableId the table ID
      * @param partitionId the partition ID, null for non-partitioned tables
@@ -1508,27 +1509,22 @@ public class ReplicaManager implements ServerReconfigurable {
         TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
         try {
             DerivedDvManager dvManager = dvLeaderKvTablet(tb).getDvManager();
-            if (masks.releasesCut()) {
-                dvManager.releaseCut(readableSnapshotId, masks.cut(), masks.holds());
-                return new GetDvSnapshotResponse();
-            }
             try {
                 DvPinnedCut cut =
                         masks.cut() == null
                                 ? dvManager.pinCut(
                                         readableSnapshotId,
                                         masks.waitForCatchUp(),
-                                        masks.pinRequestId(),
-                                        masks.holds())
+                                        masks.pinRequestId())
                                 : pinnedCut(tb, dvManager, readableSnapshotId, masks.cut());
                 return ServerRpcMessageUtils.buildDvCutResponse(cut, masks);
             } catch (DvRowTtlFoldException e) {
                 // Decided when a pin would freeze the masks, as a cut no version had expired below
-                // then stays exact. Row TTL may have removed a version the masks miss: no masks,
-                // the reader reads the bucket by key up to the cut, which is exact whatever
-                // expired; no cut was pinned for it.
+                // then stays exact. On Paimon row TTL may have removed a version the masks miss:
+                // no masks, the reader reads the bucket by key up to the cut, which is exact
+                // whatever expired; no cut was pinned for it.
                 dvManager.foldCutServed(e.cut());
-                return ServerRpcMessageUtils.buildDvFoldResponse(e.cut()).setTtlUnsafe(true);
+                return ServerRpcMessageUtils.buildDvFoldResponse(e.cut());
             } catch (StaleSnapshotException e) {
                 if (masks.waitForCatchUp() || masks.cut() != null) {
                     // A cut that is gone is stale for a read that does not wait too: the leader
@@ -1559,7 +1555,7 @@ public class ReplicaManager implements ServerReconfigurable {
     }
 
     /**
-     * Returns a cut a union read pinned. A cut the bucket does not hold fails as stale. The message
+     * Returns a cut a union read pinned. A cut the bucket does not keep fails as stale. The message
      * names the bucket and the cut after the snapshot ids, which clients read from it.
      */
     private static DvPinnedCut pinnedCut(
@@ -1595,26 +1591,73 @@ public class ReplicaManager implements ServerReconfigurable {
         return kvTablet;
     }
 
-    /** Returns the positions of the given primary keys in snapshot {@code snapshotId}. */
-    public GetDvSnapshotResponse lookupDvPositions(
+    /**
+     * Returns a part of the deletes of a tiering round on snapshot {@code snapshotId} that ends at
+     * {@code endOffset}, or of its log mask, from {@code fromOffset} on, or from the snapshot's
+     * readable offset if null. The part names the round it was read for, so the reader checks it
+     * against its own, and the epoch of the leader that read it.
+     */
+    public GetDvSnapshotResponse roundPart(
             long tableId,
             @Nullable Long partitionId,
             int bucketId,
             long snapshotId,
-            List<byte[]> keys) {
+            @Nullable Long fromOffset,
+            long endOffset,
+            boolean logMask) {
         TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
         try {
-            List<Object[]> found = dvLeaderKvTablet(tb).getDvManager().lookup(snapshotId, keys);
-            GetDvSnapshotResponse resp = new GetDvSnapshotResponse();
-            for (Object[] f : found) {
-                resp.addKeyPosition().setFilePath((String) f[1]).setPos((Long) f[2]);
-            }
-            return resp;
+            DerivedDvManager dvManager = dvLeaderKvTablet(tb).getDvManager();
+            GetDvSnapshotResponse part =
+                    logMask
+                            ? ServerRpcMessageUtils.buildDvRoundMaskResponse(
+                                    dvManager.roundMask(snapshotId, fromOffset, endOffset))
+                            : ServerRpcMessageUtils.buildDvRoundDeletesResponse(
+                                    dvManager.roundDeletes(snapshotId, fromOffset, endOffset));
+            return part.setRoundSnapshotId(snapshotId)
+                    .setRoundEndOffset(endOffset)
+                    .setLeaderEpoch(getReplicaOrException(tb).getLeaderEpoch());
         } catch (ApiException e) {
             throw e;
         } catch (Exception e) {
             throw new FlussRuntimeException(
-                    "Failed to get DV snapshot for " + tb + " snapshot " + snapshotId, e);
+                    String.format(
+                            "Failed to get the round %s of %s snapshot %d up to %d",
+                            logMask ? "mask" : "deletes", tb, snapshotId, endOffset),
+                    e);
+        }
+    }
+
+    /**
+     * Plans the end of a tiering round of a bucket with deletion vectors that starts at {@code
+     * startOffset}, from the leader's log up to its high watermark ({@link DvRoundEnd}). Reads the
+     * offset indexes of the local segments, and of the remote segments below the local log start.
+     */
+    public GetDvSnapshotResponse planDvRound(
+            long tableId,
+            @Nullable Long partitionId,
+            int bucketId,
+            long startOffset,
+            long maxRecords,
+            long maxBytes) {
+        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+        try {
+            dvLeaderKvTablet(tb);
+            LogTablet log = getReplicaOrException(tb).getLogTablet();
+            long highWatermark = log.getHighWatermark();
+            return ServerRpcMessageUtils.buildDvRoundEndResponse(
+                    DvRoundEnd.plan(
+                            DvRoundEnd.logPieces(
+                                    tb, log, remoteLogManager, startOffset, highWatermark),
+                            startOffset,
+                            highWatermark,
+                            maxRecords,
+                            maxBytes));
+        } catch (ApiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    "Failed to plan the round of " + tb + " from offset " + startOffset, e);
         }
     }
 

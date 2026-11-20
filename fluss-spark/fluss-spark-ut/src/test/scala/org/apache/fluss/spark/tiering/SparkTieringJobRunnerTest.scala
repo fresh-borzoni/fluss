@@ -193,7 +193,7 @@ class SparkTieringJobRunnerTest extends AnyFunSuite {
       .schema(Schema.newBuilder().column("id", DataTypes.INT()).primaryKey("id").build())
       .distributedBy(1, "id")
       .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
-      .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+      .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
       .build()
     val tableInfo = TableInfo.of(tablePath, 1L, 1, descriptor, "remote", 0L, 0L)
     when(f.admin.getTableInfo(tablePath)).thenReturn(CompletableFuture.completedFuture(tableInfo))

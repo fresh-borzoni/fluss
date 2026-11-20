@@ -102,6 +102,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.fluss.config.ConfigOptions.CURRENT_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
+import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createPartition;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newCreateDatabaseRequest;
@@ -1274,15 +1275,13 @@ class TableManagerITCase {
                                     newPartitionedTableBuilder(null)
                                             .property(ConfigOptions.TABLE_AUTO_PARTITION_KEY, "dt")
                                             .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                            .property(
-                                                    ConfigOptions.TABLE_DELETION_VECTORS_ENABLED,
-                                                    true)
+                                            .property(TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                             .build(),
                                     false))
                     .get();
             assertThatThrownBy(() -> setHistoricalPartitionEnabled(gateway, dvTable, true))
                     .cause()
-                    .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                    .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                     .hasMessageContaining(
                             ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key());
             assertThat(isHistoricalPartitionEnabled(gateway, dvTable)).isFalse();
@@ -1295,8 +1294,7 @@ class TableManagerITCase {
                                                     newAlterTableRequest(
                                                             historicalTable,
                                                             Collections.singletonMap(
-                                                                    ConfigOptions
-                                                                            .TABLE_DELETION_VECTORS_ENABLED
+                                                                    TABLE_DATALAKE_DELETION_VECTORS_ENABLED
                                                                             .key(),
                                                                     "true"),
                                                             Collections.emptyList(),
@@ -1304,7 +1302,7 @@ class TableManagerITCase {
                                                             false))
                                             .get())
                     .cause()
-                    .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+                    .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key());
             TableDescriptor descriptor =
                     TableDescriptor.fromJsonBytes(
                             gateway.getTableInfo(newGetTableInfoRequest(historicalTable))
@@ -1312,7 +1310,7 @@ class TableManagerITCase {
                                     .getTableJson());
             assertThat(
                             Configuration.fromMap(descriptor.getProperties())
-                                    .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED))
+                                    .get(TABLE_DATALAKE_DELETION_VECTORS_ENABLED))
                     .isFalse();
         } finally {
             cluster.close();

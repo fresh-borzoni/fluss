@@ -227,9 +227,7 @@ class DvBucketPartReaderTest {
         assertThat(log.subscribedFrom).isEqualTo(97L);
         assertThat(bucket.pins()).hasSize(2);
         for (GetDvSnapshotRequest request : server.requests()) {
-            if (!request.hasReleaseCut()) {
-                assertThat(request.hasWaitForCatchUp() && !request.isWaitForCatchUp()).isTrue();
-            }
+            assertThat(request.hasWaitForCatchUp() && !request.isWaitForCatchUp()).isTrue();
         }
         // no backoff: the leader serves the snapshot before right away
         assertThat(context.sleeps).isEmpty();
@@ -394,7 +392,7 @@ class DvBucketPartReaderTest {
                         DvBucketPart.BUCKET_LOG,
                         106L,
                         100L);
-        assertThat(logPart.sharesBucket()).isTrue();
+        assertThat(logPart.isPinned()).isTrue();
 
         assertThatThrownBy(() -> bucket.read(logPart, Integer.MAX_VALUE))
                 .isInstanceOf(IllegalStateException.class)
@@ -418,8 +416,6 @@ class DvBucketPartReaderTest {
         assertThatThrownBy(() -> bucket.read(bucket.bucketPart(), Integer.MAX_VALUE))
                 .isInstanceOf(LakeTableRolledBackException.class)
                 .hasMessageContaining("commit-b");
-        // the part releases the cut it pinned before it found the snapshot reused
-        assertThat(bucket.releases()).hasSize(1);
     }
 
     /**
@@ -468,7 +464,7 @@ class DvBucketPartReaderTest {
 
     /**
      * A part's own pin is lost before its masks are fetched: the leader evicted the cut, or a new
-     * leader holds no such cut. The part releases its pin and pins again, and reads as exactly.
+     * leader has no such cut. The part pins again, and reads as exactly.
      */
     @ParameterizedTest
     @EnumSource(Loss.class)
@@ -496,8 +492,6 @@ class DvBucketPartReaderTest {
         assertThat(bucket.pins()).hasSize(2);
         assertThat(bucket.pins().get(0).getPinRequestId())
                 .isNotEqualTo(bucket.pins().get(1).getPinRequestId());
-        // the lost pin and the second one are both released
-        assertThat(bucket.releases()).hasSize(2);
         assertThat(context.keyReads).isEmpty();
     }
 
@@ -574,17 +568,15 @@ class DvBucketPartReaderTest {
         assertThat(read.resolved.getMaskLogEndOffset()).isEqualTo(107L);
         assertThat(context.keyReads).containsExactly("log", "f0.parquet", "f1.parquet");
         assertThat(bucket.pins()).hasSizeGreaterThan(1);
-        // every pin is released: none is held for the folded read
-        assertThat(bucket.releases()).hasSameSizeAs(bucket.pins());
     }
 
     /**
-     * A part pinned at planning whose cut is gone resolves afresh on the snapshot its leader covers
-     * now, which reads the bucket's log from another offset. Restored before it returned a row, it
-     * reads the log from that offset again, not from the one planning pinned.
+     * A part whose leader covers a newer snapshot than planned resolves on that one, which reads
+     * the bucket's log from another offset. Restored before it returned a row, it reads the log
+     * from that offset again, not from the planned one.
      */
     @Test
-    void testRestoreOfAPartPinnedAgainReadsTheLogFromItsNewStart() throws Exception {
+    void testRestoreOfAReplannedPartReadsTheLogFromItsNewStart() throws Exception {
         // snapshot 6 holds none of the bucket's files; its log is read from offset 150
         long newer = 6L;
         List<Long> held = new ArrayList<>();
@@ -609,25 +601,13 @@ class DvBucketPartReaderTest {
                             .setSnapshotStartOffset(150);
                 };
         context.waitForCatchUp = false;
-        DvBucketPart planned =
-                DvBucketPart.pinned(
-                        BUCKET,
-                        null,
-                        SNAPSHOT,
-                        100L,
-                        200L,
-                        null,
-                        DvBucketPart.WHOLE_BUCKET,
-                        106L,
-                        100L);
+        DvBucketPart planned = DvBucketPart.ofBucket(BUCKET, null, SNAPSHOT, 100L, 200L, null);
 
         DvBucketPart resolved = new DvBucketPartReader(planned, context).resolve();
 
         assertThat(resolved.getSnapshotId()).isEqualTo(newer);
         assertThat(resolved.getMaskLogEndOffset()).isEqualTo(180L);
         assertThat(resolved.getMaskState().getLogStartOffset()).isEqualTo(150L);
-        // not the planning pin's: its cut is gone
-        assertThat(resolved.isPinned() && resolved.getPinnedLogStartOffset() != 150L).isFalse();
 
         // restored before any row: the masks are not kept
         server.clearRequests();
@@ -643,37 +623,23 @@ class DvBucketPartReaderTest {
     }
 
     /**
-     * The leader's answer names the offset the masks start at. A fetch that expected another fails
-     * rather than read the log from the wrong offset; a part that reads its whole bucket then
-     * resolves afresh.
+     * The leader's answer names the offset the masks start at. A fetch of the cut planning pinned
+     * that names another start fails rather than read the log from the wrong offset; the part then
+     * derives the cut's masks from the keys, from the start planning named.
      */
     @Test
     void testMasksOfAnotherStartAreNotReadFromThePlannedStart() throws Exception {
         bucket.standardBucket();
-        // the bucket's log is read from offset 102 in the snapshot, not from 100 as planned
-        server.answer =
-                request -> {
-                    GetDvSnapshotResponse response = masks(SNAPSHOT, 102, 106);
-                    response.clearLakeDvEntries();
-                    return response;
-                };
-        DvBucketPart planned =
-                DvBucketPart.pinned(
-                        BUCKET,
-                        null,
-                        SNAPSHOT,
-                        100L,
-                        106L,
-                        null,
-                        DvBucketPart.WHOLE_BUCKET,
-                        106L,
-                        100L);
+        // the masks start at offset 102, not at 100 as when planning pinned the cut
+        server.answer = request -> masks(SNAPSHOT, 102, 106);
+        DvBucketPart logPart = bucket.pinnedPart(null, DvBucketPart.BUCKET_LOG, 106L);
 
-        Read read = bucket.read(planned, Integer.MAX_VALUE);
+        Read read = bucket.read(logPart, Integer.MAX_VALUE);
 
-        assertThat(read.resolved.getMaskState().getLogStartOffset()).isEqualTo(102L);
-        assertThat(log.subscribedFrom).isEqualTo(102L);
-        assertThat(read.rows).containsExactlyInAnyOrder("6=b");
+        assertThat(read.resolved.getMaskState().getLogStartOffset()).isEqualTo(100L);
+        assertThat(context.keyReads).containsExactly("log");
+        assertThat(log.subscribedFrom).isEqualTo(100L);
+        assertThat(read.rows).containsExactlyInAnyOrder("1=b", "6=b");
     }
 
     /**
@@ -712,34 +678,30 @@ class DvBucketPartReaderTest {
         assertThat(server.requests())
                 .filteredOn(GetDvSnapshotRequest::hasLogDvFromOffset)
                 .isNotEmpty();
-        // the cut was pinned at planning, whose engine releases it
-        assertThat(bucket.releases()).isEmpty();
     }
 
     /**
-     * A part that pinned its own cut when it started, unpinned at planning, releases the cut when
-     * it ends: read to the end, or closed before, as when the read is cancelled.
+     * A part that reads its whole bucket pins its own cut once when it starts, whether it is read
+     * to the end or closed before, as when the read is cancelled. Every other request it sends asks
+     * for masks.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testPartReleasesTheCutItPinned(boolean readToTheEnd) throws Exception {
+    void testWholeBucketPartPinsItsOwnCutOnce(boolean readToTheEnd) throws Exception {
         bucket.standardBucket();
 
         Read read = bucket.read(bucket.bucketPart(), readToTheEnd ? Integer.MAX_VALUE : 1);
 
         assertThat(read.rows).hasSize(readToTheEnd ? EXACT.size() : 1);
-        assertThat(bucket.releases())
-                .singleElement()
-                .satisfies(
-                        release -> {
-                            assertThat(release.getReadableSnapshotId()).isEqualTo(SNAPSHOT);
-                            assertThat(release.getLogEndOffset()).isEqualTo(106L);
-                            assertThat(release.getLakeDvFileNamesCount()).isZero();
-                            assertThat(release.hasLogDvFromOffset()).isFalse();
-                        });
-        // the release is the part's last request
-        List<GetDvSnapshotRequest> requests = server.requests();
-        assertThat(requests.get(requests.size() - 1)).isSameAs(bucket.releases().get(0));
+        assertThat(bucket.pins()).singleElement();
+        assertThat(server.requests())
+                .allSatisfy(
+                        request ->
+                                assertThat(
+                                                !request.hasLogEndOffset()
+                                                        || request.getLakeDvFileNamesCount() > 0
+                                                        || request.hasLogDvFromOffset())
+                                        .isTrue());
     }
 
     /**
@@ -834,53 +796,32 @@ class DvBucketPartReaderTest {
                 .hasMessageContaining("could not derive its masks");
     }
 
-    /** A part that reads its whole bucket resolves afresh when its pinned cut is lost. */
-    @Test
-    void testLostCutOfAWholeBucketPartResolvesAfresh() throws Exception {
-        bucket.standardBucket();
-        PinningServer pins = bucket.pinningServer();
-        long cut = pins.pin();
-        pins.cuts.clear();
-        log.append(107, ChangeType.UPDATE_AFTER, 3, "later");
-
-        Read read =
-                bucket.read(
-                        bucket.pinnedPart(lake.plans.get(SNAPSHOT), DvBucketPart.WHOLE_BUCKET, cut),
-                        Integer.MAX_VALUE);
-
-        // as of the new cut, after both late writes
-        assertThat(read.rows)
-                .containsExactlyInAnyOrder("0=late", "1=b", "2=a", "3=later", "5=a", "6=b");
-        assertThat(read.resolved.getMaskLogEndOffset()).isEqualTo(108L);
-    }
-
     /**
-     * On a table with row TTL, key 6 was inserted at 100, expired from the KV before it was tiered,
-     * and inserted again at 101, which could not name it: masks would keep both. A leader that says
-     * so serves no masks and has the bucket read by key, which keeps the last; it holds no cut for
-     * the read. Masks a leader serves, unflagged, read key 6 twice.
+     * On a Paimon table with row TTL, key 6 was inserted at 100, expired from the KV before it was
+     * tiered, and inserted again at 101, which could not name it: masks would keep both. A leader
+     * that knows serves no masks and has the bucket read by key, which keeps the last; it pins no
+     * cut for the read. Masks a leader serves anyway read key 6 twice.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testBucketWhoseMasksMayMissAnExpiredVersionIsReadByKey(boolean flagged) throws Exception {
+    void testBucketWhoseMasksMayMissAnExpiredVersionIsReadByKey(boolean folded) throws Exception {
         lake.plan(SNAPSHOT, new FileSplit("f0.parquet", new int[] {0, 1, 2}, "a"));
         log.append(100, ChangeType.INSERT, 6, "a");
         log.append(101, ChangeType.INSERT, 6, "b");
         server.answer =
                 request ->
-                        flagged
-                                ? new GetDvSnapshotResponse().setFoldCut(102).setTtlUnsafe(true)
+                        folded
+                                ? new GetDvSnapshotResponse().setFoldCut(102)
                                 : new GetDvSnapshotResponse()
                                         .setLogEndOffset(102)
                                         .setSnapshotStartOffset(100);
 
         Read read = bucket.read(bucket.bucketPart(), Integer.MAX_VALUE);
 
-        if (flagged) {
+        if (folded) {
             assertThat(read.rows).containsExactlyInAnyOrder("0=a", "1=a", "2=a", "6=b");
             assertThat(read.resolved.getReadMode()).isEqualTo(ReadMode.FOLDED);
             assertThat(read.resolved.getMaskLogEndOffset()).isEqualTo(102L);
-            assertThat(bucket.releases()).isEmpty();
         } else {
             assertThat(read.rows).containsExactlyInAnyOrder("0=a", "1=a", "2=a", "6=a", "6=b");
             assertThat(read.resolved.getReadMode()).isEqualTo(ReadMode.MASKED);
@@ -1023,8 +964,7 @@ class DvBucketPartReaderTest {
         bucket.standardBucket();
         server.failures.add(new DeletionVectorsNotReadyException("switching"));
         context.interruptSleeps = true;
-        DvBucketPart part =
-                bucket.pinnedPart(lake.plans.get(SNAPSHOT), DvBucketPart.WHOLE_BUCKET, 106L);
+        DvBucketPart part = bucket.pinnedPart(lake.plans.get(SNAPSHOT).subList(0, 1), 0, 106L);
 
         try {
             assertThatThrownBy(() -> bucket.read(part, Integer.MAX_VALUE))

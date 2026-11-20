@@ -27,6 +27,7 @@ import org.apache.fluss.client.tiering.TableBucketWriteResult;
 import org.apache.fluss.client.tiering.TieringLogSplit;
 import org.apache.fluss.client.tiering.TieringRowPosSplit;
 import org.apache.fluss.client.tiering.TieringSnapshotSplit;
+import org.apache.fluss.client.tiering.TieringSplit;
 import org.apache.fluss.client.write.HashBucketAssigner;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
@@ -36,7 +37,6 @@ import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
 import org.apache.fluss.lake.writer.LakeWriter;
-import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.MergeEngineType;
@@ -55,6 +55,8 @@ import org.apache.flink.metrics.testutils.MetricListener;
 import org.apache.flink.runtime.metrics.groups.InternalSourceReaderMetricGroup;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -397,39 +399,66 @@ class TieringSplitReaderTest extends FlinkTestBase {
     }
 
     /**
-     * A full round-buffering lake writer ends its bucket's round right after the record that filled
-     * it. The write result covers exactly the records written, ends at the offset after the last of
-     * them and is marked as ended early, so the next round tiers the rest of the split from there.
+     * A round its leader planned is written up to its planned end, whatever the round's caps and
+     * whatever the writer holds, and the time limit does not cut it: its log mask is exact at that
+     * end only. A round the caps cut below the leader's high watermark is reported as such, so the
+     * next round starts at once.
      */
-    @Test
-    void testRoundOfAFullBufferingWriterEndsEarly() throws Exception {
-        TablePath tablePath = TablePath.of("fluss", "tiering_table_with_round_budget");
+    @ParameterizedTest(name = "time limit {0}")
+    @ValueSource(booleans = {false, true})
+    void testPlannedRoundIsWrittenToItsEnd(boolean timeLimit) throws Exception {
+        TablePath tablePath =
+                TablePath.of("fluss", "tiering_planned_rounds" + (timeLimit ? "_limited" : ""));
         long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
         Map<TableBucket, List<InternalRow>> rows = putRows(tableId, tablePath, 30);
         org.apache.fluss.config.Configuration lakeTieringConfig =
                 new org.apache.fluss.config.Configuration();
-        int budget = 3;
+        // the caps apply when the round is planned, not while it is written
         lakeTieringConfig.set(
-                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_KEYS_PER_BUCKET, budget);
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET, 1);
+        // the table has no deletion vectors, so its leaders serve no masks
+        lakeTieringConfig.set(
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_ROUND_MASK_ENABLED, false);
         try (Connection connection =
                         ConnectionFactory.createConnection(
                                 FLUSS_CLUSTER_EXTENSION.getClientConfig());
                 TieringSplitReader<TestingWriteResult> tieringSplitReader =
                         new TieringSplitReader<>(
                                 connection,
-                                new BufferingLakeTieringFactory(),
+                                new CountingLakeTieringFactory(),
                                 Thread.currentThread().getContextClassLoader(),
                                 new TieringMetrics(
                                         InternalSourceReaderMetricGroup.mock(
                                                 new MetricListener().getMetricGroup())),
                                 lakeTieringConfig)) {
             List<FlinkTieringSplit> splits = new ArrayList<>();
+            Map<TableBucket, Long> ends = new HashMap<>();
             for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
-                int records = rows.get(new TableBucket(tableId, bucket)).size();
-                assertThat(records).isGreaterThan(budget);
-                splits.add(createLogSplit(tablePath, tableId, bucket, 0, records));
+                TableBucket tb = new TableBucket(tableId, bucket);
+                int records = rows.get(tb).size();
+                assertThat(records).isGreaterThan(2);
+                // bucket 0 is planned up to its end, the others below it
+                long end = bucket == 0 ? records : records - 1;
+                ends.put(tb, end);
+                splits.add(
+                        new FlinkTieringSplit(
+                                new TieringLogSplit(
+                                        tablePath,
+                                        tb,
+                                        null,
+                                        0,
+                                        end,
+                                        3,
+                                        false,
+                                        TieringSplit.UNKNOWN_SPLIT_INDEX,
+                                        TieringSplit.UNKNOWN_TIERING_ROUND_TIMESTAMP,
+                                        -1L,
+                                        bucket != 0)));
             }
             tieringSplitReader.handleSplitsChanges(new SplitsAddition<>(splits));
+            if (timeLimit) {
+                tieringSplitReader.handleTableReachTieringMaxDuration(tableId);
+            }
 
             Map<TableBucket, TableBucketWriteResult<TestingWriteResult>> results = new HashMap<>();
             Set<String> finished = new HashSet<>();
@@ -445,9 +474,11 @@ class TieringSplitReaderTest extends FlinkTestBase {
             }
             assertThat(results).hasSize(DEFAULT_BUCKET_NUM);
             for (TableBucketWriteResult<TestingWriteResult> result : results.values()) {
-                assertThat(result.writeResult().getWriteResult()).isEqualTo(budget);
-                assertThat(result.logEndOffset()).isEqualTo(budget);
-                assertThat(result.endedEarly()).isTrue();
+                long end = ends.get(result.tableBucket());
+                assertThat(result.writeResult().getWriteResult()).isEqualTo((int) end);
+                assertThat(result.logStartOffset()).isZero();
+                assertThat(result.logEndOffset()).isEqualTo(end);
+                assertThat(result.endedEarly()).isEqualTo(result.tableBucket().getBucket() != 0);
             }
         }
     }
@@ -817,34 +848,23 @@ class TieringSplitReaderTest extends FlinkTestBase {
         return hashBucketAssigner.assignBucket(key, DEFAULT_BUCKET_NUM);
     }
 
-    private static class BufferingLakeTieringFactory extends TestingLakeTieringFactory {
+    private static class CountingLakeTieringFactory extends TestingLakeTieringFactory {
 
         @Override
         public LakeWriter<TestingWriteResult> createLakeWriter(WriterInitContext writerInitContext)
                 throws IOException {
-            return new BufferingLakeWriter();
+            return new CountingLakeWriter();
         }
     }
 
-    /** Holds every record it writes until it completes, like a writer that folds by key. */
-    private static class BufferingLakeWriter
-            implements LakeWriter<TestingWriteResult>, RoundBufferingLakeWriter {
+    /** Counts the records it writes. */
+    private static class CountingLakeWriter implements LakeWriter<TestingWriteResult> {
 
         private int writtenRecords;
 
         @Override
         public void write(LogRecord record) {
             writtenRecords++;
-        }
-
-        @Override
-        public long bufferedKeys() {
-            return writtenRecords;
-        }
-
-        @Override
-        public long bufferedBytes() {
-            return 0;
         }
 
         @Override

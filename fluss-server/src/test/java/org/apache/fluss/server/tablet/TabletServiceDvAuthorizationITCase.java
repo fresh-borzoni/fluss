@@ -48,8 +48,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests that every kind of {@code GetDvSnapshot} request needs the permission to read the table:
- * union reads pin, fetch and release cuts of its buckets, and tiering looks up its keys, which
- * reveals whether a key exists.
+ * union reads pin cuts of its buckets and fetch them, and tiering looks up its keys, which reveals
+ * whether a key exists.
  */
 class TabletServiceDvAuthorizationITCase {
 
@@ -72,7 +72,8 @@ class TabletServiceDvAuthorizationITCase {
                                 .schema(DATA1_SCHEMA_PK)
                                 .distributedBy(1, "a")
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                 .build());
         TableBucket tb = new TableBucket(tableId, 0);
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
@@ -83,16 +84,18 @@ class TabletServiceDvAuthorizationITCase {
             TabletServerGateway guest = gateway(guestClient, leader);
             assertDenied(guest, request(tableId));
             assertDenied(guest, request(tableId).setLogEndOffset(0).setLogDvFromOffset(0));
-            assertDenied(guest, request(tableId).setLogEndOffset(0).setReleaseCut(true));
             assertDenied(guest, request(tableId).setWaitForCatchUp(false));
-            GetDvSnapshotRequest lookup = request(tableId);
-            lookup.addLookupKey(new byte[] {1});
-            assertDenied(guest, lookup);
+            assertDenied(guest, request(tableId).setRoundEndOffset(0));
 
-            // a principal allowed to read the table pins a cut
+            // a principal allowed to read the table pins a cut, and takes a round's deletes
             TabletServerGateway root = gateway(rootClient, leader);
             GetDvSnapshotResponse pin = getDvWhenReady(root, request(tableId));
             assertThat(pin.getLogEndOffset()).isGreaterThanOrEqualTo(0L);
+            GetDvSnapshotResponse round =
+                    getDvWhenReady(root, request(tableId).setRoundEndOffset(0));
+            assertThat(round.getRoundNextOffset()).isZero();
+            assertThat(round.getSnapshotStartOffset()).isZero();
+            assertThat(round.getLakeDvEntriesCount()).isZero();
         }
     }
 

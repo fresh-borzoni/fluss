@@ -116,11 +116,7 @@ final class IndexCheckpoints {
         }
     }
 
-    /**
-     * Lists the bucket's checkpoint directories. Throws on a directory of the layout before
-     * per-attempt directories, which this version does not read: the table's {@code rowPos/} was
-     * written by an older build and must be cleared.
-     */
+    /** Lists the bucket's checkpoint directories. */
     List<Listed> list(TableBucket bucket) throws IOException {
         FsPath bucketDir = layout.checkpointDir(bucket);
         FileSystem fs = bucketDir.getFileSystem();
@@ -132,14 +128,6 @@ final class IndexCheckpoints {
             String name = st.getPath().getName();
             Long snapshotId = checkpointSnapshot(name);
             if (snapshotId == null) {
-                if (parseLong(name) != null) {
-                    throw new IllegalStateException(
-                            String.format(
-                                    "The position index checkpoint %s is of a layout this Fluss"
-                                            + " version does not read. Delete %s and let the"
-                                            + " tiering service index the table again.",
-                                    st.getPath(), layout.path(IndexLayout.ROW_POS_DIR)));
-                }
                 continue;
             }
             FsPath dir = st.getPath();

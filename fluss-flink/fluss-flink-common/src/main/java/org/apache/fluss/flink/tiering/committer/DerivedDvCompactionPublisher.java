@@ -325,7 +325,7 @@ final class DerivedDvCompactionPublisher<WriteResult, Committable> {
      * files of their part from 0. This committer is the single allocator of a table's ids. The
      * parts' SSTs are rewritten with the ids, in parallel.
      */
-    private static Map<TableBucket, PositionIndexStore.BucketChange> assignFileIds(
+    private Map<TableBucket, PositionIndexStore.BucketChange> assignFileIds(
             PositionIndexStore store, long changeId, Map<TableBucket, CompactionIndexPart> parts)
             throws Exception {
         int files = 0;
@@ -350,7 +350,9 @@ final class DerivedDvCompactionPublisher<WriteResult, Committable> {
         Map<TableBucket, PositionIndexStore.BucketChange> change = new HashMap<>();
         ExecutorService pool =
                 Executors.newFixedThreadPool(
-                        Math.min(PublishedParts.PUBLISH_THREADS, parts.size()));
+                        Math.min(
+                                PublishedParts.publishThreads(context.lakeTieringConfig),
+                                parts.size()));
         try {
             Map<TableBucket, Future<PositionIndexStore.BucketPart>> remapped = new HashMap<>();
             for (Map.Entry<TableBucket, CompactionIndexPart> e : parts.entrySet()) {

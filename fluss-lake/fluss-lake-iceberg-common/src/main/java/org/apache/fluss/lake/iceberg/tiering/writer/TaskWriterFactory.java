@@ -34,13 +34,17 @@ import org.apache.iceberg.util.PropertyUtil;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES;
 import static org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT;
 
 /** A factory to create Iceberg {@link TaskWriter}. */
 public class TaskWriterFactory {
+
+    private static final String METRICS_PROPERTY_PREFIX = "write.metadata.metrics.";
 
     public static TaskWriter<Record> createTaskWriter(
             Table table, @Nullable String partition, int bucket) {
@@ -73,7 +77,7 @@ public class TaskWriterFactory {
         // commit.
         if (dvEnabled || equalityFieldIds.length == 0) {
             FileAppenderFactory<Record> fileAppenderFactory =
-                    new GenericAppenderFactory(schema, table.spec());
+                    appenderFactory(table, schema, null, null);
             return new GenericRecordAppendOnlyWriter(
                     table,
                     format,
@@ -86,8 +90,7 @@ public class TaskWriterFactory {
 
         } else {
             FileAppenderFactory<Record> appenderFactory =
-                    new GenericAppenderFactory(
-                            schema, table.spec(), equalityFieldIds, schema, null);
+                    appenderFactory(table, schema, equalityFieldIds, schema);
             List<String> columns = new ArrayList<>();
             for (Integer fieldId : schema.identifierFieldIds()) {
                 columns.add(schema.findField(fieldId).name());
@@ -132,12 +135,28 @@ public class TaskWriterFactory {
         return new GenericRecordAppendOnlyWriter(
                 table,
                 format,
-                new GenericAppenderFactory(rewriteSchema(table), table.spec()),
+                appenderFactory(table, rewriteSchema(table), null, null),
                 OutputFileFactory.builderFor(table, bucket, 0).format(format).build(),
                 table.io(),
                 targetFileSize(table),
                 partition,
                 bucket);
+    }
+
+    /**
+     * An appender factory that writes with the table's properties. The metrics come from the table
+     * itself, so the columns of its sort order keep their bounds, which compaction sorts by.
+     */
+    private static FileAppenderFactory<Record> appenderFactory(
+            Table table,
+            Schema schema,
+            @Nullable int[] equalityFieldIds,
+            @Nullable Schema eqDeleteRowSchema) {
+        // the table-aware constructor refuses metrics keys in the config, it reads them itself
+        Map<String, String> config = new HashMap<>(table.properties());
+        config.keySet().removeIf(key -> key.startsWith(METRICS_PROPERTY_PREFIX));
+        return new GenericAppenderFactory(
+                table, schema, table.spec(), config, equalityFieldIds, eqDeleteRowSchema, null);
     }
 
     private static FileFormat fileFormat(Table icebergTable) {

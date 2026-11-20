@@ -43,7 +43,7 @@ import java.util.function.LongSupplier;
 /**
  * The owner of a bucket's derived deletion vector state: the one place its transitions run, one
  * step at a time. It holds the state, changes it only in its steps, and publishes it as an
- * immutable {@link DvState} after each step, which reads and lookups take without a lock.
+ * immutable {@link DvState} after each step, which reads take without a lock.
  *
  * <h3>Mailbox</h3>
  *
@@ -100,10 +100,12 @@ import java.util.function.LongSupplier;
  * <p>A failed apply, trim or hand-off drops the change list: masks are served again once a TAIL
  * load replayed it. A step that fails unexpectedly does the same, logs at ERROR and counts in
  * {@code dvOwnerFaultPerSecond}; only a {@link VirtualMachineError} then stops the tablet server,
- * as on its other pools. If the owner falls behind its writes, the hand-off overflows ({@link
- * DvHandOff}) and the change list is replayed after a backoff ({@link DvRebuild}). A FULL or TAIL
- * load ends with a final pass ({@link DvReplay}): the owner buffers the changes it drains from then
- * on, and the swap installs them with the replayed change list.
+ * as on its other pools. A cover whose row TTL state is corrupt drops it too ({@link
+ * DvRowTtlGuard}), and no TAIL load replays it until the bucket covers a snapshot the state allows.
+ * If the owner falls behind its writes, the hand-off overflows ({@link DvHandOff}) and the change
+ * list is replayed after a backoff ({@link DvRebuild}). A FULL or TAIL load ends with a final pass
+ * ({@link DvReplay}): the owner buffers the changes it drains from then on, and the swap installs
+ * them with the replayed change list.
  */
 final class DvOwner {
 
@@ -157,7 +159,7 @@ final class DvOwner {
     volatile String logName = "table=- partition=- bucket=-";
 
     // The fields below are the owner's: only its steps read and write them, unless noted
-    // otherwise. Reads and lookups take the published state instead.
+    // otherwise. Reads take the published state instead.
     long coveredSnapshotId = -1;
     // what the covered snapshot's id named when it was registered, for readers to check
     @Nullable String coveredIdentity;
@@ -183,10 +185,10 @@ final class DvOwner {
     // Who may still call the RocksDB, which the manager owns: it closes once the last lease after
     // close() is released.
     final DvDbLeases leases;
-    // The version of the index the bucket covers: lookups and lake positions are read through it.
+    // The version of the index the bucket covers: lake positions are read through it.
     // Starts as the empty lake's. The owner's; readers take it from the published state.
     DvVersion version;
-    // The state the owner published after its last step; reads and lookups take it without a lock.
+    // The state the owner published after its last step; reads take it without a lock.
     volatile DvState state;
     // The replay whose final pass runs: the owner buffers the changes it drains for it.
     @Nullable DvReplay finalPass;
@@ -198,7 +200,7 @@ final class DvOwner {
     // may follow an expired version of its key, so it supersedes the key's last version.
     // Volatile: set on the caller's thread before the first recovery, read by replay jobs.
     volatile boolean rowTtl;
-    // with row TTL, whether masks are exact or reads fold the bucket by key
+    // with row TTL, whether masks are exact, or the bucket serves none or reads fold it by key
     final DvRowTtlGuard rowTtlGuard = new DvRowTtlGuard(this);
     // The tablet server's memory for deletion vector state.
     final DerivedDvHeapBudget heapBudget;
@@ -349,9 +351,9 @@ final class DvOwner {
             coveredSnapshotId = -1;
             coveredIdentity = null;
             snapshotStartOffset = 0;
-            rowTtlGuard.covered(0);
             emptyLakeTracked = false;
-            maskState.tailFailure = null;
+            // a corrupt row TTL state leaves the change list missing: no replay serves masks
+            maskState.tailFailure = rowTtlGuard.covered(0);
             maskState.resetTail();
         }
         if (!closed && maskState.tailMissing()) {
@@ -486,10 +488,14 @@ final class DvOwner {
 
     // ---- the facade's calls, on the callers' threads ----
 
-    /** Marks the table as one with row TTL of {@code ttlMs}; before the first recovery. */
-    void useRowTtl(long ttlMs, @Nullable RowTtlFilterClock filterClock) {
+    /**
+     * Marks the table as one with row TTL of {@code ttlMs}, on a lake whose readable offset can
+     * move back or not; before the first recovery.
+     */
+    void useRowTtl(
+            long ttlMs, @Nullable RowTtlFilterClock filterClock, boolean readableOffsetMovesBack) {
         rowTtl = true;
-        rowTtlGuard.useRowTtl(ttlMs, filterClock);
+        rowTtlGuard.useRowTtl(ttlMs, filterClock, readableOffsetMovesBack);
     }
 
     /** Names the bucket in log lines. */

@@ -113,7 +113,8 @@ class DvRowTtlEventTimeTest {
                                 .distributedBy(1, "a")
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                        "true")
                                 .property(
                                         ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
                                         String.valueOf(KvValueLayout.VERSIONED.version()))

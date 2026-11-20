@@ -279,6 +279,25 @@ public class TestingGoldenFiles {
                 .build();
     }
 
+    /**
+     * Creates a deletion vector of the golden table: a blob at {@code contentOffset} of the Puffin
+     * file {@code name}, of the data file {@code dataFile}.
+     */
+    public static DeleteFile deletionVector(
+            String name, String dataFile, long contentOffset, long contentSize) {
+        return FileMetadata.deleteFileBuilder(SPEC)
+                .ofPositionDeletes()
+                .withPath(location(name))
+                .withFormat(FileFormat.PUFFIN)
+                .withPartitionPath(PARTITION_PATH)
+                .withFileSizeInBytes(1024)
+                .withRecordCount(3)
+                .withReferencedDataFile(location(dataFile))
+                .withContentOffset(contentOffset)
+                .withContentSizeInBytes(contentSize)
+                .build();
+    }
+
     /** Asserts that two collections of data or delete files are equal, in iteration order. */
     private static void assertContentFilesEqual(
             Collection<? extends ContentFile<?>> actual,

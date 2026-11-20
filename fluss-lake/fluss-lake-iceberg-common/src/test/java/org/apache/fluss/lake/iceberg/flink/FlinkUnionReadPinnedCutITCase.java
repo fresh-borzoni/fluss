@@ -71,7 +71,10 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
     private static final int BUCKETS = 3;
     private static final int ROUNDS = 3;
     private static final int KEYS_PER_ROUND = 300;
-    private static final String IDLE_TIMEOUT = "kv.deletion-vectors.pinned-cut-idle-timeout";
+    // short, so the tests that use it see cuts idle out while a read goes on
+    private static final Duration SHORT_IDLE = Duration.ofSeconds(1);
+    // the short idle timeout and the sweep after it, with room for a slow machine
+    private static final Duration SHORT_IDLE_EXPIRY_WAIT = Duration.ofSeconds(30);
     // the lake snapshot a part is read on, in the message it logs when it starts
     private static final Pattern READ_SNAPSHOT =
             Pattern.compile("^Reading .* as (?:MASKED|FOLDED) \\(snapshot (-?\\d+),");
@@ -113,9 +116,7 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
      */
     @Test
     void testSplitsDeriveTheMasksOfACutTheLeaderDropped() throws Exception {
-        Configuration shortIdle = new Configuration();
-        shortIdle.setString(IDLE_TIMEOUT, "1s");
-        restartTabletServers(shortIdle);
+        restartTabletServers(shortIdle());
         try {
             TablePath tablePath = TablePath.of(DEFAULT_DB, "pinned_parts_dropped_cut");
             long tableId = createDerivedTable(tablePath);
@@ -139,7 +140,7 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
     /**
      * Reads while tiering keeps registering snapshots, so leaders switch during the read. A read
      * that does not wait may read a bucket whose leader still covers the snapshot before on that
-     * one; both reads are exact.
+     * one, or a bucket as of a cut below the writes before it; both reads are exact.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
@@ -150,15 +151,15 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
 
         JobClient tiering = buildTieringJob(execEnv);
         try (LogCapture log = LogCapture.of(DV_READ_LOGGER)) {
-            new UnionReadUnderWrites(clientConf, tablePath)
-                    .withHint(FILE_GROUP_ROWS, "1")
-                    .withHint(
-                            ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.key(),
-                            String.valueOf(waitForCatchUp))
-                    .withMillisPerRow(2)
-                    .readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
+            UnionReadUnderWrites read =
+                    new UnionReadUnderWrites(clientConf, tablePath)
+                            .withHint(FILE_GROUP_ROWS, "1")
+                            .withMillisPerRow(2);
             if (waitForCatchUp) {
+                read.readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
                 assertThat(log.messagesWith("while it switches to it")).isEmpty();
+            } else {
+                read.readWithoutWaitingAndCheck(everyNth(before, 7), Duration.ofMinutes(5));
             }
         } finally {
             tiering.cancel().get();
@@ -182,7 +183,6 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
         CountDownLatch switches = new CountDownLatch(1);
         FLUSS_CLUSTER_EXTENSION.holdDvSwitches(switches);
         long next;
-        Map<Integer, Set<String>> written;
         try {
             // a round tiers the log tail into a new snapshot, which the leaders do not switch to
             JobClient tiering = buildTieringJob(execEnv);
@@ -200,9 +200,8 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
             }
 
             try (LogCapture log = LogCapture.of(DV_READ_LOGGER)) {
-                written =
-                        noWaitRead(tablePath)
-                                .readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
+                noWaitRead(tablePath)
+                        .readWithoutWaitingAndCheck(everyNth(before, 7), Duration.ofMinutes(5));
                 // planned on the new snapshot, each bucket was read on the one before
                 assertThat(
                                 log.messagesWith(
@@ -217,38 +216,16 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
         }
 
         waitUntilLeadersCover(tableId, next);
-        Map<Integer, String> after = lastValues(before, written);
         try (LogCapture log = LogCapture.of(DV_READ_LOGGER)) {
-            noWaitRead(tablePath).readAndCheck(after, everyNth(after, 7), Duration.ofMinutes(5));
+            noWaitRead(tablePath)
+                    .readWithoutWaitingAndCheck(everyNth(before, 7), Duration.ofMinutes(5));
             assertThat(log.messagesWith("while it switches to it")).isEmpty();
             assertThat(snapshotsRead(log.messages())).containsOnly(next);
         }
     }
 
-    /** The table as writes left it: each key's last value written, numbered by the writes. */
-    private static Map<Integer, String> lastValues(
-            Map<Integer, String> before, Map<Integer, Set<String>> written) {
-        Map<Integer, String> after = new TreeMap<>(before);
-        written.forEach(
-                (key, values) ->
-                        after.put(
-                                key,
-                                values.stream()
-                                        .max(
-                                                (a, b) ->
-                                                        Integer.compare(
-                                                                Integer.parseInt(a.substring(1)),
-                                                                Integer.parseInt(b.substring(1))))
-                                        .get()));
-        return after;
-    }
-
     private UnionReadUnderWrites noWaitRead(TablePath tablePath) {
-        return new UnionReadUnderWrites(clientConf, tablePath)
-                .withHint(FILE_GROUP_ROWS, "1")
-                .withHint(
-                        ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.key(),
-                        "false");
+        return new UnionReadUnderWrites(clientConf, tablePath).withHint(FILE_GROUP_ROWS, "1");
     }
 
     /**
@@ -377,46 +354,39 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
         }
     }
 
-    /**
-     * A read releases the cuts it pinned on the buckets' leaders when it ends, instead of leaving
-     * them to the idle timeout: when it finishes, and when it is cancelled.
-     */
+    /** The cuts a read pinned on the buckets' leaders idle out once it ended. */
     @Test
-    void testCutsAreReleasedWhenTheReadEnds() throws Exception {
-        TablePath tablePath = TablePath.of(DEFAULT_DB, "pinned_parts_released");
-        long tableId = createDerivedTable(tablePath);
-        Map<Integer, String> before = tierInRounds(tablePath, tableId);
-        assertThat(pinnedCuts(tableId)).isZero();
+    void testCutsOfAFinishedReadIdleOut() throws Exception {
+        restartTabletServers(shortIdle());
+        try {
+            TablePath tablePath = TablePath.of(DEFAULT_DB, "pinned_parts_idle_out");
+            long tableId = createDerivedTable(tablePath);
+            Map<Integer, String> before = tierInRounds(tablePath, tableId);
+            assertThat(pinnedCuts(tableId)).isZero();
 
-        new UnionReadUnderWrites(clientConf, tablePath)
-                .withHint(FILE_GROUP_ROWS, "1")
-                .readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
-        waitUntil(
-                () -> pinnedCuts(tableId) == 0,
-                Duration.ofSeconds(30),
-                "the cuts of the finished read are still held");
-
-        // a slow read holds its cuts until it is cancelled
-        JobClient read =
+            try (LogCapture log = LogCapture.of(DV_READ_LOGGER)) {
                 new UnionReadUnderWrites(clientConf, tablePath)
                         .withHint(FILE_GROUP_ROWS, "1")
-                        .withMillisPerRow(100)
-                        .startRead();
-        try {
+                        .readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
+                assertThat(log.messagesWith("Pinned the mask cuts of 3 of 3 buckets")).hasSize(1);
+            }
             waitUntil(
-                    () -> pinnedCuts(tableId) > 0,
-                    Duration.ofMinutes(1),
-                    "the read pinned no cuts");
+                    () -> pinnedCuts(tableId) == 0,
+                    SHORT_IDLE_EXPIRY_WAIT,
+                    "the cuts of the finished read did not idle out");
         } finally {
-            read.cancel().get();
+            restartTabletServers(new Configuration());
         }
-        waitUntil(
-                () -> pinnedCuts(tableId) == 0,
-                Duration.ofSeconds(30),
-                "the cuts of the cancelled read are still held");
     }
 
-    /** The cuts the table's bucket leaders hold. */
+    /** The tablet server configuration of the tests that let pinned cuts idle out quickly. */
+    private static Configuration shortIdle() {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT, SHORT_IDLE);
+        return conf;
+    }
+
+    /** The cuts the table's bucket leaders keep. */
     private int pinnedCuts(long tableId) {
         int cuts = 0;
         for (int b = 0; b < BUCKETS; b++) {
@@ -519,7 +489,8 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
                         .distributedBy(BUCKETS)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .customProperty("iceberg.format-version", "3")
                         .build());
     }

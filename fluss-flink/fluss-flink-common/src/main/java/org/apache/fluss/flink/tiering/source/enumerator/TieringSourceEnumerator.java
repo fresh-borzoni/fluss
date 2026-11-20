@@ -33,6 +33,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.LakeTableExternallyModifiedException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.metrics.FlinkMetricRegistry;
+import org.apache.fluss.flink.tiering.committer.ConsecutiveCommitFailureCounter;
 import org.apache.fluss.flink.tiering.event.FailedTieringEvent;
 import org.apache.fluss.flink.tiering.event.FinishedTieringEvent;
 import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
@@ -118,6 +119,12 @@ public class TieringSourceEnumerator
 
     private static final Logger LOG = LoggerFactory.getLogger(TieringSourceEnumerator.class);
 
+    /** Consecutive failed rounds of a table from which each of its failures is logged at ERROR. */
+    @VisibleForTesting static final int CONSECUTIVE_FAILED_ROUNDS_TO_LOG_ERROR = 10;
+
+    // the tables whose failed rounds are counted at most; see ConsecutiveCommitFailureCounter
+    private static final int MAX_TABLES_WITH_FAILED_ROUNDS = 10_000;
+
     /** Delay between claims when draining consecutive empty tables, to pace the claim RPC rate. */
     private static final long EMPTY_TABLE_POLL_DELAY_MS = 1000L;
 
@@ -140,6 +147,12 @@ public class TieringSourceEnumerator
     private final Map<Long, Long> failedTableEpochs;
     private final Map<Long, TieringFinishInfo> finishedTables;
     private final Set<Long> tieringReachMaxDurationsTables;
+    // Table ID -> consecutive failed rounds: commits that failed, events that could not be
+    // handled, splits that could not be generated, and failovers of the readers. The enumerator
+    // outlives the failovers of the readers and the committer, which lose their own counts.
+    // Guarded by itself.
+    private final ConsecutiveCommitFailureCounter consecutiveFailedRounds =
+            new ConsecutiveCommitFailureCounter(MAX_TABLES_WITH_FAILED_ROUNDS);
     // Tables whose lake table was rolled back or written by another engine. The error is logged
     // once per table.
     private final Set<Long> rolledBackTables = new HashSet<>();
@@ -211,9 +224,10 @@ public class TieringSourceEnumerator
         this.failedTableEpochs = new ConcurrentHashMap<>();
         this.tieringReachMaxDurationsTables = Collections.synchronizedSet(new TreeSet<>());
         this.tieringMetrics =
-                TieringMetrics.registerReadersAwaitingSplitRatio(
+                TieringMetrics.registerEnumeratorMetrics(
                         enumeratorMetricGroup,
-                        () -> (double) readersAwaitingSplit.size() / context.currentParallelism());
+                        () -> (double) readersAwaitingSplit.size() / context.currentParallelism(),
+                        this::maxConsecutiveFailedRounds);
     }
 
     @Override
@@ -228,7 +242,28 @@ public class TieringSourceEnumerator
         CoordinatorGateway gateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, rpcClient, CoordinatorGateway.class);
-        start(gateway, admin, new TieringSplitGenerator(admin));
+        start(gateway, admin, splitGenerator(admin));
+    }
+
+    /**
+     * The generator of the splits. If the lake takes deletes, the rounds of tables with deletion
+     * vectors are planned at their leaders, which fix each round's end within its caps, since a
+     * round's log mask is exact at that end only; on other lakes their rounds end at the high
+     * watermark.
+     */
+    private TieringSplitGenerator splitGenerator(Admin admin) {
+        if (!(lakeTieringFactory instanceof SupportsDeletionVectorTiering)
+                || ((SupportsDeletionVectorTiering) lakeTieringFactory).mergesByPrimaryKey()) {
+            return new TieringSplitGenerator(admin);
+        }
+        return new TieringSplitGenerator(
+                admin,
+                lakeTieringConfig.get(
+                        ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET),
+                lakeTieringConfig
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET)
+                        .getBytes(),
+                flussConf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis());
     }
 
     @VisibleForTesting
@@ -380,8 +415,9 @@ public class TieringSourceEnumerator
                         "The finished table {} is not in tiering table, won't report it to Fluss to mark as finished.",
                         finishedTableId);
             } else {
-                // A round that reached its max duration, or whose buckets ended early on full
-                // lake writers, has more to tier. The table is tiered again at once.
+                roundFinished(finishedTableId);
+                // A round that reached its max duration, or whose buckets' leaders capped it below
+                // their high watermarks, has more to tier. The table is tiered again at once.
                 boolean isForceFinished =
                         tieringReachMaxDurationsTables.remove(finishedTableId)
                                 | finishedTieringEvent.hasMoreToTier();
@@ -414,6 +450,7 @@ public class TieringSourceEnumerator
                         failedTableId);
             } else {
                 failedTableEpochs.put(failedTableId, tieringEpoch);
+                roundFailed(failedTableId, failedEvent.failReason());
             }
         }
     }
@@ -472,6 +509,7 @@ public class TieringSourceEnumerator
         Long tieringEpoch = tieringTableEpochs.remove(tableId);
         if (tieringEpoch != null) {
             failedTableEpochs.put(tableId, tieringEpoch);
+            roundFailed(tableId, ExceptionUtils.stringifyException(cause));
         }
     }
 
@@ -520,6 +558,10 @@ public class TieringSourceEnumerator
                 "Handling source reader fail over, mark current tiering table epoch {} as failed.",
                 tieringTableEpochs);
         // we need to make all as failed
+        for (Long tableId : tieringTableEpochs.keySet()) {
+            roundFailed(
+                    tableId, "the tiering job's readers failed over; their logs have the cause");
+        }
         failedTableEpochs.putAll(new HashMap<>(tieringTableEpochs));
         tieringTableEpochs.clear();
         tieringReachMaxDurationsTables.clear();
@@ -759,6 +801,51 @@ public class TieringSourceEnumerator
             }
             failedTableEpochs.put(tieringTable.f0, tieringTable.f1);
             tieringTableEpochs.remove(tieringTable.f0);
+            // a rollback is logged at ERROR above once
+            roundFailed(
+                    tieringTable.f0,
+                    rollback.isPresent() ? null : ExceptionUtils.stringifyException(e));
+        }
+    }
+
+    /**
+     * Counts a failed round of the table. From {@link #CONSECUTIVE_FAILED_ROUNDS_TO_LOG_ERROR}
+     * failed rounds in a row on, each is logged at ERROR with its {@code cause}, unless null: the
+     * job does not fail, so a table whose rounds keep failing, e.g. as its lake client broke for
+     * good, would only show in WARN lines and in the coordinator's tiering metrics.
+     */
+    private void roundFailed(long tableId, @Nullable String cause) {
+        int failures;
+        synchronized (consecutiveFailedRounds) {
+            failures = consecutiveFailedRounds.recordFailure(tableId);
+        }
+        if (cause != null && failures >= CONSECUTIVE_FAILED_ROUNDS_TO_LOG_ERROR) {
+            LOG.error(
+                    "The round of tiering table {} failed, {} rounds in a row: its lake data does"
+                            + " not advance until a round succeeds. The last failure: {}",
+                    tableId,
+                    failures,
+                    cause);
+        }
+    }
+
+    private void roundFinished(long tableId) {
+        synchronized (consecutiveFailedRounds) {
+            consecutiveFailedRounds.recordSuccess(tableId);
+        }
+    }
+
+    @VisibleForTesting
+    int getConsecutiveFailedRounds(long tableId) {
+        synchronized (consecutiveFailedRounds) {
+            return consecutiveFailedRounds.getFailures(tableId);
+        }
+    }
+
+    /** The most consecutive failed rounds of a table, the enumerator's gauge. */
+    int maxConsecutiveFailedRounds() {
+        synchronized (consecutiveFailedRounds) {
+            return consecutiveFailedRounds.maxFailures();
         }
     }
 

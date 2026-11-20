@@ -92,16 +92,9 @@ class FlinkUnionReadRowTtlITCase extends FlinkDerivedDvTestBase {
         assertThat(lookup(tablePath, KEY)).isNotNull();
         upsert(tablePath, expected, KEY, KEY + 1, "rewritten");
 
-        long folds = rowTtlFolds();
+        // the write named the version it superseded: the masks are exact
         assertThat(unionRead(tableName)).containsExactlyInAnyOrderElementsOf(asRows(expected));
-        // the write named the version it superseded: masks served regardless of row TTL are exact
-        FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(true);
-        try {
-            assertThat(unionRead(tableName)).containsExactlyInAnyOrderElementsOf(asRows(expected));
-        } finally {
-            FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(false);
-        }
-        assertThat(rowTtlFolds()).isEqualTo(folds);
+        assertThat(rowTtlCorruptions()).isZero();
 
         // a lake snapshot holds the key's version: the cap moves past it, and it expires
         tierAll(tablePath, tableId);
@@ -138,7 +131,8 @@ class FlinkUnionReadRowTtlITCase extends FlinkDerivedDvTestBase {
                                         ConfigOptions.TABLE_DATALAKE_FRESHNESS,
                                         Duration.ofMillis(500))
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                        "true")
                                 .property(ConfigOptions.TABLE_KV_TTL.key(), TTL.toMillis() + "ms")
                                 .property(ConfigOptions.TABLE_KV_TTL_TIME_COLUMN.key(), "ts")
                                 .customProperty("iceberg.format-version", "3")
@@ -156,17 +150,9 @@ class FlinkUnionReadRowTtlITCase extends FlinkDerivedDvTestBase {
         assertThat(lookup(tablePath, KEY)).isNotNull();
         write(tablePath, expected, KEY, KEY + 1, "rewritten", backfilled);
 
-        long folds = rowTtlFolds();
         assertThat(unionRead(tableName, "c1, c2"))
                 .containsExactlyInAnyOrderElementsOf(asRows(expected));
-        FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(true);
-        try {
-            assertThat(unionRead(tableName, "c1, c2"))
-                    .containsExactlyInAnyOrderElementsOf(asRows(expected));
-        } finally {
-            FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(false);
-        }
-        assertThat(rowTtlFolds()).isEqualTo(folds);
+        assertThat(rowTtlCorruptions()).isZero();
 
         // new leaders restore the buckets from KV snapshots with the filter's state: the cap
         // holds the backfilled row at once, and reads keep masks
@@ -192,10 +178,9 @@ class FlinkUnionReadRowTtlITCase extends FlinkDerivedDvTestBase {
                 });
         compact(tableId);
         assertThat(lookup(tablePath, KEY)).isNotNull();
-        folds = rowTtlFolds();
         assertThat(unionRead(tableName, "c1, c2"))
                 .containsExactlyInAnyOrderElementsOf(asRows(expected));
-        assertThat(rowTtlFolds()).isEqualTo(folds);
+        assertThat(rowTtlCorruptions()).isZero();
 
         tierAll(tablePath, tableId);
         retry(
@@ -280,16 +265,17 @@ class FlinkUnionReadRowTtlITCase extends FlinkDerivedDvTestBase {
         }
     }
 
-    private static long rowTtlFolds() {
-        long folds = 0;
+    /** Buckets whose saved row TTL state was found corrupt, on the running tablet servers. */
+    private static long rowTtlCorruptions() {
+        long corruptions = 0;
         for (TabletServer server : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {
-            folds +=
+            corruptions +=
                     server.getReplicaManager()
                             .getServerMetricGroup()
-                            .dvRowTtlFoldCount()
+                            .dvRowTtlCorruptCount()
                             .getCount();
         }
-        return folds;
+        return corruptions;
     }
 
     private List<String> unionRead(String tableName) throws Exception {

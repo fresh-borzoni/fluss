@@ -64,7 +64,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <pre>
  * From                Event                                    To
- * PLANNED             MASKS (the pin's answer: c)              PINNED, holding its own pin of c
+ * PLANNED             MASKS (the pin's answer: c)              PINNED on c
  * PLANNED             REBUILDING (cut f)                       FOLDING S from o up to f
  * PLANNED             COVERED (S'), replans left               REPLANNING S' (R if S' has no offset)
  * PLANNED             COVERED (none left), NOT_READY,          REPLANNING R to read it by key up to
@@ -73,7 +73,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * PLANNED             ROLLED_BACK, INTERRUPTED                 FAILED
  * REPLANNING          REPLANNED                                PLANNED, or FOLDING for R
  * REPLANNING          ROLLED_BACK, INTERRUPTED, ERROR          FAILED
- * PINNED              MASKS (all of c)                         READY, masked, keeping its own pin
+ * PINNED              MASKS (all of c)                         READY, masked
  * PINNED              COVERED, REBUILDING, NOT_READY,          PLANNED (c is lost), and once
  *                     LEADER_LOST                                MAX_REPINS were lost FOLDING S up to c
  * PINNED              PARTITION_DROPPED                        READY, lake only
@@ -81,8 +81,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * PINNED_AT_PLANNING  MASKS                                    READY, masked
  * PINNED_AT_PLANNING  ROLLED_BACK, INTERRUPTED                 FAILED
  * PINNED_AT_PLANNING  any other answer, started                FAILED: cannot resume
- * PINNED_AT_PLANNING  any other answer, whole                  PLANNED on S
- * PINNED_AT_PLANNING  any other answer, not whole              FOLDING c from the pinned start
+ * PINNED_AT_PLANNING  any other answer, not started            FOLDING c from the pinned start
  * FOLDING             DERIVED                                  READY, folded (masked if the part
  *                                                                was pinned at planning)
  * FOLDING             any failure                              FAILED
@@ -114,10 +113,8 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * FOLDED                                        FOLDING its cut again
  * </pre>
  *
- * <p>The part's own pin ({@link DvOwnPin}) is held from the pin's answer, before anything checks
- * it, while the part is PINNED, and in READY and the reading states of a part read with the masks
- * of that pin. Entering any other state releases it: a lost cut, a fold, a lake-only read, and the
- * ends DONE, FAILED and CLOSED.
+ * <p>A part has all its masks before it returns rows, so a cut that expires later does not affect
+ * it.
  */
 @Internal
 final class DvPartMachine {
@@ -166,7 +163,6 @@ final class DvPartMachine {
     private final DvBucketPart part;
     private final TablePath tablePath;
     private final ReadStats stats;
-    private final DvOwnPin ownPin;
     // the states the part went through, for tests and messages
     private final List<DvPartState> history = new ArrayList<>();
 
@@ -195,11 +191,10 @@ final class DvPartMachine {
     private boolean returnedRows;
     @Nullable private Throwable failure;
 
-    DvPartMachine(DvBucketPart part, TablePath tablePath, ReadStats stats, DvOwnPin ownPin) {
+    DvPartMachine(DvBucketPart part, TablePath tablePath, ReadStats stats) {
         this.part = part;
         this.tablePath = tablePath;
         this.stats = stats;
-        this.ownPin = ownPin;
         this.target = Target.of(part);
         this.state = initial();
         history.add(state);
@@ -286,9 +281,6 @@ final class DvPartMachine {
             case MASKS:
                 GetDvSnapshotResponse answer = checkNotNull(event.pinAnswer);
                 cut = answer.getLogEndOffset();
-                // the leader pinned the cut for this part: released when the part leaves it or
-                // ends, also if the snapshot turns out to name another commit now
-                ownPin.hold(target.snapshotId, cut);
                 pinAnswer = answer;
                 enter(PINNED);
                 return;
@@ -376,7 +368,7 @@ final class DvPartMachine {
             case NOT_READY:
             case LEADER_LOST:
                 // The leader lost the cut before its masks were fetched: it evicted it, or a new
-                // leader holds no such cut. Nothing of the part was read, so it pins again.
+                // leader has no such cut. Nothing of the part was read, so it pins again.
                 String why = whyOf(event.failure);
                 if (++repins <= MAX_REPINS) {
                     LOG.info(
@@ -413,9 +405,9 @@ final class DvPartMachine {
     }
 
     /**
-     * The masks of a cut pinned at planning: if the leader dropped the cut, a part that reads its
-     * whole bucket and emitted nothing resolves afresh. A part that shares the cut derives its
-     * masks from the keys, because other parts of the bucket read with that cut.
+     * The masks of a cut pinned at planning. If the leader dropped the cut, a part that emitted
+     * nothing derives its masks from the keys, because the other parts of its bucket read with that
+     * cut.
      */
     private void onPinnedAtPlanning(DvPartEvent event) {
         switch (event.kind) {
@@ -438,15 +430,6 @@ final class DvPartMachine {
                             cannotResume(
                                     String.format("its leader no longer serves them (%s)", why),
                                     event.failure));
-                    return;
-                }
-                if (!part.sharesBucket()) {
-                    LOG.info(
-                            "The cut pinned for {} is no longer served ({}); resolving it afresh.",
-                            part.describe(),
-                            why);
-                    target = Target.of(part);
-                    enter(PLANNED);
                     return;
                 }
                 LOG.warn(
@@ -562,7 +545,7 @@ final class DvPartMachine {
      * the drop would read nothing of it.
      */
     private void partitionDropped() {
-        if (!returnedRows && !part.isStarted() && !part.sharesBucket()) {
+        if (!returnedRows && !part.isStarted() && !part.isPinned()) {
             LOG.warn(
                     "The partition of {} was dropped before its log was read; the part ends"
                             + " without rows.",
@@ -650,18 +633,9 @@ final class DvPartMachine {
         enter(FAILED);
     }
 
-    /** Enters {@code next}, releasing the part's own pin unless {@code next} reads with it. */
     private void enter(DvPartState next) {
         state = next;
         history.add(next);
-        boolean readsWithOwnPin =
-                next == PINNED
-                        || (next.isReading()
-                                && resolved != null
-                                && resolved.getReadMode() == ReadMode.MASKED);
-        if (!readsWithOwnPin) {
-            ownPin.release();
-        }
     }
 
     private IllegalStateException unexpected(DvPartEvent event) {

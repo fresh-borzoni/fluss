@@ -24,6 +24,8 @@ import org.apache.fluss.server.exception.CorruptIndexException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -141,6 +143,30 @@ public final class OffsetIndex extends AbstractIndex {
                     } else {
                         return parseEntry(idx, slot);
                     }
+                });
+    }
+
+    /**
+     * Find the smallest offset greater than or equal to the given targetOffset and return a pair
+     * holding this offset and its corresponding physical file position.
+     *
+     * @param targetOffset The offset to look up.
+     * @return The offset found and the corresponding file position for this offset, or null if
+     *     every entry of the index is below the target offset (or the index is empty).
+     */
+    @Nullable
+    public OffsetPosition lookupCeiling(long targetOffset) {
+        return inReadLock(
+                remapLock,
+                () -> {
+                    ByteBuffer idx = mmap().duplicate();
+                    // the upper bound search may skip an entry equal to the target
+                    int slot = largestLowerBoundSlotFor(idx, targetOffset, IndexSearchType.KEY);
+                    if (slot >= 0 && parseEntry(idx, slot).getOffset() < targetOffset) {
+                        slot++;
+                    }
+                    slot = Math.max(slot, 0);
+                    return slot < entries() ? parseEntry(idx, slot) : null;
                 });
     }
 

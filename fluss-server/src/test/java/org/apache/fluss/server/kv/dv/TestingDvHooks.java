@@ -35,7 +35,6 @@ public final class TestingDvHooks implements DvTestHooks {
     private volatile boolean resolvesPaused;
     private volatile boolean rowTtlExpiryIgnored;
     @Nullable private volatile Runnable beforeResolveLookup;
-    @Nullable private volatile Runnable afterLookupRead;
     @Nullable private volatile Runnable afterIngest;
     @Nullable private volatile Consumer<BooleanSupplier> beforeCompaction;
     @Nullable private volatile Consumer<String> beforeFileDrop;
@@ -55,21 +54,18 @@ public final class TestingDvHooks implements DvTestHooks {
         this.switchGate = gate;
     }
 
-    /** Pauses the background resolves, which then neither apply nor look up. */
+    /** See {@link DvTestHooks#ignoresRowTtlExpiry}. */
     public void setRowTtlExpiryIgnored(boolean ignored) {
         this.rowTtlExpiryIgnored = ignored;
     }
 
+    /** Pauses the background resolves, which then neither apply nor look up. */
     public void setResolvesPaused(boolean paused) {
         this.resolvesPaused = paused;
     }
 
     public void setBeforeResolveLookup(@Nullable Runnable hook) {
         this.beforeResolveLookup = hook;
-    }
-
-    public void setAfterLookupRead(@Nullable Runnable hook) {
-        this.afterLookupRead = hook;
     }
 
     public void setAfterIngest(@Nullable Runnable hook) {
@@ -140,11 +136,6 @@ public final class TestingDvHooks implements DvTestHooks {
     @Override
     public void beforeResolveLookup() {
         run(beforeResolveLookup);
-    }
-
-    @Override
-    public void afterLookupRead() {
-        run(afterLookupRead);
     }
 
     @Override

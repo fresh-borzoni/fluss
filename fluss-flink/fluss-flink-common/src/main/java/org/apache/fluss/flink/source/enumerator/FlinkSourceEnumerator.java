@@ -20,15 +20,12 @@ package org.apache.fluss.flink.source.enumerator;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
-import org.apache.fluss.client.admin.DvAdmin;
 import org.apache.fluss.client.initializer.BucketOffsetsRetrieverImpl;
 import org.apache.fluss.client.initializer.NoStoppingOffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.client.initializer.OffsetsInitializer.BucketOffsetsRetriever;
 import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.client.metadata.KvSnapshots;
-import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPart;
-import org.apache.fluss.client.table.scanner.batch.dv.DvBucketPlanner;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.KvBatchStrategy;
@@ -39,7 +36,6 @@ import org.apache.fluss.flink.lake.split.DvBucketSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.FlinkSource;
-import org.apache.fluss.flink.source.event.DvSplitsFinishedEvent;
 import org.apache.fluss.flink.source.event.FinishedKvSnapshotConsumeEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
@@ -75,10 +71,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -211,20 +205,6 @@ public class FlinkSourceEnumerator
 
     /** checkpointId -> tableBuckets who finished consume kv snapshots. */
     private final TreeMap<Long, Set<TableBucket>> consumedKvSnapshotMap = new TreeMap<>();
-
-    // The parts of buckets this enumerator pinned mask cuts for, by split id. Each holds one hold
-    // of its bucket's cut, released when a reader reports its split finished, or when the read
-    // ends. A restored enumerator pinned none and releases none; the cuts then idle out on the
-    // leaders. The split generation worker adds to it.
-    @GuardedBy("pinnedDvParts")
-    private final Map<String, DvBucketPart> pinnedDvParts = new HashMap<>();
-
-    // set once the enumerator released its cuts: cuts pinned later are released at once
-    @GuardedBy("pinnedDvParts")
-    private boolean pinnedDvCutsReleased;
-
-    // How long closing waits for the leaders to release the pinned cuts.
-    private static final Duration DV_RELEASE_TIMEOUT = Duration.ofSeconds(5);
 
     // Lazily instantiated or mutable fields.
     private Connection connection;
@@ -1314,6 +1294,8 @@ public class FlinkSourceEnumerator
                     flussConf.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS));
             lakeSplitGenerator.setWaitForCatchUp(
                     flussConf.get(ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP));
+            lakeSplitGenerator.setRequestTimeout(
+                    flussConf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT));
             List<SourceSplitBase> generatedSplits =
                     lakeSplitGenerator.generateHybridLakeFlussSplits();
             if (generatedSplits == null) {
@@ -1321,106 +1303,11 @@ public class FlinkSourceEnumerator
                 pendingHybridLakeFlussSplits = Collections.emptyList();
                 return null;
             } else {
-                recordPinnedDvParts(generatedSplits);
                 pendingHybridLakeFlussSplits = generatedSplits;
                 return new ArrayList<>(generatedSplits);
             }
         } catch (Exception e) {
             throw new FlinkRuntimeException("Failed to generate hybrid lake fluss splits", e);
-        }
-    }
-
-    /**
-     * Releases the holds of the mask cuts this enumerator pinned on the buckets' leaders that the
-     * splits did not release, as the read ends: finished, cancelled, or failed over (whose restored
-     * splits then derive masks from keys or keep theirs). Best effort; cuts not released are
-     * dropped once they idle.
-     */
-    private void releasePinnedDvCuts() {
-        List<DvBucketPart> parts;
-        synchronized (pinnedDvParts) {
-            pinnedDvCutsReleased = true;
-            parts = new ArrayList<>(pinnedDvParts.values());
-            pinnedDvParts.clear();
-        }
-        releaseDvHolds(parts, true);
-    }
-
-    /** Records the parts the split generation pinned cuts for, to release their holds. */
-    @VisibleForTesting
-    void recordPinnedDvParts(List<SourceSplitBase> splits) {
-        Map<String, DvBucketPart> pinned = new HashMap<>();
-        for (SourceSplitBase split : splits) {
-            if (split instanceof DvBucketSplit && ((DvBucketSplit) split).getPart().isPinned()) {
-                pinned.put(split.splitId(), ((DvBucketSplit) split).getPart());
-            }
-        }
-        boolean released;
-        synchronized (pinnedDvParts) {
-            released = pinnedDvCutsReleased;
-            if (!released) {
-                pinnedDvParts.putAll(pinned);
-            }
-        }
-        if (released) {
-            // the enumerator closed while the splits were generated
-            releaseDvHolds(pinned.values(), true);
-        }
-    }
-
-    /**
-     * Releases the holds of the splits a reader finished reading: they need their cuts no more. A
-     * split restored from a checkpoint taken before it finished reads again: its cut may be gone
-     * then, and it derives its masks from the keys or keeps those it read with.
-     */
-    private void dvSplitsFinished(Collection<String> splitIds) {
-        List<DvBucketPart> finished = new ArrayList<>();
-        synchronized (pinnedDvParts) {
-            for (String splitId : splitIds) {
-                DvBucketPart part = pinnedDvParts.remove(splitId);
-                if (part != null) {
-                    finished.add(part);
-                }
-            }
-        }
-        if (!finished.isEmpty()) {
-            releaseDvHolds(finished, false);
-        }
-    }
-
-    /**
-     * Releases one hold of their cuts for each of {@code parts}. Waits for the leaders when {@code
-     * wait}, as the enumerator closes; otherwise releases in the background.
-     */
-    @VisibleForTesting
-    void releaseDvHolds(Collection<DvBucketPart> parts, boolean wait) {
-        if (parts.isEmpty() || flussAdmin == null) {
-            return;
-        }
-        DvAdmin admin = DvAdmin.of(flussAdmin);
-        List<DvBucketPart> released = new ArrayList<>(parts);
-        if (!wait) {
-            workerExecutor.callAsync(
-                    () -> {
-                        DvBucketPlanner.releasePinnedCuts(
-                                admin, tablePath, released, DV_RELEASE_TIMEOUT);
-                        return null;
-                    },
-                    (ignored, t) -> {
-                        if (t != null) {
-                            LOG.warn(
-                                    "Could not release the mask cuts of {} finished splits of {}.",
-                                    released.size(),
-                                    tablePath,
-                                    t);
-                        }
-                    });
-            return;
-        }
-        try {
-            DvBucketPlanner.releasePinnedCuts(admin, tablePath, released, DV_RELEASE_TIMEOUT);
-        } catch (RuntimeException e) {
-            LOG.warn("Could not release the mask cuts pinned for {}.", tablePath, e);
         }
     }
 
@@ -1498,7 +1385,7 @@ public class FlinkSourceEnumerator
                 // its reader reads the lake files of a dropped partition only
                 return false;
             }
-            if (dvSplit.sharesBucket()) {
+            if (dvSplit.isPinned()) {
                 // the log split of a bucket read in several splits: the others return lake rows
                 // masked by changes in that log, so its reader fails the read rather than end
                 // without them
@@ -1746,7 +1633,7 @@ public class FlinkSourceEnumerator
         // lake splits (bucket == -1, e.g. of a Paimon unaware-bucket log table) have no bucket to
         // assign by either.
         // todo: refactor the split assign logic
-        if ((split instanceof DvBucketSplit && ((DvBucketSplit) split).sharesBucket())
+        if ((split instanceof DvBucketSplit && ((DvBucketSplit) split).isPinned())
                 || (split.isLakeSplit() && tableBucket.getBucket() == -1)) {
             return (split.splitId().hashCode() & 0x7FFFFFFF) % context.currentParallelism();
         }
@@ -1795,8 +1682,6 @@ public class FlinkSourceEnumerator
             for (Long partitionToRemove : partitionsPendingRemove) {
                 assignedPartitions.remove(partitionToRemove);
             }
-        } else if (sourceEvent instanceof DvSplitsFinishedEvent) {
-            dvSplitsFinished(((DvSplitsFinishedEvent) sourceEvent).getSplitIds());
         } else if (sourceEvent instanceof FinishedKvSnapshotConsumeEvent) {
             FinishedKvSnapshotConsumeEvent event = (FinishedKvSnapshotConsumeEvent) sourceEvent;
             long checkpointId = event.getCheckpointId();
@@ -1955,8 +1840,6 @@ public class FlinkSourceEnumerator
                 unassignedSplits.size(),
                 checkpointTriggeredBefore);
         try {
-            // first: a lease drop that fails must not leave the leaders' cuts to idle out
-            releasePinnedDvCuts();
             maybeDropKvSnapshotLease();
 
             closed = true;
@@ -1977,8 +1860,7 @@ public class FlinkSourceEnumerator
         }
     }
 
-    @VisibleForTesting
-    void maybeDropKvSnapshotLease() throws Exception {
+    private void maybeDropKvSnapshotLease() throws Exception {
         if (flussAdmin != null
                 && hasPrimaryKey
                 && startingOffsetsInitializer instanceof SnapshotOffsetsInitializer

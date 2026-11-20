@@ -146,7 +146,9 @@ class CommitLakeTableSnapshotFencingITCase {
                                         .property(
                                                 ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                                         .property(
-                                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                                ConfigOptions
+                                                        .TABLE_DATALAKE_DELETION_VECTORS_ENABLED
+                                                        .key(),
                                                 "true")
                                         .property(
                                                 ConfigOptions.TABLE_DATALAKE_FRESHNESS,
@@ -159,7 +161,7 @@ class CommitLakeTableSnapshotFencingITCase {
         PbCommitLakeTableSnapshotRespForTable resp = commit(tableId, 1, null);
         assertThat(resp.getErrorCode()).isEqualTo(Errors.UNSUPPORTED_VERSION.code());
         assertThat(resp.getErrorMessage())
-                .contains(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .contains(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .contains("tiering epoch");
         assertThat(zkClient.getLakeTable(tableId)).isEmpty();
 

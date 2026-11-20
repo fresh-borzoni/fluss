@@ -419,7 +419,7 @@ abstract class DvLoad implements Closeable {
             m.replaceVersion(next);
             m.coveredSnapshotId = next.snapshotId;
             m.snapshotStartOffset = next.readableOffset;
-            m.rowTtlGuard.covered(next.readableOffset);
+            IOException corruptRowTtl = m.rowTtlGuard.covered(next.readableOffset);
             m.rebuild.clearReplayFailure();
             m.unreachable = Long.MIN_VALUE;
             m.maskState.fullResolvePending = false;
@@ -438,6 +438,11 @@ abstract class DvLoad implements Closeable {
                 return;
             } finally {
                 trimNanos += System.nanoTime() - trimStart;
+            }
+            if (corruptRowTtl != null) {
+                // no masks: the change list is dropped, and no replay serves masks
+                m.faults.changeListLost(corruptRowTtl);
+                return;
             }
             if (derivation == null) {
                 m.maskState.resolveWholeTail();
@@ -727,23 +732,28 @@ abstract class DvLoad implements Closeable {
             m.unmarkPassed(snapshotId);
             m.coveredSnapshotId = snapshotId;
             m.snapshotStartOffset = readableOffset;
-            m.rowTtlGuard.covered(readableOffset);
+            IOException corruptRowTtl = m.rowTtlGuard.covered(readableOffset);
             m.entriesApplied = upTo + 1;
             m.index.entriesAtCheckpoint = checkpoint == null ? 0 : checkpoint.chainIndex + 1;
-            if (replayFailure != null) {
-                // the index stays, union reads retry the replay and fail until it succeeds
+            if (replayFailure != null || corruptRowTtl != null) {
+                // the index stays, union reads retry the replay and fail until it succeeds; with a
+                // corrupt row TTL state no replay serves masks
                 m.maskState.resetTail();
-                m.maskState.tailFailure =
-                        isDiskFailure(replayFailure)
-                                ? new TailDiskException(replayFailure)
-                                : replayFailure;
+                if (corruptRowTtl != null) {
+                    m.maskState.tailFailure = corruptRowTtl;
+                } else {
+                    m.maskState.tailFailure =
+                            isDiskFailure(replayFailure)
+                                    ? new TailDiskException(replayFailure)
+                                    : replayFailure;
+                    LOG.warn(
+                            "The deletion vectors cover snapshot {} but cannot replay the log from"
+                                    + " offset {}; union reads fail until a replay succeeds.",
+                            snapshotId,
+                            readableOffset,
+                            replayFailure);
+                }
                 m.maskState.reportTail(true);
-                LOG.warn(
-                        "The deletion vectors cover snapshot {} but cannot replay the log from"
-                                + " offset {}; union reads fail until a replay succeeds.",
-                        snapshotId,
-                        readableOffset,
-                        replayFailure);
                 return true;
             }
             DvReplay r = replay;

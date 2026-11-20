@@ -352,7 +352,7 @@ class PaimonCommitOutcomeTest {
                                 .distributedBy(1)
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED,
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED,
                                         deletionVectors)
                                 .build(),
                         "/remote",

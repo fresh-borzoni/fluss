@@ -142,6 +142,25 @@ final class OffsetIndexTest {
         assertThat(index.fetchUpperBoundOffset(second, 200)).isEqualTo(Optional.empty());
     }
 
+    /** The first entry at or above an offset, also one equal to the first or the last entry. */
+    @Test
+    void testLookupCeiling() {
+        assertThat(index.lookupCeiling(baseOffset)).isNull();
+        for (int i = 0; i < 20; i++) {
+            index.append(baseOffset + 5 + 10L * i, 100 * i);
+        }
+        assertThat(index.lookupCeiling(baseOffset))
+                .isEqualTo(new OffsetPosition(baseOffset + 5, 0));
+        for (long offset = baseOffset; offset <= baseOffset + 195; offset++) {
+            long expected = baseOffset + 5 + 10 * ((offset - baseOffset + 4) / 10);
+            assertThat(index.lookupCeiling(offset))
+                    .as("ceiling of %s", offset)
+                    .isEqualTo(
+                            new OffsetPosition(expected, (int) (expected - baseOffset - 5) * 10));
+        }
+        assertThat(index.lookupCeiling(baseOffset + 196)).isNull();
+    }
+
     @Test
     void testReopen() throws IOException {
         OffsetPosition first = new OffsetPosition(51, 0);

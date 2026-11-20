@@ -1108,7 +1108,7 @@ final class KvManagerTest {
                 logManager.getOrCreateLog(
                         tempDir, physicalTablePath, tableBucket, LogFormat.ARROW, 1, true);
         Configuration tableConf = new Configuration();
-        tableConf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        tableConf.set(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true);
         return kvManager.getOrCreateKv(
                 physicalTablePath,
                 tableBucket,

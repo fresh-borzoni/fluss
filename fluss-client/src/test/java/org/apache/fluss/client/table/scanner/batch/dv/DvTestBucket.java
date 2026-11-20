@@ -163,17 +163,6 @@ public final class DvTestBucket {
         return pins;
     }
 
-    /** The requests that released a cut. */
-    public List<GetDvSnapshotRequest> releases() {
-        List<GetDvSnapshotRequest> releases = new ArrayList<>();
-        for (GetDvSnapshotRequest request : server.requests()) {
-            if (request.hasReleaseCut() && request.isReleaseCut()) {
-                releases.add(request);
-            }
-        }
-        return releases;
-    }
-
     /** The rows a reader returns for a part, at most {@code maxRows}, and how it resolved it. */
     public Read read(DvBucketPart part, int maxRows) throws IOException {
         List<String> rows = new ArrayList<>();
@@ -285,14 +274,13 @@ public final class DvTestBucket {
     /**
      * The bucket's leader. {@link #answer} gives all masks of the cut a request gets, and the
      * response carries the parts the request asks for. Failures and queued answers come first, in
-     * order. Releases succeed, unless a release failure is queued.
+     * order.
      */
     public static final class MaskServer implements DvAdmin {
         public Function<GetDvSnapshotRequest, GetDvSnapshotResponse> answer;
         private final List<GetDvSnapshotRequest> requests = new ArrayList<>();
         public final Deque<Exception> failures = new ArrayDeque<>();
         public final Deque<GetDvSnapshotResponse> answers = new ArrayDeque<>();
-        public final Deque<Exception> releaseFailures = new ArrayDeque<>();
         @Nullable public LakeSnapshot readable;
 
         @Override
@@ -300,13 +288,7 @@ public final class DvTestBucket {
                 TablePath tablePath, GetDvSnapshotRequest request) {
             requests.add(request);
             CompletableFuture<GetDvSnapshotResponse> response = new CompletableFuture<>();
-            if (request.hasReleaseCut() && request.isReleaseCut()) {
-                if (releaseFailures.isEmpty()) {
-                    response.complete(new GetDvSnapshotResponse());
-                } else {
-                    response.completeExceptionally(releaseFailures.poll());
-                }
-            } else if (!failures.isEmpty()) {
+            if (!failures.isEmpty()) {
                 response.completeExceptionally(failures.poll());
             } else if (!answers.isEmpty()) {
                 response.complete(answers.poll());
@@ -327,17 +309,6 @@ public final class DvTestBucket {
             return response;
         }
 
-        @Override
-        public CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
-                TablePath tablePath,
-                long tableId,
-                @Nullable Long partitionId,
-                int bucketId,
-                long snapshotId,
-                List<byte[]> keys) {
-            throw new UnsupportedOperationException("lookupDvPositions");
-        }
-
         /** The requests the leader got, in order. */
         public synchronized List<GetDvSnapshotRequest> requests() {
             return new ArrayList<>(requests);
@@ -351,7 +322,7 @@ public final class DvTestBucket {
     /**
      * A leader that pins cuts of the standard bucket. A request without a cut pins the high
      * watermark. Later requests get parts of the masks of a pinned cut, or a stale error once the
-     * cut is gone.
+     * cut is gone: a test removes it from {@link PinningServer#cuts}, as its idle timeout would.
      */
     public PinningServer pinningServer() {
         return new PinningServer();

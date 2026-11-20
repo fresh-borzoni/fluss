@@ -348,7 +348,8 @@ final class ReplicaTest extends ReplicaTestBase {
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1, "a")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .properties(dvRowTtl(rowTtl))
                         .build();
         TableInfo dvTableInfo =
@@ -367,8 +368,7 @@ final class ReplicaTest extends ReplicaTestBase {
         // The replica must be DV-enabled, otherwise the test proves nothing.
         assertThat(dvReplica.getTableInfo().isDeletionVectorsEnabled()).isTrue();
         assertThat(dvReplica.getKvTablet().getDvManager()).isNotNull();
-        assertThat(dvReplica.getKvTablet().getKvValueLayout())
-                .isEqualTo(rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED);
+        assertThat(dvReplica.getKvTablet().getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
 
         KvRecordTestUtils.KvRecordFactory kvRecordFactory =
                 KvRecordTestUtils.KvRecordFactory.of(DATA1_ROW_TYPE);
@@ -668,24 +668,25 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     /**
-     * A table with deletion vectors keeps the log offset of each KV value's version, in the value's
-     * tag, or in its version offset slot with row TTL, which names the version a later change
-     * supersedes. A new leader restores the KV from a snapshot and replays the log after it; the
-     * restored values carry the same version offsets, from the snapshot's files and from the
-     * replayed log alike, and later changes name them.
+     * A table with deletion vectors keeps the log offset of each KV value's version in its version
+     * offset slot, with row TTL or without, which names the version a later change supersedes. A
+     * new leader restores the KV from a snapshot and replays the log after it; the restored values
+     * carry the same version offsets, from the snapshot's files and from the replayed log alike,
+     * and later changes name them.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void testDvVersionTagsSurviveKvRecovery(boolean rowTtl, @TempDir File snapshotKvTabletDir)
+    void testDvVersionOffsetsSurviveKvRecovery(boolean rowTtl, @TempDir File snapshotKvTabletDir)
             throws Exception {
-        TablePath dvTablePath = TablePath.of("test_db_1", "dv_tagged_table_" + rowTtl);
+        TablePath dvTablePath = TablePath.of("test_db_1", "dv_versioned_table_" + rowTtl);
         long dvTableId = rowTtl ? 100012L : 100002L;
         TableDescriptor dvDescriptor =
                 TableDescriptor.builder()
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1, "a")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .properties(dvRowTtl(rowTtl))
                         .build();
         TableInfo dvTableInfo =
@@ -722,7 +723,7 @@ final class ReplicaTest extends ReplicaTestBase {
         // only in the log after the snapshot: a=2 updated (-U at 4, +U at 5), a=3 inserted at 6
         putRecordsToLeader(
                 leader, dvBatch(keyEncoder, new Object[] {2, "d"}, new Object[] {3, "e"}));
-        assertThat(versionTags(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
+        assertThat(versionOffsets(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
 
         // as a follower the replica drops its KV; as the leader again it restores the snapshot and
         // replays its local log after it
@@ -732,35 +733,40 @@ final class ReplicaTest extends ReplicaTestBase {
         makeLeaderReplica(leader, dvTablePath, dvBucket, 2);
         assertThat(leader.getKvTablet()).isNotSameAs(before);
         assertThat(leader.getLocalLogEndOffset()).isEqualTo(7L);
-        assertThat(leader.getKvTablet().getKvValueLayout())
-                .isEqualTo(rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED);
-        assertThat(versionTags(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
+        assertThat(leader.getKvTablet().getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
+        assertThat(versionOffsets(leader, keyEncoder, 1, 2, 3)).containsExactly(2L, 5L, 6L);
 
         // after the restore: a=1 updated (-U at 7, +U at 8), a=4 inserted at 9, a=3 deleted at
         // 10; a second snapshot holds them, then a=4 is updated (-U at 11, +U at 12) in the log
         putRecordsToLeader(
                 leader, dvBatch(keyEncoder, new Object[] {1, "f"}, new Object[] {4, "g"}));
         putRecordsToLeader(leader, dvDeleteBatch(keyEncoder, 3));
-        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 9L);
+        assertThat(versionOffsets(leader, keyEncoder, 1, 2, 3, 4))
+                .containsExactly(8L, 5L, null, 9L);
         context.scheduledExecutorService.triggerAllNonPeriodicTasks();
         context.testKvSnapshotStore.waitUntilSnapshotComplete(dvBucket, 1);
         putRecordsToLeader(leader, dvBatch(keyEncoder, new Object[] {4, "h"}));
-        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 12L);
+        assertThat(versionOffsets(leader, keyEncoder, 1, 2, 3, 4))
+                .containsExactly(8L, 5L, null, 12L);
 
         leader.makeFollower(dvLeaderAndIsr(dvPath, dvBucket, 3));
         makeLeaderReplica(leader, dvTablePath, dvBucket, 4);
         assertThat(leader.getLocalLogEndOffset()).isEqualTo(13L);
-        assertThat(versionTags(leader, keyEncoder, 1, 2, 3, 4)).containsExactly(8L, 5L, null, 12L);
+        assertThat(versionOffsets(leader, keyEncoder, 1, 2, 3, 4))
+                .containsExactly(8L, 5L, null, 12L);
     }
 
-    /** The table properties of row TTL, long enough that no value expires during a test. */
+    /**
+     * The value layout of a table with deletion vectors, as the coordinator creates it, and the row
+     * TTL, long enough that no value expires during a test.
+     */
     private static Map<String, String> dvRowTtl(boolean rowTtl) {
         Map<String, String> properties = new HashMap<>();
+        properties.put(
+                ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
+                String.valueOf(KvValueLayout.VERSIONED.version()));
         if (rowTtl) {
             properties.put(ConfigOptions.TABLE_KV_TTL.key(), "1 d");
-            properties.put(
-                    ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
-                    String.valueOf(KvValueLayout.VERSIONED.version()));
         }
         return properties;
     }
@@ -786,14 +792,14 @@ final class ReplicaTest extends ReplicaTestBase {
         return KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID).ofRecords(records);
     }
 
-    private static List<Long> versionTags(Replica replica, KeyEncoder keyEncoder, int... keys)
+    private static List<Long> versionOffsets(Replica replica, KeyEncoder keyEncoder, int... keys)
             throws IOException {
         KvTablet kv = checkNotNull(replica.getKvTablet());
-        List<Long> tags = new ArrayList<>();
+        List<Long> offsets = new ArrayList<>();
         for (int a : keys) {
-            tags.add(kv.versionOffset(keyEncoder.encodeKey(row(a, ""))));
+            offsets.add(kv.versionOffset(keyEncoder.encodeKey(row(a, ""))));
         }
-        return tags;
+        return offsets;
     }
 
     private static NotifyLeaderAndIsrData dvLeaderAndIsr(

@@ -523,13 +523,13 @@ public class PaimonConversions {
         // Deletion vector masks index the rows of Paimon's deletion-vector reads, which skip
         // level-0 files and return one live row per key.
         if (Configuration.fromMap(tableDescriptor.getProperties())
-                .get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED)) {
+                .get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED)) {
             if (options.containsKey(CoreOptions.DELETION_VECTORS_ENABLED.key())
                     && !options.get(CoreOptions.DELETION_VECTORS_ENABLED)) {
                 throw new InvalidTableException(
                         String.format(
                                 "'%s' requires Paimon option '%s' = true.",
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                                 CoreOptions.DELETION_VECTORS_ENABLED.key()));
             }
             options.set(CoreOptions.DELETION_VECTORS_ENABLED, true);
@@ -584,7 +584,7 @@ public class PaimonConversions {
     public static void validateDeletionVectorsOptions(
             @Nullable String table, Map<String, String> options, Set<String> catalogDefaults) {
         CoreOptions coreOptions = new CoreOptions(options);
-        String flussOption = ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key();
+        String flussOption = ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key();
         String prefix =
                 table == null
                         ? String.format("'%s'", flussOption)
@@ -670,15 +670,16 @@ public class PaimonConversions {
     }
 
     /**
-     * Whether a Paimon table belongs to a Fluss table with {@code table.deletion-vectors.enabled}.
-     * Fluss mirrors its table options into the Paimon table's options when it creates it, and the
-     * option cannot be altered afterwards. A table with Paimon's own {@code
-     * deletion-vectors.enabled} alone does not count.
+     * Whether a Paimon table belongs to a Fluss table with {@code
+     * table.datalake.deletion-vectors.enabled}. Fluss mirrors its table options into the Paimon
+     * table's options when it creates it, and the option cannot be altered afterwards. A table with
+     * Paimon's own {@code deletion-vectors.enabled} alone does not count.
      */
     public static boolean isFlussDeletionVectorsTable(Map<String, String> paimonOptions) {
         return Boolean.parseBoolean(
                 paimonOptions.get(
-                        FLUSS_CONF_PREFIX + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+                        FLUSS_CONF_PREFIX
+                                + ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()));
     }
 
     private static String origin(String key, Set<String> catalogDefaults) {

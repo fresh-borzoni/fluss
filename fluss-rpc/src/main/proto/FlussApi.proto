@@ -834,7 +834,7 @@ message LakeTieringHeartbeatRequest {
   // finished or failed. A round checks its epoch before its lake commit, which Fluss cannot undo,
   // so a round of a table handed to another tiering service meanwhile stops instead.
   repeated PbTieringEpochForTable checked_tables = 6;
-  // Whether the tiering service tiers tables with 'table.deletion-vectors.enabled'. The
+  // Whether the tiering service tiers tables with 'table.datalake.deletion-vectors.enabled'. The
   // coordinator hands such tables only to a service that sets it in its table requests; a service
   // that predates deletion vectors never sets it, and would commit their rows without deletes.
   optional bool supports_deletion_vectors = 7;
@@ -1774,96 +1774,138 @@ message GetDvSnapshotRequest {
   // The lake snapshot the read is planned on, or the base snapshot of a tiering round.
   optional int64 readable_snapshot_id = 3;
   optional int64 partition_id = 4;
-  // Primary keys whose live position in readable_snapshot_id is requested. If set, the response
-  // carries key_positions; otherwise it carries the masks of a union read. A request names at
-  // most 100,000 keys (MAX_LOOKUP_KEYS); one that names more fails with INVALID_REQUEST.
-  repeated bytes lookup_keys = 5;
 
   // A union read fetches its masks in parts, all of one cut. A request without log_end_offset pins
-  // a cut: the bucket's masks up to the high watermark, frozen until the read releases them. Each
-  // response carries only the masks of the lake files in lake_dv_file_names and the log mask from
-  // log_dv_from_offset on.
+  // a cut: the bucket's masks up to the high watermark, frozen. The server keeps a cut until no
+  // request asked for it within kv.deletion-vectors.pinned-cut-idle-timeout; every pin and fetch
+  // of the cut renews it. Each response carries only the masks of the lake files in
+  // lake_dv_file_names and the log mask from log_dv_from_offset on.
   //
   // The cut to serve the masks of: the log_end_offset of an earlier response for the same
   // readable_snapshot_id. The server answers with the masks of exactly that cut, or fails with
-  // STALE_SNAPSHOT once it no longer holds them, also for a read that does not wait.
-  optional int64 log_end_offset = 6;
+  // STALE_SNAPSHOT once it no longer keeps them, also for a read that does not wait.
+  optional int64 log_end_offset = 5;
   // Names (last path segment) of the lake data files whose masks are requested.
-  repeated string lake_dv_file_names = 7;
+  repeated string lake_dv_file_names = 6;
   // The log offset from which the log mask is requested, in [0, log_end_offset]; none is requested
   // if absent.
-  optional int64 log_dv_from_offset = 8;
+  optional int64 log_dv_from_offset = 7;
   // The most bytes of serialized log mask one response carries, at least one container of the
   // bitmap; 1 MiB if absent. It must be positive.
-  optional int32 max_log_dv_bytes = 9;
+  optional int32 max_log_dv_bytes = 8;
   // False: the read does not wait for its bucket's leader. A leader that covers the snapshot
   // registered right before readable_snapshot_id, which is the newest registered, answers a pin at
   // once with covered_snapshot_id and behind, and the reader reads the bucket on that snapshot. A
   // leader that covers another snapshot answers a pin with covered_snapshot_id, as a stale
-  // snapshot. A leader that has no masks to serve yet (it rebuilds after a leader change or
-  // restart, replays its change list, or covers no snapshot) answers a pin with fold_cut. Nor
+  // snapshot. A leader that has no masks to serve (it rebuilds after a leader change or restart,
+  // replays its change list, covers no snapshot, or the bucket's row TTL state is corrupt) answers
+  // a pin with fold_cut. Nor
   // does the read wait for lake-position lookups still pending: it gets the last masks built while
   // none was pending, with a log_end_offset below the high watermark. Absent means true; such a
   // read waits instead, and gets the errors DELETION_VECTORS_NOT_READY and STALE_SNAPSHOT.
-  optional bool wait_for_catch_up = 10;
-  // Releases holds of the cut log_end_offset of readable_snapshot_id, as a union read that pinned
-  // it ends; log_end_offset must be set. The server drops the cut once every hold of it is
-  // released, or when no request asked for it within kv.deletion-vectors.pinned-cut-idle-timeout.
-  // The response carries no masks.
-  optional bool release_cut = 11;
+  optional bool wait_for_catch_up = 9;
   // Identifies a request that pins a cut, the same in every retry of it: a retry of a pin the
   // server took already gets the same cut without pinning it again. A request id that pinned a
   // cut of another snapshot pins a new cut.
-  optional int64 pin_request_id = 12;
-  // The holds a request that pins a cut takes, or a release drops, in [1, 4096]; 1 if absent. A
-  // read whose parts each release their own hold when they are done pins with one hold per part.
-  // The cut is dropped once all its holds are released.
-  optional int32 holds = 13;
+  optional int64 pin_request_id = 10;
+
+  // A tiering round on readable_snapshot_id tiers the log of the bucket from the snapshot's
+  // readable offset o up to its end e (exclusive), which the leader picks when the round is planned
+  // (round_start_offset) and which never moves after: the round's log mask is exact only at e.
+  // A request for a round sets none of the fields of a union read above; one that does fails with
+  // INVALID_REQUEST. Nothing is pinned for a round.
+  //
+  // The end e of a round. The response carries a part of the round's deletes in lake_dv_entries:
+  // per lake data file of the snapshot, the positions of the rows whose keys changed in [o, e).
+  // Or, with round_log_mask, a part of the round's log mask. The parts are bounded; the leader
+  // answers DELETION_VECTORS_NOT_READY until it holds every change below e, also while it replays
+  // its change list.
+  optional int64 round_end_offset = 11;
+  // With round_end_offset: where the part starts, the round_next_offset of the part before, in
+  // [o, e]. Absent for the first part, which starts at o. A request that sets it without
+  // round_end_offset fails with INVALID_REQUEST.
+  optional int64 round_from_offset = 12;
+  // With round_end_offset: the part carries the round's log mask in log_dv_bitmap instead of its
+  // deletes: the offsets in [o, e) whose version a change below e supersedes, in the parts' union.
+  // Absent means false. A request that sets it without round_end_offset fails with INVALID_REQUEST.
+  optional bool round_log_mask = 13;
+
+  // Plans a round from this offset, the round's start o: the snapshot's readable offset of the
+  // bucket, 0 if the snapshot does not have the bucket. The response carries the round's end in
+  // round_end_offset. The plan reads the bucket's log only, so it never waits for the deletion
+  // vectors. A plan sets round_max_records and round_max_bytes, and none of round_end_offset,
+  // round_from_offset and round_log_mask; otherwise it fails with INVALID_REQUEST.
+  optional int64 round_start_offset = 14;
+  // With round_start_offset: the most log records the round tiers, positive.
+  optional int64 round_max_records = 15;
+  // With round_start_offset: the most log bytes the round tiers, as the offset index of the log
+  // places them, positive. A round tiers at least one record batch whatever its size.
+  optional int64 round_max_bytes = 16;
 }
 
 message GetDvSnapshotResponse {
   // Masks of the requested lake data files (LakeDv): per file, the positions of rows whose keys
-  // changed in Fluss after the snapshot, as the cut froze them.
+  // changed in Fluss after the snapshot, as the cut froze them. Or a tiering round's deletes.
   repeated PbLakeDvEntry lake_dv_entries = 1;
   // Masks of the log: offsets to skip in [log_dv_from_offset, log_dv_to_offset)
   optional bytes log_dv_bitmap = 2;
-  // The cut: the offset the masks cover the log up to (exclusive). Absent for a key lookup, a
-  // release and an answer without masks.
+  // The cut: the offset the masks cover the log up to (exclusive). Absent for a round's deletes
+  // and an answer without masks.
   optional int64 log_end_offset = 3;
-  // The snapshot's readable offset, where the log masks start. Absent for a key lookup, a release
-  // and a fold_cut answer.
+  // The snapshot's readable offset, where the log masks and a round start. Absent for a fold_cut
+  // answer.
   optional int64 snapshot_start_offset = 4;
-  // Positions of the requested lookup_keys found in the snapshot
-  repeated PbDvKeyPosition key_positions = 5;
   // The commit the snapshot's id named when Fluss registered it, for a lake that reuses snapshot
   // ids after a rollback (Paimon): the reader checks the id names it still before using the masks
-  optional string lake_snapshot_identity = 6;
+  optional string lake_snapshot_identity = 5;
   // With log_dv_from_offset: log_dv_bitmap holds the log mask of [log_dv_from_offset,
   // log_dv_to_offset), where log_dv_to_offset > log_dv_from_offset unless it is log_end_offset.
-  optional int64 log_dv_to_offset = 7;
+  optional int64 log_dv_to_offset = 6;
 
-  // The answers to a pin with wait_for_catch_up = false that gets no masks; the response then
-  // carries no masks.
+  // The answers to a pin that gets no masks; the response then carries no masks.
   //
-  // The leader has no masks to serve yet: the reader reads the bucket by key, its lake files and
-  // its log from the readable offset of the snapshot it planned on up to this offset, the log
-  // folded to the latest change of each key. It is the leader's high watermark, or the log end of
-  // the previous leader right after a leader change, which can be above the high watermark.
-  optional int64 fold_cut = 8;
+  // The leader serves no masks: the reader reads the bucket by key up to this offset, its lake
+  // files and its log from the readable offset of the snapshot it planned on, the log folded to the
+  // latest change of each key, which is exact. A read that does not wait gets it while the leader
+  // has nothing to serve (it rebuilds or replays its change list, or the bucket's row TTL state is
+  // corrupt). On Paimon a read of a table with row TTL gets it whether it waits or not while the
+  // bucket's readable offset is below the offset its TTL filter was capped for, as a version after
+  // the readable offset may have expired before it was tiered; no cut is pinned for it. It is the
+  // leader's high watermark, or the log end of the previous leader right after a leader change,
+  // which can be above the high watermark.
+  optional int64 fold_cut = 7;
   // The leader covers this lake snapshot, not readable_snapshot_id: the reader plans the bucket
   // again on it. snapshot_start_offset is its readable offset, from which the reader reads the
   // log; log_end_offset is absent.
-  optional int64 covered_snapshot_id = 9;
+  optional int64 covered_snapshot_id = 8;
   // With covered_snapshot_id: the covered snapshot is the one registered right before the newest
   // one, readable_snapshot_id, which the leader still catches up to. Otherwise the requested
   // snapshot is stale.
-  optional bool behind = 10;
-  // Set with fold_cut on the answer to a pin of a table with row TTL, whether the read waits or
-  // not: a version written after the readable offset may have expired from the KV before it was
-  // tiered, and the next write of its key could not name it, so masks could keep both. The answer
-  // carries no masks and the leader holds no cut for it: the reader reads the bucket by key up to
-  // fold_cut, which is exact whatever expired.
-  optional bool ttl_unsafe = 11;
+  optional bool behind = 9;
+  // With round_end_offset: where the next part of the round's deletes or log mask starts;
+  // round_end_offset if this part is the last. snapshot_start_offset is the readable offset o,
+  // where the round starts. A part of the log mask carries its offsets in log_dv_bitmap, absent if
+  // it has none.
+  optional int64 round_next_offset = 10;
+  // The answer to a plan: the round's end e, the largest offset at most the high watermark whose
+  // round stays within round_max_records and round_max_bytes, and past round_start_offset unless
+  // the high watermark is not. With round_next_offset: the end the part was read for.
+  optional int64 round_end_offset = 11;
+  // With a plan's round_end_offset: the caps put e below the high watermark, so more is left to
+  // tier.
+  optional bool round_capped = 12;
+  // With round_next_offset: the lake snapshot the part was read on. A reader checks that the
+  // snapshot, snapshot_start_offset and round_end_offset are those of its round.
+  optional int64 round_snapshot_id = 13;
+  // The leader epoch of the leader that answered a part of a round. All parts of one round's log
+  // mask come from one leader epoch.
+  optional int32 leader_epoch = 14;
+  // With a part of a round's log mask: its changes, the records from the part's start to
+  // round_next_offset that supersede a version: the +U and -D records, and the +I records too if
+  // round_changes_with_inserts (a table with row TTL, where an insert may follow an expired
+  // version). The reader counts the same records of the round it reads.
+  optional int64 round_changes = 15;
+  optional bool round_changes_with_inserts = 16;
 }
 
 // The mask of one lake data file.
@@ -1871,10 +1913,4 @@ message PbLakeDvEntry {
   optional string file_path = 1;
   // Serialized Roaring64Bitmap of the masked row positions
   optional bytes deleted_positions_bitmap = 2;
-}
-
-// The live position of a requested lookup key; keys not found are left out.
-message PbDvKeyPosition {
-  optional string file_path = 1;
-  optional int64 pos = 2;
 }

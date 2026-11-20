@@ -32,7 +32,7 @@ import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
 import org.apache.fluss.lake.iceberg.utils.IcebergUtils;
 import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
 import org.apache.fluss.lake.writer.LakeWriter;
-import org.apache.fluss.lake.writer.RoundBufferingLakeWriter;
+import org.apache.fluss.lake.writer.RoundMaskMismatchException;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -66,7 +66,7 @@ import java.util.concurrent.TimeoutException;
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 
 /** Implementation of {@link LakeWriter} for Iceberg. */
-public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundBufferingLakeWriter {
+public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult> {
 
     protected static final Logger LOG = LoggerFactory.getLogger(IcebergLakeWriter.class);
 
@@ -169,20 +169,6 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
     }
 
     @Override
-    public long bufferedKeys() {
-        return recordWriter instanceof DerivedDvRecordWriter
-                ? ((DerivedDvRecordWriter) recordWriter).bufferedKeys()
-                : 0;
-    }
-
-    @Override
-    public long bufferedBytes() {
-        return recordWriter instanceof DerivedDvRecordWriter
-                ? ((DerivedDvRecordWriter) recordWriter).bufferedBytes()
-                : 0;
-    }
-
-    @Override
     public IcebergWriteResult complete() throws IOException {
         try {
             WriteResult writeResult = recordWriter.complete();
@@ -202,6 +188,9 @@ public class IcebergLakeWriter implements LakeWriter<IcebergWriteResult>, RoundB
                         ((DerivedDvRecordWriter) recordWriter).stagedIndexPart());
             }
             return new IcebergWriteResult(writeResult, icebergTable.specs(), rewriteDataFileResult);
+        } catch (RoundMaskMismatchException e) {
+            // the tiering service reads the round again and has it written in sort mode
+            throw e;
         } catch (Exception e) {
             throw new IOException("Failed to complete Iceberg write.", e);
         }
