@@ -17,7 +17,13 @@
 
 package org.apache.fluss.flink.adapter;
 
+import org.apache.flink.table.connector.sink.abilities.SupportsReadBackAfterCheckpoint;
 import org.apache.flink.table.connector.sink.abilities.SupportsReadYourWrites;
 
-/** Flink's read-your-writes sink ability, see {@link SupportsReadYourWrites}. */
-public interface SupportsReadYourWritesAdapter extends SupportsReadYourWrites {}
+/**
+ * Flink's read-your-writes sink ability, see {@link SupportsReadYourWrites}. The sink also lets its
+ * rows be read back once a checkpoint completes: the writer flushes before the barrier, and a flush
+ * returns once the tablet servers acknowledged every write.
+ */
+public interface SupportsReadYourWritesAdapter
+        extends SupportsReadYourWrites, SupportsReadBackAfterCheckpoint {}
