@@ -356,6 +356,9 @@ message PrefixLookupRequest {
   optional bool fail_on_limit_exceeded = 4;
   // Exclusive bucket log position to read at. Requires API version 5.
   optional int64 next_offset = 5;
+  // Reads an Index Table at a cut of its main table: one exclusive next offset per main table
+  // bucket whose rows the read returns. Requires API version 6; excludes next_offset.
+  repeated PbIndexSourcePosition source_positions = 6;
 }
 
 message PrefixLookupResponse {
@@ -1225,6 +1228,10 @@ message PbPutIndexReqForBucket {
   required int64 source_end_offset = 4;
   required bytes progress_key = 5;
   required bytes records = 6;
+  // The earliest retained position of the source bucket of a main table with bucket history: the
+  // Index Table bucket may purge the removed pointers of the source bucket below it. Requires API
+  // version 1.
+  optional int64 source_history_floor = 7;
 }
 
 message PbPutIndexRespForBucket {
@@ -1270,6 +1277,13 @@ message PbPrefixLookupReqForBucket {
   optional int32 routing_bucket_count = 4;
   // Used instead of keys when a lookup has bounds or direction.
   repeated PbPrefixLookupKey lookups = 5;
+}
+
+// The exclusive next offset of one main table bucket in a read of an Index Table at a cut.
+message PbIndexSourcePosition {
+  optional int64 partition_id = 1;
+  required int32 bucket_id = 2;
+  required int64 next_offset = 3;
 }
 
 message PbPrefixLookupKey {

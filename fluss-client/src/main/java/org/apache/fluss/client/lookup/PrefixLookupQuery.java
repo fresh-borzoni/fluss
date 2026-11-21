@@ -25,6 +25,7 @@ import org.apache.fluss.metadata.TablePath;
 import javax.annotation.Nullable;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -40,6 +41,9 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable private final byte[] endKey;
     @Nullable private final ReadDirection direction;
     private final int keyLimit;
+
+    /** Exclusive next offset per main table bucket for a read of an Index Table at a cut. */
+    @Nullable private Map<TableBucket, Long> sourceCut;
 
     PrefixLookupQuery(
             TablePath tablePath, TableBucket tableBucket, byte[] prefixKey, int bucketCount) {
@@ -166,5 +170,15 @@ public class PrefixLookupQuery extends AbstractLookupQuery<List<byte[]>> {
     @Nullable
     public ReadDirection direction() {
         return direction;
+    }
+
+    /** Returns the cut of the main table at which an Index Table is read, or null. */
+    @Nullable
+    Map<TableBucket, Long> sourceCut() {
+        return sourceCut;
+    }
+
+    void setSourceCut(@Nullable Map<TableBucket, Long> sourceCut) {
+        this.sourceCut = sourceCut;
     }
 }

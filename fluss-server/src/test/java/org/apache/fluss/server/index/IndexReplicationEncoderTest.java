@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.index;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
@@ -24,6 +25,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.server.metadata.TableMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
@@ -91,6 +93,70 @@ class IndexReplicationEncoderTest {
                 .isNotEqualTo(encoder.encodeProgress(0, 1L).key());
         assertThat(encoder.encodeProgress(0, 2L).key())
                 .isEqualTo(encoder.encodeProgress(0, 1L).key());
+    }
+
+    /**
+     * The removed pointer of a row sits in the bucket of its data pointer, under its own record
+     * kind and the same routing key, names its source bucket and carries the offset of the change
+     * that removed it.
+     */
+    @Test
+    void testRemovedPointersOfAMainTableWithHistory() {
+        TableDescriptor main = withHistory(mainDescriptor(2));
+        TableDescriptor index =
+                IndexTableDescriptorFactory.derive(main, 1L, main.getSchema().getIndexes().get(0));
+        TabletServerMetadataCache cache = indexCache(index);
+        TableInfo mainInfo = tableInfo(MAIN_PATH, 1L, main);
+        IndexReplicationEncoder encoder =
+                IndexReplicationEncoder.createAll(mainInfo, new TableBucket(1L, 10L, 1), cache)
+                        .get(0);
+        assertThat(encoder.retainsRemovals()).isTrue();
+        assertThat(encoder.getIndexBucketCount()).isEqualTo(2);
+
+        GenericRow row = GenericRow.of(1, fromString("name"), fromString("p"));
+        IndexReplicationEncoder.IndexEntry data = encoder.encodeDataEntry(row);
+        byte[] dataKey = data.key();
+        int bucket = data.targetBucket();
+        BinaryRow dataValue = data.value().copy();
+        IndexReplicationEncoder.IndexEntry removed = encoder.encodeRemovedEntry(row, 42L, bucket);
+        BinaryRow removedValue = removed.value().copy();
+
+        // [name, id, p, partition id, kind, routing key, row key, source offset]
+        assertThat(removed.targetBucket()).isEqualTo(bucket);
+        assertThat(dataKey[0]).isEqualTo(IndexTableUtils.DATA_RECORD_KIND);
+        assertThat(removed.key()[0]).isEqualTo(IndexTableUtils.REMOVED_RECORD_KIND);
+        assertThat(removedValue.getByte(4)).isEqualTo(IndexTableUtils.REMOVED_RECORD_KIND);
+        assertThat(removedValue.getBytes(5)).isEqualTo(dataValue.getBytes(5));
+        assertThat(removedValue.getBytes(6))
+                .isEqualTo(IndexTableUtils.removedRowKey(1, dataValue.getBytes(6)));
+        assertThat(IndexTableUtils.sourceBucketOf(removedValue.getBytes(6))).isEqualTo(1);
+        assertThat(removedValue.getLong(7)).isEqualTo(42L);
+        assertThat(dataValue.isNullAt(7)).isTrue();
+        for (int i = 0; i < 4; i++) {
+            assertThat(removedValue.isNullAt(i)).isFalse();
+        }
+        assertThat(removedValue.getString(0)).isEqualTo(fromString("name"));
+        assertThat(removedValue.getInt(1)).isEqualTo(1);
+        assertThat(removedValue.getLong(3)).isEqualTo(10L);
+
+        // a later removal of the same pointer replaces it; another source bucket has its own
+        assertThat(encoder.encodeRemovedEntry(row, 50L, bucket).key()).isEqualTo(removed.key());
+        IndexReplicationEncoder otherBucket =
+                IndexReplicationEncoder.createAll(mainInfo, new TableBucket(1L, 10L, 0), cache)
+                        .get(0);
+        assertThat(otherBucket.encodeRemovedEntry(row, 42L, bucket).key())
+                .isNotEqualTo(removed.key());
+
+        // a main table without history deletes pointers outright
+        IndexReplicationEncoder plain =
+                IndexReplicationEncoder.createAll(
+                                tableInfo(MAIN_PATH, 1L, mainDescriptor(2)),
+                                new TableBucket(1L, 10L, 1),
+                                cache)
+                        .get(0);
+        assertThat(plain.retainsRemovals()).isFalse();
+        assertThatThrownBy(() -> plain.encodeRemovedEntry(row, 42L, bucket))
+                .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
@@ -162,6 +228,16 @@ class IndexReplicationEncoderTest {
                 .schema(schema)
                 .distributedBy(3, "id")
                 .partitionedBy("p")
+                .build()
+                .withReplicationFactor(3);
+    }
+
+    private static TableDescriptor withHistory(TableDescriptor descriptor) {
+        return TableDescriptor.builder()
+                .schema(descriptor.getSchema())
+                .distributedBy(3, "id")
+                .partitionedBy("p")
+                .property(ConfigOptions.TABLE_KV_MVCC_ENABLED, true)
                 .build()
                 .withReplicationFactor(3);
     }

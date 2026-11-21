@@ -237,6 +237,29 @@ public class FlinkConnectorOptions {
                             "Skip complete update pairs with equal projected values when scanning a subset of "
                                     + "a primary-key table's columns. Skipped updates do not advance watermarks.");
 
+    public static final ConfigOption<Duration> SCAN_EPOCH_INTERVAL =
+            ConfigOptions.key("scan.epoch.interval")
+                    .durationType()
+                    .defaultValue(Duration.ofMillis(200))
+                    .withDescription(
+                            "The length of the epochs that a scan cuts its changes into when a "
+                                    + "query reads the table as of them, e.g. a versioned delta "
+                                    + "join. Epoch numbers come from the wall clock, so that the "
+                                    + "scans of different tables count the same epochs; the "
+                                    + "tables of one query should use the same interval. Requires "
+                                    + "a primary-key table created with 'table.kv.mvcc.enabled'.");
+
+    public static final ConfigOption<Duration> SCAN_EPOCH_CLOSE_AFTER =
+            ConfigOptions.key("scan.epoch.close-after")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "If set, the epochs of a scan end that long after they open, once they "
+                                    + "hold a change, instead of every 'scan.epoch.interval' by "
+                                    + "the wall clock. The job's source coordinators decide the "
+                                    + "epochs for all scans of the query, so a change waits for "
+                                    + "its epoch about this long while the input is quiet.");
+
     public static final ConfigOption<Integer> SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE =
             ConfigOptions.key("scan.split.assignment.batch-size")
                     .intType()

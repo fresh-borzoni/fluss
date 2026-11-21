@@ -48,6 +48,8 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
@@ -74,6 +76,9 @@ public final class IndexReplicationManager implements AutoCloseable {
     private final IndexReplicationScheduler scheduler;
     private final ReplicatorWorker[] workers;
     private final IndexSender sender;
+
+    /** See {@link #pauseReadsForTesting}. */
+    private volatile boolean readsPaused;
 
     /** Starts node-owned replication workers using the supplied shared infrastructure. */
     public IndexReplicationManager(
@@ -114,7 +119,11 @@ public final class IndexReplicationManager implements AutoCloseable {
         for (int i = 0; i < numWorkers; i++) {
             this.workers[i] =
                     new ReplicatorWorker(
-                            "index-replicator-pool-" + i, i, WORKER_BACKOFF_MS, scheduler);
+                            "index-replicator-pool-" + i,
+                            i,
+                            WORKER_BACKOFF_MS,
+                            scheduler,
+                            () -> readsPaused);
             this.workers[i].start();
         }
         LOG.info("Index replication started with {} workers", numWorkers);
@@ -138,16 +147,22 @@ public final class IndexReplicationManager implements AutoCloseable {
         }
     }
 
-    /** Creates the per-replica owner of metadata readiness and leader transitions. */
+    /**
+     * Creates the per-replica owner of metadata readiness and leader transitions.
+     *
+     * @param sourceHistoryFloor the earliest retained position of the source bucket if the main
+     *     table keeps bucket history, else a negative value
+     */
     public IndexReplicationSupervisor createSupervisor(
-            TableInfo tableInfo, TableBucket tableBucket) {
+            TableInfo tableInfo, TableBucket tableBucket, LongSupplier sourceHistoryFloor) {
         return new IndexReplicationSupervisor(
                 tableInfo,
                 tableBucket,
                 metadataCache,
                 metadataProvider,
                 this,
-                metrics.indexReplicationRetries());
+                metrics.indexReplicationRetries(),
+                sourceHistoryFloor);
     }
 
     /**
@@ -159,7 +174,8 @@ public final class IndexReplicationManager implements AutoCloseable {
             List<IndexReplicationEncoder> indexes,
             LogRecordReadContext readContext,
             long replayStartOffset,
-            IndexProgressListener onProgress) {
+            IndexProgressListener onProgress,
+            LongSupplier sourceHistoryFloor) {
         return new IndexReplicator(
                 new IndexSourceReader(log, remoteLogManager, remoteReadExecutor),
                 indexes,
@@ -173,7 +189,8 @@ public final class IndexReplicationManager implements AutoCloseable {
                 retryBackoff,
                 SystemClock.getInstance(),
                 metrics,
-                maxTransportRequestBytes);
+                maxTransportRequestBytes,
+                sourceHistoryFloor);
     }
 
     void register(IndexReplicator replicator) {
@@ -195,6 +212,15 @@ public final class IndexReplicationManager implements AutoCloseable {
     @VisibleForTesting
     IndexSendBuffer sendBuffer() {
         return sendBuffer;
+    }
+
+    /** Stops or resumes reading the sources of this node; windows already sent still complete. */
+    @VisibleForTesting
+    public void pauseReadsForTesting(boolean paused) {
+        readsPaused = paused;
+        if (!paused) {
+            wakeupWorkers();
+        }
     }
 
     static ExponentialBackoff createRetryBackoff(long maxRetryBackoffMs) {
@@ -263,13 +289,24 @@ public final class IndexReplicationManager implements AutoCloseable {
         private final IndexReplicationScheduler scheduler;
         private final long backoffMs;
         private final int workerId;
+        private final BooleanSupplier paused;
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition condition = lock.newCondition();
         private volatile boolean wakeupRequested;
 
         ReplicatorWorker(
                 String name, int workerId, long backoffMs, IndexReplicationScheduler scheduler) {
+            this(name, workerId, backoffMs, scheduler, () -> false);
+        }
+
+        ReplicatorWorker(
+                String name,
+                int workerId,
+                long backoffMs,
+                IndexReplicationScheduler scheduler,
+                BooleanSupplier paused) {
             super(name, false);
+            this.paused = paused;
             this.scheduler = scheduler;
             this.backoffMs = backoffMs;
             this.workerId = workerId;
@@ -290,7 +327,7 @@ public final class IndexReplicationManager implements AutoCloseable {
 
         @Override
         public void doWork() {
-            boolean didWork = scheduler.pollWorker(workerId);
+            boolean didWork = !paused.getAsBoolean() && scheduler.pollWorker(workerId);
             if (!didWork) {
                 inLock(
                         lock,

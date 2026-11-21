@@ -1494,7 +1494,10 @@ public class ServerRpcMessageUtils {
                             sourceBucket,
                             bucketRequest.getSourceEndOffset(),
                             bucketRequest.getProgressKey(),
-                            records));
+                            records,
+                            bucketRequest.hasSourceHistoryFloor()
+                                    ? bucketRequest.getSourceHistoryFloor()
+                                    : -1L));
         }
         return result;
     }

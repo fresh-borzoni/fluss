@@ -89,7 +89,8 @@ public enum ApiKeys {
     // Version 3: Supports ordered primary-key prefixes and per-lookup range bounds and direction.
     // Version 4: Supports per-lookup limits.
     // Version 5: Supports positioned bucket history lookups.
-    PREFIX_LOOKUP(1034, 0, 5, PUBLIC),
+    // Version 6: Supports reads of an Index Table at a cut of its main table.
+    PREFIX_LOOKUP(1034, 0, 6, PUBLIC),
 
     GET_DATABASE_INFO(1035, 0, 0, PUBLIC),
     CREATE_PARTITION(1036, 0, 0, PUBLIC),
@@ -141,7 +142,8 @@ public enum ApiKeys {
     DELETE_CONSUMER_GROUPS(1073, 0, 0, PUBLIC),
     CREATE_TABLE_FROM_LAKE(1074, 0, 0, PUBLIC),
     DESCRIBE_CLUSTER(1075, 0, 0, PUBLIC),
-    PUT_INDEX(1076, 0, 0, PRIVATE),
+    // Version 1: Carries the history floor of the source bucket.
+    PUT_INDEX(1076, 0, 1, PRIVATE),
     GET_BUCKET_READ_RANGE(1077, 0, 0, PUBLIC);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =

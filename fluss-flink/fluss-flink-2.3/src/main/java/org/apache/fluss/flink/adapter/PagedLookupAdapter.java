@@ -27,7 +27,10 @@ import org.apache.flink.table.functions.FunctionContext;
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
 
-/** An adapter for the lookup functions of Flink versions that can read in pages. */
+/**
+ * An adapter for the lookup functions of Flink versions that can read in pages, and as of the
+ * epochs of a scan.
+ */
 public class PagedLookupAdapter {
 
     private PagedLookupAdapter() {}
@@ -38,11 +41,11 @@ public class PagedLookupAdapter {
     }
 
     /**
-     * Delegates lookups to the Fluss function, and reads pages through it. Public, as Flink
-     * instantiates only public function classes.
+     * Delegates lookups to the Fluss function, and reads pages and versions through it. Public, as
+     * Flink instantiates only public function classes.
      */
     public static final class PagedFunction extends AsyncLookupFunction
-            implements SupportsPagedLookup {
+            implements SupportsPagedLookup, SupportsVersionedLookupAdapter {
 
         private static final long serialVersionUID = 1L;
 
@@ -60,6 +63,11 @@ public class PagedLookupAdapter {
         @Override
         public CompletableFuture<Collection<RowData>> asyncLookup(RowData keyRow) {
             return function.asyncLookup(keyRow);
+        }
+
+        @Override
+        public CompletableFuture<Collection<RowData>> asyncLookupAsOf(RowData keyRow, long epoch) {
+            return function.asyncLookupAsOf(keyRow, epoch);
         }
 
         @Override

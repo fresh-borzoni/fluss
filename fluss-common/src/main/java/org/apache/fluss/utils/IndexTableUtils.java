@@ -19,7 +19,10 @@ package org.apache.fluss.utils;
 
 import org.apache.fluss.config.ConfigOption;
 
+import java.nio.ByteBuffer;
+
 import static org.apache.fluss.config.ConfigBuilder.key;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Utility constants and helpers shared by the Global Secondary Index Table layer. */
 public final class IndexTableUtils {
@@ -49,12 +52,34 @@ public final class IndexTableUtils {
     /** Uniquely identifies a record within one routing-key prefix. */
     public static final String ROW_KEY_SYSTEM_COLUMN = "__idx_row_key";
 
-    /** Source WAL end offset, populated only for progress records. */
+    /**
+     * A source WAL offset: the applied end offset of a progress record, the offset of the removing
+     * change of a removed record, or the purge offset of a purge-floor record. Null for data
+     * records.
+     */
     public static final String SOURCE_PROGRESS_SYSTEM_COLUMN = "__idx_source_progress";
 
+    /** A pointer from the current index values of a main row to its primary key. */
     public static final byte DATA_RECORD_KIND = 0;
 
+    /** How far an Index Table bucket applied the changes of one source bucket. */
     public static final byte PROGRESS_RECORD_KIND = 1;
+
+    /**
+     * A pointer the main row no longer has, kept for reads at earlier positions of a main table
+     * with bucket history. It shares the routing key and bucket of the data pointer; its row key is
+     * the source bucket followed by the data row key, and its source offset is that of the removing
+     * change.
+     */
+    public static final byte REMOVED_RECORD_KIND = 2;
+
+    /**
+     * Per source bucket, the offset below which removed pointers were purged, so reads at earlier
+     * positions expire. Its row key is the source bucket.
+     */
+    public static final byte PURGE_FLOOR_RECORD_KIND = 3;
+
+    private static final int SOURCE_BUCKET_BYTES = Integer.BYTES;
 
     /** Reserved, operationally distinct prefix for internal Index Tables. */
     public static final String INDEX_TABLE_NAME_PREFIX = "__idx__";
@@ -67,6 +92,28 @@ public final class IndexTableUtils {
     /** Builds the internal Index Table name from its owning main-table name and index name. */
     public static String indexTableName(String mainTableName, String indexName) {
         return INDEX_TABLE_NAME_PREFIX + mainTableName + INDEX_TABLE_NAME_SEPARATOR + indexName;
+    }
+
+    /** The row key of a progress or purge-floor record of a source bucket. */
+    public static byte[] sourceBucketRowKey(int sourceBucket) {
+        return removedRowKey(sourceBucket, new byte[0]);
+    }
+
+    /** The row key of a removed pointer: the big-endian source bucket, then the data row key. */
+    public static byte[] removedRowKey(int sourceBucket, byte[] dataRowKey) {
+        return ByteBuffer.allocate(SOURCE_BUCKET_BYTES + dataRowKey.length)
+                .putInt(sourceBucket)
+                .put(dataRowKey)
+                .array();
+    }
+
+    /** The source bucket at the start of the row key of a removed, progress or floor record. */
+    public static int sourceBucketOf(byte[] rowKey) {
+        checkArgument(
+                rowKey.length >= SOURCE_BUCKET_BYTES,
+                "A row key of %s bytes names no source bucket.",
+                rowKey.length);
+        return ByteBuffer.wrap(rowKey).getInt();
     }
 
     /** Returns whether a table name is reserved for a system-managed Index Table. */

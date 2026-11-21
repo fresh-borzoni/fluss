@@ -130,7 +130,7 @@ public class FlussTable implements Table {
                         tablePath.getDatabaseName(),
                         IndexTableUtils.indexTableName(tablePath.getTableName(), indexName));
         return SecondaryIndexLookuper.create(
-                mainSchema,
+                tableInfo,
                 index.getColumnNames(),
                 conn.getTable(indexTablePath),
                 this.newLookup().createLookuper(),

@@ -26,10 +26,12 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.adapter.LookupContextAdapter;
 import org.apache.fluss.flink.adapter.PagedLookupAdapter;
+import org.apache.fluss.flink.adapter.SupportsEpochsAdapter;
 import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter;
 import org.apache.fluss.flink.adapter.SupportsLookupCustomShuffleAdapter.InputDataPartitionerAdapter;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
+import org.apache.fluss.flink.source.epochs.EpochSettings;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkFullCacheLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
@@ -100,6 +102,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -131,7 +134,8 @@ public class FlinkTableSource
                 SupportsLimitPushDown,
                 SupportsAggregatePushDown,
                 SupportsWatermarkPushDown,
-                SupportsLookupCustomShuffleAdapter {
+                SupportsLookupCustomShuffleAdapter,
+                SupportsEpochsAdapter {
 
     public static final Logger LOG = LoggerFactory.getLogger(FlinkTableSource.class);
 
@@ -199,6 +203,9 @@ public class FlinkTableSource
 
     /** Custom partitioner prepared for the current lookup runtime provider. */
     @Nullable private InputDataPartitionerAdapter lookupInputPartitioner;
+
+    /** The domain of the epochs that the scan cuts and the lookups read as of, or null. */
+    @Nullable private String epochDomain;
 
     public FlinkTableSource(
             TablePath tablePath,
@@ -486,6 +493,7 @@ public class FlinkTableSource
                         : new ArrayList<>(source.deferredLakeFilters);
         this.logRecordBatchFilter = source.logRecordBatchFilter;
         this.watermarkStrategy = source.watermarkStrategy;
+        this.epochDomain = source.epochDomain;
     }
 
     @Override
@@ -645,6 +653,9 @@ public class FlinkTableSource
                         partitionFilters,
                         enableLakeSource ? lakeSource : null,
                         leaseContext);
+        if (epochDomain != null) {
+            source.withEpochs(epochSettings());
+        }
 
         if (!streaming) {
             // return a bounded source provide to make planner happy,
@@ -792,6 +803,20 @@ public class FlinkTableSource
                             org.apache.flink.configuration.Configuration.fromMap(tableOptions)));
         }
         this.lookupInputPartitioner = createLookupInputPartitioner(lookupNormalizer);
+        if (epochDomain != null) {
+            // never cached: a cache holds the latest rows, not the rows as of an epoch
+            return AsyncLookupFunctionProvider.of(
+                    PagedLookupAdapter.wrap(
+                            new FlinkAsyncLookupFunction(
+                                    flussConfig,
+                                    tablePath,
+                                    tableOutputType,
+                                    lookupNormalizer,
+                                    projectedFields,
+                                    insertIfNotExists,
+                                    requiresWriter,
+                                    epochSettings())));
+        }
         if (lookupAsync || requiresWriter) {
             AsyncLookupFunction asyncLookupFunction =
                     PagedLookupAdapter.wrap(
@@ -883,6 +908,64 @@ public class FlinkTableSource
     @Override
     public DynamicTableSource copy() {
         return new FlinkTableSource(this);
+    }
+
+    /**
+     * Cuts the changes of the scan into the epochs of the domain and lets lookups read as of them.
+     * Requires a primary-key table with {@link ConfigOptions#TABLE_KV_MVCC_ENABLED} whose changelog
+     * the scan reads from Fluss alone.
+     */
+    @Override
+    public boolean applyEpochs(String domain) {
+        String refusal = null;
+        if (!streaming) {
+            refusal = "a batch scan has no epochs";
+        } else if (!hasPrimaryKey()) {
+            refusal = "it has no primary key";
+        } else if (!tableConfig.isMvccEnabled()) {
+            refusal =
+                    "it keeps no history; create it with '"
+                            + ConfigOptions.TABLE_KV_MVCC_ENABLED.key()
+                            + "' = 'true'";
+        } else if (isPartitioned()) {
+            refusal = "its partitions are not supported yet";
+        } else if (isDataLakeEnabled
+                && startupOptions.startupMode == FlinkConnectorOptions.ScanStartupMode.FULL) {
+            refusal = "a scan that unions the lake cannot cut epochs";
+        } else if (singleRowFilter != null || limit > 0 || selectRowCount) {
+            refusal = "the scan was pushed down into a query of the current rows";
+        } else if (insertIfNotExists) {
+            refusal = "its lookups insert missing keys";
+        } else if (lookupCacheType == LookupOptions.LookupCacheType.FULL) {
+            refusal = "its lookups read a full cache";
+        } else if (watermarkStrategy != null) {
+            // the epochs are the timestamps and watermarks of the scan
+            refusal = "the scan has watermarks of its own";
+        }
+        if (refusal != null) {
+            LOG.info("Fluss table {} cannot cut its changes into epochs: {}.", tablePath, refusal);
+            return false;
+        }
+        this.epochDomain = domain;
+        return true;
+    }
+
+    private EpochSettings epochSettings() {
+        org.apache.flink.configuration.Configuration options =
+                org.apache.flink.configuration.Configuration.fromMap(tableOptions);
+        long intervalMs = options.get(FlinkConnectorOptions.SCAN_EPOCH_INTERVAL).toMillis();
+        long closeAfterMs =
+                options.getOptional(FlinkConnectorOptions.SCAN_EPOCH_CLOSE_AFTER)
+                        .map(Duration::toMillis)
+                        .orElse(0L);
+        return new EpochSettings(checkNotNull(epochDomain), intervalMs, closeAfterMs);
+    }
+
+    /** The domain of the epochs that the source applied, or null. */
+    @Nullable
+    @VisibleForTesting
+    public String getEpochDomain() {
+        return epochDomain;
     }
 
     @Override

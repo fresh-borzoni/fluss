@@ -44,8 +44,12 @@ import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.IndexTableUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -55,11 +59,15 @@ import static org.apache.fluss.record.LogRecordBatchFormat.NO_BATCH_SEQUENCE;
 import static org.apache.fluss.record.LogRecordBatchFormat.NO_WRITER_ID;
 import static org.apache.fluss.utils.IndexTableUtils.DATA_RECORD_KIND;
 import static org.apache.fluss.utils.IndexTableUtils.PROGRESS_RECORD_KIND;
+import static org.apache.fluss.utils.IndexTableUtils.PURGE_FLOOR_RECORD_KIND;
+import static org.apache.fluss.utils.IndexTableUtils.REMOVED_RECORD_KIND;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Applies replicated index windows using recoverable target progress for idempotency. */
 @Internal
 public final class IndexReplicationApplier {
+
+    private static final Logger LOG = LoggerFactory.getLogger(IndexReplicationApplier.class);
 
     private final TableInfo tableInfo;
     private final TableBucket tableBucket;
@@ -70,6 +78,7 @@ public final class IndexReplicationApplier {
     private final int partitionIdKeyPosition;
     private final int recordKindPosition;
     private final int sourceProgressPosition;
+    private final IndexTableRows rows;
 
     /** Creates the application state for one Index Table replica. */
     public IndexReplicationApplier(
@@ -90,6 +99,7 @@ public final class IndexReplicationApplier {
                 schema.getColumnNames().indexOf(IndexTableUtils.RECORD_KIND_SYSTEM_COLUMN);
         this.sourceProgressPosition =
                 schema.getColumnNames().indexOf(IndexTableUtils.SOURCE_PROGRESS_SYSTEM_COLUMN);
+        this.rows = new IndexTableRows(tableInfo, schemaGetter);
         List<String> primaryKeys =
                 schema.getPrimaryKey()
                         .map(Schema.PrimaryKey::getColumnNames)
@@ -170,7 +180,66 @@ public final class IndexReplicationApplier {
                             + " is awaiting durable flush on "
                             + tableBucket);
         }
-        return kvTablet.putAsLeader(records, null, MergeMode.OVERWRITE);
+        LogAppendInfo appended = kvTablet.putAsLeader(records, null, MergeMode.OVERWRITE);
+        if (data.sourceHistoryFloor() > 0) {
+            purgeRemovedBelow(kvTablet, sourceBucket, data.sourceHistoryFloor());
+        }
+        return appended;
+    }
+
+    /**
+     * Purges the removed pointers of a source bucket below its history floor, where reads of the
+     * main table expire. The purge floor is written first in the same batch, so a read at an
+     * earlier position sees that it expired before it can miss a purged pointer.
+     */
+    private void purgeRemovedBelow(KvTablet kvTablet, TableBucket source, long historyFloor)
+            throws Exception {
+        byte[] floorKey = rows.sourceRecordKey(PURGE_FLOOR_RECORD_KIND, source);
+        long purgedBelow =
+                rows.sourceOffset(
+                        rows.decode(
+                                kvTablet.multiGetFromBufferOrKv(Collections.singletonList(floorKey))
+                                        .get(0)),
+                        PURGE_FLOOR_RECORD_KIND);
+        if (historyFloor <= purgedBelow) {
+            return;
+        }
+        // the record kind leads the key, so all removed pointers share this prefix
+        List<byte[]> candidates = new ArrayList<>();
+        for (ByteArraySlice value : kvTablet.prefixLookup(new byte[] {REMOVED_RECORD_KIND})) {
+            InternalRow row = rows.decode(value);
+            if (rows.sourceBucketOf(row).equals(source)
+                    && rows.sourceOffset(row, REMOVED_RECORD_KIND) < historyFloor) {
+                candidates.add(rows.keyOf(row));
+            }
+        }
+        // a later removal of the same pointer may still wait in the pre-write buffer
+        List<ByteArraySlice> latest =
+                candidates.isEmpty()
+                        ? Collections.emptyList()
+                        : kvTablet.multiGetFromBufferOrKv(candidates);
+        IndexReplicator.BucketBatchBuilder batch =
+                new IndexReplicator.BucketBatchBuilder(
+                        (short) rows.schemaId(), tableInfo.getTableConfig().getKvFormat());
+        batch.appendUpsert(
+                floorKey, rows.sourceRecordValue(PURGE_FLOOR_RECORD_KIND, source, historyFloor));
+        int purged = 0;
+        for (int i = 0; i < candidates.size(); i++) {
+            InternalRow row = rows.decode(latest.get(i));
+            if (row != null
+                    && rows.recordKind(row) == REMOVED_RECORD_KIND
+                    && rows.sourceOffset(row, REMOVED_RECORD_KIND) < historyFloor) {
+                batch.appendDelete(candidates.get(i));
+                purged++;
+            }
+        }
+        kvTablet.putAsLeader(batch.toRecordBatch(), null, MergeMode.OVERWRITE);
+        LOG.debug(
+                "Purged {} removed pointers of {} below {} in {}.",
+                purged,
+                source,
+                historyFloor,
+                tableBucket);
     }
 
     private void validateSource(TableBucket sourceBucket) {
@@ -219,8 +288,10 @@ public final class IndexReplicationApplier {
             boolean last = recordIndex == records.getRecordCount() - 1;
             byte[] key = BytesUtils.toArray(record.getKey());
             InternalRow physicalKey = keyDecoder.decodeKey(key);
-            byte expectedKind = last ? PROGRESS_RECORD_KIND : DATA_RECORD_KIND;
-            if (physicalKey.getByte(0) != expectedKind) {
+            byte keyKind = physicalKey.getByte(0);
+            if (last
+                    ? keyKind != PROGRESS_RECORD_KIND
+                    : keyKind != DATA_RECORD_KIND && keyKind != REMOVED_RECORD_KIND) {
                 throw new CorruptRecordException("PutIndex progress must be the final record");
             }
             validatePartition(sourceBucket, physicalKey, partitionIdKeyPosition);
@@ -238,7 +309,7 @@ public final class IndexReplicationApplier {
                 }
                 validatePartition(sourceBucket, value, partitionIdPosition);
             } else if (value != null) {
-                if (value.getByte(recordKindPosition) != DATA_RECORD_KIND) {
+                if (value.getByte(recordKindPosition) != keyKind) {
                     throw new CorruptRecordException("Invalid PutIndex data record kind");
                 }
                 validatePartition(sourceBucket, value, partitionIdPosition);

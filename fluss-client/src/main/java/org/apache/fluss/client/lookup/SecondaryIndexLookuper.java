@@ -18,17 +18,25 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.exception.LookupPositionExpiredException;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
+import org.apache.fluss.metadata.BucketReadPosition;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.predicate.Equal;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.IndexTableUtils;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
@@ -36,8 +44,10 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -64,6 +74,11 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * {@code idxCols} disagree with the lookup key is discarded as a stale index pointer (covers both
  * the async-visibility window and the natural lag during partition-tombstone cleanup).
  *
+ * <p>Reads at a cut: for a main table with bucket history, whose Index Table keeps removed pointers
+ * with the offset of the removing change, {@link #lookup(InternalRow, Map)} reads at one position
+ * per main table bucket. Hop 1 returns the data pointers plus the removed pointers still valid at
+ * the cut, and Hop 2 and the recheck run at the position of each candidate's bucket.
+ *
  * <p>Threading: Hop 2 is dispatched on {@code continuationExecutor} instead of the thread that
  * completes the Hop 1 future (a Netty I/O thread in production). Hop 2 submits point lookups
  * against the main table, which may synchronously block on a metadata refresh when partition
@@ -80,6 +95,35 @@ public final class SecondaryIndexLookuper implements Lookuper {
                     IndexTableUtils.RECORD_KIND_SYSTEM_COLUMN,
                     IndexTableUtils.ROUTING_KEY_SYSTEM_COLUMN);
 
+    /** The position of a main table bucket that a read at a cut reads as empty. */
+    public static final long EMPTY_BUCKET_POSITION = -1L;
+
+    /** Reads the pointers of an Index Table prefix at a cut of the main table. */
+    @FunctionalInterface
+    interface CutReader {
+        CompletableFuture<LookupResult> read(InternalRow indexKey, Map<TableBucket, Long> cut);
+    }
+
+    /** What a read at a cut needs of the main table. */
+    static final class MainTableCuts {
+        private final CutReader cutReader;
+        private final Set<TableBucket> buckets;
+        private final Function<InternalRow, TableBucket> bucketOfPrimaryKey;
+
+        /**
+         * @param buckets every bucket of the main table, which a cut names
+         * @param bucketOfPrimaryKey the bucket of a primary key of the main table
+         */
+        MainTableCuts(
+                CutReader cutReader,
+                Set<TableBucket> buckets,
+                Function<InternalRow, TableBucket> bucketOfPrimaryKey) {
+            this.cutReader = checkNotNull(cutReader, "cutReader");
+            this.buckets = Collections.unmodifiableSet(new HashSet<>(buckets));
+            this.bucketOfPrimaryKey = checkNotNull(bucketOfPrimaryKey, "bucketOfPrimaryKey");
+        }
+    }
+
     private final Lookuper indexTablePrefixLookuper;
     private final Lookuper mainTablePointLookuper;
     private final Function<InternalRow, InternalRow> indexLookupKeyEncoder;
@@ -95,6 +139,9 @@ public final class SecondaryIndexLookuper implements Lookuper {
     /** The most candidates a lookup of the Index Table may read, which bounds a page. */
     private final int maxCandidates;
 
+    /** Reads at cuts of the main table; null if the lookuper does not read at cuts. */
+    private final @Nullable MainTableCuts cuts;
+
     /**
      * Assembles a lookuper for one secondary index of {@code mainSchema}.
      *
@@ -104,6 +151,45 @@ public final class SecondaryIndexLookuper implements Lookuper {
      */
     public static SecondaryIndexLookuper create(
             Schema mainSchema,
+            List<String> idxCols,
+            Table indexTable,
+            Lookuper mainTablePointLookuper,
+            Executor continuationExecutor,
+            int maxCandidates) {
+        return create(
+                mainSchema,
+                null,
+                idxCols,
+                indexTable,
+                mainTablePointLookuper,
+                continuationExecutor,
+                maxCandidates);
+    }
+
+    /**
+     * Assembles a lookuper for one secondary index of a main table, which also reads at cuts of the
+     * main table if it has no partitions, see {@link #lookup(InternalRow, Map)}.
+     */
+    public static SecondaryIndexLookuper create(
+            TableInfo mainTableInfo,
+            List<String> idxCols,
+            Table indexTable,
+            Lookuper mainTablePointLookuper,
+            Executor continuationExecutor,
+            int maxCandidates) {
+        return create(
+                mainTableInfo.getSchema(),
+                mainTableInfo,
+                idxCols,
+                indexTable,
+                mainTablePointLookuper,
+                continuationExecutor,
+                maxCandidates);
+    }
+
+    private static SecondaryIndexLookuper create(
+            Schema mainSchema,
+            @Nullable TableInfo mainTableInfo,
             List<String> idxCols,
             Table indexTable,
             Lookuper mainTablePointLookuper,
@@ -156,6 +242,16 @@ public final class SecondaryIndexLookuper implements Lookuper {
                     return pk;
                 };
 
+        MainTableCuts cuts = null;
+        if (mainTableInfo != null
+                && !mainTableInfo.isPartitioned()
+                && indexTablePrefixLookuper instanceof PrefixKeyLookuper) {
+            cuts =
+                    new MainTableCuts(
+                            ((PrefixKeyLookuper) indexTablePrefixLookuper)::lookupAtCut,
+                            bucketsOf(mainTableInfo),
+                            bucketOfPrimaryKey(mainTableInfo));
+        }
         return new SecondaryIndexLookuper(
                 indexTablePrefixLookuper,
                 mainTablePointLookuper,
@@ -166,7 +262,43 @@ public final class SecondaryIndexLookuper implements Lookuper {
                 basePkExtractor,
                 continuationExecutor,
                 indexTable,
-                maxCandidates);
+                maxCandidates,
+                cuts);
+    }
+
+    private static Set<TableBucket> bucketsOf(TableInfo mainTableInfo) {
+        Set<TableBucket> buckets = new HashSet<>();
+        for (int bucket = 0; bucket < mainTableInfo.getNumBuckets(); bucket++) {
+            buckets.add(new TableBucket(mainTableInfo.getTableId(), bucket));
+        }
+        return buckets;
+    }
+
+    /** Routes a primary key of a table without partitions to its bucket, as writes do. */
+    private static Function<InternalRow, TableBucket> bucketOfPrimaryKey(TableInfo mainTableInfo) {
+        RowType primaryKeyType = mainTableInfo.getRowType().project(mainTableInfo.getPrimaryKeys());
+        KeyEncoder primaryKeyEncoder =
+                KeyEncoder.ofPrimaryKeyEncoder(
+                        primaryKeyType,
+                        mainTableInfo.getPhysicalPrimaryKeys(),
+                        mainTableInfo.getTableConfig(),
+                        mainTableInfo.isDefaultBucketKey());
+        KeyEncoder bucketKeyEncoder =
+                KeyEncoder.ofBucketKeyEncoder(
+                        primaryKeyType,
+                        mainTableInfo.getBucketKeys(),
+                        mainTableInfo.getTableConfig(),
+                        mainTableInfo.isDefaultBucketKey(),
+                        primaryKeyEncoder);
+        BucketingFunction bucketing =
+                BucketingFunction.of(
+                        mainTableInfo.getTableConfig().getDataLakeFormat().orElse(null));
+        long tableId = mainTableInfo.getTableId();
+        int numBuckets = mainTableInfo.getNumBuckets();
+        return primaryKey ->
+                new TableBucket(
+                        tableId,
+                        bucketing.bucketing(bucketKeyEncoder.encodeKey(primaryKey), numBuckets));
     }
 
     SecondaryIndexLookuper(
@@ -188,7 +320,8 @@ public final class SecondaryIndexLookuper implements Lookuper {
                 basePkExtractorFromIndexRow,
                 continuationExecutor,
                 null,
-                0);
+                0,
+                null);
     }
 
     SecondaryIndexLookuper(
@@ -201,9 +334,11 @@ public final class SecondaryIndexLookuper implements Lookuper {
             Function<InternalRow, GenericRow> basePkExtractorFromIndexRow,
             Executor continuationExecutor,
             @Nullable Table indexTable,
-            int maxCandidates) {
+            int maxCandidates,
+            @Nullable MainTableCuts cuts) {
         this.indexTable = indexTable;
         this.maxCandidates = maxCandidates;
+        this.cuts = cuts;
         this.indexTablePrefixLookuper =
                 checkNotNull(indexTablePrefixLookuper, "indexTablePrefixLookuper");
         this.mainTablePointLookuper =
@@ -235,6 +370,97 @@ public final class SecondaryIndexLookuper implements Lookuper {
                 .lookup(indexLookupKeyEncoder.apply(lookupKey))
                 .thenComposeAsync(
                         hop1Result -> doHop2(hop1Result, expectedIdxValues), continuationExecutor);
+    }
+
+    /**
+     * Reads the main rows whose index columns equal the key at a cut of a main table with bucket
+     * history.
+     *
+     * <p>The future fails without retrying with {@link LookupPositionNotYetReadableException} while
+     * the Index Table or the main table has not applied the cut yet, and with {@link
+     * LookupPositionExpiredException} once the history of a position is gone.
+     *
+     * @param cut the exclusive next offset of every bucket of the main table, or {@link
+     *     #EMPTY_BUCKET_POSITION} for a bucket read as empty
+     */
+    public CompletableFuture<LookupResult> lookup(
+            InternalRow lookupKey, Map<TableBucket, Long> cut) {
+        if (cuts == null) {
+            return FutureUtils.completedExceptionally(
+                    new UnsupportedOperationException(
+                            "This secondary index lookuper does not read at cuts; only the"
+                                    + " indexes of tables without partitions do."));
+        }
+        if (!cut.keySet().equals(cuts.buckets)) {
+            return FutureUtils.completedExceptionally(
+                    new IllegalArgumentException(
+                            "A cut must name every bucket of the main table "
+                                    + cuts.buckets
+                                    + ", but names "
+                                    + cut.keySet()
+                                    + '.'));
+        }
+        Map<TableBucket, Long> readCut = new HashMap<>();
+        for (Map.Entry<TableBucket, Long> position : cut.entrySet()) {
+            long nextOffset = checkNotNull(position.getValue(), "position");
+            if (nextOffset < EMPTY_BUCKET_POSITION) {
+                return FutureUtils.completedExceptionally(
+                        new IllegalArgumentException(
+                                "Invalid position " + nextOffset + " of " + position.getKey()));
+            }
+            if (nextOffset != EMPTY_BUCKET_POSITION) {
+                readCut.put(position.getKey(), nextOffset);
+            }
+        }
+        if (hasNull(lookupKey) || readCut.isEmpty()) {
+            return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
+        }
+        Object[] expectedIdxValues = snapshotLookupKey(lookupKey);
+        return cuts.cutReader
+                .read(indexLookupKeyEncoder.apply(lookupKey), readCut)
+                .thenComposeAsync(
+                        hop1Result ->
+                                mainRowsAt(hop1Result.getRowList(), expectedIdxValues, readCut)
+                                        .thenApply(LookupResult::new),
+                        continuationExecutor);
+    }
+
+    /**
+     * Hop 2 and the recheck at a cut, which drop the pointers added after the cut and those removed
+     * before it.
+     */
+    private CompletableFuture<List<InternalRow>> mainRowsAt(
+            List<InternalRow> candidateIndexRows,
+            Object[] expectedIdxValues,
+            Map<TableBucket, Long> readCut) {
+        List<CompletableFuture<LookupResult>> mainFutures = new ArrayList<>();
+        Set<GenericRow> seenBasePrimaryKeys = new HashSet<>();
+        for (InternalRow indexRow : candidateIndexRows) {
+            GenericRow basePk = copyRow(basePkExtractorFromIndexRow.apply(indexRow));
+            if (!seenBasePrimaryKeys.add(basePk)) {
+                continue;
+            }
+            TableBucket bucket = cuts.bucketOfPrimaryKey.apply(basePk);
+            Long position = readCut.get(bucket);
+            if (position != null) {
+                mainFutures.add(
+                        mainTablePointLookuper.lookup(
+                                basePk, BucketReadPosition.of(bucket, position)));
+            }
+        }
+        return CompletableFuture.allOf(mainFutures.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        v -> {
+                            List<InternalRow> aggregated = new ArrayList<>();
+                            for (CompletableFuture<LookupResult> f : mainFutures) {
+                                for (InternalRow mainRow : f.join().getRowList()) {
+                                    if (idxColsMatch(expectedIdxValues, mainRow)) {
+                                        aggregated.add(mainRow);
+                                    }
+                                }
+                            }
+                            return aggregated;
+                        });
     }
 
     private CompletableFuture<LookupResult> doHop2(

@@ -88,6 +88,7 @@ final class ServerConnection {
     private static final short PREFIX_LOOKUP_KEY_LIMIT_MIN_VERSION = 4;
     private static final short POSITIONED_LOOKUP_MIN_VERSION = 3;
     private static final short POSITIONED_PREFIX_LOOKUP_MIN_VERSION = 5;
+    private static final short INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION = 6;
 
     private final ServerNode node;
 
@@ -465,6 +466,17 @@ final class ServerConnection {
             throw new UnsupportedVersionException(
                     "Positioned lookups require version "
                             + POSITIONED_PREFIX_LOOKUP_MIN_VERSION
+                            + " of "
+                            + apiKey
+                            + '.');
+        }
+
+        if (apiKey == ApiKeys.PREFIX_LOOKUP
+                && version < INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION
+                && ((PrefixLookupRequest) rawRequest).getSourcePositionsCount() > 0) {
+            throw new UnsupportedVersionException(
+                    "Reads of an Index Table at a cut of its main table require version "
+                            + INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION
                             + " of "
                             + apiKey
                             + '.');

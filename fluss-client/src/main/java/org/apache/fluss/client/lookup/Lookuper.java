@@ -95,6 +95,24 @@ public interface Lookuper {
     }
 
     /**
+     * Looks up at most {@code limit} rows matching the configured equality columns and the supplied
+     * range, in the direction configured on {@link Lookup}, so a reverse lookuper returns the last
+     * rows of the range first.
+     *
+     * <p>Requires a lookuper created with {@link Lookup#rangeBy(String)}.
+     *
+     * @param lookupKey values for the configured lookup columns
+     * @param bounds bounds for the configured range column, with one non-null field per endpoint
+     * @param limit the most rows to return, positive
+     * @throws UnsupportedOperationException if this lookuper has no configured range column
+     */
+    default CompletableFuture<LookupResult> lookupFirst(
+            InternalRow lookupKey, Range<? extends InternalRow> bounds, int limit) {
+        throw new UnsupportedOperationException(
+                "This lookuper does not support limited range lookups.");
+    }
+
+    /**
      * Looks up a primary key or prefix in a versioned table at the supplied bucket position.
      *
      * <p>The key must route to the physical bucket identified by the position. The result in the

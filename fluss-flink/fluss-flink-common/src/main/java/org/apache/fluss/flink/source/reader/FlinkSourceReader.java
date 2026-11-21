@@ -21,6 +21,8 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.adapter.SingleThreadMultiplexSourceReaderBaseAdapter;
 import org.apache.fluss.flink.lake.LakeSplitStateInitializer;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
+import org.apache.fluss.flink.source.epochs.ReaderEpochs;
+import org.apache.fluss.flink.source.event.EpochOpenedEvent;
 import org.apache.fluss.flink.source.event.FinishedKvSnapshotConsumeEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
@@ -39,10 +41,13 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.types.RowType;
 
+import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
+import org.apache.flink.core.io.InputStatus;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,9 +57,15 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
-/** The source reader for Fluss. */
+/**
+ * The source reader for Fluss.
+ *
+ * <p>With {@link ReaderEpochs}, it cuts the changes it emits into epochs and emits their
+ * watermarks.
+ */
 public class FlinkSourceReader<OUT>
         extends SingleThreadMultiplexSourceReaderBaseAdapter<
                 RecordAndPos, OUT, SourceSplitBase, SourceSplitState> {
@@ -63,6 +74,11 @@ public class FlinkSourceReader<OUT>
 
     /** the tableBuckets ignore to send FinishedKvSnapshotConsumeEvent as it already sending. */
     private final Set<TableBucket> finishedKvSnapshotConsumeBuckets;
+
+    /** The epochs that the reader cuts its changes into, or null. */
+    @Nullable private final ReaderEpochs<OUT> epochs;
+
+    private final FutureCompletingBlockingQueue<RecordsWithSplitIds<RecordAndPos>> elementsQueue;
 
     public FlinkSourceReader(
             FutureCompletingBlockingQueue<RecordsWithSplitIds<RecordAndPos>> elementsQueue,
@@ -75,6 +91,35 @@ public class FlinkSourceReader<OUT>
             FlinkSourceReaderMetrics flinkSourceReaderMetrics,
             FlinkRecordEmitter<OUT> recordEmitter,
             LakeSource<LakeSplit> lakeSource) {
+        this(
+                elementsQueue,
+                flussConfig,
+                tablePath,
+                sourceOutputType,
+                context,
+                projectedFields,
+                logRecordBatchFilter,
+                flinkSourceReaderMetrics,
+                recordEmitter,
+                lakeSource,
+                null);
+    }
+
+    /**
+     * @param epochs the epochs that the reader cuts its changes into, or null
+     */
+    public FlinkSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<RecordAndPos>> elementsQueue,
+            Configuration flussConfig,
+            TablePath tablePath,
+            RowType sourceOutputType,
+            SourceReaderContext context,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            FlinkSourceReaderMetrics flinkSourceReaderMetrics,
+            FlinkRecordEmitter<OUT> recordEmitter,
+            LakeSource<LakeSplit> lakeSource,
+            @Nullable ReaderEpochs<OUT> epochs) {
         super(
                 elementsQueue,
                 new FlinkSourceFetcherManager(
@@ -89,15 +134,53 @@ public class FlinkSourceReader<OUT>
                                         lakeSource,
                                         flinkSourceReaderMetrics),
                         (ignore) -> {}),
-                recordEmitter,
+                epochs == null ? recordEmitter : epochs.wrap(recordEmitter),
                 context.getConfiguration(),
                 context);
         this.finishedKvSnapshotConsumeBuckets = new HashSet<>();
+        this.epochs = epochs;
+        this.elementsQueue = elementsQueue;
+    }
+
+    @Override
+    public InputStatus pollNext(ReaderOutput<OUT> output) throws Exception {
+        if (epochs == null) {
+            return super.pollNext(output);
+        }
+        InputStatus status = epochs.beforePoll(output);
+        if (status != null) {
+            return status;
+        }
+        return epochs.afterPoll(super.pollNext(output));
+    }
+
+    @Override
+    public CompletableFuture<Void> isAvailable() {
+        CompletableFuture<Void> records = super.isAvailable();
+        return epochs == null ? records : epochs.availability(records);
+    }
+
+    @Override
+    public void addSplits(List<SourceSplitBase> splits) {
+        if (epochs != null) {
+            try {
+                splits = epochs.addingSplits(splits);
+            } catch (Exception e) {
+                throw new FlinkRuntimeException("Failed to prepare the epochs of " + splits, e);
+            }
+        }
+        super.addSplits(splits);
+        if (epochs != null) {
+            // new splits need a watermark even if they have no records
+            elementsQueue.notifyAvailable();
+        }
     }
 
     @Override
     protected void onSplitFinished(Map<String, SourceSplitState> map) {
-        // do nothing
+        if (epochs != null) {
+            epochs.splitsFinished(map.keySet());
+        }
     }
 
     @Override
@@ -106,6 +189,10 @@ public class FlinkSourceReader<OUT>
 
         // do not modify this state.
         List<SourceSplitBase> sourceSplitBases = super.snapshotState(checkpointId);
+        if (epochs != null) {
+            // a finished split with records held back reads them again after a restore
+            sourceSplitBases.addAll(epochs.finishedSplitsHoldingRecords());
+        }
         for (SourceSplitBase sourceSplitBase : sourceSplitBases) {
             TableBucket tableBucket = sourceSplitBase.getTableBucket();
             if (finishedKvSnapshotConsumeBuckets.contains(tableBucket)) {
@@ -143,6 +230,12 @@ public class FlinkSourceReader<OUT>
 
     @Override
     public void handleSourceEvents(SourceEvent sourceEvent) {
+        if (sourceEvent instanceof EpochOpenedEvent) {
+            if (epochs != null) {
+                epochs.epochOpened(((EpochOpenedEvent) sourceEvent).getEpoch());
+            }
+            return;
+        }
         if (sourceEvent instanceof PartitionsRemovedEvent) {
             PartitionsRemovedEvent partitionsRemovedEvent = (PartitionsRemovedEvent) sourceEvent;
             Consumer<Set<TableBucket>> unsubscribeTableBucketsCallback =
@@ -160,16 +253,32 @@ public class FlinkSourceReader<OUT>
 
     @Override
     protected SourceSplitState initializedState(SourceSplitBase split) {
+        SourceSplitState state;
         if (split.isHybridSnapshotLogSplit()) {
-            return new HybridSnapshotLogSplitState(split.asHybridSnapshotLogSplit());
+            state = new HybridSnapshotLogSplitState(split.asHybridSnapshotLogSplit());
         } else if (split.isLogSplit()) {
-            return new LogSplitState(split.asLogSplit());
+            state = new LogSplitState(split.asLogSplit());
         } else if (split.isKvBatchSplit()) {
-            return new KvBatchSplitState(split.asKvBatchSplit());
+            state = new KvBatchSplitState(split.asKvBatchSplit());
         } else if (split.isLakeSplit()) {
-            return LakeSplitStateInitializer.initializedState(split);
+            state = LakeSplitStateInitializer.initializedState(split);
         } else {
             throw new UnsupportedOperationException("Unsupported split type: " + split);
+        }
+        if (epochs != null) {
+            epochs.track(split, state);
+        }
+        return state;
+    }
+
+    @Override
+    public void close() throws Exception {
+        try {
+            super.close();
+        } finally {
+            if (epochs != null) {
+                epochs.close();
+            }
         }
     }
 

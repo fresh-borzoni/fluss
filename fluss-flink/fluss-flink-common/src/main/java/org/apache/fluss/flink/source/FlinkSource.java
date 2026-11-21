@@ -27,6 +27,10 @@ import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
 import org.apache.fluss.flink.source.emitter.RowDataProjection;
 import org.apache.fluss.flink.source.enumerator.FlinkSourceEnumerator;
+import org.apache.fluss.flink.source.epochs.EpochRegistry;
+import org.apache.fluss.flink.source.epochs.EpochSettings;
+import org.apache.fluss.flink.source.epochs.ReaderEpochs;
+import org.apache.fluss.flink.source.event.EpochChangedEvent;
 import org.apache.fluss.flink.source.metrics.FlinkSourceReaderMetrics;
 import org.apache.fluss.flink.source.reader.FlinkSourceReader;
 import org.apache.fluss.flink.source.reader.LeaseContext;
@@ -54,6 +58,7 @@ import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.util.FlinkRuntimeException;
 
 import javax.annotation.Nullable;
 
@@ -88,6 +93,9 @@ public class FlinkSource<OUT>
     private final LeaseContext leaseContext;
 
     @Nullable private final Predicate logRecordBatchFilter;
+
+    /** The epochs that the scan cuts its changes into, or null. */
+    @Nullable private EpochSettings epochs;
 
     public FlinkSource(
             Configuration flussConf,
@@ -345,6 +353,20 @@ public class FlinkSource<OUT>
         this.leaseContext = leaseContext;
     }
 
+    /**
+     * Cuts the changes of the scan into the epochs, so that lookups of the table can read it as of
+     * them, see {@link ReaderEpochs}.
+     */
+    public FlinkSource<OUT> withEpochs(EpochSettings epochs) {
+        this.epochs = epochs;
+        return this;
+    }
+
+    @Nullable
+    public EpochSettings getEpochs() {
+        return epochs;
+    }
+
     @Override
     public Boundedness getBoundedness() {
         return boundedness;
@@ -363,22 +385,41 @@ public class FlinkSource<OUT>
     @Override
     public SplitEnumerator<SourceSplitBase, SourceEnumeratorState> createEnumerator(
             SplitEnumeratorContext<SourceSplitBase> splitEnumeratorContext) {
-        return new FlinkSourceEnumerator(
-                tablePath,
-                flussConf,
-                hasPrimaryKey,
-                isPartitioned,
-                splitEnumeratorContext,
-                offsetsInitializer,
-                stoppingOffsetsInitializer,
-                boundedness,
-                scanPartitionDiscoveryIntervalMs,
-                splitPerAssignmentBatchSize,
-                streaming,
-                partitionFilters,
-                lakeSource,
-                leaseContext,
-                false);
+        if (epochs != null) {
+            // a fresh scan must not take an earlier run's epochs as its own; its readers record
+            // epochs only after this enumerator assigned them splits
+            try {
+                EpochRegistry.clear(flussConf, tablePath, epochs.getDomain());
+            } catch (Exception e) {
+                throw new FlinkRuntimeException(
+                        "Failed to clear the epochs of " + tablePath + " before a fresh scan.", e);
+            }
+        }
+        return coordinated(
+                new FlinkSourceEnumerator(
+                        tablePath,
+                        flussConf,
+                        hasPrimaryKey,
+                        isPartitioned,
+                        splitEnumeratorContext,
+                        offsetsInitializer,
+                        stoppingOffsetsInitializer,
+                        boundedness,
+                        scanPartitionDiscoveryIntervalMs,
+                        splitPerAssignmentBatchSize,
+                        streaming,
+                        partitionFilters,
+                        lakeSource,
+                        leaseContext,
+                        false));
+    }
+
+    /** With epochs that the coordinators open, the enumerator joins the epochs of its domain. */
+    private FlinkSourceEnumerator coordinated(FlinkSourceEnumerator enumerator) {
+        if (epochs != null && epochs.getCloseAfterMs() > 0) {
+            enumerator.coordinateEpochs(epochs);
+        }
+        return enumerator;
     }
 
     @Override
@@ -393,29 +434,30 @@ public class FlinkSource<OUT>
             remainingHybridLakeFlussSplits = Collections.emptyList();
         }
 
-        return new FlinkSourceEnumerator(
-                tablePath,
-                flussConf,
-                hasPrimaryKey,
-                isPartitioned,
-                splitEnumeratorContext,
-                sourceEnumeratorState.getAssignedBuckets(),
-                sourceEnumeratorState.getAssignedPartitions(),
-                remainingHybridLakeFlussSplits,
-                offsetsInitializer,
-                stoppingOffsetsInitializer,
-                boundedness,
-                scanPartitionDiscoveryIntervalMs,
-                splitPerAssignmentBatchSize,
-                streaming,
-                partitionFilters,
-                lakeSource,
-                new LeaseContext(
-                        sourceEnumeratorState.getLeaseId(),
-                        leaseContext.getKvSnapshotLeaseDurationMs()),
-                true,
-                sourceEnumeratorState.isInitialDiscoveryFinished(),
-                sourceEnumeratorState.getUnassignedSplits());
+        return coordinated(
+                new FlinkSourceEnumerator(
+                        tablePath,
+                        flussConf,
+                        hasPrimaryKey,
+                        isPartitioned,
+                        splitEnumeratorContext,
+                        sourceEnumeratorState.getAssignedBuckets(),
+                        sourceEnumeratorState.getAssignedPartitions(),
+                        remainingHybridLakeFlussSplits,
+                        offsetsInitializer,
+                        stoppingOffsetsInitializer,
+                        boundedness,
+                        scanPartitionDiscoveryIntervalMs,
+                        splitPerAssignmentBatchSize,
+                        streaming,
+                        partitionFilters,
+                        lakeSource,
+                        new LeaseContext(
+                                sourceEnumeratorState.getLeaseId(),
+                                leaseContext.getKvSnapshotLeaseDurationMs()),
+                        true,
+                        sourceEnumeratorState.isInitialDiscoveryFinished(),
+                        sourceEnumeratorState.getUnassignedSplits()));
     }
 
     @Override
@@ -458,7 +500,16 @@ public class FlinkSource<OUT>
                 logRecordBatchFilter,
                 flinkSourceReaderMetrics,
                 recordEmitter,
-                lakeSource);
+                lakeSource,
+                epochs == null
+                        ? null
+                        : ReaderEpochs.open(
+                                readerConf,
+                                tablePath,
+                                epochs,
+                                epoch ->
+                                        context.sendSourceEventToCoordinator(
+                                                new EpochChangedEvent(epoch))));
     }
 
     @Override

@@ -398,6 +398,20 @@ public class ServerConnectionTest {
                     .setReverse(true)
                     .setLimit(1);
             connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 5, prefix);
+
+            // a read of an Index Table at a cut of its main table needs v6
+            PrefixLookupRequest atCut = new PrefixLookupRequest();
+            atCut.addSourcePosition().setBucketId(0).setNextOffset(3L);
+            for (short version = 1; version < 6; version++) {
+                final short oldVersion = version;
+                assertThatThrownBy(
+                                () ->
+                                        connection.validateVersionCompatibility(
+                                                ApiKeys.PREFIX_LOOKUP, oldVersion, atCut))
+                        .isInstanceOf(UnsupportedVersionException.class)
+                        .hasMessageContaining("PREFIX_LOOKUP");
+            }
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 6, atCut);
         } finally {
             connection.close().get();
         }

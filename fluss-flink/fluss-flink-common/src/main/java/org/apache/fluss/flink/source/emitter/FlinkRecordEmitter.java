@@ -121,6 +121,17 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
      *     UPDATE_BEFORE records that are buffered pending their UPDATE_AFTER pair)
      */
     private boolean processAndEmitRecord(ScanRecord scanRecord, SourceOutput<OUT> sourceOutput) {
+        OUT record = deserialize(scanRecord);
+        if (record != null) {
+            collect(sourceOutput, record, scanRecord.timestamp());
+            return true;
+        }
+        return false;
+    }
+
+    /** Deserializes and projects a record; null if it is not emitted. */
+    @Nullable
+    private OUT deserialize(ScanRecord scanRecord) {
         OUT record;
         try {
             record = deserializationSchema.deserialize(scanRecord);
@@ -133,17 +144,70 @@ public class FlinkRecordEmitter<OUT> implements RecordEmitter<RecordAndPos, OUT,
         if (record != null && outputProjection != null) {
             record = outputProjection.project(record);
         }
+        return record;
+    }
 
-        if (record != null) {
-            long timestamp = scanRecord.timestamp();
-            if (timestamp > 0) {
-                sourceOutput.collect(record, timestamp);
-            } else {
-                sourceOutput.collect(record);
-            }
-            return true;
+    private static <OUT> void collect(SourceOutput<OUT> sourceOutput, OUT record, long timestamp) {
+        if (timestamp > 0) {
+            sourceOutput.collect(record, timestamp);
+        } else {
+            sourceOutput.collect(record);
         }
-        return false;
+    }
+
+    /**
+     * Prepares a record whose emission waits: deserializes it now, as the reader may reuse it, and
+     * moves the split state past it only once emitted, as {@link #emitRecord} would.
+     */
+    public DeferredRecord<OUT> defer(RecordAndPos recordAndPosition, SourceSplitState splitState) {
+        if (splitState.isHybridSnapshotLogSplitState()) {
+            if (recordAndPosition.isSnapshotPhaseFinished()) {
+                return (output, state) ->
+                        state.asHybridSnapshotLogSplitState().markSnapshotFinished();
+            }
+            ScanRecord scanRecord = recordAndPosition.record();
+            long offset = scanRecord.logOffset();
+            long timestamp = scanRecord.timestamp();
+            long readRecordsCount = recordAndPosition.readRecordsCount();
+            OUT record = recordAndPosition.skipEmission() ? null : deserialize(scanRecord);
+            return (output, state) -> {
+                HybridSnapshotLogSplitState hybrid = state.asHybridSnapshotLogSplitState();
+                if (offset >= 0) {
+                    hybrid.setNextOffset(offset + 1);
+                } else {
+                    hybrid.setRecordsToSkip(readRecordsCount);
+                }
+                if (record != null) {
+                    collect(output, record, timestamp);
+                }
+            };
+        } else if (splitState.isLogSplitState()) {
+            ScanRecord scanRecord = recordAndPosition.record();
+            long offset = scanRecord.logOffset();
+            long timestamp = scanRecord.timestamp();
+            boolean skipEmission = recordAndPosition.skipEmission();
+            OUT record = skipEmission ? null : deserialize(scanRecord);
+            // like emitRecord: a buffered $binlog update-before keeps the offset to replay it
+            boolean consumed = skipEmission || record != null;
+            return (output, state) -> {
+                if (record != null) {
+                    collect(output, record, timestamp);
+                }
+                if (consumed) {
+                    state.asLogSplitState().setNextOffset(offset + 1);
+                }
+            };
+        }
+        throw new UnsupportedOperationException(
+                "Records of " + splitState.getClass().getSimpleName() + " cannot wait.");
+    }
+
+    /** A record whose emission waits, with what it changes in the state of its split. */
+    @FunctionalInterface
+    public interface DeferredRecord<OUT> {
+
+        /** Emits the record and moves the split state past it. */
+        void emit(SourceOutput<OUT> output, SourceSplitState splitState);
     }
 
     /** Projection applied after deserialization and before the record is emitted. */

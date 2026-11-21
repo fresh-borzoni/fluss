@@ -87,6 +87,7 @@ import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
 import org.apache.fluss.rpc.messages.PbFetchLogReqForTable;
+import org.apache.fluss.rpc.messages.PbIndexSourcePosition;
 import org.apache.fluss.rpc.messages.PbPrefixLookupKey;
 import org.apache.fluss.rpc.messages.PbScanReqForBucket;
 import org.apache.fluss.rpc.messages.PbTableBucket;
@@ -220,6 +221,9 @@ public final class TabletService extends RpcServiceBase
 
     /** The first PREFIX_LOOKUP version that carries a bucket read position. */
     static final short POSITIONED_PREFIX_LOOKUP_MIN_VERSION = 5;
+
+    /** The first PREFIX_LOOKUP version that reads an Index Table at a cut of its main table. */
+    static final short INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION = 6;
 
     private final String serviceName;
     private final ReplicaManager replicaManager;
@@ -618,6 +622,11 @@ public final class TabletService extends RpcServiceBase
                     POSITIONED_PREFIX_LOOKUP_MIN_VERSION,
                     request.getNextOffset());
         }
+        List<PbIndexSourcePosition> sourcePositions = null;
+        if (request.getSourcePositionsCount() > 0) {
+            sourcePositions = request.getSourcePositionsList();
+            validateIndexCut(request, sourcePositions);
+        }
         long tableId = request.getTableId();
         Map<TableBucket, List<PbPrefixLookupKey>> prefixLookupData = toPrefixLookupData(request);
         Map<TableBucket, PrefixLookupResultForBucket> errorResponseMap = new HashMap<>();
@@ -646,8 +655,41 @@ public final class TabletService extends RpcServiceBase
                 request.hasLimit() ? request.getLimit() : 0,
                 request.hasFailOnLimitExceeded() && request.isFailOnLimitExceeded(),
                 request.hasNextOffset() ? request.getNextOffset() : null,
+                sourcePositions,
                 value -> response.complete(makePrefixLookupResponse(value, errorResponseMap)));
         return response;
+    }
+
+    private void validateIndexCut(
+            PrefixLookupRequest request, List<PbIndexSourcePosition> sourcePositions) {
+        if (currentSession().getApiVersion() < INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION) {
+            throw new UnsupportedVersionException(
+                    "Reads of an Index Table at a cut of its main table require "
+                            + ApiKeys.PREFIX_LOOKUP
+                            + " version "
+                            + INDEX_CUT_PREFIX_LOOKUP_MIN_VERSION
+                            + '.');
+        }
+        if (request.hasNextOffset()) {
+            throw new InvalidRequestException(
+                    "A read at a cut of the main table has no position of its own.");
+        }
+        Set<TableBucket> sources = new HashSet<>();
+        for (PbIndexSourcePosition position : sourcePositions) {
+            if (position.getNextOffset() < 0) {
+                throw new InvalidRequestException("A bucket next offset cannot be negative.");
+            }
+            if (!sources.add(
+                    new TableBucket(
+                            0L,
+                            position.hasPartitionId() ? position.getPartitionId() : null,
+                            position.getBucketId()))) {
+                throw new InvalidRequestException(
+                        "A cut names main table bucket "
+                                + position.getBucketId()
+                                + " more than once.");
+            }
+        }
     }
 
     /**

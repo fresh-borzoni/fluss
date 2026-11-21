@@ -18,7 +18,6 @@
 package org.apache.fluss.server.index;
 
 import org.apache.fluss.annotation.Internal;
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.memory.AbstractPagedOutputView;
@@ -27,6 +26,8 @@ import org.apache.fluss.memory.UnmanagedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.DefaultKvRecordBatch;
+import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.KvRecordBatchBuilder;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
@@ -65,6 +66,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -92,6 +94,9 @@ final class IndexReplicator implements AutoCloseable {
     // Bound failed payload retention independently of the configured retry interval.
     private static final long RETAINED_WINDOW_FAILURE_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(10);
 
+    /** See {@link #reachesEveryBucket}. */
+    private static final long PROGRESS_BROADCAST_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(100);
+
     private final IndexSourceReader sourceReader;
     private final List<IndexReplicationState> indexStates;
     private final Map<String, IndexReplicationState> indexStatesByName;
@@ -114,6 +119,12 @@ final class IndexReplicator implements AutoCloseable {
 
     /** Signal fired to wake the owning read-pool worker so it polls again promptly. */
     private final Runnable wakeupSignal;
+
+    /**
+     * The earliest retained position of the source bucket, or a negative value if unknown; Index
+     * Table buckets purge removed pointers below it.
+     */
+    private final LongSupplier sourceHistoryFloor;
 
     IndexReplicator(
             IndexSourceReader sourceReader,
@@ -155,7 +166,40 @@ final class IndexReplicator implements AutoCloseable {
             Clock clock,
             @Nullable TabletServerMetricGroup metrics,
             long maxTransportRequestBytes) {
+        this(
+                sourceReader,
+                indexEncoders,
+                sendBuffer,
+                readContext,
+                replayStartOffset,
+                sourceReadTargetBytes,
+                onProgress,
+                scheduler,
+                wakeupSignal,
+                retryBackoff,
+                clock,
+                metrics,
+                maxTransportRequestBytes,
+                () -> -1L);
+    }
+
+    IndexReplicator(
+            IndexSourceReader sourceReader,
+            List<IndexReplicationEncoder> indexEncoders,
+            IndexSendBuffer sendBuffer,
+            LogRecordReadContext readContext,
+            long replayStartOffset,
+            int sourceReadTargetBytes,
+            IndexProgressListener onProgress,
+            IndexReplicationScheduler scheduler,
+            Runnable wakeupSignal,
+            ExponentialBackoff retryBackoff,
+            Clock clock,
+            @Nullable TabletServerMetricGroup metrics,
+            long maxTransportRequestBytes,
+            LongSupplier sourceHistoryFloor) {
         checkArgument(maxTransportRequestBytes > 0, "maxTransportRequestBytes must be positive");
+        this.sourceHistoryFloor = checkNotNull(sourceHistoryFloor, "sourceHistoryFloor");
         if (replayStartOffset < 0) {
             throw new IllegalArgumentException(
                     "replayStartOffset must be non-negative, but was " + replayStartOffset);
@@ -388,6 +432,16 @@ final class IndexReplicator implements AutoCloseable {
             }
 
             for (WindowBuildState window : windows) {
+                if (!window.deferred && reachesEveryBucket(window)) {
+                    try {
+                        window.addEveryTargetBucket();
+                    } catch (RuntimeException failure) {
+                        deferWindow(window, failure);
+                    }
+                }
+            }
+
+            for (WindowBuildState window : windows) {
                 publishWindow(window);
                 if (window.sizingFailure != null) {
                     retrySmallerWindow(window, window.sizingFailure);
@@ -398,6 +452,25 @@ final class IndexReplicator implements AutoCloseable {
                 window.close();
             }
         }
+    }
+
+    /**
+     * Whether the window carries progress to every bucket of an index that keeps removed pointers,
+     * since reads at a cut wait for the progress of each bucket. It does so when the window reaches
+     * the end of the source, and at least once per {@link #PROGRESS_BROADCAST_INTERVAL_NS} behind.
+     */
+    private static boolean reachesEveryBucket(WindowBuildState window) {
+        IndexReplicationState state = window.state;
+        if (!state.encoder.retainsRemovals()) {
+            return false;
+        }
+        long now = System.nanoTime();
+        if (window.input.isByteLimited()
+                && now - state.lastBroadcastNanos < PROGRESS_BROADCAST_INTERVAL_NS) {
+            return false;
+        }
+        state.lastBroadcastNanos = now;
+        return true;
     }
 
     private void publishWindow(WindowBuildState build) {
@@ -415,6 +488,7 @@ final class IndexReplicator implements AutoCloseable {
             return;
         }
 
+        long historyFloor = state.encoder.retainsRemovals() ? readSourceHistoryFloor() : -1L;
         // Encode and validate the entire window before publishing any target batch.
         IndexReplicationWindow window =
                 new IndexReplicationWindow(state, endOffset, build.builders.size(), this);
@@ -437,7 +511,8 @@ final class IndexReplicator implements AutoCloseable {
                                 progress.key(),
                                 encoded,
                                 entry.value().retainedBytes(),
-                                window));
+                                window,
+                                historyFloor));
             }
             long largestFrame = 0;
             long retainedBytes = 0;
@@ -478,6 +553,16 @@ final class IndexReplicator implements AutoCloseable {
             throw failure;
         }
         scheduler.releaseCapacityWait(this, state);
+    }
+
+    private long readSourceHistoryFloor() {
+        try {
+            return sourceHistoryFloor.getAsLong();
+        } catch (RuntimeException failure) {
+            // without a floor nothing is purged; a later window sends one
+            LOG.debug("No history floor of source bucket {}", sourceBucket(), failure);
+            return -1L;
+        }
     }
 
     private void retrySmallerWindow(WindowBuildState build, Throwable failure) {
@@ -632,7 +717,8 @@ final class IndexReplicator implements AutoCloseable {
                 for (WindowBuildState window : windows) {
                     if (!window.deferred) {
                         try {
-                            window.captureBefore(first.getRow());
+                            // the row is gone at positions after the delete
+                            window.captureBefore(first.getRow(), first.logOffset());
                             appendMutation(window, null);
                         } catch (RuntimeException failure) {
                             deferWindow(window, failure);
@@ -661,7 +747,8 @@ final class IndexReplicator implements AutoCloseable {
         for (WindowBuildState window : windows) {
             if (!window.deferred) {
                 try {
-                    window.captureBefore(first.getRow());
+                    // the row changes after the UPDATE_AFTER, the record after this one
+                    window.captureBefore(first.getRow(), first.logOffset() + 1);
                 } catch (RuntimeException failure) {
                     deferWindow(window, failure);
                 }
@@ -888,6 +975,9 @@ final class IndexReplicator implements AutoCloseable {
         private int adaptiveReadTargetBytes = Integer.MAX_VALUE;
         @Nullable private volatile IndexReplicationWindow inFlightWindow;
 
+        /** When a window last carried progress to every bucket of the index. */
+        private long lastBroadcastNanos = System.nanoTime() - PROGRESS_BROADCAST_INTERVAL_NS;
+
         private IndexReplicationState(
                 IndexReplicationEncoder encoder,
                 long replayStartOffset,
@@ -1069,6 +1159,11 @@ final class IndexReplicator implements AutoCloseable {
         @Nullable private byte[] beforeKey;
         private int beforeBucket;
 
+        /** The removed pointer that replaces the data pointer of the before image, if kept. */
+        @Nullable private byte[] removedKey;
+
+        @Nullable private BinaryRow removedValue;
+
         private WindowBuildState(
                 IndexReplicationState state,
                 IndexSendBuffer.Reservation reservation,
@@ -1082,12 +1177,28 @@ final class IndexReplicator implements AutoCloseable {
             this.optionalAsync = optionalAsync;
         }
 
-        void captureBefore(InternalRow row) {
+        /**
+         * Captures the data pointer of the before image and, if removals are kept, its removed
+         * pointer.
+         *
+         * @param removedAt the offset after which the row no longer has the before image
+         */
+        void captureBefore(InternalRow row, long removedAt) {
             beforeKey = null;
-            IndexReplicationEncoder.IndexEntry entry = state.encoder.encodeDataEntry(row);
+            removedKey = null;
+            removedValue = null;
+            IndexReplicationEncoder encoder = state.encoder;
+            IndexReplicationEncoder.IndexEntry entry = encoder.encodeDataEntry(row);
             if (entry != null) {
                 beforeKey = entry.key();
                 beforeBucket = entry.targetBucket();
+                if (encoder.retainsRemovals()) {
+                    IndexReplicationEncoder.IndexEntry removed =
+                            encoder.encodeRemovedEntry(row, removedAt, beforeBucket);
+                    removedKey = removed.key();
+                    // the next encoding reuses the storage of the value
+                    removedValue = removed.value().copy();
+                }
             }
         }
 
@@ -1100,7 +1211,12 @@ final class IndexReplicator implements AutoCloseable {
                         beforeKey != null
                                 && (entry == null || !Arrays.equals(beforeKey, entry.key()));
                 if (keysDiffer) {
-                    bucketBuilder(beforeBucket).appendDelete(beforeKey);
+                    BucketBatchBuilder before = bucketBuilder(beforeBucket);
+                    if (removedKey != null) {
+                        // before the delete, so a partially applied batch never misses both
+                        before.appendUpsert(removedKey, removedValue);
+                    }
+                    before.appendDelete(beforeKey);
                 }
                 if (entry != null && (beforeKey == null || keysDiffer)) {
                     bucketBuilder(entry.targetBucket()).appendUpsert(entry.key(), entry.value());
@@ -1108,6 +1224,15 @@ final class IndexReplicator implements AutoCloseable {
             } finally {
                 // Only stable keys cross the BEFORE/AFTER decoder boundary; never retain a row.
                 beforeKey = null;
+                removedKey = null;
+                removedValue = null;
+            }
+        }
+
+        /** Makes the window carry progress to every bucket of the index. */
+        void addEveryTargetBucket() {
+            for (int bucket = 0; bucket < state.encoder.getIndexBucketCount(); bucket++) {
+                bucketBuilder(bucket);
             }
         }
 
@@ -1128,6 +1253,8 @@ final class IndexReplicator implements AutoCloseable {
         @Override
         public void close() {
             beforeKey = null;
+            removedKey = null;
+            removedValue = null;
             builders.clear();
             reservation.close();
         }
@@ -1138,7 +1265,7 @@ final class IndexReplicator implements AutoCloseable {
         private final AbstractPagedOutputView output;
         final KvRecordBatchBuilder builder;
 
-        @VisibleForTesting
+        /** A builder in memory of its own, outside the budget of the send buffer. */
         BucketBatchBuilder(short schemaId, KvFormat kvFormat) {
             this(schemaId, kvFormat, new UnmanagedPagedOutputView(PAGE_SIZE));
         }
@@ -1187,6 +1314,14 @@ final class IndexReplicator implements AutoCloseable {
         BytesView finish(byte[] progressKey, BinaryRow progressValue) throws IOException {
             builder.append(progressKey, progressValue);
             return builder.build();
+        }
+
+        /** The records appended so far, as a batch in memory of its own. */
+        KvRecordBatch toRecordBatch() throws IOException {
+            BytesView built = builder.build();
+            byte[] bytes = new byte[built.getBytesLength()];
+            built.getByteBuf().getBytes(0, bytes);
+            return DefaultKvRecordBatch.pointToBytes(bytes);
         }
 
         long retainedBytes() {

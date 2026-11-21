@@ -18,22 +18,31 @@
 package org.apache.fluss.flink.source.lookup;
 
 import org.apache.fluss.client.Connection;
-import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.lookup.PrefixPages;
 import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
+import org.apache.fluss.client.table.BucketCalculator;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
 import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.flink.adapter.SupportsVersionedLookupAdapter;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.sink.writer.ReadYourWrites;
+import org.apache.fluss.flink.source.epochs.EpochRegistry;
+import org.apache.fluss.flink.source.epochs.EpochResolver;
+import org.apache.fluss.flink.source.epochs.EpochSettings;
+import org.apache.fluss.flink.source.epochs.Epochs;
 import org.apache.fluss.flink.source.lookup.LookupNormalizer.RemainingFilter;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
+import org.apache.fluss.metadata.BucketReadPosition;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
@@ -54,16 +63,29 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
-/** A flink async lookup function for fluss. */
-public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
+/**
+ * A flink async lookup function for fluss.
+ *
+ * <p>With {@link EpochSettings}, it also reads as of an epoch of the scan of the same table, at the
+ * position where the scan ended the epoch in the key's bucket (see {@link EpochRegistry}). A
+ * secondary index lookup reads at the cut of all buckets, since the rows of a key may be in any.
+ */
+public class FlinkAsyncLookupFunction extends AsyncLookupFunction
+        implements SupportsVersionedLookupAdapter {
 
     private static final Logger LOG = LoggerFactory.getLogger(FlinkAsyncLookupFunction.class);
 
@@ -72,6 +94,12 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     /** The most scans that the pages of one lookup function keep open at once. */
     private static final int MAX_OPEN_SCANS = 2;
 
+    /** Delay before a read retries a position that a replica has not applied yet. */
+    private static final long NOT_YET_READABLE_DELAY_MS = 10L;
+
+    /** The most epochs whose cuts of the whole table a lookup function keeps. */
+    private static final int MAX_CACHED_CUTS = 256;
+
     private final Configuration flussConfig;
     private final TablePath tablePath;
     private final RowType flinkRowType;
@@ -79,6 +107,9 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
     @Nullable private int[] projection;
     private final boolean insertIfNotExists;
     private final boolean requiresWriter;
+
+    /** The epochs that lookups read as of, or null if they read only the latest rows. */
+    @Nullable private final EpochSettings epochs;
 
     private transient FlussRowToFlinkRowConverter flussRowToFlinkRowConverter;
     private transient Connection connection;
@@ -98,6 +129,28 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
 
     /** The pages that asked for a scan and are not closed yet, closed with this function. */
     private transient @Nullable Set<ScanPages> openScans;
+
+    private transient @Nullable EpochResolver epochResolver;
+
+    /** The epoch resources this function shares with others, see {@link SharedLookupResources}. */
+    private transient @Nullable SharedLookupResources.Epochs sharedEpochs;
+
+    /** With epochs: schedules reads that wait for an epoch or a position. */
+    private transient @Nullable ScheduledExecutorService epochRetries;
+
+    private transient @Nullable BucketCalculator bucketCalculator;
+
+    /** The positions of the bucket keys in the normalized lookup key. */
+    private transient @Nullable int[] bucketKeyPositions;
+
+    /** With epochs: copies normalized keys, for reads that outlive the call. */
+    private transient @Nullable RowData.FieldGetter[] normalizedKeyGetters;
+
+    /** With a secondary index: every bucket of the table. */
+    private transient @Nullable List<TableBucket> tableBuckets;
+
+    /** With a secondary index: the cuts of recent epochs, which never change once resolved. */
+    private transient @Nullable Map<Long, Map<TableBucket, Long>> cutsByEpoch;
 
     public FlinkAsyncLookupFunction(
             Configuration flussConfig,
@@ -128,6 +181,29 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
             @Nullable int[] projection,
             boolean insertIfNotExists,
             boolean requiresWriter) {
+        this(
+                flussConfig,
+                tablePath,
+                flinkRowType,
+                lookupNormalizer,
+                projection,
+                insertIfNotExists,
+                requiresWriter,
+                null);
+    }
+
+    /**
+     * @param epochs the epochs that lookups read as of, see {@link #asyncLookupAsOf}, or null
+     */
+    public FlinkAsyncLookupFunction(
+            Configuration flussConfig,
+            TablePath tablePath,
+            RowType flinkRowType,
+            LookupNormalizer lookupNormalizer,
+            @Nullable int[] projection,
+            boolean insertIfNotExists,
+            boolean requiresWriter,
+            @Nullable EpochSettings epochs) {
         if (requiresWriter
                 && lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
             // the rows a writer has not flushed yet are found by their primary key, not by the
@@ -146,12 +222,13 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         this.lookupNormalizer = lookupNormalizer;
         this.projection = projection;
         this.insertIfNotExists = insertIfNotExists;
+        this.epochs = epochs;
     }
 
     @Override
-    public void open(FunctionContext context) {
+    public void open(FunctionContext context) throws Exception {
         LOG.info("start open ...");
-        connection = ConnectionFactory.createConnection(flussConfig);
+        connection = SharedLookupResources.acquireConnection(flussConfig);
         table = connection.getTable(tablePath);
 
         final RowType outputRowType;
@@ -183,8 +260,243 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         // the pages of prefix and index lookups scan
         scanPermits = new ScanPermits(MAX_OPEN_SCANS);
         openScans = ConcurrentHashMap.newKeySet();
+        if (epochs != null) {
+            openEpochs(epochs);
+        }
 
         LOG.info("end open.");
+    }
+
+    private void openEpochs(EpochSettings epochs) throws Exception {
+        TableInfo tableInfo = table.getTableInfo();
+        if (tableInfo.isPartitioned()) {
+            throw new UnsupportedOperationException(
+                    "Lookups as of epochs of partitioned table '"
+                            + tablePath
+                            + "' are unsupported.");
+        }
+        sharedEpochs =
+                SharedLookupResources.acquireEpochs(
+                        flussConfig, connection, tablePath.getDatabaseName(), epochs);
+        epochRetries = sharedEpochs.retries;
+        epochResolver = sharedEpochs.resolver;
+        RowType keyType =
+                FlinkUtils.projectRowType(flinkRowType, lookupNormalizer.getLookupKeyIndexes());
+        if (lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
+            tableBuckets = new ArrayList<>(tableInfo.getNumBuckets());
+            for (int bucket = 0; bucket < tableInfo.getNumBuckets(); bucket++) {
+                tableBuckets.add(new TableBucket(tableInfo.getTableId(), bucket));
+            }
+            cutsByEpoch =
+                    new LinkedHashMap<Long, Map<TableBucket, Long>>(16, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(
+                                Map.Entry<Long, Map<TableBucket, Long>> eldest) {
+                            return size() > MAX_CACHED_CUTS;
+                        }
+                    };
+        } else {
+            List<String> keyNames = keyType.getFieldNames();
+            List<String> bucketKeys = tableInfo.getBucketKeys();
+            bucketKeyPositions = new int[bucketKeys.size()];
+            for (int i = 0; i < bucketKeyPositions.length; i++) {
+                bucketKeyPositions[i] = keyNames.indexOf(bucketKeys.get(i));
+                if (bucketKeyPositions[i] < 0) {
+                    throw new UnsupportedOperationException(
+                            String.format(
+                                    "Lookups as of epochs need the bucket keys %s of table '%s' in"
+                                            + " their keys %s.",
+                                    bucketKeys, tablePath, keyNames));
+                }
+            }
+            bucketCalculator = BucketCalculator.forBucketKeyRow(tableInfo);
+        }
+        normalizedKeyGetters = new RowData.FieldGetter[keyType.getFieldCount()];
+        for (int i = 0; i < normalizedKeyGetters.length; i++) {
+            normalizedKeyGetters[i] = RowData.createFieldGetter(keyType.getTypeAt(i), i);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Collection<RowData>> asyncLookupAsOf(RowData keyRow, long epoch) {
+        CompletableFuture<Collection<RowData>> future = new CompletableFuture<>();
+        if (epochResolver == null) {
+            future.completeExceptionally(
+                    new IllegalStateException(
+                            "Lookups of Fluss table '"
+                                    + tablePath
+                                    + "' read as of no epochs: the source applied none."));
+            return future;
+        }
+        // the key is read after the epoch ended, when the caller may have reused its row
+        RowData normalizedKeyRow = copyNormalizedKey(lookupNormalizer.normalizeLookupKey(keyRow));
+        RemainingFilter remainingFilter = lookupNormalizer.createRemainingFilter(keyRow);
+        InternalRow flussKeyRow = new FlinkAsFlussRow(normalizedKeyRow);
+        if (lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP) {
+            offNetworkThread(cutAt(epoch))
+                    .whenComplete(
+                            (cut, error) -> {
+                                if (error != null) {
+                                    future.completeExceptionally(resolveFailure(epoch, error));
+                                } else {
+                                    readUntilReadable(
+                                            () ->
+                                                    ((SecondaryIndexLookuper) lookuper)
+                                                            .lookup(flussKeyRow, cut),
+                                            "the end of epoch " + epoch,
+                                            remainingFilter,
+                                            future);
+                                }
+                            });
+            return future;
+        }
+        TableBucket bucket;
+        try {
+            bucket = bucketOf(flussKeyRow);
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+            return future;
+        }
+        offNetworkThread(epochResolver.endOf(bucket, epoch))
+                .whenComplete(
+                        (end, error) -> {
+                            if (error != null) {
+                                future.completeExceptionally(resolveFailure(epoch, error));
+                            } else if (end == Epochs.EMPTY) {
+                                // before the snapshot that the scan emits, the table is empty
+                                future.complete(Collections.emptyList());
+                            } else {
+                                lookupAt(
+                                        flussKeyRow,
+                                        BucketReadPosition.of(bucket, end),
+                                        remainingFilter,
+                                        future);
+                            }
+                        });
+        return future;
+    }
+
+    private RuntimeException resolveFailure(long epoch, Throwable error) {
+        return new RuntimeException(
+                "Failed to resolve epoch " + epoch + " of Fluss table '" + tablePath + "'.", error);
+    }
+
+    /**
+     * Continues a pending future on the epoch executor: a client network thread must not issue
+     * lookups, as a full lookup queue would block it and the replies that drain the queue.
+     */
+    private <T> CompletableFuture<T> offNetworkThread(CompletableFuture<T> future) {
+        return future.isDone() ? future : future.thenApplyAsync(value -> value, epochRetries);
+    }
+
+    private void lookupAt(
+            InternalRow flussKeyRow,
+            BucketReadPosition position,
+            @Nullable RemainingFilter remainingFilter,
+            CompletableFuture<Collection<RowData>> future) {
+        readUntilReadable(
+                () -> lookuper.lookup(flussKeyRow, position), position, remainingFilter, future);
+    }
+
+    /**
+     * Reads at a position or cut that the scan read, again while a replica that serves the read has
+     * not applied it yet.
+     */
+    private void readUntilReadable(
+            Supplier<CompletableFuture<LookupResult>> read,
+            Object position,
+            @Nullable RemainingFilter remainingFilter,
+            CompletableFuture<Collection<RowData>> future) {
+        CompletableFuture<LookupResult> lookup;
+        synchronized (this) {
+            lookup = read.get();
+        }
+        lookup.whenComplete(
+                (result, throwable) -> {
+                    if (throwable == null) {
+                        handleLookupSuccess(future, result.getRowList(), remainingFilter);
+                    } else if (ExceptionUtils.findThrowable(
+                                    throwable, LookupPositionNotYetReadableException.class)
+                            .isPresent()) {
+                        epochRetries.schedule(
+                                () -> readUntilReadable(read, position, remainingFilter, future),
+                                NOT_YET_READABLE_DELAY_MS,
+                                TimeUnit.MILLISECONDS);
+                    } else {
+                        LOG.error("Fluss lookup at {} failed", position, throwable);
+                        future.completeExceptionally(
+                                new RuntimeException(
+                                        "Execution of Fluss lookup at "
+                                                + position
+                                                + " failed: "
+                                                + throwable.getMessage(),
+                                        throwable));
+                    }
+                });
+    }
+
+    /**
+     * The cut of the table at the end of an epoch: the end of the epoch in every bucket, or {@link
+     * SecondaryIndexLookuper#EMPTY_BUCKET_POSITION} for a bucket empty then. Waits until the scan
+     * ended the epoch in every bucket.
+     */
+    private CompletableFuture<Map<TableBucket, Long>> cutAt(long epoch) {
+        Map<TableBucket, Long> known;
+        synchronized (cutsByEpoch) {
+            known = cutsByEpoch.get(epoch);
+        }
+        if (known != null) {
+            return CompletableFuture.completedFuture(known);
+        }
+        List<CompletableFuture<Long>> ends = new ArrayList<>(tableBuckets.size());
+        for (TableBucket bucket : tableBuckets) {
+            ends.add(epochResolver.endOf(bucket, epoch));
+        }
+        return CompletableFuture.allOf(ends.toArray(new CompletableFuture<?>[0]))
+                .thenApply(
+                        ignored -> {
+                            Map<TableBucket, Long> cut = new HashMap<>();
+                            for (int i = 0; i < ends.size(); i++) {
+                                long end = ends.get(i).join();
+                                cut.put(
+                                        tableBuckets.get(i),
+                                        end == Epochs.EMPTY
+                                                ? SecondaryIndexLookuper.EMPTY_BUCKET_POSITION
+                                                : end);
+                            }
+                            Map<TableBucket, Long> resolved = Collections.unmodifiableMap(cut);
+                            synchronized (cutsByEpoch) {
+                                cutsByEpoch.put(epoch, resolved);
+                            }
+                            return resolved;
+                        });
+    }
+
+    /** The bucket that a normalized lookup key routes to. */
+    private TableBucket bucketOf(InternalRow flussKeyRow) {
+        InternalRow bucketKey = ProjectedRow.from(bucketKeyPositions).replaceRow(flussKeyRow);
+        int bucketId;
+        synchronized (bucketCalculator) {
+            bucketId =
+                    bucketCalculator.getBucketId(
+                            bucketCalculator.encodeKey(bucketKey),
+                            table.getTableInfo().getNumBuckets());
+        }
+        return new TableBucket(table.getTableInfo().getTableId(), bucketId);
+    }
+
+    private RowData copyNormalizedKey(RowData keyRow) {
+        GenericRowData copy = new GenericRowData(normalizedKeyGetters.length);
+        for (int i = 0; i < normalizedKeyGetters.length; i++) {
+            Object value = normalizedKeyGetters[i].getFieldOrNull(keyRow);
+            if (value instanceof StringData) {
+                value = StringData.fromString(value.toString());
+            } else if (value instanceof byte[]) {
+                value = ((byte[]) value).clone();
+            }
+            copy.setField(i, value);
+        }
+        return copy;
     }
 
     /**
@@ -580,11 +892,15 @@ public class FlinkAsyncLookupFunction extends AsyncLookupFunction {
         if (pageReader != null) {
             pageReader.shutdownNow();
         }
+        if (sharedEpochs != null) {
+            SharedLookupResources.releaseEpochs(
+                    flussConfig, tablePath.getDatabaseName(), epochs, sharedEpochs);
+        }
         if (table != null) {
             table.close();
         }
         if (connection != null) {
-            connection.close();
+            SharedLookupResources.releaseConnection(flussConfig, connection);
         }
         LOG.info("end close.");
     }

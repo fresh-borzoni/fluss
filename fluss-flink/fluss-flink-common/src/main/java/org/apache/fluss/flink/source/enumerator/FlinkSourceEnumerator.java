@@ -35,6 +35,10 @@ import org.apache.fluss.flink.lake.LakeSplitGenerator;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
 import org.apache.fluss.flink.source.FlinkSource;
+import org.apache.fluss.flink.source.epochs.CoordinatedEpochs;
+import org.apache.fluss.flink.source.epochs.EpochSettings;
+import org.apache.fluss.flink.source.event.EpochChangedEvent;
+import org.apache.fluss.flink.source.event.EpochOpenedEvent;
 import org.apache.fluss.flink.source.event.FinishedKvSnapshotConsumeEvent;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
@@ -85,6 +89,7 @@ import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.LongConsumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
@@ -117,6 +122,13 @@ public class FlinkSourceEnumerator
     private final Configuration flussConf;
 
     private final SplitEnumeratorContext<SourceSplitBase> context;
+
+    /** With epochs that the coordinators open: their settings, the domain and the listener. */
+    @Nullable private EpochSettings coordinatedEpochs;
+
+    @Nullable private CoordinatedEpochs.Domain epochDomain;
+
+    @Nullable private LongConsumer epochListener;
 
     private final Map<Integer, List<SourceSplitBase>> pendingSplitAssignment;
 
@@ -623,8 +635,28 @@ public class FlinkSourceEnumerator
         this.unassignedSplits = new ArrayList<>(unassignedSplits);
     }
 
+    /** Opens the epochs of the scans of the domain with the other coordinators of the job. */
+    public void coordinateEpochs(EpochSettings epochs) {
+        this.coordinatedEpochs = epochs;
+    }
+
+    /** Tells every registered reader the open epoch. Runs in the coordinator thread. */
+    private void tellEpoch(long epoch) {
+        for (int subtask : context.registeredReaders().keySet()) {
+            context.sendEventToSourceReader(subtask, new EpochOpenedEvent(epoch));
+        }
+    }
+
     @Override
     public void start() {
+        if (coordinatedEpochs != null) {
+            epochListener = epoch -> context.runInCoordinatorThread(() -> tellEpoch(epoch));
+            epochDomain =
+                    CoordinatedEpochs.join(
+                            coordinatedEpochs.getDomain(),
+                            coordinatedEpochs.getCloseAfterMs(),
+                            epochListener);
+        }
         LOG.info(
                 "Starting FlinkSourceEnumerator for table {}: "
                         + "isPartitioned={}, hasPrimaryKey={}, streaming={}, lakeSource={}, "
@@ -1589,6 +1621,15 @@ public class FlinkSourceEnumerator
 
     @Override
     public void handleSourceEvent(int subtaskId, SourceEvent sourceEvent) {
+        if (sourceEvent instanceof EpochChangedEvent && epochDomain != null) {
+            long open = epochDomain.open();
+            if (((EpochChangedEvent) sourceEvent).getEpoch() < open) {
+                // the reader does not know the open epoch yet
+                context.sendEventToSourceReader(subtaskId, new EpochOpenedEvent(open));
+            }
+            epochDomain.noteChange();
+            return;
+        }
         if (sourceEvent instanceof PartitionBucketsUnsubscribedEvent) {
             PartitionBucketsUnsubscribedEvent removedEvent =
                     (PartitionBucketsUnsubscribedEvent) sourceEvent;
@@ -1675,6 +1716,9 @@ public class FlinkSourceEnumerator
                         ? pendingSplitAssignment.get(subtaskId).size()
                         : 0);
         assignPendingSplits(Collections.singleton(subtaskId));
+        if (epochDomain != null) {
+            context.sendEventToSourceReader(subtaskId, new EpochOpenedEvent(epochDomain.open()));
+        }
     }
 
     @Override
@@ -1773,6 +1817,10 @@ public class FlinkSourceEnumerator
                 assignedTableBuckets.size(),
                 unassignedSplits.size(),
                 checkpointTriggeredBefore);
+        if (epochDomain != null) {
+            CoordinatedEpochs.leave(coordinatedEpochs.getDomain(), epochDomain, epochListener);
+            epochDomain = null;
+        }
         try {
             maybeDropKvSnapshotLease();
 

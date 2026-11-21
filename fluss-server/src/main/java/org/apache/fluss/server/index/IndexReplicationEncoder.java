@@ -46,7 +46,6 @@ import org.apache.fluss.utils.IndexTableUtils;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -56,8 +55,10 @@ import java.util.Set;
 
 import static org.apache.fluss.utils.IndexTableUtils.DATA_RECORD_KIND;
 import static org.apache.fluss.utils.IndexTableUtils.PROGRESS_RECORD_KIND;
+import static org.apache.fluss.utils.IndexTableUtils.REMOVED_RECORD_KIND;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
  * Encodes DATA and PROGRESS records for one secondary index of one source bucket.
@@ -82,6 +83,12 @@ final class IndexReplicationEncoder {
     @FunctionalInterface
     interface ProgressEncoder {
         IndexEntry encode(int targetBucket, long sourceEndOffset);
+    }
+
+    /** Encodes the removed pointer that replaces a data pointer removed at {@code removedAt}. */
+    @FunctionalInterface
+    interface RemovedEntryEncoder {
+        IndexEntry encode(InternalRow row, long removedAt, int targetBucket);
     }
 
     /**
@@ -123,6 +130,12 @@ final class IndexReplicationEncoder {
     private final int[] idxColumnIndices;
     private final DataEntryEncoder dataEncoder;
     private final ProgressEncoder progressEncoder;
+
+    /** The buckets of the Index Table, or 0 if unknown. */
+    private final int indexBucketCount;
+
+    /** Encodes removed pointers if the main table keeps bucket history, null otherwise. */
+    @Nullable private final RemovedEntryEncoder removedEncoder;
 
     /**
      * Builds the list of {@link IndexReplicationEncoder}s for every secondary index declared on the
@@ -168,6 +181,41 @@ final class IndexReplicationEncoder {
             int[] idxColumnIndices,
             DataEntryEncoder dataEncoder,
             ProgressEncoder progressEncoder) {
+        this(
+                indexName,
+                visibility,
+                indexTableId,
+                indexSchemaId,
+                indexKvFormat,
+                idxColumnIndices,
+                dataEncoder,
+                progressEncoder,
+                0,
+                null);
+    }
+
+    /**
+     * @param indexBucketCount the buckets of the Index Table, which progress reaches all of when
+     *     removed pointers are kept
+     * @param removedEncoder encodes removed pointers, which the index keeps for reads at earlier
+     *     positions of a main table with bucket history; null to delete pointers outright
+     */
+    IndexReplicationEncoder(
+            String indexName,
+            IndexVisibility visibility,
+            long indexTableId,
+            int indexSchemaId,
+            KvFormat indexKvFormat,
+            int[] idxColumnIndices,
+            DataEntryEncoder dataEncoder,
+            ProgressEncoder progressEncoder,
+            int indexBucketCount,
+            @Nullable RemovedEntryEncoder removedEncoder) {
+        checkArgument(
+                removedEncoder == null || indexBucketCount > 0,
+                "An index that keeps removed pointers needs its bucket count.");
+        this.indexBucketCount = indexBucketCount;
+        this.removedEncoder = removedEncoder;
         this.indexName = checkNotNull(indexName, "indexName");
         this.visibility = checkNotNull(visibility, "visibility");
         this.indexTableId = indexTableId;
@@ -212,6 +260,21 @@ final class IndexReplicationEncoder {
 
     IndexEntry encodeProgress(int targetBucket, long sourceEndOffset) {
         return progressEncoder.encode(targetBucket, sourceEndOffset);
+    }
+
+    /** Whether removed data pointers are kept for reads at earlier positions of the main table. */
+    boolean retainsRemovals() {
+        return removedEncoder != null;
+    }
+
+    int getIndexBucketCount() {
+        return indexBucketCount;
+    }
+
+    /** The removed pointer for the data pointer of {@code row} in {@code targetBucket}. */
+    IndexEntry encodeRemovedEntry(InternalRow row, long removedAt, int targetBucket) {
+        checkState(removedEncoder != null, "Index %s keeps no removed pointers", indexName);
+        return removedEncoder.encode(row, removedAt, targetBucket);
     }
 
     private static IndexReplicationEncoder createEncoder(
@@ -328,8 +391,45 @@ final class IndexReplicationEncoder {
                     }
                 };
 
-        byte[] sourceBucketKey =
-                ByteBuffer.allocate(Integer.BYTES).putInt(sourceBucket.getBucket()).array();
+        RemovedEntryEncoder removedEncoder = null;
+        if (mainTableInfo.getTableConfig().isMvccEnabled()) {
+            int sourceBucketId = sourceBucket.getBucket();
+            removedEncoder =
+                    (row, removedAt, targetBucket) -> {
+                        try {
+                            for (int i = 0; i < valueFieldGetters.length; i++) {
+                                identity.setField(i, valueFieldGetters[i].getFieldOrNull(row));
+                            }
+                            if (partitioned) {
+                                identity.setField(storedColCount, partitionId);
+                            }
+                            byte[] routingKey = logicalIndexKeyEncoder.encodeKey(row);
+                            // prefixed by the source bucket so removals of different source
+                            // buckets never collide
+                            byte[] rowKey =
+                                    IndexTableUtils.removedRowKey(
+                                            sourceBucketId, primaryKeySuffixEncoder.encodeKey(row));
+                            physicalRowEncoder.startNewRow();
+                            for (int i = 0; i < totalColCount; i++) {
+                                physicalRowEncoder.encodeField(i, identity.getField(i));
+                            }
+                            physicalRowEncoder.encodeField(recordKindPosition, REMOVED_RECORD_KIND);
+                            physicalRowEncoder.encodeField(routingKeyPosition, routingKey);
+                            physicalRowEncoder.encodeField(rowKeyPosition, rowKey);
+                            physicalRowEncoder.encodeField(sourceProgressPosition, removedAt);
+                            BinaryRow value = physicalRowEncoder.finishRow();
+                            // the bucket of the data pointer, not one derived from this key
+                            return new IndexReplicationEncoder.IndexEntry(
+                                    physicalKeyEncoder.encodeKey(value), value, targetBucket);
+                        } finally {
+                            for (int i = 0; i < totalColCount; i++) {
+                                identity.setField(i, null);
+                            }
+                        }
+                    };
+        }
+
+        byte[] sourceBucketKey = IndexTableUtils.sourceBucketRowKey(sourceBucket.getBucket());
         byte[] progressRoutingKey = new byte[0];
         ProgressEncoder progressEncoder =
                 (targetBucket, sourceEndOffset) -> {
@@ -362,7 +462,9 @@ final class IndexReplicationEncoder {
                 indexKvFormat,
                 idxColumnIndices,
                 dataEncoder,
-                progressEncoder);
+                progressEncoder,
+                indexBucketCount,
+                removedEncoder);
     }
 
     /**

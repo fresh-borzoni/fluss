@@ -23,6 +23,7 @@ import org.apache.fluss.client.table.ReadDirection;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.client.utils.IndexKeyRange;
 import org.apache.fluss.exception.InvalidBucketRoutingException;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.BucketReadPosition;
 import org.apache.fluss.metadata.DataLakeFormat;
@@ -44,6 +45,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -314,7 +316,7 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
 
     private CompletableFuture<LookupResult> lookupAndFilter(
             InternalRow prefixKey, @Nullable BucketReadPosition position) {
-        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null, 0, position);
+        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null, 0, position, null);
         if (clientFilterKeyGetters.length == 0) {
             return result;
         }
@@ -335,6 +337,21 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                 });
     }
 
+    /**
+     * Reads the data and removed pointers under an Index Table prefix at a cut of its main table.
+     * Fails with {@link LookupPositionNotYetReadableException} until the Index Table bucket applied
+     * every main table bucket up to the cut.
+     *
+     * @param sourceCut the exclusive next offset of each main table bucket whose rows to read
+     */
+    CompletableFuture<LookupResult> lookupAtCut(
+            InternalRow prefixKey, Map<TableBucket, Long> sourceCut) {
+        checkArgument(
+                tableInfo.isIndexTable() && rangeType == null && clientFilterKeyGetters.length == 0,
+                "Only exact prefix lookups of an Index Table read at a cut of its main table.");
+        return lookupPrefix(prefixKey, null, 0, null, checkNotNull(sourceCut, "sourceCut"));
+    }
+
     @Override
     public CompletableFuture<LookupResult> lookupFirst(InternalRow prefixKey, int limit) {
         checkArgument(limit > 0, "The limit must be positive.");
@@ -344,7 +361,7 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
             throw new UnsupportedOperationException(
                     "Only forward lookups by exactly the prefix support limits.");
         }
-        return lookupPrefix(prefixKey, null, limit, null);
+        return lookupPrefix(prefixKey, null, limit, null, null);
     }
 
     private boolean matches(InternalRow row, Object[] expected) {
@@ -372,14 +389,34 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
         for (int i = 0; i < prefixKey.getFieldCount(); i++) {
             checkArgument(!prefixKey.isNullAt(i), "Null equality keys are not supported.");
         }
-        return lookupPrefix(prefixKey, bounds, 0, null);
+        return lookupPrefix(prefixKey, bounds, 0, null, null);
+    }
+
+    @Override
+    public CompletableFuture<LookupResult> lookupFirst(
+            InternalRow prefixKey, Range<? extends InternalRow> bounds, int limit) {
+        checkArgument(limit > 0, "The limit must be positive.");
+        if (rangeType == null) {
+            throw new UnsupportedOperationException(
+                    "This lookuper has no configured range column.");
+        }
+        checkNotNull(prefixKey, "lookupKey");
+        checkNotNull(bounds, "bounds");
+        checkArgument(
+                prefixKey.getFieldCount() == lookupRowType.getFieldCount(),
+                "Lookup key arity does not match the lookup columns.");
+        for (int i = 0; i < prefixKey.getFieldCount(); i++) {
+            checkArgument(!prefixKey.isNullAt(i), "Null equality keys are not supported.");
+        }
+        return lookupPrefix(prefixKey, bounds, limit, null, null);
     }
 
     private CompletableFuture<LookupResult> lookupPrefix(
             InternalRow prefixKey,
             @Nullable Range<? extends InternalRow> bounds,
             int keyLimit,
-            @Nullable BucketReadPosition position) {
+            @Nullable BucketReadPosition position,
+            @Nullable Map<TableBucket, Long> sourceCut) {
         byte[] prefixKeyBytes = prefixKeyEncoder.encodeKey(prefixKey);
         byte[] bucketKeyBytes =
                 prefixKeyEncoder == bucketKeyEncoder
@@ -400,7 +437,7 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                 partitionId = routing.getPartitionId();
                 bucketCount = routing.getBucketCount();
             } catch (PartitionNotExistException e) {
-                if (position != null) {
+                if (position != null || sourceCut != null) {
                     CompletableFuture<LookupResult> failed = new CompletableFuture<>();
                     failed.completeExceptionally(e);
                     return failed;
@@ -423,33 +460,42 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                     new IllegalArgumentException("The position belongs to another bucket."));
             return lookupFuture;
         }
-        lookupClient
-                .prefixLookup(
-                        tableInfo.getTablePath(),
-                        tableBucket,
-                        prefixKeyBytes,
-                        bucketCount,
-                        limit,
-                        failOnLimitExceeded,
-                        keyRange == null ? null : keyRange.getStartKey(),
-                        keyRange == null ? null : keyRange.getEndKey(),
-                        direction,
-                        keyLimit,
-                        position == null ? null : position.getNextOffset())
-                .whenComplete(
-                        (result, error) -> {
-                            if (error != null && position != null) {
-                                lookupFuture.completeExceptionally(error);
-                            } else if (error != null) {
-                                lookupFuture.completeExceptionally(
-                                        new RuntimeException(
-                                                "Failed to perform prefix lookup for table: "
-                                                        + tableInfo.getTablePath(),
-                                                error));
-                            } else {
-                                handleLookupResponse(result, lookupFuture);
-                            }
-                        });
+        CompletableFuture<List<byte[]>> values =
+                sourceCut != null
+                        ? lookupClient.prefixLookupAtCut(
+                                tableInfo.getTablePath(),
+                                tableBucket,
+                                prefixKeyBytes,
+                                bucketCount,
+                                limit,
+                                failOnLimitExceeded,
+                                sourceCut)
+                        : lookupClient.prefixLookup(
+                                tableInfo.getTablePath(),
+                                tableBucket,
+                                prefixKeyBytes,
+                                bucketCount,
+                                limit,
+                                failOnLimitExceeded,
+                                keyRange == null ? null : keyRange.getStartKey(),
+                                keyRange == null ? null : keyRange.getEndKey(),
+                                direction,
+                                keyLimit,
+                                position == null ? null : position.getNextOffset());
+        values.whenComplete(
+                (result, error) -> {
+                    if (error != null && (position != null || sourceCut != null)) {
+                        lookupFuture.completeExceptionally(error);
+                    } else if (error != null) {
+                        lookupFuture.completeExceptionally(
+                                new RuntimeException(
+                                        "Failed to perform prefix lookup for table: "
+                                                + tableInfo.getTablePath(),
+                                        error));
+                    } else {
+                        handleLookupResponse(result, lookupFuture);
+                    }
+                });
         return lookupFuture;
     }
 

@@ -66,6 +66,9 @@ final class IndexRequestFactory {
         if (batch.sourceBucket().getPartitionId() != null) {
             request.setSourcePartitionId(batch.sourceBucket().getPartitionId());
         }
+        if (batch.sourceHistoryFloor() >= 0) {
+            request.setSourceHistoryFloor(batch.sourceHistoryFloor());
+        }
     }
 
     private static PutIndexRequest newPutIndexRequest(

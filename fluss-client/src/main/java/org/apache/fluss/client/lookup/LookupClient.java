@@ -35,6 +35,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -338,6 +339,28 @@ public class LookupClient {
                         direction,
                         keyLimit);
         prefixLookup.setNextOffset(nextOffset);
+        lookupQueue.appendLookup(prefixLookup);
+        return prefixLookup.future();
+    }
+
+    /**
+     * Adds a complete read of the data and removed pointers under an Index Table prefix at a cut of
+     * its main table, with a candidate limit of the request (0 for none).
+     *
+     * @param sourceCut the exclusive next offset of each main table bucket whose rows to read
+     */
+    CompletableFuture<List<byte[]>> prefixLookupAtCut(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            int limit,
+            boolean failOnLimitExceeded,
+            Map<TableBucket, Long> sourceCut) {
+        PrefixLookupQuery prefixLookup =
+                new PrefixLookupQuery(
+                        tablePath, tableBucket, keyBytes, bucketCount, limit, failOnLimitExceeded);
+        prefixLookup.setSourceCut(sourceCut);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
     }

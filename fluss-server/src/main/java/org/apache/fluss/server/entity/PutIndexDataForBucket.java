@@ -30,6 +30,7 @@ public final class PutIndexDataForBucket {
     private final long sourceEndOffset;
     private final byte[] progressKey;
     private final KvRecordBatch records;
+    private final long sourceHistoryFloor;
 
     public PutIndexDataForBucket(
             TableBucket targetBucket,
@@ -37,6 +38,21 @@ public final class PutIndexDataForBucket {
             long sourceEndOffset,
             byte[] progressKey,
             KvRecordBatch records) {
+        this(targetBucket, sourceBucket, sourceEndOffset, progressKey, records, -1L);
+    }
+
+    /**
+     * @param sourceHistoryFloor the earliest retained position of the source bucket, below which
+     *     the target may purge removed pointers of the source bucket, or a negative value if none
+     */
+    public PutIndexDataForBucket(
+            TableBucket targetBucket,
+            TableBucket sourceBucket,
+            long sourceEndOffset,
+            byte[] progressKey,
+            KvRecordBatch records,
+            long sourceHistoryFloor) {
+        this.sourceHistoryFloor = sourceHistoryFloor;
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.sourceBucket = checkNotNull(sourceBucket, "sourceBucket");
         this.sourceEndOffset = sourceEndOffset;
@@ -62,5 +78,10 @@ public final class PutIndexDataForBucket {
 
     public KvRecordBatch records() {
         return records;
+    }
+
+    /** The earliest retained position of the source bucket, or a negative value if unknown. */
+    public long sourceHistoryFloor() {
+        return sourceHistoryFloor;
     }
 }

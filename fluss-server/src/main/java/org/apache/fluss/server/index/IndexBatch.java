@@ -46,6 +46,9 @@ final class IndexBatch {
     private final long retainedBytes;
     private final IndexReplicationWindow window;
 
+    /** The history floor of the source bucket, or a negative value if none is sent. */
+    private final long sourceHistoryFloor;
+
     private int attempts;
 
     /** One-shot guard ensuring pending-byte accounting is released at most once. */
@@ -57,6 +60,17 @@ final class IndexBatch {
             BytesView encoded,
             long retainedBytes,
             IndexReplicationWindow window) {
+        this(targetBucket, progressKey, encoded, retainedBytes, window, -1L);
+    }
+
+    IndexBatch(
+            TableBucket targetBucket,
+            byte[] progressKey,
+            BytesView encoded,
+            long retainedBytes,
+            IndexReplicationWindow window,
+            long sourceHistoryFloor) {
+        this.sourceHistoryFloor = sourceHistoryFloor;
         this.targetBucket = checkNotNull(targetBucket, "targetBucket");
         this.progressKey = checkNotNull(progressKey, "progressKey");
         this.encoded = checkNotNull(encoded, "encoded");
@@ -83,6 +97,10 @@ final class IndexBatch {
 
     byte[] progressKey() {
         return progressKey;
+    }
+
+    long sourceHistoryFloor() {
+        return sourceHistoryFloor;
     }
 
     BytesView encoded() {

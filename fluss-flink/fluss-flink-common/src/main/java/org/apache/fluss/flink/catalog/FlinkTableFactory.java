@@ -252,6 +252,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL,
                                 FlinkConnectorOptions.SCAN_FILTER_UNCHANGED_ROW_ENABLED,
                                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE,
+                                FlinkConnectorOptions.SCAN_EPOCH_INTERVAL,
+                                FlinkConnectorOptions.SCAN_EPOCH_CLOSE_AFTER,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_ID,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_DURATION,
                                 FlinkConnectorOptions.LOOKUP_ASYNC,

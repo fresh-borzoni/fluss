@@ -24,12 +24,17 @@ import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.ChangeType;
+import org.apache.fluss.record.DefaultKvRecordBatch;
 import org.apache.fluss.record.DefaultLogRecordBatch;
+import org.apache.fluss.record.KvRecord;
+import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.record.KvRecordReadContext;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.record.LogRecordBatch;
 import org.apache.fluss.record.LogRecordReadContext;
 import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
+import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.compacted.CompactedRow;
 import org.apache.fluss.row.compacted.CompactedRowWriter;
 import org.apache.fluss.rpc.TestingTabletGatewayService;
@@ -42,6 +47,7 @@ import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.ExponentialBackoff;
 import org.apache.fluss.utils.clock.ManualClock;
@@ -52,8 +58,10 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -1120,6 +1128,141 @@ class IndexReplicatorTest {
             assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(4L);
             assertThat(sendBuffer.pendingBytes()).isZero();
         }
+    }
+
+    /**
+     * An index that keeps removed pointers replaces each data pointer that a change removes with a
+     * removed pointer at the offset of the change, ahead of the delete, and carries its progress
+     * and the history floor of the source to every bucket of the index.
+     */
+    @Test
+    void keepsRemovedPointersAndReachesEveryIndexBucket() throws Exception {
+        TableBucket sourceBucket = new TableBucket(1L, 0);
+        RowType rowType = RowType.of(DataTypes.INT(), DataTypes.INT());
+        // offsets: 0 insert (1, 10); 1-2 update to (1, 20); 3-4 update of another column; 5 delete
+        MemoryLogRecords sourceRecords =
+                createBasicMemoryLogRecords(
+                        rowType,
+                        1,
+                        0L,
+                        0L,
+                        CURRENT_LOG_MAGIC_VALUE,
+                        NO_WRITER_ID,
+                        NO_BATCH_SEQUENCE,
+                        Arrays.asList(
+                                ChangeType.INSERT,
+                                ChangeType.UPDATE_BEFORE,
+                                ChangeType.UPDATE_AFTER,
+                                ChangeType.UPDATE_BEFORE,
+                                ChangeType.UPDATE_AFTER,
+                                ChangeType.DELETE),
+                        Arrays.asList(
+                                new Object[] {1, 10},
+                                new Object[] {1, 10},
+                                new Object[] {1, 20},
+                                new Object[] {1, 20},
+                                new Object[] {1, 20},
+                                new Object[] {1, 20}),
+                        LogFormat.COMPACTED,
+                        DEFAULT_COMPRESSION);
+        IndexSourceReader sourceReader =
+                new IndexSourceReader(
+                        new TestingIndexSourceLog(
+                                sourceBucket,
+                                () -> 6L,
+                                0L,
+                                ignored -> sourceRecords,
+                                new AtomicInteger()),
+                        null,
+                        Runnable::run);
+        // pointers of value 10 go to bucket 0, of value 20 to bucket 1; bucket 2 gets none
+        IndexReplicationEncoder encoder =
+                new IndexReplicationEncoder(
+                        "idx",
+                        IndexVisibility.ASYNC,
+                        2L,
+                        1,
+                        KvFormat.COMPACTED,
+                        new int[] {1},
+                        row ->
+                                new IndexReplicationEncoder.IndexEntry(
+                                        ("D" + row.getInt(1)).getBytes(),
+                                        longValue(-1L),
+                                        row.getInt(1) == 10 ? 0 : 1),
+                        (targetBucket, sourceEndOffset) ->
+                                new IndexReplicationEncoder.IndexEntry(
+                                        "P".getBytes(), longValue(sourceEndOffset), targetBucket),
+                        3,
+                        (row, removedAt, targetBucket) ->
+                                new IndexReplicationEncoder.IndexEntry(
+                                        ("R" + row.getInt(1)).getBytes(),
+                                        longValue(removedAt),
+                                        targetBucket));
+        IndexSendBuffer sendBuffer = new IndexSendBuffer();
+        IndexReplicationScheduler scheduler = new IndexReplicationScheduler(8);
+        try (IndexReplicator replicator =
+                new IndexReplicator(
+                        sourceReader,
+                        Collections.singletonList(encoder),
+                        sendBuffer,
+                        // the test records are indexed rows
+                        LogRecordReadContext.createIndexedReadContext(rowType, 1, null),
+                        0L,
+                        1 << 20,
+                        (syncOffset, allOffset) -> {},
+                        scheduler,
+                        () -> {},
+                        new ExponentialBackoff(100, 2, 10_000, 0.2),
+                        new ManualClock(),
+                        null,
+                        ConfigOptions.NETTY_SERVER_MAX_REQUEST_SIZE.defaultValue().getBytes(),
+                        () -> 4L)) {
+            scheduler.register(0, replicator);
+            assertThat(replicator.poll()).isTrue();
+
+            assertThat(sendBuffer.buckets())
+                    .containsExactlyInAnyOrder(
+                            new TableBucket(2L, 0), new TableBucket(2L, 1), new TableBucket(2L, 2));
+            assertThat(claimRecords(sendBuffer, new TableBucket(2L, 0)))
+                    .containsExactly("D10=-1", "R10=2", "D10=deleted", "P=6");
+            assertThat(claimRecords(sendBuffer, new TableBucket(2L, 1)))
+                    .containsExactly("D20=-1", "R20=5", "D20=deleted", "P=6");
+            assertThat(claimRecords(sendBuffer, new TableBucket(2L, 2))).containsExactly("P=6");
+            assertThat(replicator.getAllIndexPushedOffset()).isEqualTo(6L);
+        }
+    }
+
+    /** Claims and acknowledges the batch of a bucket; returns its records and checks its floor. */
+    private static List<String> claimRecords(IndexSendBuffer sendBuffer, TableBucket target) {
+        IndexBatch batch = sendBuffer.claimFirstReady(target);
+        assertThat(batch).isNotNull();
+        assertThat(batch.sourceHistoryFloor()).isEqualTo(4L);
+        KvRecordBatch.ReadContext context =
+                KvRecordReadContext.createReadContext(
+                        KvFormat.COMPACTED,
+                        new TestingSchemaGetter(1, RowType.of(DataTypes.BIGINT())));
+        List<String> records = new ArrayList<>();
+        for (KvRecord record :
+                DefaultKvRecordBatch.pointToBytesView(batch.encoded()).records(context)) {
+            String key = new String(BytesUtils.toArray(record.getKey()));
+            records.add(
+                    key
+                            + "="
+                            + (record.getRow() == null
+                                    ? "deleted"
+                                    : String.valueOf(record.getRow().getLong(0))));
+        }
+        assertThat(sendBuffer.completeClaim(batch)).isTrue();
+        batch.window().onBatchAcked();
+        return records;
+    }
+
+    private static CompactedRow longValue(long value) {
+        CompactedRowWriter writer = new CompactedRowWriter(1);
+        writer.writeLong(value);
+        CompactedRow row = new CompactedRow(new DataType[] {DataTypes.BIGINT()});
+        row.pointTo(writer.segment(), 0, writer.position());
+        return row;
     }
 
     private static CompactedRow binaryValue(int length) {

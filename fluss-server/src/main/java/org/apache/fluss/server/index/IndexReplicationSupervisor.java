@@ -38,6 +38,7 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -84,6 +85,13 @@ public final class IndexReplicationSupervisor {
     @Nullable private final MetadataProvider metadataProvider;
     private final IndexReplicationManager manager;
     private final Counter retries;
+
+    /**
+     * The earliest retained position of the source bucket if the main table keeps bucket history,
+     * else a negative value.
+     */
+    private final LongSupplier sourceHistoryFloor;
+
     private volatile State state = State.NOT_STARTED;
     private final Object lifecycleLock = new Object();
 
@@ -95,7 +103,9 @@ public final class IndexReplicationSupervisor {
             TabletServerMetadataCache metadataCache,
             @Nullable MetadataProvider metadataProvider,
             IndexReplicationManager manager,
-            Counter retries) {
+            Counter retries,
+            LongSupplier sourceHistoryFloor) {
+        this.sourceHistoryFloor = sourceHistoryFloor;
         this.tableInfo = tableInfo;
         this.tableBucket = tableBucket;
         this.metadataCache = metadataCache;
@@ -228,7 +238,12 @@ public final class IndexReplicationSupervisor {
                         tableInfo, false, SchemaResolution.DYNAMIC, null, schemaGetter, null);
         IndexReplicator replicator =
                 manager.createReplicator(
-                        logTablet, indexEncoders, readContext, replayStartOffset, onProgress);
+                        logTablet,
+                        indexEncoders,
+                        readContext,
+                        replayStartOffset,
+                        onProgress,
+                        sourceHistoryFloor);
         // Register with the read pool; the pool worker will catch up on any WAL entries already
         // committed before this replicator was created.
         installIndexReplicator(replicator);

@@ -17,6 +17,8 @@
 
 package org.apache.fluss.client.lookup;
 
+import org.apache.fluss.metadata.BucketReadPosition;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
@@ -30,13 +32,17 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Covers the two Hop2 safeguards of a secondary index lookup that end-to-end tests cannot isolate:
@@ -150,6 +156,151 @@ class SecondaryIndexLookuperTest {
             }
             assertThat(lookuper.lookup(key).get().getRowList()).isEmpty();
         }
+    }
+
+    /**
+     * A read at a cut reads the candidates of the buckets in the cut at the cut, reads each
+     * candidate at the position of its bucket, keeps the rows that match there, and reads nothing
+     * of a bucket that the cut reads as empty.
+     */
+    @Test
+    void testReadAtACutReadsEveryCandidateAtThePositionOfItsBucket() throws Exception {
+        // main rows at the cut: pk 1 and 4 match, pk 6 moved to another city, pk 3 is gone
+        Map<Integer, InternalRow> rowsAtCut = new LinkedHashMap<>();
+        rowsAtCut.put(1, row(1, "Shanghai", 30));
+        rowsAtCut.put(6, row(6, "Beijing", 30));
+        rowsAtCut.put(4, row(4, "Shanghai", 30));
+        Map<TableBucket, Long> cut = new HashMap<>();
+        cut.put(bucket(0), 10L);
+        cut.put(bucket(1), 20L);
+        cut.put(bucket(2), SecondaryIndexLookuper.EMPTY_BUCKET_POSITION);
+        List<Map<TableBucket, Long>> hop1Cuts = new ArrayList<>();
+        List<String> hop2Reads = new ArrayList<>();
+        SecondaryIndexLookuper lookuper =
+                atCutLookuper(
+                        (indexKey, readCut) -> {
+                            hop1Cuts.add(readCut);
+                            // pk 1 twice: a data and a removed pointer of the same row
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(indexRowsFor(1, 6, 3, 1, 4, 5)));
+                        },
+                        (basePk, position) -> {
+                            int pk = basePk.getInt(0);
+                            hop2Reads.add(pk + "@" + position.getNextOffset());
+                            assertThat(position.getTableBucket()).isEqualTo(bucket(pk % 3));
+                            InternalRow mainRow = rowsAtCut.get(pk);
+                            return CompletableFuture.completedFuture(
+                                    new LookupResult(
+                                            mainRow == null
+                                                    ? Collections.<InternalRow>emptyList()
+                                                    : Collections.singletonList(mainRow)));
+                        });
+
+        LookupResult result = lookuper.lookup(row("Shanghai", 30), cut).get();
+
+        Map<TableBucket, Long> readCut = new HashMap<>(cut);
+        readCut.remove(bucket(2));
+        assertThat(hop1Cuts).containsExactly(readCut);
+        // bucket of pk = pk % 3: pk 5 is in the bucket read as empty
+        assertThat(hop2Reads).containsExactly("1@20", "6@10", "3@10", "4@20");
+        assertThat(basePksOf(result)).containsExactly(1, 4);
+    }
+
+    @Test
+    void testReadAtACutNeedsEveryBucketOfTheMainTable() throws Exception {
+        SecondaryIndexLookuper lookuper =
+                atCutLookuper(
+                        (indexKey, readCut) -> {
+                            throw new AssertionError("an invalid cut must not be read");
+                        },
+                        (basePk, position) -> {
+                            throw new AssertionError("an invalid cut must not be read");
+                        });
+        Map<TableBucket, Long> partial = new HashMap<>();
+        partial.put(bucket(0), 10L);
+        partial.put(bucket(1), 20L);
+        assertThatThrownBy(() -> lookuper.lookup(row("Shanghai", 30), partial).get())
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+        Map<TableBucket, Long> empty = new HashMap<>();
+        for (int bucket = 0; bucket < 3; bucket++) {
+            empty.put(bucket(bucket), SecondaryIndexLookuper.EMPTY_BUCKET_POSITION);
+        }
+        assertThat(lookuper.lookup(row("Shanghai", 30), empty).get().getRowList()).isEmpty();
+        // a lookuper without cuts of its main table rejects reads at a cut
+        assertThatThrownBy(() -> lookuper(Collections.emptyList()).lookup(row("a", 1), empty).get())
+                .hasCauseInstanceOf(UnsupportedOperationException.class);
+    }
+
+    /** Reads a positioned point lookup of the main table. */
+    private interface PositionedLookup {
+        CompletableFuture<LookupResult> lookup(InternalRow basePk, BucketReadPosition position);
+    }
+
+    private static TableBucket bucket(int bucket) {
+        return new TableBucket(1L, bucket);
+    }
+
+    /** A lookuper whose main table has three buckets: the bucket of a pk is pk % 3. */
+    private static SecondaryIndexLookuper atCutLookuper(
+            SecondaryIndexLookuper.CutReader cutReader, PositionedLookup mainAtPosition) {
+        Lookuper latestOnly =
+                ignored -> {
+                    throw new AssertionError("a read at a cut must not read the latest rows");
+                };
+        Lookuper mainTablePointLookuper =
+                new Lookuper() {
+                    @Override
+                    public CompletableFuture<LookupResult> lookup(InternalRow lookupKey) {
+                        throw new AssertionError("a read at a cut reads at positions");
+                    }
+
+                    @Override
+                    public CompletableFuture<LookupResult> lookup(
+                            InternalRow lookupKey, BucketReadPosition position) {
+                        return mainAtPosition.lookup(lookupKey, position);
+                    }
+                };
+        Set<TableBucket> buckets = new HashSet<>();
+        for (int bucket = 0; bucket < 3; bucket++) {
+            buckets.add(bucket(bucket));
+        }
+        return new SecondaryIndexLookuper(
+                latestOnly,
+                mainTablePointLookuper,
+                key -> key,
+                new InternalRow.FieldGetter[] {
+                    InternalRow.createFieldGetter(DataTypes.STRING(), 0),
+                    InternalRow.createFieldGetter(DataTypes.INT(), 1)
+                },
+                new InternalRow.FieldGetter[] {
+                    InternalRow.createFieldGetter(DataTypes.STRING(), 1),
+                    InternalRow.createFieldGetter(DataTypes.INT(), 2)
+                },
+                IDX_COLUMN_TYPES,
+                SecondaryIndexLookuperTest::basePkOfIndexRow,
+                Runnable::run,
+                null,
+                0,
+                new SecondaryIndexLookuper.MainTableCuts(
+                        cutReader, buckets, basePk -> bucket(basePk.getInt(0) % 3)));
+    }
+
+    private SecondaryIndexLookuper lookuper(List<InternalRow> hop1Rows) {
+        return new SecondaryIndexLookuper(
+                ignored -> CompletableFuture.completedFuture(new LookupResult(hop1Rows)),
+                ignored -> CompletableFuture.completedFuture(new LookupResult(hop1Rows)),
+                key -> key,
+                new InternalRow.FieldGetter[] {
+                    InternalRow.createFieldGetter(DataTypes.STRING(), 0),
+                    InternalRow.createFieldGetter(DataTypes.INT(), 1)
+                },
+                new InternalRow.FieldGetter[] {
+                    InternalRow.createFieldGetter(DataTypes.STRING(), 1),
+                    InternalRow.createFieldGetter(DataTypes.INT(), 2)
+                },
+                IDX_COLUMN_TYPES,
+                SecondaryIndexLookuperTest::basePkOfIndexRow,
+                Runnable::run);
     }
 
     private LookupResult lookup(List<InternalRow> hop1Rows, InternalRow lookupKey)

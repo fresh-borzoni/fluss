@@ -62,6 +62,7 @@ import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.PutIndexDataForBucket;
+import org.apache.fluss.server.index.IndexCutReader;
 import org.apache.fluss.server.index.IndexPartitionTombstoneFilter;
 import org.apache.fluss.server.index.IndexReplicationApplier;
 import org.apache.fluss.server.index.IndexReplicationManager;
@@ -252,6 +253,10 @@ public final class Replica {
     private final IndexReplicationSupervisor indexReplicationSupervisor;
     @Nullable private volatile IndexReplicationLag indexReplicationLag;
     @Nullable private final IndexReplicationApplier indexReplicationApplier;
+
+    /** Reads an Index Table at cuts of its main table; null for other tables. */
+    @Nullable private final IndexCutReader indexCutReader;
+
     @Nullable private IndexPartitionTombstoneFilter indexPartitionTombstoneFilter;
 
     /** Whether this main-table schema declares at least one secondary index. */
@@ -334,12 +339,15 @@ public final class Replica {
         this.remoteLogManager = remoteLogManager;
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
         this.indexReplicationSupervisor =
-                indexReplicationManager.createSupervisor(tableInfo, tableBucket);
+                indexReplicationManager.createSupervisor(
+                        tableInfo, tableBucket, this::indexSourceHistoryFloor);
         this.indexReplicationApplier =
                 tableInfo.isIndexTable()
                         ? new IndexReplicationApplier(
                                 tableInfo, tableBucket, metadataCache, schemaGetter)
                         : null;
+        this.indexCutReader =
+                tableInfo.isIndexTable() ? new IndexCutReader(tableInfo, schemaGetter) : null;
         List<Schema.Index> secondaryIndexes = tableInfo.getSchema().getIndexes();
         this.hasSecondaryIndexes = !secondaryIndexes.isEmpty();
         this.hasSyncIndexes =
@@ -2135,6 +2143,75 @@ public final class Replica {
                                     reverse,
                                     nextOffset);
                 });
+    }
+
+    /**
+     * Reads an Index Table at a cut of its main table under local leadership, see {@link
+     * IndexCutReader}.
+     *
+     * @param cut the exclusive next offset of each main table bucket whose rows to return
+     */
+    public List<List<ByteArraySlice>> indexLookupAt(
+            List<byte[]> dataPrefixes,
+            Map<TableBucket, Long> cut,
+            int limit,
+            boolean failOnLimitExceeded) {
+        if (indexCutReader == null) {
+            throw new InvalidTableException(
+                    "Only Index Tables are read at a cut of their main table, not "
+                            + getTablePath());
+        }
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    if (!isLeader()) {
+                        throw new NotLeaderOrFollowerException(
+                                String.format(
+                                        "Leader not local for bucket %s on tabletServer %d",
+                                        tableBucket, localTabletServerId));
+                    }
+                    KvTablet kv =
+                            checkNotNull(
+                                    kvTablet, "KvTablet for the Index Table must not be null.");
+                    try {
+                        return indexCutReader.read(
+                                kv, dataPrefixes, cut, limit, failOnLimitExceeded);
+                    } catch (IOException e) {
+                        throw new KvStorageException(
+                                "Failed to read Index Table bucket "
+                                        + tableBucket
+                                        + " at a cut: "
+                                        + e.getMessage(),
+                                e);
+                    }
+                });
+    }
+
+    /**
+     * The earliest retained position of this main table bucket, sent to its Index Table buckets for
+     * purging; negative if the table has no bucket history or none is known yet.
+     */
+    private long indexSourceHistoryFloor() {
+        if (!tableInfo.getTableConfig().isMvccEnabled()) {
+            return -1L;
+        }
+        KvTablet kv = kvTablet;
+        if (kv == null) {
+            return -1L;
+        }
+        try {
+            return kv.getBucketReadRange().getEarliestPosition().getNextOffset();
+        } catch (IOException | RuntimeException e) {
+            return -1L;
+        }
+    }
+
+    /** The main table of an Index Table, whose buckets its cuts name. */
+    public long indexMainTableId() {
+        if (indexCutReader == null) {
+            throw new InvalidTableException(getTablePath() + " is not an Index Table");
+        }
+        return indexCutReader.mainTableId();
     }
 
     /** Observes the served history interval under the current local leadership. */

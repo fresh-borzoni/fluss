@@ -63,4 +63,18 @@ public class HybridSnapshotLogSplitState extends SourceSplitState {
         snapshotFinished = true;
         this.nextOffset = nextOffset;
     }
+
+    /** The records of the snapshot read so far, which a restore skips. */
+    public long getRecordsToSkip() {
+        return recordsToSkip;
+    }
+
+    public boolean isSnapshotFinished() {
+        return snapshotFinished;
+    }
+
+    /** The next log offset to read, once the snapshot is finished. */
+    public long getNextOffset() {
+        return nextOffset;
+    }
 }

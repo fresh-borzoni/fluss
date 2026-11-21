@@ -29,6 +29,7 @@ import org.apache.fluss.exception.InvalidBucketRoutingException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidPartitionException;
+import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
@@ -74,6 +75,7 @@ import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
+import org.apache.fluss.rpc.messages.PbIndexSourcePosition;
 import org.apache.fluss.rpc.messages.PbPrefixLookupKey;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.ApiKeys;
@@ -1382,6 +1384,31 @@ public class ReplicaManager implements ServerReconfigurable {
             boolean failOnLimitExceeded,
             @Nullable Long nextOffset,
             Consumer<Map<TableBucket, PrefixLookupResultForBucket>> responseCallback) {
+        prefixLookups(
+                entriesPerBucket,
+                apiVersion,
+                limit,
+                failOnLimitExceeded,
+                nextOffset,
+                null,
+                responseCallback);
+    }
+
+    /**
+     * Looks up each prefix with an independent candidate limit, at a committed position, at a cut
+     * of the main table of an Index Table, or at the latest state if both are omitted.
+     *
+     * @param sourcePositions for a read of an Index Table at a cut of its main table: the exclusive
+     *     next offset of each main table bucket whose rows the read returns
+     */
+    public void prefixLookups(
+            Map<TableBucket, List<PbPrefixLookupKey>> entriesPerBucket,
+            short apiVersion,
+            int limit,
+            boolean failOnLimitExceeded,
+            @Nullable Long nextOffset,
+            @Nullable List<PbIndexSourcePosition> sourcePositions,
+            Consumer<Map<TableBucket, PrefixLookupResultForBucket>> responseCallback) {
         TableMetricGroup tableMetrics = null;
         Map<TableBucket, PrefixLookupResultForBucket> result = new HashMap<>();
         for (Map.Entry<TableBucket, List<PbPrefixLookupKey>> entry : entriesPerBucket.entrySet()) {
@@ -1393,6 +1420,19 @@ public class ReplicaManager implements ServerReconfigurable {
                         ApiKeys.PREFIX_LOOKUP, apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalPrefixLookupRequests().inc();
+                if (sourcePositions != null) {
+                    result.put(
+                            tb,
+                            new PrefixLookupResultForBucket(
+                                    tb,
+                                    indexLookupAt(
+                                            replica,
+                                            entry.getValue(),
+                                            sourcePositions,
+                                            limit,
+                                            failOnLimitExceeded)));
+                    continue;
+                }
                 for (PbPrefixLookupKey key : entry.getValue()) {
                     if (key.hasStartKey() || key.hasEndKey() || key.hasReverse()) {
                         if (apiVersion < 3
@@ -1446,6 +1486,33 @@ public class ReplicaManager implements ServerReconfigurable {
             }
         }
         responseCallback.accept(result);
+    }
+
+    private static List<List<ByteArraySlice>> indexLookupAt(
+            Replica replica,
+            List<PbPrefixLookupKey> keys,
+            List<PbIndexSourcePosition> sourcePositions,
+            int limit,
+            boolean failOnLimitExceeded) {
+        List<byte[]> prefixes = new ArrayList<>(keys.size());
+        for (PbPrefixLookupKey key : keys) {
+            if (key.hasStartKey() || key.hasEndKey() || key.hasReverse() || key.hasLimit()) {
+                throw new InvalidRequestException(
+                        "Reads of an Index Table at a cut support only whole prefixes.");
+            }
+            prefixes.add(key.getPrefixKey());
+        }
+        long mainTableId = replica.indexMainTableId();
+        Map<TableBucket, Long> cut = new HashMap<>();
+        for (PbIndexSourcePosition position : sourcePositions) {
+            cut.put(
+                    new TableBucket(
+                            mainTableId,
+                            position.hasPartitionId() ? position.getPartitionId() : null,
+                            position.getBucketId()),
+                    position.getNextOffset());
+        }
+        return replica.indexLookupAt(prefixes, cut, limit, failOnLimitExceeded);
     }
 
     private static @Nullable Long positionBound(Exception error) {

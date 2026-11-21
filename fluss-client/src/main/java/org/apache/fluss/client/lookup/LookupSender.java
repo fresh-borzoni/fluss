@@ -38,6 +38,7 @@ import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.LookupResponse;
+import org.apache.fluss.rpc.messages.PbIndexSourcePosition;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbPrefixLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PbValueList;
@@ -56,6 +57,7 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
@@ -404,29 +406,47 @@ class LookupSender implements Runnable {
     @VisibleForTesting
     void sendLookups(
             int destination, LookupType lookupType, List<AbstractLookupQuery<?>> lookupBatches) {
-        if (lookupBatches.stream().noneMatch(query -> query.nextOffset() != null)) {
-            sendLookupGroup(destination, lookupType, lookupBatches, null);
+        if (lookupBatches.stream()
+                .noneMatch(query -> query.nextOffset() != null || sourceCutOf(query) != null)) {
+            sendLookupGroup(destination, lookupType, lookupBatches, null, null);
             return;
         }
-        Map<Long, List<AbstractLookupQuery<?>>> groups = new LinkedHashMap<>();
+        // a request reads at one position, or at one cut
+        Map<List<Object>, List<AbstractLookupQuery<?>>> groups = new LinkedHashMap<>();
         for (AbstractLookupQuery<?> query : lookupBatches) {
-            groups.computeIfAbsent(query.nextOffset(), offset -> new ArrayList<>()).add(query);
+            groups.computeIfAbsent(
+                            Arrays.asList(query.nextOffset(), sourceCutOf(query)),
+                            key -> new ArrayList<>())
+                    .add(query);
         }
-        groups.forEach(
-                (position, queries) -> sendLookupGroup(destination, lookupType, queries, position));
+        groups.values()
+                .forEach(
+                        queries ->
+                                sendLookupGroup(
+                                        destination,
+                                        lookupType,
+                                        queries,
+                                        queries.get(0).nextOffset(),
+                                        sourceCutOf(queries.get(0))));
+    }
+
+    @Nullable
+    private static Map<TableBucket, Long> sourceCutOf(AbstractLookupQuery<?> query) {
+        return query instanceof PrefixLookupQuery ? ((PrefixLookupQuery) query).sourceCut() : null;
     }
 
     private void sendLookupGroup(
             int destination,
             LookupType lookupType,
             List<AbstractLookupQuery<?>> lookupBatches,
-            @Nullable Long nextOffset) {
+            @Nullable Long nextOffset,
+            @Nullable Map<TableBucket, Long> sourceCut) {
         if (lookupType == LookupType.LOOKUP) {
             sendLookupRequest(destination, lookupBatches, false, nextOffset);
         } else if (lookupType == LookupType.LOOKUP_WITH_INSERT_IF_NOT_EXISTS) {
             sendLookupRequest(destination, lookupBatches, true, nextOffset);
         } else if (lookupType == LookupType.PREFIX_LOOKUP) {
-            sendPrefixLookupRequest(destination, lookupBatches, nextOffset);
+            sendPrefixLookupRequest(destination, lookupBatches, nextOffset, sourceCut);
         } else {
             throw new IllegalArgumentException("Unsupported lookup type: " + lookupType);
         }
@@ -518,7 +538,8 @@ class LookupSender implements Runnable {
     private void sendPrefixLookupRequest(
             int destination,
             List<AbstractLookupQuery<?>> prefixLookups,
-            @Nullable Long nextOffset) {
+            @Nullable Long nextOffset,
+            @Nullable Map<TableBucket, Long> sourceCut) {
         if (!prefixLookups.isEmpty()) {
             PrefixLookupQuery first = (PrefixLookupQuery) prefixLookups.get(0);
             boolean sameLimit = true;
@@ -536,7 +557,8 @@ class LookupSender implements Runnable {
                         prefixLookups,
                         first.limit(),
                         first.failOnLimitExceeded(),
-                        nextOffset);
+                        nextOffset,
+                        sourceCut);
                 return;
             }
         }
@@ -551,7 +573,12 @@ class LookupSender implements Runnable {
         byLimit.forEach(
                 (options, queries) ->
                         sendPrefixLookupRequest(
-                                destination, queries, options.f0, options.f1, nextOffset));
+                                destination,
+                                queries,
+                                options.f0,
+                                options.f1,
+                                nextOffset,
+                                sourceCut));
     }
 
     private void sendPrefixLookupRequest(
@@ -559,7 +586,8 @@ class LookupSender implements Runnable {
             List<AbstractLookupQuery<?>> prefixLookups,
             int limit,
             boolean failOnLimitExceeded,
-            @Nullable Long nextOffset) {
+            @Nullable Long nextOffset,
+            @Nullable Map<TableBucket, Long> sourceCut) {
         // table id -> (bucket -> lookups)
         Map<Long, Map<TableBucket, PrefixLookupBatch>> lookupByTableId = new HashMap<>();
         for (AbstractLookupQuery<?> abstractLookupQuery : prefixLookups) {
@@ -596,6 +624,18 @@ class LookupSender implements Runnable {
                                     failOnLimitExceeded);
                     if (nextOffset != null) {
                         request.setNextOffset(nextOffset);
+                    }
+                    if (sourceCut != null) {
+                        sourceCut.forEach(
+                                (source, position) -> {
+                                    PbIndexSourcePosition pb =
+                                            request.addSourcePosition()
+                                                    .setBucketId(source.getBucket())
+                                                    .setNextOffset(position);
+                                    if (source.getPartitionId() != null) {
+                                        pb.setPartitionId(source.getPartitionId());
+                                    }
+                                });
                     }
                     sendPrefixLookupRequestAndHandleResponse(
                             destination, gateway, request, tableId, prefixLookupBatch);
