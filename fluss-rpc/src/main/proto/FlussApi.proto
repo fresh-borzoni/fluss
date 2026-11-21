@@ -339,6 +339,8 @@ message LookupRequest {
   optional bool insert_if_not_exists = 3;
   optional int32 acks = 4;
   optional int32 timeout_ms = 5;
+  // Exclusive bucket log position to read at. Requires API version 3.
+  optional int64 next_offset = 6;
 }
 
 message LookupResponse {
@@ -352,12 +354,25 @@ message PrefixLookupRequest {
   // Per-prefix candidate limit. Absent means unlimited. Requires API version 2.
   optional int32 limit = 3;
   optional bool fail_on_limit_exceeded = 4;
+  // Exclusive bucket log position to read at. Requires API version 5.
+  optional int64 next_offset = 5;
 }
 
 message PrefixLookupResponse {
   repeated PbPrefixLookupRespForBucket buckets_resp = 1;
 }
 
+
+// A Coordinator resolves the current leader. A TabletServer returns the served interval.
+message GetBucketReadRangeRequest {
+  required PbTableBucket bucket = 1;
+}
+
+message GetBucketReadRangeResponse {
+  optional int32 leader_id = 1;
+  optional int64 earliest_next_offset = 2;
+  optional int64 latest_next_offset = 3;
+}
 
 // limit scan request and response
 message LimitScanRequest {
@@ -1062,8 +1077,9 @@ message PbTableMetadata {
   // When present, bucket_count_epoch is also present, including epoch zero.
   optional int32 bucket_count = 10;
 
-  // TODO add a new filed 'deleted_table' to indicate this table is deleted in UpdateMetadataRequest.
-  // trace by: https://github.com/apache/fluss/issues/981
+  // UPDATE_METADATA v1: a deletion applies only to the table instance identified by table_id.
+  // Version 0 uses a sentinel table_id or table_path instead.
+  optional bool deleted = 11;
 }
 
 message PbPartitionMetadata {
@@ -1235,6 +1251,7 @@ message PbLookupRespForBucket {
   repeated PbValue values = 5;
   // The original partition name for historical lookup. It is unset for normal lookup.
   optional string original_partition_name = 6;
+  optional int64 position_bound = 7;
 }
 
 message PbValue {
@@ -1271,6 +1288,7 @@ message PbPrefixLookupRespForBucket {
   optional int32 error_code = 3;
   optional string error_message = 4;
   repeated PbValueList value_lists = 5;
+  optional int64 position_bound = 6;
 }
 
 message PbTableBucket {

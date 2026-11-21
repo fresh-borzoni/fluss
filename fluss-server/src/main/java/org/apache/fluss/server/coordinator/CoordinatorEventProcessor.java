@@ -1848,6 +1848,12 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         }
 
         List<Integer> newReplicas = planForBucket.getNewReplicas();
+        for (int replica : newReplicas) {
+            if (!coordinatorContext.supportsReplicaStorage(replica, tableBucket)) {
+                LOG.warn("TabletServer {} cannot host rebalance target {}.", replica, tableBucket);
+                return ExecutionResult.IN_PROGRESS;
+            }
+        }
         ReplicaReassignment reassignment =
                 ReplicaReassignment.build(planForBucket.getOriginReplicas(), newReplicas);
 
@@ -2273,6 +2279,11 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         return !targetReplicas.isEmpty()
                 && isTargetReplicaReadyToLead(tableBucket, leaderAndIsr, targetReplicas.get(0))
                 && coordinatorContext.liveTabletServerSet().containsAll(targetReplicas)
+                && targetReplicas.stream()
+                        .allMatch(
+                                replica ->
+                                        coordinatorContext.supportsReplicaStorage(
+                                                replica, tableBucket))
                 && new HashSet<>(leaderAndIsr.isr()).containsAll(targetReplicas);
     }
 

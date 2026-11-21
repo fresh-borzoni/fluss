@@ -81,6 +81,7 @@ import static org.apache.fluss.server.testutils.KvTestUtils.registerRecoverySnap
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.apache.fluss.utils.concurrent.Executors.directExecutor;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatObject;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link KvTabletSnapshotTarget}. */
@@ -171,6 +172,114 @@ class KvTabletSnapshotTargetTest {
         assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(indexed ? 1L : 2L);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testLostCommitResponseAndFailedQueryAllowNextVersionedSnapshot(
+            boolean indexed, @TempDir Path directory) throws Throwable {
+        if (indexed) {
+            indexPushedOffsetGenerator.set(0L);
+        }
+        registerRecoverySnapshot(
+                zooKeeperClient, tableBucket, new BucketSnapshot(0, 0, "file:/initial"));
+        CompletedSnapshotStore store =
+                new CompletedSnapshotStore(
+                        10,
+                        new SharedKvFileRegistry(),
+                        Collections.emptyList(),
+                        new ZooKeeperCompletedSnapshotHandleStore(zooKeeperClient),
+                        directExecutor(),
+                        snapshot -> false);
+        CompletedKvSnapshotCommitter committer =
+                (snapshot, coordinatorEpoch, leaderEpoch, previousRecoverySnapshotId) -> {
+                    store.add(snapshot, previousRecoverySnapshotId, leaderEpoch);
+                    throw new IOException("Commit response lost.");
+                };
+        AtomicBoolean failQuery = new AtomicBoolean(true);
+        Configuration configuration = new Configuration();
+        configuration.set(ConfigOptions.REMOTE_DATA_DIR, directory.toUri().toString());
+        ZooKeeperClient reader =
+                new ZooKeeperClient(
+                        new CuratorFrameworkWithUnhandledErrorListener(
+                                zooKeeperClient.getCuratorClient(), (message, error) -> {}),
+                        configuration) {
+                    @Override
+                    public Optional<BucketSnapshot> getRecoveryBucketSnapshot(TableBucket bucket)
+                            throws Exception {
+                        if (failQuery.getAndSet(false)) {
+                            throw new IOException("Snapshot query failed.");
+                        }
+                        return super.getRecoveryBucketSnapshot(bucket);
+                    }
+                };
+        KvTabletSnapshotTarget original =
+                createSnapshotTargetWithCustomZkAndCommitter(
+                        FsPath.fromLocalFile(directory.resolve("original").toFile()),
+                        reader,
+                        committer);
+        AtomicLong publishedHistoryFloor = new AtomicLong();
+        original.configureVersionHistory(
+                0L,
+                floor -> {
+                    publishedHistoryFloor.set(floor);
+                    historyFloorGenerator.accumulateAndGet(floor, Math::max);
+                },
+                () -> this::getCurrentTabletState);
+        historyFloorGenerator.set(1L);
+        original.getRocksIncrementalSnapshot().notifySnapshotComplete(0L);
+        rocksDBExtension.getRocksDb().put("key".getBytes(), "value".getBytes());
+        PeriodicSnapshotManager.SnapshotRunnable task = original.initSnapshot().get();
+        task.getSnapshotRunnable().run();
+        SnapshotResult result = task.getSnapshotRunnable().get();
+        assertThatThrownBy(
+                        () ->
+                                original.handleSnapshotResult(
+                                        task.getSnapshotId(),
+                                        task.getCoordinatorEpoch(),
+                                        task.getBucketLeaderEpoch(),
+                                        task.getSnapshotLocation(),
+                                        result))
+                .isInstanceOf(IOException.class);
+        assertThat(updateMinRetainOffsetConsumer).hasValue(Long.MAX_VALUE);
+        assertThat(publishedHistoryFloor).hasValue(0L);
+        CompletedSnapshot selected =
+                zooKeeperClient
+                        .getRecoveryBucketSnapshot(tableBucket)
+                        .get()
+                        .toCompletedSnapshotHandle()
+                        .retrieveCompleteSnapshot();
+        assertThat(selected.getHistoryFloor()).isEqualTo(1L);
+
+        // A TTL extension can lower the next candidate until the previous result is reconciled.
+        historyFloorGenerator.set(0L);
+        assertThat(original.initSnapshot()).isEmpty();
+        assertThat(publishedHistoryFloor).hasValue(1L);
+        logOffsetGenerator.set(2L);
+        if (indexed) {
+            indexPushedOffsetGenerator.set(1L);
+        }
+        PeriodicSnapshotManager.SnapshotRunnable next = original.initSnapshot().get();
+        next.getSnapshotRunnable().run();
+        SnapshotResult nextResult = next.getSnapshotRunnable().get();
+        original.handleSnapshotResult(
+                next.getSnapshotId(),
+                next.getCoordinatorEpoch(),
+                next.getBucketLeaderEpoch(),
+                next.getSnapshotLocation(),
+                nextResult);
+        assertThat(zooKeeperClient.getRecoveryBucketSnapshot(tableBucket).get().getSnapshotId())
+                .isEqualTo(2L);
+        assertThat(updateMinRetainOffsetConsumer.get()).isEqualTo(indexed ? 1L : 2L);
+        assertThat(publishedHistoryFloor).hasValue(1L);
+        assertThat(
+                        zooKeeperClient
+                                .getRecoveryBucketSnapshot(tableBucket)
+                                .get()
+                                .toCompletedSnapshotHandle()
+                                .retrieveCompleteSnapshot()
+                                .getHistoryFloor())
+                .isEqualTo(1L);
+    }
+
     @RegisterExtension
     public static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =
             new AllCallbackWrapper<>(new ZooKeeperExtension());
@@ -188,6 +297,7 @@ class KvTabletSnapshotTargetTest {
     private AtomicLong logOffsetGenerator;
     private AtomicLong indexPushedOffsetGenerator;
     private final AtomicLong syncIndexPushedOffsetGenerator = new AtomicLong(-1);
+    private AtomicLong historyFloorGenerator;
     private AtomicLong updateMinRetainOffsetConsumer;
     private AtomicInteger updateMinRetainOffsetCount;
 
@@ -218,6 +328,7 @@ class KvTabletSnapshotTargetTest {
         snapshotIdGenerator = new AtomicLong(1);
         logOffsetGenerator = new AtomicLong(1);
         indexPushedOffsetGenerator = new AtomicLong(-1);
+        historyFloorGenerator = new AtomicLong();
         updateMinRetainOffsetConsumer = new AtomicLong(Long.MAX_VALUE);
         updateMinRetainOffsetCount = new AtomicInteger();
         scheduledExecutorService = new ManuallyTriggeredScheduledExecutorService();
@@ -486,9 +597,10 @@ class KvTabletSnapshotTargetTest {
 
         periodicSnapshotManager = createSnapshotManager(kvTabletSnapshotTarget);
         periodicSnapshotManager.start();
-        periodicSnapshotManager.triggerSnapshot();
+        scheduledExecutorService.triggerNonPeriodicScheduledTask();
 
         if (snapshotFailType == SnapshotFailType.SYNC_PHASE) {
+            assertThatObject(scheduledExecutorService.removeNonPeriodicScheduledTask()).isNotNull();
             // Native preparation failure must not create or delete remote directories.
             assertThat(mkdirsCalls).hasValue(0);
             assertThat(deleteCalls).hasValue(0);
@@ -624,6 +736,9 @@ class KvTabletSnapshotTargetTest {
                                             snapshot.getMetadataFilePath().toString()));
                             throw new IOException("Commit failed.");
                         });
+        AtomicLong publishedFloor = new AtomicLong();
+        target.configureVersionHistory(0L, publishedFloor::set, () -> this::getCurrentTabletState);
+        historyFloorGenerator.set(1L);
         rocksDBExtension.getRocksDb().put("key".getBytes(), "value".getBytes());
         PeriodicSnapshotManager.SnapshotRunnable task = target.initSnapshot().get();
         task.getSnapshotRunnable().run();
@@ -645,6 +760,13 @@ class KvTabletSnapshotTargetTest {
         assertThat(result.getSnapshotPath().getFileSystem().exists(result.getSnapshotPath()))
                 .isTrue();
         assertThat(updateMinRetainOffsetConsumer).hasValue(Long.MAX_VALUE);
+        assertThat(publishedFloor).hasValue(0L);
+        // The failed commit does not move the recovery selection.
+        assertThat(
+                        zooKeeperClient
+                                .getRecoveryBucketSnapshot(tableBucket)
+                                .map(BucketSnapshot::getSnapshotId))
+                .isEqualTo(failQuery ? Optional.of(0L) : Optional.empty());
     }
 
     private PeriodicSnapshotManager createSnapshotManager(
@@ -747,7 +869,8 @@ class KvTabletSnapshotTargetTest {
                 logOffsetGenerator.get(),
                 null,
                 indexPushedOffset >= 0 ? indexPushedOffset : null,
-                null);
+                null,
+                historyFloorGenerator.get());
     }
 
     private void recordMinRetainOffset(long offset) {

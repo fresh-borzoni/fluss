@@ -73,6 +73,8 @@ public class CompletedSnapshot {
     /** The next log offset when the snapshot is triggered. */
     private final long logOffset;
 
+    private final long historyFloor;
+
     /**
      * The row count of the snapshot, null for legacy tables that doesn't support row count
      * statistics.
@@ -114,7 +116,8 @@ public class CompletedSnapshot {
                 rowCount,
                 null,
                 null,
-                autoIncIDRanges);
+                autoIncIDRanges,
+                0);
     }
 
     public CompletedSnapshot(
@@ -127,6 +130,58 @@ public class CompletedSnapshot {
             @Nullable Long allIndexPushedOffset,
             @Nullable Long syncIndexPushedOffset,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(
+                tableBucket,
+                snapshotID,
+                snapshotLocation,
+                kvSnapshotHandle,
+                logOffset,
+                rowCount,
+                allIndexPushedOffset,
+                syncIndexPushedOffset,
+                autoIncIDRanges,
+                0);
+    }
+
+    /** Constructs a completed snapshot with the published history floor. */
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            long historyFloor) {
+        this(
+                tableBucket,
+                snapshotID,
+                snapshotLocation,
+                kvSnapshotHandle,
+                logOffset,
+                rowCount,
+                null,
+                null,
+                autoIncIDRanges,
+                historyFloor);
+    }
+
+    /**
+     * Constructs a completed snapshot with index replication progress and the published history
+     * floor.
+     */
+    public CompletedSnapshot(
+            TableBucket tableBucket,
+            long snapshotID,
+            FsPath snapshotLocation,
+            KvSnapshotHandle kvSnapshotHandle,
+            long logOffset,
+            @Nullable Long rowCount,
+            @Nullable Long allIndexPushedOffset,
+            @Nullable Long syncIndexPushedOffset,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            long historyFloor) {
+        this.historyFloor = historyFloor;
         this.tableBucket = tableBucket;
         this.snapshotID = snapshotID;
         this.snapshotLocation = snapshotLocation;
@@ -179,6 +234,11 @@ public class CompletedSnapshot {
      */
     public long getMinRetainLogOffset() {
         return allIndexPushedOffset == null ? logOffset : Math.min(logOffset, allIndexPushedOffset);
+    }
+
+    /** Returns the history floor selected when this snapshot was published. */
+    public long getHistoryFloor() {
+        return historyFloor;
     }
 
     @Nullable

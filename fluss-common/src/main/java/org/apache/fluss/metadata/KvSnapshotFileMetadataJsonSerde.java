@@ -59,6 +59,7 @@ public final class KvSnapshotFileMetadataJsonSerde
     private static final String ROW_COUNT = "row_count";
     private static final String SYNC_INDEX_PUSHED_OFFSET = "sync_index_pushed_offset";
     private static final String INDEX_PUSHED_OFFSET = "index_pushed_offset";
+    private static final String HISTORY_FLOOR = "history_floor";
     private static final String AUTO_INC_ID_RANGE = "auto_inc_id_range";
     private static final String AUTO_INC_COLUMN_ID = "column_id";
     private static final String AUTO_INC_ID_START = "start";
@@ -92,6 +93,9 @@ public final class KvSnapshotFileMetadataJsonSerde
         generator.writeEndObject();
 
         generator.writeNumberField(LOG_OFFSET, metadata.getLogOffset());
+        if (metadata.getHistoryFloor() != 0) {
+            generator.writeNumberField(HISTORY_FLOOR, metadata.getHistoryFloor());
+        }
         if (metadata.getRowCount() != null) {
             generator.writeNumberField(ROW_COUNT, metadata.getRowCount());
         }
@@ -161,7 +165,8 @@ public final class KvSnapshotFileMetadataJsonSerde
                 node.has(SYNC_INDEX_PUSHED_OFFSET)
                         ? node.get(SYNC_INDEX_PUSHED_OFFSET).asLong()
                         : null,
-                ranges);
+                ranges,
+                node.path(HISTORY_FLOOR).asLong(0));
     }
 
     /** Serializes standard KV snapshot file metadata to JSON bytes. */

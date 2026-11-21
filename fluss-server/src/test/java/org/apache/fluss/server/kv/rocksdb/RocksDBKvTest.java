@@ -26,9 +26,13 @@ import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.server.kv.KvCloseMode;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
+import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
+import io.github.fluss_contrib.rocksdb.Checkpoint;
 import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.FlushOptions;
 import io.github.fluss_contrib.rocksdb.RocksDBException;
@@ -39,9 +43,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -680,7 +686,119 @@ class RocksDBKvTest {
         try (RocksDBKv ignored = buildRocksDBKv(tempDir.toFile())) {}
     }
 
+    @Test
+    void versionedSegmentRestoresRowsAndProgressFromCheckpoint(@TempDir Path path)
+            throws Exception {
+        byte[] first = {1, 1};
+        byte[] second = {1, 2};
+        byte[] initial = {10};
+        byte[] next = {20};
+        byte[] other = {30};
+        Path restored = Files.createDirectory(path.resolve("restored"));
+        Path checkpoint = restored.resolve(RocksDBKvBuilder.DB_INSTANCE_DIR_STRING);
+        try (RocksDBKv kv = buildRocksDBKv(path.resolve("source").toFile(), true);
+                RocksDBWriteBatchWrapper writer =
+                        kv.newNoSlowdownWriteBatch(
+                                1024, new SimpleCounter(), new TestHistogram())) {
+            KvPreWriteBuffer buffer =
+                    new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+            buffer.insert(Key.of(first), initial, 0);
+            buffer.insert(Key.of(second), other, 1);
+            buffer.update(Key.of(first), next, 2);
+            buffer.delete(Key.of(second), 3);
+            TreeMap<Long, Long> batchTimestamps = new TreeMap<>();
+            batchTimestamps.put(2L, 100L);
+            batchTimestamps.put(4L, 200L);
+            kv.writeVersionedSegment(writer, 0, buffer.prepareFlush(4), batchTimestamps);
+            assertThat(kv.selectHistoryFloor(0, 4, 150)).isEqualTo(2);
+            kv.stageCheckpointHistoryFloor(2);
+            assertThat(kv.get(first)).isEqualTo(next);
+            assertThat(kv.multiGet(Arrays.asList(first, second))).containsExactly(next, null);
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {1})) {
+                assertThat(lookup.readAll()).containsExactly(next);
+            }
+            try (Checkpoint snapshot = Checkpoint.create(kv.getDb())) {
+                snapshot.createCheckpoint(checkpoint.toString());
+            }
+        }
+
+        try (RocksDBKv kv = buildRocksDBKv(restored.toFile(), true)) {
+            assertThat(kv.readVersionedAppliedEnd()).isEqualTo(4);
+            assertThat(kv.readCheckpointHistoryFloor()).isEqualTo(2);
+            kv.applyPublishedHistoryFloor(2);
+            assertThat(kv.readHistoryFloor()).isEqualTo(2);
+            kv.getDb().compactRange(kv.getDefaultColumnFamilyHandle());
+            assertThat(kv.selectHistoryFloor(2, 4, 150)).isEqualTo(2);
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookupAt(new byte[] {1}, 2)) {
+                assertThat(lookup.readAll()).containsExactly(initial, other);
+            }
+            assertThat(kv.multiGetAt(Arrays.asList(first, second), 2))
+                    .containsExactly(initial, other);
+            assertThat(kv.multiGetAt(Arrays.asList(first, second), 4)).containsExactly(next, null);
+        }
+    }
+
+    @Test
+    void versionedPrefixLookupHonorsBoundsDirectionAndLimit(@TempDir Path path) throws Exception {
+        byte[] first = {1, 1};
+        byte[] second = {1, 2};
+        byte[] third = {1, 3};
+        byte[] firstValue = {10};
+        byte[] secondValue = {20};
+        byte[] thirdValue = {30};
+        byte[] firstUpdate = {11};
+        try (RocksDBKv kv = buildRocksDBKv(path.toFile(), true);
+                RocksDBWriteBatchWrapper writer =
+                        kv.newNoSlowdownWriteBatch(
+                                1024, new SimpleCounter(), new TestHistogram())) {
+            KvPreWriteBuffer buffer =
+                    new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+            buffer.insert(Key.of(first), firstValue, 0);
+            buffer.insert(Key.of(second), secondValue, 1);
+            buffer.insert(Key.of(third), thirdValue, 2);
+            buffer.update(Key.of(first), firstUpdate, 3);
+            TreeMap<Long, Long> batchTimestamps = new TreeMap<>();
+            batchTimestamps.put(4L, 100L);
+            kv.writeVersionedSegment(writer, 0, buffer.prepareFlush(4), batchTimestamps);
+
+            byte[] prefix = {1};
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, second, null, false, 3)) {
+                assertThat(lookup.readAll()).containsExactly(secondValue, thirdValue);
+            }
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, null, null, true, 3)) {
+                assertThat(lookup.readAll()).containsExactly(thirdValue, secondValue, firstValue);
+            }
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, null, third, true, 4)) {
+                assertThat(lookup.readAll()).containsExactly(secondValue, firstUpdate);
+            }
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, null, null, false, 4)) {
+                assertThat(lookup.readAll(1)).containsExactly(firstUpdate);
+            }
+            // the candidate limit applies to the rows visible at the position
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, null, null, false, 1)) {
+                assertThat(lookup.readAll(1, true)).containsExactly(firstValue);
+            }
+            try (RocksDBKv.PrefixLookup lookup =
+                    kv.openPrefixLookupAt(prefix, null, null, false, 2)) {
+                assertThatThrownBy(() -> lookup.readAll(1, true))
+                        .isInstanceOf(LookupLimitExceededException.class);
+            }
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix, null, null, true)) {
+                assertThat(lookup.readAll()).containsExactly(thirdValue, secondValue, firstUpdate);
+            }
+        }
+    }
+
     private RocksDBKv buildRocksDBKv(File instanceBasePath) throws Exception {
+        return buildRocksDBKv(instanceBasePath, false);
+    }
+
+    private RocksDBKv buildRocksDBKv(File instanceBasePath, boolean versioned) throws Exception {
         RocksDBResourceContainer rocksDBResourceContainer =
                 new RocksDBResourceContainer(new Configuration(), instanceBasePath);
         RocksDBKvBuilder rocksDBKvBuilder =
@@ -688,6 +806,9 @@ class RocksDBKvTest {
                         instanceBasePath,
                         rocksDBResourceContainer,
                         rocksDBResourceContainer.getColumnOptions());
+        if (versioned) {
+            rocksDBKvBuilder.enableVersionHistory();
+        }
         return rocksDBKvBuilder.build();
     }
 }

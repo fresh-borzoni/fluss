@@ -160,6 +160,24 @@ public class LookupClient {
             boolean insertIfNotExists,
             @Nullable String originalPartitionName,
             int bucketCount) {
+        return lookup(
+                tablePath,
+                tableBucket,
+                keyBytes,
+                insertIfNotExists,
+                originalPartitionName,
+                bucketCount,
+                null);
+    }
+
+    CompletableFuture<byte[]> lookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            boolean insertIfNotExists,
+            @Nullable String originalPartitionName,
+            int bucketCount,
+            @Nullable Long nextOffset) {
         LookupQuery lookup =
                 new LookupQuery(
                         tablePath,
@@ -168,6 +186,7 @@ public class LookupClient {
                         insertIfNotExists,
                         originalPartitionName,
                         bucketCount);
+        lookup.setNextOffset(nextOffset);
         lookupQueue.appendLookup(lookup);
         return lookup.future();
     }
@@ -254,6 +273,58 @@ public class LookupClient {
             @Nullable byte[] endKey,
             @Nullable ReadDirection direction,
             int keyLimit) {
+        return prefixLookup(
+                tablePath,
+                tableBucket,
+                keyBytes,
+                bucketCount,
+                limit,
+                failOnLimitExceeded,
+                startKey,
+                endKey,
+                direction,
+                keyLimit,
+                null);
+    }
+
+    /** Adds a complete prefix read at an exclusive bucket log position, or the latest if null. */
+    CompletableFuture<List<byte[]>> prefixLookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            @Nullable Long nextOffset) {
+        return prefixLookup(
+                tablePath,
+                tableBucket,
+                keyBytes,
+                bucketCount,
+                0,
+                false,
+                null,
+                null,
+                null,
+                0,
+                nextOffset);
+    }
+
+    /**
+     * Adds a prefix read with a candidate limit of the request (0 for none), optional bounds and
+     * direction, a limit of its own (0 for none), at an exclusive bucket log position, or at the
+     * latest state if the position is null.
+     */
+    CompletableFuture<List<byte[]>> prefixLookup(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            byte[] keyBytes,
+            int bucketCount,
+            int limit,
+            boolean failOnLimitExceeded,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            @Nullable ReadDirection direction,
+            int keyLimit,
+            @Nullable Long nextOffset) {
         PrefixLookupQuery prefixLookup =
                 new PrefixLookupQuery(
                         tablePath,
@@ -266,6 +337,7 @@ public class LookupClient {
                         endKey,
                         direction,
                         keyLimit);
+        prefixLookup.setNextOffset(nextOffset);
         lookupQueue.appendLookup(prefixLookup);
         return prefixLookup.future();
     }

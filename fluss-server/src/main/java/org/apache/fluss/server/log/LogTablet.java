@@ -176,14 +176,14 @@ public final class LogTablet {
         this.logFormat = tableConfig.getLogFormat();
 
         this.scheduler = scheduler;
+        this.clock = clock;
         // scheduler the writer expiration interval check.
         writerExpireCheck =
                 scheduler.schedule(
                         "PeriodicWriterIdExpirationCheck",
-                        () -> removeExpiredWriter(System.currentTimeMillis()),
+                        () -> removeExpiredWriter(clock.milliseconds()),
                         writerExpirationCheckIntervalMs,
                         writerExpirationCheckIntervalMs);
-        this.clock = clock;
         this.isChangeLog = isChangelog;
         // Default value to 0L for changelog to avoid cleaning up any segments in case of not
         // updating this value in time. Default value to Long.MAX_VALUE for normal log table,
@@ -399,7 +399,8 @@ public final class LogTablet {
                                 recoveryPoint,
                                 logFormat,
                                 writerStateManager,
-                                isCleanShutdown)
+                                isCleanShutdown,
+                                clock)
                         .load();
 
         LocalLog log =
@@ -1406,7 +1407,8 @@ public final class LogTablet {
                         batch,
                         updatedWriters,
                         isAppendAsLeader,
-                        WriterAppendInfo.SequenceValidation.ENFORCE);
+                        WriterAppendInfo.SequenceValidation.ENFORCE,
+                        clock.milliseconds());
             }
         }
 
@@ -1437,7 +1439,13 @@ public final class LogTablet {
             // Additionally, using 0 versus using logStartOffset does not affect correctness—they
             // both can restore the complete WriterState. The only difference is that using
             // logStartOffset can potentially skip over more segments.
-            rebuildWriterState(writerStateManager, localLog.getSegments(), 0, lastOffset, false);
+            rebuildWriterState(
+                    writerStateManager,
+                    localLog.getSegments(),
+                    0,
+                    lastOffset,
+                    false,
+                    clock.milliseconds());
         }
     }
 
@@ -1545,14 +1553,15 @@ public final class LogTablet {
             LogRecordBatch batch,
             Map<Long, WriterAppendInfo> writers,
             boolean isAppendAsLeader,
-            WriterAppendInfo.SequenceValidation sequenceValidation) {
+            WriterAppendInfo.SequenceValidation sequenceValidation,
+            long currentTimeMs) {
         long writerId = batch.writerId();
         // update writers.
         WriterAppendInfo appendInfo =
                 writers.computeIfAbsent(writerId, id -> writerStateManager.prepareUpdate(writerId));
         appendInfo.append(
                 batch,
-                writerStateManager.isWriterInBatchExpired(System.currentTimeMillis(), batch),
+                writerStateManager.isWriterInBatchExpired(currentTimeMs, batch),
                 isAppendAsLeader,
                 sequenceValidation);
     }
@@ -1562,7 +1571,8 @@ public final class LogTablet {
             LogSegments segments,
             long logStartOffset,
             long lastOffset,
-            boolean reloadFromCleanShutdown)
+            boolean reloadFromCleanShutdown,
+            long currentTimeMs)
             throws IOException {
         List<Optional<Long>> offsetsToSnapshot = new ArrayList<>();
         if (!segments.isEmpty()) {
@@ -1610,8 +1620,7 @@ public final class LogTablet {
             boolean isEmptyBeforeTruncation =
                     writerStateManager.isEmpty() && writerStateManager.mapEndOffset() >= lastOffset;
             long writerStateLoadStart = System.currentTimeMillis();
-            writerStateManager.truncateAndReload(
-                    logStartOffset, lastOffset, System.currentTimeMillis());
+            writerStateManager.truncateAndReload(logStartOffset, lastOffset, currentTimeMs);
             long segmentRecoveryStart = System.currentTimeMillis();
 
             // Only do the potentially expensive reloading if the last snapshot offset is lower than
@@ -1651,7 +1660,8 @@ public final class LogTablet {
                     FetchDataInfo fetchDataInfo =
                             segment.read(startOffset, Integer.MAX_VALUE, maxPosition, false);
                     if (fetchDataInfo != null) {
-                        loadWritersFromRecords(writerStateManager, fetchDataInfo.getRecords());
+                        loadWritersFromRecords(
+                                writerStateManager, fetchDataInfo.getRecords(), currentTimeMs);
                     }
                 }
             }
@@ -1668,7 +1678,7 @@ public final class LogTablet {
     }
 
     private static void loadWritersFromRecords(
-            WriterStateManager writerStateManager, LogRecords records) {
+            WriterStateManager writerStateManager, LogRecords records, long currentTimeMs) {
         Map<Long, WriterAppendInfo> loadedWriters = new HashMap<>();
         for (LogRecordBatch batch : records.batches()) {
             if (batch.hasWriterId()) {
@@ -1679,7 +1689,8 @@ public final class LogTablet {
                         batch,
                         loadedWriters,
                         false,
-                        WriterAppendInfo.SequenceValidation.WARN_AND_ACCEPT);
+                        WriterAppendInfo.SequenceValidation.WARN_AND_ACCEPT,
+                        currentTimeMs);
             }
         }
         loadedWriters.values().forEach(writerStateManager::update);

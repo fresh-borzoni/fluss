@@ -35,6 +35,7 @@ import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.BucketReadRange;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.LogFormat;
@@ -113,6 +114,7 @@ import org.apache.fluss.server.replica.delay.DelayedWrite;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.RowType;
@@ -881,7 +883,8 @@ public final class Replica {
                 base.getFlushedLogOffset(),
                 base.getRowCount(),
                 indexPushedOffset,
-                base.getAutoIncIDRanges());
+                base.getAutoIncIDRanges(),
+                base.getHistoryFloor());
     }
 
     private void createKv(KvRecovery recovery) {
@@ -1170,6 +1173,14 @@ public final class Replica {
                         .advanceHistoricalCleanupOffset(restoreStartOffset);
             }
             recoverKvTablet(restoreStartOffset, rowCount, autoIncIDRange);
+            if (tableConfig.isMvccEnabled() && !isHistoricalPartition()) {
+                long expectedFloor =
+                        optCompletedSnapshot.map(CompletedSnapshot::getHistoryFloor).orElse(0L);
+                if (kvTablet.getPublishedHistoryFloor() != expectedFloor) {
+                    throw new IOException(
+                            "Recovered KV history floor does not match the selected snapshot.");
+                }
+            }
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(
@@ -1246,7 +1257,8 @@ public final class Replica {
         try {
             kvSnapshotDataDownloader.transferAllDataToDirectory(downloadSpec, closeableRegistry);
         } catch (Exception e) {
-            if (isSnapshotDataNotExists(e, downloadSpec)) {
+            // Falling back to an older image can make an expired read position visible again.
+            if (!getTableConfig().isMvccEnabled() && isSnapshotDataNotExists(e, downloadSpec)) {
                 try {
                     snapshotContext.handleSnapshotBroken(completedSnapshot);
                 } catch (Exception t) {
@@ -1322,6 +1334,15 @@ public final class Replica {
 
     private Optional<CompletedSnapshot> getLatestSnapshot(TableBucket tableBucket) {
         try {
+            if (getTableConfig().isMvccEnabled()) {
+                Optional<BucketSnapshot> selected =
+                        snapshotContext.getZooKeeperClient().getRecoveryBucketSnapshot(tableBucket);
+                if (selected.isPresent()) {
+                    return Optional.of(
+                            selected.get().toCompletedSnapshotHandle().retrieveCompleteSnapshot());
+                }
+                return Optional.empty();
+            }
             return Optional.ofNullable(
                     snapshotContext.getLatestCompletedSnapshotProvider().apply(tableBucket));
         } catch (Exception e) {
@@ -1474,6 +1495,21 @@ public final class Replica {
                             lastCompletedSnapshotIndexPushedOffset,
                             lastCompletedSnapshotSyncIndexPushedOffset,
                             snapshotSize);
+            if (getTableConfig().isMvccEnabled()) {
+                kvTabletSnapshotTarget.configureVersionHistory(
+                        kvTablet.getPublishedHistoryFloor(),
+                        kvTablet::publishHistoryFloor,
+                        () -> {
+                            Supplier<TabletState> capture =
+                                    kvTablet.prepareVersionedSnapshot(
+                                            () ->
+                                                    clock.milliseconds()
+                                                            - getTableConfig()
+                                                                    .getMvccTtl()
+                                                                    .toMillis());
+                            return () -> augmentTabletState(capture.get());
+                        });
+            }
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,
@@ -2044,6 +2080,82 @@ public final class Replica {
                         throw new KvStorageException(errorMsg, e);
                     }
                 });
+    }
+
+    /** Reads multiple keys at one position while local leadership is held. */
+    public List<ByteArraySlice> lookupsAt(List<byte[]> keys, long nextOffset) throws IOException {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    localLogOrThrow(true);
+                    return requireKvForPositionedLookup().multiGetAt(keys, nextOffset);
+                });
+    }
+
+    /** Reads complete prefix results at one position while local leadership is held. */
+    public List<List<ByteArraySlice>> prefixLookupsAt(List<byte[]> prefixes, long nextOffset)
+            throws IOException {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    localLogOrThrow(true);
+                    KvTablet tablet = requireKvForPositionedLookup();
+                    List<List<ByteArraySlice>> values = new ArrayList<>(prefixes.size());
+                    for (byte[] prefix : prefixes) {
+                        values.add(tablet.prefixLookupAt(prefix, nextOffset));
+                    }
+                    return values;
+                });
+    }
+
+    /**
+     * Reads a prefix intersected with inclusive start and exclusive end keys, with a candidate
+     * limit, at one position while local leadership is held; zero preserves unlimited reads.
+     */
+    public List<ByteArraySlice> prefixLookupAt(
+            byte[] prefixKey,
+            int limit,
+            boolean failOnLimitExceeded,
+            @Nullable byte[] startKey,
+            @Nullable byte[] endKey,
+            boolean reverse,
+            long nextOffset)
+            throws IOException {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    localLogOrThrow(true);
+                    return requireKvForPositionedLookup()
+                            .prefixLookupAt(
+                                    prefixKey,
+                                    limit,
+                                    failOnLimitExceeded,
+                                    startKey,
+                                    endKey,
+                                    reverse,
+                                    nextOffset);
+                });
+    }
+
+    /** Observes the served history interval under the current local leadership. */
+    public BucketReadRange getBucketReadRange() throws IOException {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    localLogOrThrow(true);
+                    return requireKvForPositionedLookup().getBucketReadRange();
+                });
+    }
+
+    private KvTablet requireKvForPositionedLookup() {
+        if (!isKvTable()) {
+            throw new org.apache.fluss.exception.TableNotVersionedException(
+                    "The table was created without version history.");
+        }
+        if (kvTablet == null) {
+            throw new NotLeaderOrFollowerException("The KV tablet is still recovering.");
+        }
+        return kvTablet;
     }
 
     public List<ByteArraySlice> prefixLookup(byte[] prefixKey) {

@@ -32,17 +32,20 @@ import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.messages.AuthenticateRequest;
 import org.apache.fluss.rpc.messages.AuthenticateResponse;
+import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.PbPrefixLookupKey;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.ScanKvRequest;
+import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.rpc.metrics.ConnectionMetrics;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.ApiManager;
 import org.apache.fluss.rpc.protocol.ApiMethod;
 import org.apache.fluss.rpc.protocol.MessageCodec;
+import org.apache.fluss.rpc.protocol.UpdateMetadataRequestCompat;
 import org.apache.fluss.security.auth.ClientAuthenticator;
 import org.apache.fluss.shaded.netty4.io.netty.bootstrap.Bootstrap;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
@@ -83,6 +86,8 @@ final class ServerConnection {
     private static final short PREFIX_LOOKUP_LIMIT_MIN_VERSION = 2;
     private static final short PREFIX_LOOKUP_RANGE_MIN_VERSION = 3;
     private static final short PREFIX_LOOKUP_KEY_LIMIT_MIN_VERSION = 4;
+    private static final short POSITIONED_LOOKUP_MIN_VERSION = 3;
+    private static final short POSITIONED_PREFIX_LOOKUP_MIN_VERSION = 5;
 
     private final ServerNode node;
 
@@ -327,8 +332,13 @@ final class ServerConnection {
                 try {
                     version = serverApiVersions.highestAvailableVersion(apiKey);
                     validateVersionCompatibility(apiKey, version, rawRequest);
-                } catch (Exception e) {
-                    responseFuture.completeExceptionally(e);
+                    if (apiKey == ApiKeys.UPDATE_METADATA && version == 0) {
+                        rawRequest =
+                                UpdateMetadataRequestCompat.toVersion0(
+                                        (UpdateMetadataRequest) rawRequest);
+                    }
+                } catch (Throwable t) {
+                    responseFuture.completeExceptionally(t);
                     return responseFuture;
                 }
             }
@@ -439,6 +449,27 @@ final class ServerConnection {
                                 + " or newer.");
             }
         }
+        if (apiKey == ApiKeys.LOOKUP
+                && version < POSITIONED_LOOKUP_MIN_VERSION
+                && ((LookupRequest) rawRequest).hasNextOffset()) {
+            throw new UnsupportedVersionException(
+                    "Positioned lookups require version "
+                            + POSITIONED_LOOKUP_MIN_VERSION
+                            + " of "
+                            + apiKey
+                            + '.');
+        }
+        if (apiKey == ApiKeys.PREFIX_LOOKUP
+                && version < POSITIONED_PREFIX_LOOKUP_MIN_VERSION
+                && ((PrefixLookupRequest) rawRequest).hasNextOffset()) {
+            throw new UnsupportedVersionException(
+                    "Positioned lookups require version "
+                            + POSITIONED_PREFIX_LOOKUP_MIN_VERSION
+                            + " of "
+                            + apiKey
+                            + '.');
+        }
+
         if (apiKey == ApiKeys.PRODUCE_LOG && version < HISTORICAL_PRODUCE_LOG_MIN_VERSION) {
             ProduceLogRequest produceLogRequest = (ProduceLogRequest) rawRequest;
             if (hasHistoricalProduce(produceLogRequest)) {

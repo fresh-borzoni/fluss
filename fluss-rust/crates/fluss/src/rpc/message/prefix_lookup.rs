@@ -51,6 +51,7 @@ impl PrefixLookupRequest {
             buckets_req,
             limit: None,
             fail_on_limit_exceeded: None,
+            next_offset: None,
         };
 
         Self {

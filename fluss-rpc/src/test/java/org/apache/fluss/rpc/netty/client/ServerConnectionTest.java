@@ -43,12 +43,15 @@ import org.apache.fluss.rpc.messages.ListDatabasesRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.PbApiVersion;
 import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
+import org.apache.fluss.rpc.messages.PbTableMetadata;
 import org.apache.fluss.rpc.messages.PbTablePath;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.ProduceLogRequest;
 import org.apache.fluss.rpc.messages.ProduceLogResponse;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
+import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.rpc.netty.client.ServerConnection.ConnectionState;
@@ -66,6 +69,8 @@ import org.apache.fluss.utils.NetUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Arrays;
 import java.util.HashMap;
@@ -88,6 +93,7 @@ import static org.apache.fluss.metrics.MetricNames.CLIENT_RESPONSES_RATE_AVG;
 import static org.apache.fluss.metrics.MetricNames.CLIENT_RESPONSES_RATE_TOTAL;
 import static org.apache.fluss.rpc.netty.NettyUtils.getClientSocketChannelClass;
 import static org.apache.fluss.rpc.netty.NettyUtils.newEventLoopGroup;
+import static org.apache.fluss.rpc.protocol.UpdateMetadataRequestCompat.DELETED_TABLE_ID;
 import static org.apache.fluss.utils.NetUtils.getAvailablePort;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -349,6 +355,55 @@ public class ServerConnectionTest {
     }
 
     @Test
+    void testPositionedLookupRequiresSupportingPeer() throws Exception {
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignored) -> {});
+        try {
+            // LOOKUP v2 and PREFIX_LOOKUP v2-v4 carry other features; positions need v3 and v5.
+            LookupRequest point = new LookupRequest();
+            PrefixLookupRequest prefix = new PrefixLookupRequest();
+            connection.validateVersionCompatibility(ApiKeys.LOOKUP, (short) 1, point);
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 1, prefix);
+            point.setNextOffset(0L);
+            prefix.setNextOffset(0L);
+            for (short version = 1; version < 3; version++) {
+                final short oldVersion = version;
+                assertThatThrownBy(
+                                () ->
+                                        connection.validateVersionCompatibility(
+                                                ApiKeys.LOOKUP, oldVersion, point))
+                        .isInstanceOf(UnsupportedVersionException.class);
+            }
+            for (short version = 1; version < 5; version++) {
+                final short oldVersion = version;
+                assertThatThrownBy(
+                                () ->
+                                        connection.validateVersionCompatibility(
+                                                ApiKeys.PREFIX_LOOKUP, oldVersion, prefix))
+                        .isInstanceOf(UnsupportedVersionException.class);
+            }
+            connection.validateVersionCompatibility(ApiKeys.LOOKUP, (short) 3, point);
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 5, prefix);
+            // a positioned request may carry the paging fields of earlier versions
+            prefix.setLimit(2).setFailOnLimitExceeded(true);
+            prefix.addBucketsReq()
+                    .setBucketId(0)
+                    .addLookup()
+                    .setPrefixKey(new byte[] {1})
+                    .setReverse(true)
+                    .setLimit(1);
+            connection.validateVersionCompatibility(ApiKeys.PREFIX_LOOKUP, (short) 5, prefix);
+        } finally {
+            connection.close().get();
+        }
+    }
+
+    @Test
     void testRejectBucketCountChangeForOldServer() throws Exception {
         ServerConnection connection =
                 new ServerConnection(
@@ -536,6 +591,64 @@ public class ServerConnectionTest {
                     .isInstanceOf(UnsupportedVersionException.class)
                     .hasMessageContaining("require PRODUCE_LOG version 1 or newer")
                     .hasMessageContaining("negotiated version 0");
+        } finally {
+            connection.close().get();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(shorts = {0, 1})
+    void testTableDeletionUsesNegotiatedVersion(short supportedVersion) throws Exception {
+        CompletableFuture<PbTableMetadata> received = new CompletableFuture<>();
+        nettyServer.close();
+        buildNettyServer(
+                new TestingTabletGatewayService() {
+                    @Override
+                    public CompletableFuture<ApiVersionsResponse> apiVersions(
+                            ApiVersionsRequest request) {
+                        return super.apiVersions(request)
+                                .thenApply(
+                                        response -> {
+                                            for (PbApiVersion api : response.getApiVersionsList()) {
+                                                if (api.getApiKey() == ApiKeys.UPDATE_METADATA.id) {
+                                                    api.setMaxVersion(supportedVersion);
+                                                }
+                                            }
+                                            return response;
+                                        });
+                    }
+
+                    @Override
+                    public CompletableFuture<UpdateMetadataResponse> updateMetadata(
+                            UpdateMetadataRequest request) {
+                        received.complete(
+                                new PbTableMetadata().copyFrom(request.getTableMetadataAt(0)));
+                        return CompletableFuture.completedFuture(new UpdateMetadataResponse());
+                    }
+                });
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignore) -> {});
+        try {
+            UpdateMetadataRequest request = new UpdateMetadataRequest();
+            PbTableMetadata deletion =
+                    request.addTableMetadata()
+                            .setTableId(10L)
+                            .setDeleted(true)
+                            .setSchemaId(0)
+                            .setTableJson(new byte[0])
+                            .setCreatedTime(-1L)
+                            .setModifiedTime(-1L);
+            deletion.setTablePath().setDatabaseName("db").setTableName("orders");
+            connection.send(ApiKeys.UPDATE_METADATA, request).get();
+            PbTableMetadata table = received.get();
+            assertThat(table.getTableId())
+                    .isEqualTo(supportedVersion == 0 ? DELETED_TABLE_ID : 10L);
+            assertThat(table.hasDeleted()).isEqualTo(supportedVersion == 1);
         } finally {
             connection.close().get();
         }

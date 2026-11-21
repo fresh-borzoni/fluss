@@ -430,6 +430,9 @@ pub struct LookupRequest {
     pub acks: ::core::option::Option<i32>,
     #[prost(int32, optional, tag = "5")]
     pub timeout_ms: ::core::option::Option<i32>,
+    /// Exclusive bucket log position to read at. Requires API version 3.
+    #[prost(int64, optional, tag = "6")]
+    pub next_offset: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LookupResponse {
@@ -448,11 +451,29 @@ pub struct PrefixLookupRequest {
     pub limit: ::core::option::Option<i32>,
     #[prost(bool, optional, tag = "4")]
     pub fail_on_limit_exceeded: ::core::option::Option<bool>,
+    /// Exclusive bucket log position to read at. Requires API version 5.
+    #[prost(int64, optional, tag = "5")]
+    pub next_offset: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrefixLookupResponse {
     #[prost(message, repeated, tag = "1")]
     pub buckets_resp: ::prost::alloc::vec::Vec<PbPrefixLookupRespForBucket>,
+}
+/// A Coordinator resolves the current leader. A TabletServer returns the served interval.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetBucketReadRangeRequest {
+    #[prost(message, required, tag = "1")]
+    pub bucket: PbTableBucket,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetBucketReadRangeResponse {
+    #[prost(int32, optional, tag = "1")]
+    pub leader_id: ::core::option::Option<i32>,
+    #[prost(int64, optional, tag = "2")]
+    pub earliest_next_offset: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "3")]
+    pub latest_next_offset: ::core::option::Option<i64>,
 }
 /// limit scan request and response
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1397,6 +1418,10 @@ pub struct PbTableMetadata {
     /// When present, bucket_count_epoch is also present, including epoch zero.
     #[prost(int32, optional, tag = "10")]
     pub bucket_count: ::core::option::Option<i32>,
+    /// UPDATE_METADATA v1: a deletion applies only to the table instance identified by table_id.
+    /// Version 0 uses a sentinel table_id or table_path instead.
+    #[prost(bool, optional, tag = "11")]
+    pub deleted: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PbPartitionMetadata {
@@ -1660,6 +1685,8 @@ pub struct PbLookupRespForBucket {
     /// The original partition name for historical lookup. It is unset for normal lookup.
     #[prost(string, optional, tag = "6")]
     pub original_partition_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "7")]
+    pub position_bound: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PbValue {
@@ -1696,6 +1723,10 @@ pub struct PbPrefixLookupKey {
     pub end_key: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(bool, optional, tag = "4")]
     pub reverse: ::core::option::Option<bool>,
+    /// PREFIX_LOOKUP v3: the most rows to return, the first ones in key order; absent or 0 for all
+    /// of them. Needs no ordered keys.
+    #[prost(int32, optional, tag = "5")]
+    pub limit: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PbPrefixLookupRespForBucket {
@@ -1709,6 +1740,8 @@ pub struct PbPrefixLookupRespForBucket {
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, repeated, tag = "5")]
     pub value_lists: ::prost::alloc::vec::Vec<PbValueList>,
+    #[prost(int64, optional, tag = "6")]
+    pub position_bound: ::core::option::Option<i64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PbTableBucket {

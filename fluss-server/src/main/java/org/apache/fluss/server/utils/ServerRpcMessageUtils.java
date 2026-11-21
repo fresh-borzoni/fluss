@@ -779,6 +779,9 @@ public class ServerRpcMessageUtils {
                 .setTableName(tablePath.getTableName());
         pbTableMetadata.addAllBucketMetadatas(
                 toPbBucketMetadata(tableMetadata.getBucketMetadataList()));
+        if (tableMetadata.isDeleted() && tableInfo.getTableId() != TableMetadata.DELETED_TABLE_ID) {
+            pbTableMetadata.setDeleted(true);
+        }
         return pbTableMetadata;
     }
 
@@ -833,12 +836,10 @@ public class ServerRpcMessageUtils {
     }
 
     private static TableMetadata toTableMetaData(PbTableMetadata pbTableMetadata) {
-        TablePath tablePath = toTablePath(pbTableMetadata.getTablePath());
-        long tableId = pbTableMetadata.getTableId();
         TableInfo tableInfo =
                 TableInfo.of(
-                        tablePath,
-                        tableId,
+                        toTablePath(pbTableMetadata.getTablePath()),
+                        pbTableMetadata.getTableId(),
                         pbTableMetadata.getSchemaId(),
                         TableDescriptor.fromJsonBytes(pbTableMetadata.getTableJson()),
                         // For backward capability. When an older Coordinator sends an
@@ -861,7 +862,10 @@ public class ServerRpcMessageUtils {
             bucketMetadata.add(toBucketMetadata(pbBucketMetadata));
         }
 
-        return new TableMetadata(tableInfo, bucketMetadata);
+        return new TableMetadata(
+                tableInfo,
+                bucketMetadata,
+                pbTableMetadata.hasDeleted() && pbTableMetadata.isDeleted());
     }
 
     private static BucketMetadata toBucketMetadata(PbBucketMetadata pbBucketMetadata) {
@@ -1842,6 +1846,9 @@ public class ServerRpcMessageUtils {
             if (bucketResult.failed()) {
                 lookupRespForBucket.setError(
                         bucketResult.getErrorCode(), bucketResult.getErrorMessage());
+                if (bucketResult.positionBound() != null) {
+                    lookupRespForBucket.setPositionBound(bucketResult.positionBound());
+                }
             } else {
                 List<ByteArraySlice> values = bucketResult.lookupValues();
                 for (ByteArraySlice value : values) {
@@ -1877,6 +1884,9 @@ public class ServerRpcMessageUtils {
             PrefixLookupResultForBucket bucketResult = entry.getValue();
             if (bucketResult.failed()) {
                 respForBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
+                if (bucketResult.positionBound() != null) {
+                    respForBucket.setPositionBound(bucketResult.positionBound());
+                }
             } else {
                 List<PbValueList> keyResultList = new ArrayList<>();
                 for (List<ByteArraySlice> res : bucketResult.prefixLookupValues()) {

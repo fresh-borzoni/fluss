@@ -34,6 +34,10 @@
     <!-- TODO: Secondary indexes and ordered keys together grow Replica past the limit; split its
          KV read paths out before both land. -->
     <suppress files="[\\/]Replica\.java$" checks="FileLength"/>
+    <!-- TODO: Secondary indexes, paged prefix lookups and positioned (MVCC) lookups together grow
+         ReplicaManager and its test past the limit; split the lookup paths out before they land. -->
+    <suppress files="[\\/]ReplicaManager\.java$" checks="FileLength"/>
+    <suppress files="[\\/]ReplicaManagerTest\.java$" checks="FileLength"/>
 
     <!-- target directory is not relevant for checkstyle -->
     <suppress

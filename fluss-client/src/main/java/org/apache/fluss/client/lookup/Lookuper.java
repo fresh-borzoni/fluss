@@ -18,6 +18,10 @@
 package org.apache.fluss.client.lookup;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.exception.LookupPositionExpiredException;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
+import org.apache.fluss.exception.TableNotVersionedException;
+import org.apache.fluss.metadata.BucketReadPosition;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.utils.Range;
 
@@ -44,7 +48,7 @@ import java.util.concurrent.CompletableFuture;
 public interface Lookuper {
 
     /**
-     * Lookups certain row from the given lookup key.
+     * Looks up the latest state visible when the request executes.
      *
      * <p>The lookup key must be a primary key if the lookuper is a Primary Key Lookuper (created by
      * {@code table.newLookup().createLookuper()}), or be the prefix key if the lookuper is a Prefix
@@ -88,5 +92,30 @@ public interface Lookuper {
      */
     default CompletableFuture<LookupResult> lookupFirst(InternalRow lookupKey, int limit) {
         throw new UnsupportedOperationException("This lookuper does not support limits.");
+    }
+
+    /**
+     * Looks up a primary key or prefix in a versioned table at the supplied bucket position.
+     *
+     * <p>The key must route to the physical bucket identified by the position. The result in the
+     * lookuper's target schema reflects the committed changes with log offsets strictly below the
+     * position's next offset. A key or prefix with no match returns an empty result.
+     *
+     * <p>The future fails with {@link TableNotVersionedException} for a table created without
+     * version history, {@link LookupPositionExpiredException} below the retained floor, or {@link
+     * LookupPositionNotYetReadableException} above the committed and applied end. The client
+     * propagates position errors without automatically retrying. This overload is unavailable when
+     * the lookuper is configured to insert missing rows.
+     *
+     * @param lookupKey the primary key or prefix used by this lookuper
+     * @param position the exclusive log position in the bucket to which the key routes
+     * @return the future containing the lookup result at the supplied position
+     */
+    default CompletableFuture<LookupResult> lookup(
+            InternalRow lookupKey, BucketReadPosition position) {
+        CompletableFuture<LookupResult> failed = new CompletableFuture<>();
+        failed.completeExceptionally(
+                new UnsupportedOperationException("Positioned lookup is unavailable."));
+        return failed;
     }
 }

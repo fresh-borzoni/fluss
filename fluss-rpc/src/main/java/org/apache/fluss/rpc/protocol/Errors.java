@@ -65,6 +65,8 @@ import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.LookupLimitExceededException;
+import org.apache.fluss.exception.LookupPositionExpiredException;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.exception.NoRebalanceInProgressException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
@@ -92,6 +94,7 @@ import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.exception.TableNotVersionedException;
 import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.exception.TooManyPartitionsException;
@@ -327,7 +330,15 @@ public enum Errors {
             "The request contains an invalid combination or value of parameters.",
             InvalidRequestException::new),
     LOOKUP_LIMIT_EXCEEDED(
-            82, "The lookup candidate limit was exceeded.", LookupLimitExceededException::new);
+            82, "The lookup candidate limit was exceeded.", LookupLimitExceededException::new),
+    LOOKUP_POSITION_EXPIRED(
+            83, "The lookup position has expired.", LookupPositionExpiredException.class),
+    LOOKUP_POSITION_NOT_YET_READABLE(
+            84,
+            "The lookup position is not yet readable.",
+            LookupPositionNotYetReadableException.class),
+    TABLE_NOT_VERSIONED(
+            85, "The table was created without version history.", TableNotVersionedException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 
@@ -341,8 +352,8 @@ public enum Errors {
                         "Code " + error.code() + " for error " + error + " has already been used");
             }
 
-            if (error.exception != null) {
-                CLASS_TO_ERROR.put(error.exception.getClass(), error);
+            if (error.exceptionType != null) {
+                CLASS_TO_ERROR.put(error.exceptionType, error);
             }
         }
     }
@@ -350,11 +361,27 @@ public enum Errors {
     private final int code;
     private final Function<String, ApiException> builder;
     private final ApiException exception;
+    private final @Nullable Class<? extends ApiException> exceptionType;
 
     Errors(int code, String defaultExceptionString, Function<String, ApiException> builder) {
+        this(code, defaultExceptionString, builder, null);
+    }
+
+    // Structured errors use the specific type for encoding. A bare error code has no payload.
+    Errors(int code, String defaultExceptionString, Class<? extends ApiException> exceptionType) {
+        this(code, defaultExceptionString, ApiException::new, exceptionType);
+    }
+
+    Errors(
+            int code,
+            String defaultExceptionString,
+            Function<String, ApiException> builder,
+            @Nullable Class<? extends ApiException> exceptionType) {
         this.code = code;
         this.builder = builder;
         this.exception = builder.apply(defaultExceptionString);
+        this.exceptionType =
+                exceptionType == null && exception != null ? exception.getClass() : exceptionType;
     }
 
     /** An instance of the exception. */

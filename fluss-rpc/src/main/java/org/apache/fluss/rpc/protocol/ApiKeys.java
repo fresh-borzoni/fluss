@@ -41,7 +41,8 @@ public enum ApiKeys {
     TABLE_EXISTS(1010, 0, 0, PUBLIC),
     GET_TABLE_SCHEMA(1011, 0, 0, PUBLIC),
     GET_METADATA(1012, 0, 0, PUBLIC),
-    UPDATE_METADATA(1013, 0, 0, PRIVATE),
+    // Version 1: table deletions carry the actual table ID and an explicit deletion flag.
+    UPDATE_METADATA(1013, 0, 1, PRIVATE),
     // Version 1: Supports original_partition_name in requests and responses for historical writes.
     PRODUCE_LOG(1014, 0, 1, PUBLIC),
     FETCH_LOG(1015, 0, 0, PUBLIC),
@@ -60,7 +61,8 @@ public enum ApiKeys {
     // Version 1: Uses CompactedKeyEncoder for primary key encoding when bucket key differs from
     //            primary key, enabling prefix lookup support.
     // Version 2: Supports ordered primary keys.
-    LOOKUP(1017, 0, 2, PUBLIC),
+    // Version 3: Supports positioned bucket history lookups.
+    LOOKUP(1017, 0, 3, PUBLIC),
 
     NOTIFY_LEADER_AND_ISR(1018, 0, 0, PRIVATE),
     STOP_REPLICA(1019, 0, 0, PRIVATE),
@@ -86,7 +88,8 @@ public enum ApiKeys {
     // Version 2: Supports per-prefix candidate limits and failure on overflow.
     // Version 3: Supports ordered primary-key prefixes and per-lookup range bounds and direction.
     // Version 4: Supports per-lookup limits.
-    PREFIX_LOOKUP(1034, 0, 4, PUBLIC),
+    // Version 5: Supports positioned bucket history lookups.
+    PREFIX_LOOKUP(1034, 0, 5, PUBLIC),
 
     GET_DATABASE_INFO(1035, 0, 0, PUBLIC),
     CREATE_PARTITION(1036, 0, 0, PUBLIC),
@@ -138,7 +141,8 @@ public enum ApiKeys {
     DELETE_CONSUMER_GROUPS(1073, 0, 0, PUBLIC),
     CREATE_TABLE_FROM_LAKE(1074, 0, 0, PUBLIC),
     DESCRIBE_CLUSTER(1075, 0, 0, PUBLIC),
-    PUT_INDEX(1076, 0, 0, PRIVATE);
+    PUT_INDEX(1076, 0, 0, PRIVATE),
+    GET_BUCKET_READ_RANGE(1077, 0, 0, PUBLIC);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =
             Arrays.stream(ApiKeys.values())

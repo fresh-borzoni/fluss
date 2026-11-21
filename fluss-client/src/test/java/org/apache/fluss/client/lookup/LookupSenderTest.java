@@ -28,10 +28,12 @@ import org.apache.fluss.exception.HistoricalPartitionThrottledException;
 import org.apache.fluss.exception.InvalidBucketRoutingException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.LookupLimitExceededException;
+import org.apache.fluss.exception.LookupPositionNotYetReadableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TimeoutException;
+import org.apache.fluss.metadata.BucketReadPosition;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -1114,6 +1116,45 @@ public class LookupSenderTest {
     }
 
     @Test
+    void testPositionedRequestsKeepTheirOwnOffsetAndDoNotRetryFuturePositions() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        gateway.setLookupHandler(
+                request -> {
+                    requests.incrementAndGet();
+                    if (request.hasNextOffset() && request.getNextOffset() == 10L) {
+                        return createSuccessResponse(request, bytes("earlier"));
+                    }
+                    assertThat(request.getNextOffset()).isEqualTo(12L);
+                    return createFailedResponse(
+                                    request,
+                                    new LookupPositionNotYetReadableException(
+                                            BucketReadPosition.of(TABLE_BUCKET, 11L)))
+                            .thenApply(
+                                    response -> {
+                                        response.getBucketsRespAt(0).setPositionBound(11L);
+                                        return response;
+                                    });
+                });
+
+        LookupQuery earlier = new LookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("key"));
+        earlier.setNextOffset(10L);
+        LookupQuery future = new LookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("key"));
+        future.setNextOffset(12L);
+        lookupSender.sendLookups(1, LookupType.LOOKUP, Arrays.asList(earlier, future));
+
+        assertThat(earlier.future().get(5, TimeUnit.SECONDS)).isEqualTo(bytes("earlier"));
+        assertThatThrownBy(() -> future.future().get(5, TimeUnit.SECONDS))
+                .cause()
+                .isInstanceOfSatisfying(
+                        LookupPositionNotYetReadableException.class,
+                        error ->
+                                assertThat(error.getLatestPosition())
+                                        .isEqualTo(BucketReadPosition.of(TABLE_BUCKET, 11L)));
+        assertThat(requests).hasValue(2);
+        assertThat(future.retries()).isZero();
+    }
+
+    @Test
     void testInvalidBucketRoutingFailsWithoutRetryAndInvalidatesMetadata() {
         AtomicInteger attemptCount = new AtomicInteger();
         gateway.setLookupHandler(
@@ -1306,6 +1347,58 @@ public class LookupSenderTest {
 
         assertThat(receivedRequests).hasSize(1);
         assertThat(receivedRequests.get(0).getBucketsReqAt(0).hasRoutingBucketCount()).isFalse();
+    }
+
+    @Test
+    void testPositionedPrefixLookupsKeepTheirOffsetAndLimitPolicy() throws Exception {
+        List<PrefixLookupRequest> requests = new ArrayList<>();
+        gateway.setPrefixLookupHandler(
+                request -> {
+                    requests.add(request);
+                    return createSuccessPrefixLookupResponse(request);
+                });
+        PrefixLookupQuery latest =
+                new PrefixLookupQuery(
+                        DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("latest"), 0, 2, true);
+        PrefixLookupQuery positioned =
+                new PrefixLookupQuery(
+                        DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("positioned"), 0, 2, true);
+        positioned.setNextOffset(7L);
+        PrefixLookupQuery positionedUnlimited =
+                new PrefixLookupQuery(DATA1_TABLE_PATH_PK, TABLE_BUCKET, bytes("unlimited"));
+        positionedUnlimited.setNextOffset(7L);
+        lookupSender.sendLookups(
+                1,
+                LookupType.PREFIX_LOOKUP,
+                Arrays.asList(latest, positioned, positionedUnlimited));
+        assertThat(requests).hasSize(3);
+        assertThat(requests)
+                .anySatisfy(
+                        request -> {
+                            assertThat(request.hasNextOffset()).isFalse();
+                            assertThat(request.hasLimit()).isTrue();
+                            assertThat(request.getLimit()).isEqualTo(2);
+                            assertThat(request.isFailOnLimitExceeded()).isTrue();
+                        });
+        assertThat(requests)
+                .anySatisfy(
+                        request -> {
+                            assertThat(request.hasNextOffset()).isTrue();
+                            assertThat(request.getNextOffset()).isEqualTo(7L);
+                            assertThat(request.hasLimit()).isTrue();
+                            assertThat(request.getLimit()).isEqualTo(2);
+                            assertThat(request.isFailOnLimitExceeded()).isTrue();
+                        });
+        assertThat(requests)
+                .anySatisfy(
+                        request -> {
+                            assertThat(request.hasNextOffset()).isTrue();
+                            assertThat(request.getNextOffset()).isEqualTo(7L);
+                            assertThat(request.hasLimit()).isFalse();
+                        });
+        for (PrefixLookupQuery query : Arrays.asList(latest, positioned, positionedUnlimited)) {
+            assertThat(query.future().get(5, TimeUnit.SECONDS)).isEmpty();
+        }
     }
 
     @Test

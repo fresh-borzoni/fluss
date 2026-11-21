@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.client.utils.IndexKeyRange;
 import org.apache.fluss.exception.InvalidBucketRoutingException;
 import org.apache.fluss.exception.PartitionNotExistException;
+import org.apache.fluss.metadata.BucketReadPosition;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
@@ -295,7 +296,25 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
         if (rangeType != null) {
             throw new UnsupportedOperationException("This lookuper requires range bounds.");
         }
-        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null, 0);
+        return lookupAndFilter(prefixKey, null);
+    }
+
+    @Override
+    public CompletableFuture<LookupResult> lookup(
+            InternalRow prefixKey, BucketReadPosition position) {
+        Objects.requireNonNull(position);
+        if (rangeType != null) {
+            CompletableFuture<LookupResult> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new UnsupportedOperationException("This lookuper requires range bounds."));
+            return failed;
+        }
+        return lookupAndFilter(prefixKey, position);
+    }
+
+    private CompletableFuture<LookupResult> lookupAndFilter(
+            InternalRow prefixKey, @Nullable BucketReadPosition position) {
+        CompletableFuture<LookupResult> result = lookupPrefix(prefixKey, null, 0, position);
         if (clientFilterKeyGetters.length == 0) {
             return result;
         }
@@ -325,7 +344,7 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
             throw new UnsupportedOperationException(
                     "Only forward lookups by exactly the prefix support limits.");
         }
-        return lookupPrefix(prefixKey, null, limit);
+        return lookupPrefix(prefixKey, null, limit, null);
     }
 
     private boolean matches(InternalRow row, Object[] expected) {
@@ -353,11 +372,14 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
         for (int i = 0; i < prefixKey.getFieldCount(); i++) {
             checkArgument(!prefixKey.isNullAt(i), "Null equality keys are not supported.");
         }
-        return lookupPrefix(prefixKey, bounds, 0);
+        return lookupPrefix(prefixKey, bounds, 0, null);
     }
 
     private CompletableFuture<LookupResult> lookupPrefix(
-            InternalRow prefixKey, @Nullable Range<? extends InternalRow> bounds, int keyLimit) {
+            InternalRow prefixKey,
+            @Nullable Range<? extends InternalRow> bounds,
+            int keyLimit,
+            @Nullable BucketReadPosition position) {
         byte[] prefixKeyBytes = prefixKeyEncoder.encodeKey(prefixKey);
         byte[] bucketKeyBytes =
                 prefixKeyEncoder == bucketKeyEncoder
@@ -378,6 +400,11 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                 partitionId = routing.getPartitionId();
                 bucketCount = routing.getBucketCount();
             } catch (PartitionNotExistException e) {
+                if (position != null) {
+                    CompletableFuture<LookupResult> failed = new CompletableFuture<>();
+                    failed.completeExceptionally(e);
+                    return failed;
+                }
                 return CompletableFuture.completedFuture(new LookupResult(Collections.emptyList()));
             } catch (InvalidBucketRoutingException e) {
                 CompletableFuture<LookupResult> failed = new CompletableFuture<>();
@@ -391,6 +418,11 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
 
         CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
         TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
+        if (position != null && !position.getTableBucket().equals(tableBucket)) {
+            lookupFuture.completeExceptionally(
+                    new IllegalArgumentException("The position belongs to another bucket."));
+            return lookupFuture;
+        }
         lookupClient
                 .prefixLookup(
                         tableInfo.getTablePath(),
@@ -402,10 +434,13 @@ class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
                         keyRange == null ? null : keyRange.getStartKey(),
                         keyRange == null ? null : keyRange.getEndKey(),
                         direction,
-                        keyLimit)
+                        keyLimit,
+                        position == null ? null : position.getNextOffset())
                 .whenComplete(
                         (result, error) -> {
-                            if (error != null) {
+                            if (error != null && position != null) {
+                                lookupFuture.completeExceptionally(error);
+                            } else if (error != null) {
                                 lookupFuture.completeExceptionally(
                                         new RuntimeException(
                                                 "Failed to perform prefix lookup for table: "

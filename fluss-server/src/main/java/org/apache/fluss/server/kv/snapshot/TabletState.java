@@ -34,6 +34,7 @@ import java.util.List;
 public class TabletState {
 
     private final long flushedLogOffset;
+    private final long historyFloor;
     @Nullable private final Long rowCount;
     @Nullable private final Long allIndexPushedOffset;
     @Nullable private final List<AutoIncIDRange> autoIncIDRanges;
@@ -42,7 +43,7 @@ public class TabletState {
             long flushedLogOffset,
             @Nullable Long rowCount,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
-        this(flushedLogOffset, rowCount, null, autoIncIDRanges);
+        this(flushedLogOffset, rowCount, null, autoIncIDRanges, 0);
     }
 
     public TabletState(
@@ -50,7 +51,27 @@ public class TabletState {
             @Nullable Long rowCount,
             @Nullable Long allIndexPushedOffset,
             @Nullable List<AutoIncIDRange> autoIncIDRanges) {
+        this(flushedLogOffset, rowCount, allIndexPushedOffset, autoIncIDRanges, 0);
+    }
+
+    /** Creates a snapshot state with its proposed version-history floor. */
+    public TabletState(
+            long flushedLogOffset,
+            @Nullable Long rowCount,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            long historyFloor) {
+        this(flushedLogOffset, rowCount, null, autoIncIDRanges, historyFloor);
+    }
+
+    /** Creates a snapshot state with index replication progress and its version-history floor. */
+    public TabletState(
+            long flushedLogOffset,
+            @Nullable Long rowCount,
+            @Nullable Long allIndexPushedOffset,
+            @Nullable List<AutoIncIDRange> autoIncIDRanges,
+            long historyFloor) {
         this.flushedLogOffset = flushedLogOffset;
+        this.historyFloor = historyFloor;
         this.rowCount = rowCount;
         this.allIndexPushedOffset = allIndexPushedOffset;
         this.autoIncIDRanges = autoIncIDRanges;
@@ -69,6 +90,11 @@ public class TabletState {
         return allIndexPushedOffset == null
                 ? flushedLogOffset
                 : Math.min(flushedLogOffset, allIndexPushedOffset);
+    }
+
+    /** Returns the history floor included in the native checkpoint. */
+    public long getHistoryFloor() {
+        return historyFloor;
     }
 
     @Nullable
