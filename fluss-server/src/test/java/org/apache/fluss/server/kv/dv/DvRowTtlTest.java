@@ -35,11 +35,11 @@ import org.apache.fluss.record.KvRecordTestUtils;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.row.encode.KvValueLayout;
+import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.KvTabletTestUtils;
-import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.RowTtlFilterClock;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
@@ -50,15 +50,19 @@ import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.log.LogTestUtils;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
+import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
 import io.github.fluss_contrib.rocksdb.Checkpoint;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.annotation.Nullable;
@@ -71,8 +75,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -81,10 +85,9 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.dict;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.lakeMasks;
 import static org.apache.fluss.server.kv.dv.DerivedDvManagerTest.offsets;
+import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * Deletion vectors of a table with row TTL: the versioned value layout keeps the version offset and
@@ -98,11 +101,16 @@ import static org.mockito.Mockito.when;
  */
 class DvRowTtlTest {
 
+    @RegisterExtension
+    static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =
+            new AllCallbackWrapper<>(new ZooKeeperExtension());
+
     private static final short SCHEMA_ID = 1;
     private static final TablePath TABLE_PATH = TablePath.of("db", "dv_row_ttl");
     private static final long T0 = 1_000_000_000L;
     private static final Duration TTL = Duration.ofHours(1);
     private static final long SNAPSHOT = 100;
+    private static final long NEVER_EXPIRE = KvValueLayout.NEVER_EXPIRE_TIMESTAMP;
 
     @TempDir Path tempDir;
 
@@ -125,9 +133,14 @@ class DvRowTtlTest {
     @Nullable private DerivedDvManager manager;
     @Nullable private DvRocksDB managerDb;
     private final List<DvEntry> handedOver = new ArrayList<>();
+    // whether the test registered the table in ZooKeeper to recover the KV
+    private boolean recovered;
 
     @AfterEach
     void afterEach() throws Exception {
+        if (recovered) {
+            ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupRoot();
+        }
         if (kv != null) {
             processorManager().set(processor(), null);
             kv.close();
@@ -321,24 +334,7 @@ class DvRowTtlTest {
         // a new leader restores its KV from a snapshot that saved no state of the TTL filter
         kv.getDvManager().restoredRowTtlFilter(recoverPoint, null);
         assertSlots(1, 0L, T0);
-        ZooKeeperClient zk = mock(ZooKeeperClient.class);
-        when(zk.getCurrentSchemaId(TABLE_PATH)).thenReturn((int) SCHEMA_ID);
-        when(zk.getSchemaById(TABLE_PATH, SCHEMA_ID))
-                .thenReturn(Optional.of(new SchemaInfo(DATA1_SCHEMA_PK, SCHEMA_ID)));
-        when(zk.getTable(TABLE_PATH)).thenReturn(Optional.of(registration));
-        new KvRecoverHelper(
-                        kv,
-                        log,
-                        recoverPoint,
-                        null,
-                        null,
-                        new KvRecoverHelper.KvRecoverContext(TABLE_PATH, zk, 1024 * 1024),
-                        KvFormat.COMPACTED,
-                        LogFormat.ARROW,
-                        schemaGetter,
-                        mock(RemoteLogFetcher.class),
-                        false)
-                .recover();
+        recover(recoverPoint);
         assertThat(kv.getFlushedLogOffset()).isEqualTo(5L);
         assertSlots(1, 3L, t1);
         assertSlots(2, 1L, T0);
@@ -351,6 +347,93 @@ class DvRowTtlTest {
         clock.advanceTime(Duration.ofDays(1));
         assertThat(filter.getAsLong()).isEqualTo(t1 + TTL.toMillis() - 1);
         assertThat(filter.safe(recoverPoint)).isTrue();
+    }
+
+    /**
+     * Without row TTL the values keep their version offsets in the versioned layout too, and the
+     * TTL timestamp that never expires: through writes, lookups, compactions long past any TTL and
+     * a KV recovery from a checkpoint and the log after it. The KV has no TTL filter to cap.
+     */
+    @Test
+    void testWithoutRowTtlVersionsSurviveRecoveryAndNeverExpire() throws Exception {
+        open(false);
+        assertThat(kv.getKvValueLayout()).isSameAs(KvValueLayout.VERSIONED);
+        assertThat(kv.getDvManager().rowTtlFilterClock()).isNull();
+        processorManager().set(processor(), null);
+        put(upsert(1, "a"), upsert(2, "b"));
+        advanceHighWatermark();
+        KvTabletTestUtils.flushAndWait(kv, log.localLogEndOffset());
+        long recoverPoint = kv.getFlushedLogOffset();
+        assertThat(recoverPoint).isEqualTo(2L);
+        File restored = tempDir.resolve("restored").toFile();
+        assertThat(restored.mkdirs()).isTrue();
+        try (Checkpoint checkpoint = Checkpoint.create(kv.getRocksDBKv().getDb())) {
+            checkpoint.createCheckpoint(new File(restored, "db").getPath());
+        }
+
+        // after the checkpoint, only in the log: key 1 updated (-U at 2, +U at 3), key 3 at 4
+        put(upsert(1, "c"), upsert(3, "d"));
+        assertSlots(1, 3L, NEVER_EXPIRE);
+        advanceHighWatermark();
+        KvTabletTestUtils.flushAndWait(kv, log.localLogEndOffset());
+        assertNeverExpires(1, 3L, "c");
+        assertNeverExpires(2, 1L, "b");
+        assertNeverExpires(3, 4L, "d");
+        kv.close();
+        kv = null;
+
+        kv = createKv(restored, tableInfo.getTableConfig());
+        assertSlots(1, 0L, NEVER_EXPIRE);
+        recover(recoverPoint);
+        assertThat(kv.getFlushedLogOffset()).isEqualTo(5L);
+        assertNeverExpires(1, 3L, "c");
+        assertNeverExpires(2, 1L, "b");
+        assertNeverExpires(3, 4L, "d");
+    }
+
+    /**
+     * Recovers the KV from the log from {@code recoverPoint} on, as a new leader does, with the
+     * table registered in ZooKeeper. The log is all local, so no remote segment is fetched.
+     */
+    private void recover(long recoverPoint) throws Exception {
+        ZooKeeperClient zk =
+                ZOO_KEEPER_EXTENSION_WRAPPER
+                        .getCustomExtension()
+                        .getZooKeeperClient(NOPErrorHandler.INSTANCE);
+        recovered = true;
+        // the schema's node creates the table's
+        zk.registerSchema(TABLE_PATH, DATA1_SCHEMA_PK, SCHEMA_ID);
+        zk.registerTable(TABLE_PATH, registration, false);
+        new KvRecoverHelper(
+                        kv,
+                        log,
+                        recoverPoint,
+                        null,
+                        null,
+                        new KvRecoverHelper.KvRecoverContext(TABLE_PATH, zk, 1024 * 1024),
+                        KvFormat.COMPACTED,
+                        LogFormat.ARROW,
+                        schemaGetter,
+                        null,
+                        false)
+                .recover();
+    }
+
+    /**
+     * The key's value carries its version offset and the TTL timestamp that never expires, and
+     * keeps both after a full compaction a year later. A lookup returns it.
+     */
+    private void assertNeverExpires(int id, long versionOffset, String value) throws Exception {
+        assertSlots(id, versionOffset, NEVER_EXPIRE);
+        clock.advanceTime(Duration.ofDays(365));
+        kv.getRocksDBKv().getDb().compactRange();
+        assertSlots(id, versionOffset, NEVER_EXPIRE);
+        assertThat(kv.multiGet(Collections.singletonList(key(id))).get(0).toByteArray())
+                .isEqualTo(
+                        ValueEncoder.encodeValue(
+                                SCHEMA_ID,
+                                compactedRow(
+                                        DATA1_SCHEMA_PK.getRowType(), new Object[] {id, value})));
     }
 
     /**
@@ -498,15 +581,15 @@ class DvRowTtlTest {
     }
 
     private void open(boolean rowTtl) throws Exception {
-        // the table as the coordinator creates it: the versioned layout with row TTL, the tagged
-        // one without
-        KvValueLayout layout = rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED;
+        // the table as the coordinator creates it: the versioned layout, with row TTL or without
+        KvValueLayout layout = KvValueLayout.VERSIONED;
         TableDescriptor.Builder descriptor =
                 TableDescriptor.builder()
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1, "a")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .property(
                                 ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key(),
                                 String.valueOf(layout.version()));

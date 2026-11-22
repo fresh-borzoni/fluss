@@ -31,10 +31,14 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
@@ -44,9 +48,11 @@ import java.util.function.LongSupplier;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
- * The pinned cuts ({@link DvPinnedCut}) of union reads of a tablet server's buckets. A cut is held
- * from the request that pins it until no request asks for it for {@code
- * kv.deletion-vectors.pinned-cut-idle-timeout}. A bucket's cuts are dropped when its leader closes.
+ * The pinned cuts ({@link DvPinnedCut}) of union reads of a tablet server's buckets. A cut is a
+ * lease: it lives until no request asked for it for {@code
+ * kv.deletion-vectors.pinned-cut-idle-timeout}, and every pin or fetch of it renews it. A sweep
+ * drops idle cuts, so a cut may outlive the timeout by up to the sweep interval. A bucket's cuts
+ * are dropped when its leader closes.
  *
  * <p>Cuts count towards the server's deletion vector memory ({@link DerivedDvHeapBudget}), so the
  * other state makes room sooner, and take at most half of it. Beyond that the least recently used
@@ -54,9 +60,13 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * dropped cut fails as stale: a part that shares its bucket's cut with other parts then derives its
  * masks from the keys, and one that reads its whole bucket pins a new cut.
  *
- * <p>A pin may name the request that took it. A retry of that request gets the same cut without
- * another pin, so a retry never leaves a pin that no read releases. A cut remembers its latest pin
- * requests only, which count towards its memory.
+ * <p>The server does not know when a read ends. Under memory pressure, the cut of a running read
+ * can be dropped while the more recently used cuts of reads that finished stay. Such a read stays
+ * exact, as its parts derive their masks from the keys, only slower.
+ *
+ * <p>A pin may name the request that took it. A retry of that request gets the same cut, also once
+ * the high watermark moved, so it pins no second cut. A cut remembers its latest pin requests only,
+ * which count towards its memory.
  */
 @Internal
 @ThreadSafe
@@ -69,7 +79,8 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
 
     /**
      * The pin requests a cut remembers, the latest ones, so a retry of one gets the cut again: a
-     * retry comes soon after its request, while a cut that stays held may be pinned by many reads.
+     * retry comes soon after its request, while the reads of an unchanged bucket may pin one cut
+     * many times.
      */
     static final int MAX_PIN_REQUESTS_PER_CUT = 1_024;
 
@@ -83,7 +94,7 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     private final long limitBytes;
     private final long idleNanos;
     private final LongSupplier nanoClock;
-    // the server's thread that drops idle cuts; scheduled only while cuts are held
+    // the server's thread that drops idle cuts; scheduled only while there are cuts
     private final ScheduledExecutorService expirer;
 
     // in access order: the least recently used first
@@ -93,6 +104,9 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     // the cut each remembered pin request took, so a retry of it gets that cut again
     @GuardedBy("this")
     private final Map<PinRequest, Entry> pinRequests = new HashMap<>();
+
+    @GuardedBy("this")
+    private final Map<DerivedDvManager, OwnerCuts> cutsByOwner = new HashMap<>();
 
     // the lowest snapshot start offset of each owner's cuts, read without the lock by log retention
     private final Map<DerivedDvManager, Long> minStartOffsets = new ConcurrentHashMap<>();
@@ -123,10 +137,17 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
         this.expirer = expirer;
     }
 
-    /** Returns and refreshes the cut of {@code owner}'s snapshot {@code snapshotId}, or null. */
+    /** Returns and renews the cut of {@code owner}'s snapshot {@code snapshotId}, or null. */
     @Nullable
     synchronized DvPinnedCut get(DerivedDvManager owner, long snapshotId, long cut) {
-        Key key = new Key(owner, snapshotId, cut);
+        Entry entry = renew(new Key(owner, snapshotId, cut));
+        return entry == null ? null : entry.cut;
+    }
+
+    /** Returns and renews the entry of {@code key}; null if there is none or it expired. */
+    @GuardedBy("this")
+    @Nullable
+    private Entry renew(Key key) {
         Entry entry = cuts.get(key);
         if (entry == null) {
             return null;
@@ -138,13 +159,13 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
             return null;
         }
         entry.lastAccessNanos = now;
-        return entry.cut;
+        return entry;
     }
 
     /**
      * Returns the cut of snapshot {@code snapshotId} that pin request {@code pinRequestId} of
-     * {@code owner} took, if it is still held, as a retry of that request gets it; null otherwise.
-     * A request id that took a cut of another snapshot is no retry of a pin of this one.
+     * {@code owner} took, if it is still pinned, as a retry of that request gets it; null
+     * otherwise. A request id that took a cut of another snapshot is no retry of a pin of this one.
      */
     @Nullable
     synchronized DvPinnedCut pinnedBy(DerivedDvManager owner, long pinRequestId, long snapshotId) {
@@ -155,23 +176,21 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     }
 
     /**
-     * Holds the masks of a union read of {@code owner}'s snapshot {@code snapshotId} as a cut. Pins
-     * at the same high watermark share one cut, so a cut held for it already is returned. Each pin
-     * takes {@code holds} holds, which count until they are released ({@link #release}). A pin that
-     * names a request ({@code pinRequestId}) that took a cut already gets that cut, without another
-     * pin.
+     * Pins the masks of a union read of {@code owner}'s snapshot {@code snapshotId} as a cut. Pins
+     * at the same high watermark share one cut, so a cut pinned for it already is renewed and
+     * returned. A pin that names a request ({@code pinRequestId}) that took a cut already gets that
+     * cut, without another pin.
      */
     DvPinnedCut pin(
             DerivedDvManager owner,
             long snapshotId,
             DvSnapshot masks,
             DerivedDvMetrics metrics,
-            @Nullable Long pinRequestId,
-            int holds)
+            @Nullable Long pinRequestId)
             throws IOException {
-        DvPinnedCut held = holdAgain(owner, snapshotId, masks, pinRequestId, holds);
-        if (held != null) {
-            return held;
+        DvPinnedCut pinned = pinnedAlready(owner, snapshotId, masks, pinRequestId);
+        if (pinned != null) {
+            return pinned;
         }
         // outside the lock: it reads the whole log mask
         DvPinnedCut frozen = DvPinnedCut.freeze(snapshotId, masks);
@@ -185,27 +204,22 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
                 return retried;
             }
             Key key = new Key(owner, snapshotId, frozen.logEndOffset());
-            long now = nanoClock.getAsLong();
-            Entry entry = cuts.get(key);
+            Entry entry = renew(key);
             if (entry != null && entry.cut.sameSnapshotAs(masks)) {
-                entry.lastAccessNanos = now;
-                entry.pins += holds;
-                recordPinRequest(entry, pinRequestId);
-                evictBeyondLimit();
-                report();
-                return entry.cut;
+                // another request pinned it meanwhile
+                return pinnedAgain(entry, pinRequestId);
             }
             if (entry != null) {
                 // the snapshot's id names another commit now
                 remove(key, Removal.DROPPED);
             }
-            Entry added = new Entry(key, frozen, metrics, now, holds);
+            Entry added = new Entry(key, frozen, metrics, nanoClock.getAsLong());
             cuts.put(key, added);
+            addToOwner(added);
             bytes += frozen.bytes();
             metrics.pinnedCutAdded(frozen.bytes());
             recordPinRequest(added, pinRequestId);
             evictBeyondLimit();
-            updateMinStartOffset(owner);
             report();
             scheduleSweep();
             return frozen;
@@ -213,31 +227,32 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     }
 
     /**
-     * Counts another pin of the cut held for {@code masks}, if one is, and returns it; returns the
-     * cut a retried request took already without counting a pin; null otherwise.
+     * Returns the cut a retry of {@code pinRequestId} took already, or renews and returns the cut
+     * pinned for {@code masks}; null if there is neither.
      */
     @Nullable
-    private synchronized DvPinnedCut holdAgain(
+    private synchronized DvPinnedCut pinnedAlready(
             DerivedDvManager owner,
             long snapshotId,
             DvSnapshot masks,
-            @Nullable Long pinRequestId,
-            int holds) {
+            @Nullable Long pinRequestId) {
         DvPinnedCut retried = retriedPin(owner, pinRequestId, snapshotId);
         if (retried != null) {
             return retried;
         }
-        DvPinnedCut held = get(owner, snapshotId, masks.getLogEndOffset());
-        if (held == null || !held.sameSnapshotAs(masks)) {
-            return null;
-        }
-        Key key = new Key(owner, snapshotId, masks.getLogEndOffset());
-        Entry entry = cuts.get(key);
-        entry.pins += holds;
+        Entry entry = renew(new Key(owner, snapshotId, masks.getLogEndOffset()));
+        return entry == null || !entry.cut.sameSnapshotAs(masks)
+                ? null
+                : pinnedAgain(entry, pinRequestId);
+    }
+
+    /** Another pin of the renewed cut of {@code entry}. */
+    @GuardedBy("this")
+    private DvPinnedCut pinnedAgain(Entry entry, @Nullable Long pinRequestId) {
         recordPinRequest(entry, pinRequestId);
         evictBeyondLimit();
         report();
-        return held;
+        return entry.cut;
     }
 
     @GuardedBy("this")
@@ -250,7 +265,7 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     /**
      * Remembers that pin request {@code pinRequestId} took the cut of {@code entry}, so a retry of
      * it gets the cut again. The cut remembers its latest {@link #MAX_PIN_REQUESTS_PER_CUT}
-     * requests; a retry of an older one pins the cut again, with holds that its idle timeout ends.
+     * requests; a retry of an older one pins as a new request does.
      */
     @GuardedBy("this")
     private void recordPinRequest(Entry entry, @Nullable Long pinRequestId) {
@@ -290,68 +305,50 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     }
 
     @GuardedBy("this")
-    private void updateMinStartOffset(DerivedDvManager owner) {
-        long min = Long.MAX_VALUE;
-        for (Map.Entry<Key, Entry> e : cuts.entrySet()) {
-            if (e.getKey().owner == owner) {
-                min = Math.min(min, e.getValue().cut.snapshotStartOffset());
-            }
-        }
-        if (min == Long.MAX_VALUE) {
+    private void addToOwner(Entry entry) {
+        DerivedDvManager owner = entry.key.owner;
+        OwnerCuts owned = cutsByOwner.computeIfAbsent(owner, o -> new OwnerCuts());
+        owned.add(entry);
+        minStartOffsets.put(owner, owned.minStartOffset());
+    }
+
+    @GuardedBy("this")
+    private void removeFromOwner(Entry entry) {
+        DerivedDvManager owner = entry.key.owner;
+        OwnerCuts owned = cutsByOwner.get(owner);
+        owned.remove(entry);
+        if (owned.isEmpty()) {
+            cutsByOwner.remove(owner);
             minStartOffsets.remove(owner);
         } else {
-            minStartOffsets.put(owner, min);
+            minStartOffsets.put(owner, owned.minStartOffset());
         }
     }
 
-    /**
-     * Releases {@code holds} holds of {@code owner}'s cut of snapshot {@code snapshotId} at {@code
-     * cut}, as the union read that pinned it, or some of its parts, end, and drops the cut once all
-     * its holds are released. Returns whether the cut was dropped. A cut not held is ignored.
-     */
-    synchronized boolean release(DerivedDvManager owner, long snapshotId, long cut, int holds) {
-        Key key = new Key(owner, snapshotId, cut);
-        Entry entry = cuts.get(key);
-        if (entry == null) {
-            return false;
-        }
-        if ((entry.pins -= holds) > 0) {
-            // a use of the cut: the read's other parts still need it
-            entry.lastAccessNanos = nanoClock.getAsLong();
-            return false;
-        }
-        remove(key, Removal.RELEASED);
+    /** Drops the cut of {@code owner}'s snapshot {@code snapshotId} at {@code cut}, if any. */
+    @VisibleForTesting
+    synchronized void drop(DerivedDvManager owner, long snapshotId, long cut) {
+        remove(new Key(owner, snapshotId, cut), Removal.DROPPED);
         report();
-        return true;
     }
 
-    /** The cuts {@code owner} holds. */
+    /** The cuts pinned for {@code owner}. */
     @VisibleForTesting
     synchronized int count(DerivedDvManager owner) {
-        int n = 0;
-        for (Key key : cuts.keySet()) {
-            if (key.owner == owner) {
-                n++;
-            }
-        }
-        return n;
+        OwnerCuts owned = cutsByOwner.get(owner);
+        return owned == null ? 0 : owned.keys.size();
     }
 
     /** Drops the cuts of {@code owner}, e.g. as its bucket's leader closes. */
     synchronized void dropAll(DerivedDvManager owner) {
-        Iterator<Map.Entry<Key, Entry>> it = cuts.entrySet().iterator();
-        boolean dropped = false;
-        while (it.hasNext()) {
-            Map.Entry<Key, Entry> e = it.next();
-            if (e.getKey().owner == owner) {
-                it.remove();
-                released(e.getKey(), e.getValue(), Removal.DROPPED);
-                dropped = true;
-            }
+        OwnerCuts owned = cutsByOwner.get(owner);
+        if (owned == null) {
+            return;
         }
-        if (dropped) {
-            report();
+        for (Key key : new ArrayList<>(owned.keys)) {
+            remove(key, Removal.DROPPED);
         }
+        report();
     }
 
     /** Drops the cuts no request asked for within the idle timeout. */
@@ -366,7 +363,7 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
                 break; // the rest were used later
             }
             it.remove();
-            released(e.getKey(), e.getValue(), Removal.EXPIRED);
+            removed(e.getKey(), e.getValue(), Removal.EXPIRED);
             expired = true;
         }
         if (expired) {
@@ -380,12 +377,12 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
         return pinRequests.size();
     }
 
-    /** The number of cuts held. */
+    /** The number of pinned cuts. */
     public synchronized int size() {
         return cuts.size();
     }
 
-    /** The estimated heap bytes of the cuts held. */
+    /** The estimated heap bytes of the pinned cuts. */
     public synchronized long bytes() {
         return bytes;
     }
@@ -411,7 +408,7 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
             Map.Entry<Key, Entry> e = it.next();
             Entry entry = e.getValue();
             it.remove();
-            released(e.getKey(), entry, Removal.EVICTED);
+            removed(e.getKey(), entry, Removal.EVICTED);
             evicted++;
             evictedBytes += entry.bytes();
         }
@@ -435,17 +432,17 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     private void remove(Key key, Removal removal) {
         Entry entry = cuts.remove(key);
         if (entry != null) {
-            released(key, entry, removal);
+            removed(key, entry, removal);
         }
     }
 
     @GuardedBy("this")
-    private void released(Key key, Entry entry, Removal removal) {
+    private void removed(Key key, Entry entry, Removal removal) {
         for (long pinRequestId : entry.pinRequestIds) {
             // a request remembered here may have taken a cut of another snapshot since
             pinRequests.remove(new PinRequest(key.owner, pinRequestId), entry);
         }
-        updateMinStartOffset(key.owner);
+        removeFromOwner(entry);
         bytes -= entry.bytes();
         entry.metrics.pinnedCutRemoved(entry.bytes());
         if (removal == Removal.EVICTED) {
@@ -487,9 +484,7 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
     private enum Removal {
         EVICTED,
         EXPIRED,
-        DROPPED,
-        // every pin was released, as the reads that pinned it ended
-        RELEASED
+        DROPPED
     }
 
     /** A bucket leader's cut: compared by the manager's identity, not its state. */
@@ -546,6 +541,35 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
         }
     }
 
+    /**
+     * The cuts of one bucket leader. Dropping them and finding their lowest start offset need no
+     * scan of the server's cuts.
+     */
+    private static final class OwnerCuts {
+        final Set<Key> keys = new HashSet<>();
+        // the number of cuts by their snapshot start offset
+        final TreeMap<Long, Integer> startOffsets = new TreeMap<>();
+
+        void add(Entry entry) {
+            keys.add(entry.key);
+            startOffsets.merge(entry.cut.snapshotStartOffset(), 1, Integer::sum);
+        }
+
+        void remove(Entry entry) {
+            keys.remove(entry.key);
+            startOffsets.computeIfPresent(
+                    entry.cut.snapshotStartOffset(), (offset, n) -> n == 1 ? null : n - 1);
+        }
+
+        boolean isEmpty() {
+            return keys.isEmpty();
+        }
+
+        long minStartOffset() {
+            return startOffsets.firstKey();
+        }
+    }
+
     private static final class Entry {
         final Key key;
         final DvPinnedCut cut;
@@ -553,16 +577,14 @@ public final class DerivedDvPinnedCuts implements DerivedDvHeapBudget.Owner {
         final ArrayDeque<Long> pinRequestIds = new ArrayDeque<>(1);
         // the pinning bucket's, which all report to the server's metrics
         final DerivedDvMetrics metrics;
+        // the last pin or fetch of the cut, which starts its idle timeout
         long lastAccessNanos;
-        // the holds not released yet; one that is never released keeps the cut until it idles
-        int pins;
 
-        Entry(Key key, DvPinnedCut cut, DerivedDvMetrics metrics, long lastAccessNanos, int pins) {
+        Entry(Key key, DvPinnedCut cut, DerivedDvMetrics metrics, long lastAccessNanos) {
             this.key = key;
             this.cut = cut;
             this.metrics = metrics;
             this.lastAccessNanos = lastAccessNanos;
-            this.pins = pins;
         }
 
         /** The heap of the cut and of the pin requests it remembers. */

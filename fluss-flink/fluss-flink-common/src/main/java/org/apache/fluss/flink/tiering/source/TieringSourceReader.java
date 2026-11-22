@@ -57,6 +57,8 @@ public final class TieringSourceReader<WriteResult>
     private static final Logger LOG = LoggerFactory.getLogger(TieringSourceReader.class);
 
     private final Connection connection;
+    // shared by the reader's split readers, which Flink creates per split
+    private final DeletionVectorPreparers<WriteResult> preparers;
 
     public TieringSourceReader(
             FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
@@ -104,6 +106,27 @@ public final class TieringSourceReader<WriteResult>
             Duration pollTimeout,
             String[] ioTmpDirs,
             Configuration lakeTieringConfig) {
+        this(
+                elementsQueue,
+                context,
+                connection,
+                lakeTieringFactory,
+                pollTimeout,
+                ioTmpDirs,
+                lakeTieringConfig,
+                new DeletionVectorPreparers<>());
+    }
+
+    private TieringSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            Duration pollTimeout,
+            String[] ioTmpDirs,
+            Configuration lakeTieringConfig,
+            DeletionVectorPreparers<WriteResult> preparers) {
         super(
                 elementsQueue,
                 createFetcherManager(
@@ -113,11 +136,13 @@ public final class TieringSourceReader<WriteResult>
                         lakeTieringFactory,
                         pollTimeout,
                         ioTmpDirs,
-                        lakeTieringConfig),
+                        lakeTieringConfig,
+                        preparers),
                 new TableBucketWriteResultEmitter<>(),
                 context.getConfiguration(),
                 context);
         this.connection = connection;
+        this.preparers = preparers;
     }
 
     private static <WriteResult> TieringSourceFetcherManager<WriteResult> createFetcherManager(
@@ -128,7 +153,8 @@ public final class TieringSourceReader<WriteResult>
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout,
             String[] ioTmpDirs,
-            Configuration lakeTieringConfig) {
+            Configuration lakeTieringConfig,
+            DeletionVectorPreparers<WriteResult> preparers) {
         TieringMetrics tieringMetrics = new TieringMetrics(context.metricGroup());
         ClassLoader userClassLoader = context.getUserCodeClassLoader().asClassLoader();
         return new TieringSourceFetcherManager<>(
@@ -141,7 +167,8 @@ public final class TieringSourceReader<WriteResult>
                                 pollTimeout,
                                 tieringMetrics,
                                 ioTmpDirs,
-                                lakeTieringConfig),
+                                lakeTieringConfig,
+                                preparers),
                 context.getConfiguration(),
                 (ignore) -> {});
     }
@@ -197,6 +224,7 @@ public final class TieringSourceReader<WriteResult>
     @Override
     public void close() throws Exception {
         super.close();
+        preparers.close();
         connection.close();
     }
 }

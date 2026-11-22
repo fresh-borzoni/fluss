@@ -19,23 +19,24 @@ package org.apache.fluss.lake.writer;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
+import java.io.IOException;
+
 /**
- * A {@link LakeWriter} that holds what a tiering round writes until the round completes, such as
- * the versions of the keys the round changed, in memory or spilled to local disk. Once the writer
- * holds as much as one round may, the tiering service ends the round of the writer's bucket early,
- * right after a record. The next round tiers the rest of the bucket's log from there.
+ * The log mask of a tiering round does not match the round ({@link
+ * DeletionVectorWriterInitContext#roundMasked()}). The tiering service finds most mismatches as it
+ * reads the round; a lake writer throws it from {@link LakeWriter#complete()} when a key it wrote a
+ * row of came again later in the round, a version the mask missed. The tiering service then reads
+ * the round again from its start and has it written in sort mode; nothing of the first read is
+ * committed.
  *
  * @since 1.1
  */
 @PublicEvolving
-public interface RoundBufferingLakeWriter {
+public class RoundMaskMismatchException extends IOException {
 
-    /**
-     * Returns the number of distinct keys the writer holds for the current round, or an upper bound
-     * of it.
-     */
-    long bufferedKeys();
+    private static final long serialVersionUID = 1L;
 
-    /** Returns an estimate of the bytes the writer holds for the current round. */
-    long bufferedBytes();
+    public RoundMaskMismatchException(String message) {
+        super(message);
+    }
 }

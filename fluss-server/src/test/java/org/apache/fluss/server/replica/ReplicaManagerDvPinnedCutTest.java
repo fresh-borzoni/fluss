@@ -18,25 +18,25 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.exception.StaleSnapshotException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
-import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DvMaskRequest;
 import org.apache.fluss.server.utils.RoaringBitmapUtils;
-import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.utils.ExceptionUtils;
 
 import org.junit.jupiter.api.Test;
 import org.roaringbitmap.longlong.LongIterator;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -46,8 +46,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
+import static org.apache.fluss.server.kv.dv.DvPinnedCut.DEFAULT_LOG_PAGE_BYTES;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.genKvRecordBatch;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -57,6 +59,17 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
     private static final TablePath DV_TABLE_PATH = TablePath.of("test_db_1", "dv_pinned_cut");
     private static final long DV_TABLE_ID = 150099L;
     private static final short PUT_KV_VERSION = 1;
+    // short, so the tests see idle cuts expire, yet far longer than the requests of one read
+    private static final Duration IDLE = Duration.ofSeconds(3);
+    // the timeout and the sweep after it, with room for a slow machine
+    private static final Duration EXPIRY_WAIT = IDLE.multipliedBy(5);
+
+    @Override
+    protected Configuration getServerConf() {
+        Configuration conf = super.getServerConf();
+        conf.set(ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT, IDLE);
+        return conf;
+    }
 
     @Test
     void testPagedRequestsReadThePinnedCut() throws Exception {
@@ -68,13 +81,13 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
         long hw = replicaManager.getReplicaOrException(tb).getLogHighWatermark();
 
         // a pin with the whole log mask in one page
-        GetDvSnapshotResponse all = getDvWhenReady(tb, paged(null, 0L, 1 << 20));
+        GetDvSnapshotResponse all = getDvWhenReady(tb, paged(null, 0L, DEFAULT_LOG_PAGE_BYTES));
         assertThat(all.getLogEndOffset()).isEqualTo(hw);
         assertThat(all.getLogDvToOffset()).isEqualTo(hw);
         Roaring64Bitmap masked = bitmap(all.getLogDvBitmap());
         assertThat(masked.getLongCardinality()).isEqualTo(40L);
 
-        GetDvSnapshotResponse pin = getDvWhenReady(tb, paged(null, null, 1 << 20));
+        GetDvSnapshotResponse pin = getDvWhenReady(tb, paged(null, null, DEFAULT_LOG_PAGE_BYTES));
         assertThat(pin.getLogEndOffset()).isEqualTo(hw);
         assertThat(pin.getSnapshotStartOffset()).isEqualTo(0L);
         assertThat(pin.hasLogDvBitmap()).isFalse();
@@ -109,7 +122,7 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
         assertThat(end.hasLogDvBitmap()).isFalse();
 
         // a pin now is another cut, at the new high watermark
-        GetDvSnapshotResponse second = getDvWhenReady(tb, paged(null, 0L, 1 << 20));
+        GetDvSnapshotResponse second = getDvWhenReady(tb, paged(null, 0L, DEFAULT_LOG_PAGE_BYTES));
         assertThat(second.getLogEndOffset()).isEqualTo(later);
         assertThat(second.getLogDvToOffset()).isEqualTo(later);
         assertThat(bitmap(second.getLogDvBitmap()).getLongCardinality()).isEqualTo(60L);
@@ -120,13 +133,14 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
         TableBucket tb = makeDvLeader(INITIAL_LEADER_EPOCH);
         put(tb, 0, 10, "a");
         put(tb, 0, 10, "b");
-        long cut = getDvWhenReady(tb, paged(null, null, 1 << 20)).getLogEndOffset();
+        long cut = getDvWhenReady(tb, paged(null, null, DEFAULT_LOG_PAGE_BYTES)).getLogEndOffset();
         put(tb, 0, 10, "c");
-        assertThat(getDvWhenReady(tb, paged(cut, 0L, 1 << 20)).getLogEndOffset()).isEqualTo(cut);
+        assertThat(getDvWhenReady(tb, paged(cut, 0L, DEFAULT_LOG_PAGE_BYTES)).getLogEndOffset())
+                .isEqualTo(cut);
 
         // a new leader epoch opens the bucket's state anew, without the cut
         makeKvTableAsLeader(tb, DV_TABLE_PATH, INITIAL_LEADER_EPOCH + 1, false);
-        assertThatThrownBy(() -> getDvWhenReady(tb, paged(cut, 0L, 1 << 20)))
+        assertThatThrownBy(() -> getDvWhenReady(tb, paged(cut, 0L, DEFAULT_LOG_PAGE_BYTES)))
                 .satisfies(
                         e -> {
                             StaleSnapshotException stale =
@@ -137,131 +151,57 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
                         })
                 .hasMessageContaining("cut " + cut);
         // a pin on the new leader works
-        GetDvSnapshotResponse pin = getDvWhenReady(tb, paged(null, 0L, 1 << 20));
+        GetDvSnapshotResponse pin = getDvWhenReady(tb, paged(null, 0L, DEFAULT_LOG_PAGE_BYTES));
         assertThat(pin.getLogEndOffset())
                 .isEqualTo(replicaManager.getReplicaOrException(tb).getLogHighWatermark());
     }
 
-    /** A request that releases a pinned cut drops it, once every pin of it is released. */
+    /**
+     * A cut no request asks for again, as that of a read that ended, was cancelled or lost its
+     * client, is dropped once it idled for the timeout.
+     */
     @Test
-    void testReleaseRequestDropsThePinnedCut() throws Exception {
+    void testCutNoRequestAsksForExpires() throws Exception {
         TableBucket tb = makeDvLeader(INITIAL_LEADER_EPOCH);
         put(tb, 0, 10, "a");
-        long cut = getDvWhenReady(tb, paged(null, null, 1 << 20)).getLogEndOffset();
-        DerivedDvManager dv = replicaManager.getReplicaOrException(tb).getKvTablet().getDvManager();
+        long cut = getDvWhenReady(tb, paged(null, null, DEFAULT_LOG_PAGE_BYTES)).getLogEndOffset();
+        DerivedDvManager dv = dvManager(tb);
         assertThat(dv.pinnedCutCount()).isEqualTo(1);
 
-        GetDvSnapshotRequest request =
-                new GetDvSnapshotRequest()
-                        .setTableId(tb.getTableId())
-                        .setBucketId(tb.getBucket())
-                        .setReadableSnapshotId(-1L)
-                        .setLogEndOffset(cut)
-                        .setReleaseCut(true);
-        DvMaskRequest release = ServerRpcMessageUtils.toDvMaskRequest(request);
-        assertThat(release.releasesCut()).isTrue();
-        GetDvSnapshotResponse released =
-                replicaManager.getDvSnapshot(
-                        tb.getTableId(), tb.getPartitionId(), tb.getBucket(), -1L, release);
-        assertThat(released.hasLogEndOffset()).isFalse();
-        assertThat(released.getLakeDvEntriesCount()).isZero();
-        assertThat(released.hasLogDvBitmap()).isFalse();
-        assertThat(dv.pinnedCutCount()).isZero();
+        waitUntil(() -> dv.pinnedCutCount() == 0, EXPIRY_WAIT, "the idle cut was not dropped");
 
-        // a release must name the cut
-        assertThatThrownBy(
-                        () ->
-                                ServerRpcMessageUtils.toDvMaskRequest(
-                                        new GetDvSnapshotRequest()
-                                                .setTableId(tb.getTableId())
-                                                .setBucketId(tb.getBucket())
-                                                .setReadableSnapshotId(-1L)
-                                                .setReleaseCut(true)))
-                .isInstanceOf(InvalidRequestException.class);
+        // gone for good once the high watermark moved past it
+        put(tb, 10, 20, "b");
+        assertThatThrownBy(() -> getDvWhenReady(tb, paged(cut, 0L, DEFAULT_LOG_PAGE_BYTES)))
+                .satisfies(
+                        e ->
+                                assertThat(
+                                                ExceptionUtils.findThrowable(
+                                                        e, StaleSnapshotException.class))
+                                        .isPresent());
     }
 
     /**
      * A pin request retried after the server took it, e.g. as its response was lost, gets the cut
-     * it pinned without another pin: the one release of the read drops the cut.
+     * it pinned without another pin, also once the high watermark moved.
      */
     @Test
     void testRetriedPinRequestPinsOnce() throws Exception {
         TableBucket tb = makeDvLeader(INITIAL_LEADER_EPOCH);
         put(tb, 0, 10, "a");
-        DvMaskRequest pin =
-                new DvMaskRequest(null, Collections.emptyList(), null, 1 << 20, true, 42L, 1);
-        long cut = getDvWhenReady(tb, pin).getLogEndOffset();
+        long cut = getDvWhenReady(tb, pin(42L)).getLogEndOffset();
         // the retry reaches the server after more writes
         put(tb, 10, 20, "b");
-        assertThat(getDvWhenReady(tb, pin).getLogEndOffset()).isEqualTo(cut);
-        DerivedDvManager dv = replicaManager.getReplicaOrException(tb).getKvTablet().getDvManager();
-        assertThat(dv.pinnedCutCount()).isEqualTo(1);
-
-        replicaManager.getDvSnapshot(
-                tb.getTableId(),
-                tb.getPartitionId(),
-                tb.getBucket(),
-                -1L,
-                DvMaskRequest.release(cut, 1));
-        assertThat(dv.pinnedCutCount()).isZero();
-    }
-
-    /**
-     * A read whose parts each release their own hold pins its cut with one hold per part: the cut
-     * stays until every hold is released, one at a time or several at once.
-     */
-    @Test
-    void testCutPinnedWithSeveralHoldsIsDroppedOnceAllAreReleased() throws Exception {
-        TableBucket tb = makeDvLeader(INITIAL_LEADER_EPOCH);
-        put(tb, 0, 10, "a");
-        DerivedDvManager dv = replicaManager.getReplicaOrException(tb).getKvTablet().getDvManager();
-        long cut =
-                getDvWhenReady(
-                                tb,
-                                new DvMaskRequest(
-                                        null, Collections.emptyList(), null, 1 << 20, true, 7L, 3))
-                        .getLogEndOffset();
-        for (int released = 1; released <= 3; released++) {
-            assertThat(dv.pinnedCutCount()).as("after %s releases", released - 1).isEqualTo(1);
-            replicaManager.getDvSnapshot(
-                    tb.getTableId(),
-                    tb.getPartitionId(),
-                    tb.getBucket(),
-                    -1L,
-                    DvMaskRequest.release(cut, 1));
-        }
-        assertThat(dv.pinnedCutCount()).isZero();
-
-        long again =
-                getDvWhenReady(
-                                tb,
-                                new DvMaskRequest(
-                                        null, Collections.emptyList(), null, 1 << 20, true, 8L, 3))
-                        .getLogEndOffset();
-        replicaManager.getDvSnapshot(
-                tb.getTableId(),
-                tb.getPartitionId(),
-                tb.getBucket(),
-                -1L,
-                DvMaskRequest.release(again, 3));
-        assertThat(dv.pinnedCutCount()).isZero();
-        assertThatThrownBy(
-                        () ->
-                                ServerRpcMessageUtils.toDvMaskRequest(
-                                        new GetDvSnapshotRequest()
-                                                .setTableId(tb.getTableId())
-                                                .setBucketId(tb.getBucket())
-                                                .setReadableSnapshotId(-1L)
-                                                .setHolds(0)))
-                .isInstanceOf(InvalidRequestException.class);
+        assertThat(getDvWhenReady(tb, pin(42L)).getLogEndOffset()).isEqualTo(cut);
+        assertThat(dvManager(tb).pinnedCutCount()).isEqualTo(1);
     }
 
     @Test
     void testInvalidPageRequestsAreRefused() throws Exception {
         TableBucket tb = makeDvLeader(INITIAL_LEADER_EPOCH);
         put(tb, 0, 5, "a");
-        long cut = getDvWhenReady(tb, paged(null, null, 1 << 20)).getLogEndOffset();
-        assertThatThrownBy(() -> getDvWhenReady(tb, paged(cut, cut + 1, 1 << 20)))
+        long cut = getDvWhenReady(tb, paged(null, null, DEFAULT_LOG_PAGE_BYTES)).getLogEndOffset();
+        assertThatThrownBy(() -> getDvWhenReady(tb, paged(cut, cut + 1, DEFAULT_LOG_PAGE_BYTES)))
                 .isInstanceOf(InvalidRequestException.class);
         assertThatThrownBy(() -> paged(cut, 0L, 0)).isInstanceOf(IllegalArgumentException.class);
     }
@@ -271,7 +211,7 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
     private TableBucket makeDvLeader(int leaderEpoch) throws Exception {
         Map<String, String> properties = new HashMap<>();
         properties.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
-        properties.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        properties.put(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true");
         registerTableInZkClient(
                 DV_TABLE_PATH,
                 DATA1_SCHEMA_PK,
@@ -308,7 +248,8 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
         long deadline = System.currentTimeMillis() + 60_000;
         while (true) {
             // built masks are served again for a moment, so they may be of an earlier hw
-            GetDvSnapshotResponse masks = getDvWhenReady(tb, paged(null, 0L, 1 << 20));
+            GetDvSnapshotResponse masks =
+                    getDvWhenReady(tb, paged(null, 0L, DEFAULT_LOG_PAGE_BYTES));
             if (masks.getLogEndOffset() == hw || System.currentTimeMillis() > deadline) {
                 assertThat(masks.getLogEndOffset()).isEqualTo(hw);
                 return masks;
@@ -318,7 +259,17 @@ class ReplicaManagerDvPinnedCutTest extends ReplicaTestBase {
     }
 
     private static DvMaskRequest paged(Long cut, Long logFrom, int maxBytes) {
-        return new DvMaskRequest(cut, Collections.emptyList(), logFrom, maxBytes, true, null, 1);
+        return new DvMaskRequest(cut, Collections.emptyList(), logFrom, maxBytes, true, null);
+    }
+
+    /** A pin of the bucket's cut by request {@code pinRequestId}. */
+    private static DvMaskRequest pin(long pinRequestId) {
+        return new DvMaskRequest(
+                null, Collections.emptyList(), null, DEFAULT_LOG_PAGE_BYTES, true, pinRequestId);
+    }
+
+    private DerivedDvManager dvManager(TableBucket tb) {
+        return replicaManager.getReplicaOrException(tb).getKvTablet().getDvManager();
     }
 
     /** A union read of the empty lake, retried while the bucket replays its log. */

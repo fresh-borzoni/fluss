@@ -245,10 +245,11 @@ public interface TabletServerGateway extends RpcGateway, AdminReadOnlyGateway {
     CompletableFuture<ScanKvResponse> scanKv(ScanKvRequest request);
 
     /**
-     * Gets the deletion vector masks of a union read of a bucket, or the positions of primary keys
-     * in a lake snapshot, from the bucket's leader.
+     * Sends a deletion vector request of a bucket to its leader: one of a union read, which pins a
+     * cut or fetches the masks of a pinned cut, or one of a tiering round, which plans the round's
+     * end or fetches a part of its log mask or of its deletes.
      *
-     * @return the masks, or the positions of the requested keys
+     * @return the masks, the plan of the round's end, or the part
      */
     @RPC(api = ApiKeys.GET_DV_SNAPSHOT)
     CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(GetDvSnapshotRequest request);

@@ -30,6 +30,7 @@ import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.OffsetPosition;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -48,6 +49,7 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -257,6 +259,34 @@ public class RemoteLogManager implements Closeable {
     }
 
     /**
+     * Get the first offset index entry at or above the given offset in the remote log segment, or
+     * null if there is none.
+     */
+    @Nullable
+    public OffsetPosition lookupIndexCeiling(RemoteLogSegment remoteLogSegment, long offset) {
+        return remoteLogIndexCacheForBucket(remoteLogSegment.tableBucket())
+                .lookupIndexCeiling(
+                        remoteLogTablet(remoteLogSegment.tableBucket()).getRemoteLogDir(),
+                        remoteLogSegment,
+                        offset);
+    }
+
+    /**
+     * The remote log segments of the bucket from the given offset on, in offset order, as {@link
+     * #relevantRemoteLogSegments}; none if the remote log is disabled or the bucket is not
+     * registered here.
+     */
+    public List<RemoteLogSegment> remoteLogSegmentsFrom(TableBucket tableBucket, long offset) {
+        if (remoteDisabled()) {
+            return Collections.emptyList();
+        }
+        RemoteLogTablet remoteLog = remoteLogs.get(tableBucket);
+        return remoteLog == null
+                ? Collections.emptyList()
+                : remoteLog.relevantRemoteLogSegments(offset);
+    }
+
+    /**
      * Get the offset of the given timestamp in the remote log segment. If not found, -1L will
      * return.
      */
@@ -295,11 +325,6 @@ public class RemoteLogManager implements Closeable {
      */
     public List<RemoteLogSegment> relevantRemoteLogSegments(TableBucket tableBucket, long offset) {
         return remoteLogTablet(tableBucket).relevantRemoteLogSegments(offset);
-    }
-
-    /** All remote log segments of the bucket, as its manifest lists them; nothing is downloaded. */
-    public List<RemoteLogSegment> allRemoteLogSegments(TableBucket tableBucket) {
-        return remoteLogTablet(tableBucket).allRemoteLogSegments();
     }
 
     /** Returns the maximal physically contiguous remote segment prefix for FetchLog v0. */

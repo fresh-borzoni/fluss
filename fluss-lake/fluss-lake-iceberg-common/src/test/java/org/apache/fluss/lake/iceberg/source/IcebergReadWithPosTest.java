@@ -138,7 +138,8 @@ class IcebergReadWithPosTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.singletonMap("round", "2"),
                     Collections.singletonMap(fileName, new long[] {1L}),
-                    baseSnapshotId);
+                    baseSnapshotId,
+                    Collections.emptyList());
         }
 
         // plan a split at the current snapshot so the FileScanTask carries the deletion vector
@@ -249,7 +250,7 @@ class IcebergReadWithPosTest {
                                         .build())
                         .distributedBy(2, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .customProperty("iceberg.format-version", String.valueOf(formatVersion))
                         .build();
         try (IcebergLakeCatalog catalog = new IcebergLakeCatalog(configuration)) {
@@ -284,7 +285,8 @@ class IcebergReadWithPosTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.singletonMap("round", "5"),
                     deletes,
-                    table.currentSnapshot().snapshotId());
+                    table.currentSnapshot().snapshotId(),
+                    Collections.emptyList());
         }
         table.refresh();
         assertThat(liveDeleteFiles(table)).hasSize(2);
@@ -364,7 +366,7 @@ class IcebergReadWithPosTest {
                         .schema(flussSchema)
                         .distributedBy(BUCKET_NUM, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .build();
         return TableInfo.of(tablePath, 0, 1, descriptor, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
     }
@@ -411,7 +413,7 @@ class IcebergReadWithPosTest {
                         .schema(flussSchema)
                         .distributedBy(BUCKET_NUM, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .build();
         try (IcebergLakeCatalog catalog = new IcebergLakeCatalog(configuration)) {
             catalog.createTable(tablePath, descriptor, new TestingLakeCatalogContext());

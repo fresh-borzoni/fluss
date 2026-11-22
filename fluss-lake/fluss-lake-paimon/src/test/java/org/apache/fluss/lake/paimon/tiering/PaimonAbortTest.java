@@ -109,7 +109,8 @@ class PaimonAbortTest {
                                                 .build())
                                 .distributedBy(1)
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                 .build(),
                         "/remote",
                         System.currentTimeMillis(),

@@ -97,7 +97,7 @@ public final class DerivedDvRebuildLimiter {
         slots.release();
     }
 
-    /** Makes the rebuilds and switches of this server's leaders run {@code testHooks}. */
+    /** Makes the rebuilds, switches and resolves of this server's leaders run {@code testHooks}. */
     @VisibleForTesting
     public void setTestHooks(DvTestHooks testHooks) {
         this.testHooks = testHooks;
@@ -119,6 +119,11 @@ public final class DerivedDvRebuildLimiter {
     /** See {@link DvTestHooks#ignoresRowTtlExpiry}. */
     boolean ignoresRowTtlExpiry() {
         return testHooks.ignoresRowTtlExpiry();
+    }
+
+    /** See {@link DvTestHooks#pausesResolves}. */
+    boolean resolvesPaused() {
+        return testHooks.pausesResolves();
     }
 
     /** Runs {@code rebuild} in the background; it takes a slot when it starts replaying. */

@@ -27,7 +27,6 @@ import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.BucketChange;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.BucketPart;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.ChainEntry;
-import org.apache.fluss.lake.dv.index.PositionIndexStore.KeyConsumer;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.ReindexPlan;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.StagedPartWriter;
 import org.apache.fluss.metadata.TableBucket;
@@ -132,7 +131,6 @@ final class IndexChangeWriter {
         // racer's lower marker never moves it back. It is not cached: another writer may have
         // moved it. Racing writers can still get the same ids; register() refuses the second. The
         // ids also start above every registered id, for changes that add ids allocated elsewhere.
-        layout.checkLayout();
         FsPath dir = layout.path(FILE_IDS_DIR);
         FileSystem fs = dir.getFileSystem();
         List<FileStatus> markers =
@@ -304,8 +302,7 @@ final class IndexChangeWriter {
             long changeId,
             TableBucket bucket,
             BucketPart staged,
-            Map<Integer, Integer> newIds,
-            KeyConsumer keys)
+            Map<Integer, Integer> newIds)
             throws IOException {
         markStarted(changeId);
         if (staged.files.isEmpty()) {
@@ -321,7 +318,7 @@ final class IndexChangeWriter {
                 File in = new File(tmp, "staged-" + f.getFileName());
                 download(new FsPath(source, f.getFileName()), in); // throws if gone
                 File out = new File(tmp, f.getFileName());
-                publishSst(in, out, newIds, keys);
+                publishSst(in, out, newIds);
                 upload(out, new FsPath(target, f.getFileName()));
                 published.add(new RowPosSstIndex.SstFileEntry(f.getFileName(), out.length()));
                 Files.delete(in.toPath());

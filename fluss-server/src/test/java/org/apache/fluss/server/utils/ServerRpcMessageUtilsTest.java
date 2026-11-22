@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.utils;
 
+import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -33,6 +34,7 @@ import org.apache.fluss.rpc.entity.ProduceLogResultForBucket;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
 import org.apache.fluss.rpc.messages.LookupResponse;
 import org.apache.fluss.rpc.messages.PbBucketMetadata;
 import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
@@ -373,6 +375,46 @@ class ServerRpcMessageUtilsTest {
                         .get(0);
         assertThat(decoded).isEqualTo(legacy);
         assertThat(decoded.getBucketEpoch()).isNull();
+    }
+
+    /**
+     * A request for a part of a round's deletes sets no field of a union read, and a part's start
+     * comes with the round's end.
+     */
+    @Test
+    void testDvSnapshotRequestIsOfOneKind() {
+        List<GetDvSnapshotRequest> invalid =
+                Arrays.asList(
+                        dvRequest().setRoundEndOffset(10).setLogEndOffset(10),
+                        dvRequest()
+                                .setRoundEndOffset(10)
+                                .addAllLakeDvFileNames(Collections.singletonList("f1.parquet")),
+                        dvRequest().setRoundEndOffset(10).setLogDvFromOffset(0),
+                        dvRequest().setRoundEndOffset(10).setMaxLogDvBytes(1024),
+                        dvRequest().setRoundEndOffset(10).setWaitForCatchUp(true),
+                        dvRequest().setRoundEndOffset(10).setPinRequestId(1),
+                        dvRequest().setRoundEndOffset(-1),
+                        dvRequest().setRoundEndOffset(10).setRoundFromOffset(11),
+                        dvRequest().setRoundFromOffset(0),
+                        dvRequest().setLogEndOffset(10).setRoundFromOffset(0));
+        for (int i = 0; i < invalid.size(); i++) {
+            GetDvSnapshotRequest request = invalid.get(i);
+            assertThatThrownBy(() -> ServerRpcMessageUtils.checkDvSnapshotRequest(request))
+                    .as("request %d", i)
+                    .isInstanceOf(InvalidRequestException.class);
+        }
+        ServerRpcMessageUtils.checkDvSnapshotRequest(dvRequest());
+        ServerRpcMessageUtils.checkDvSnapshotRequest(
+                dvRequest()
+                        .setLogEndOffset(10)
+                        .addAllLakeDvFileNames(Collections.singletonList("f1.parquet")));
+        ServerRpcMessageUtils.checkDvSnapshotRequest(dvRequest().setRoundEndOffset(10));
+        ServerRpcMessageUtils.checkDvSnapshotRequest(
+                dvRequest().setRoundEndOffset(10).setRoundFromOffset(10));
+    }
+
+    private static GetDvSnapshotRequest dvRequest() {
+        return new GetDvSnapshotRequest().setTableId(1).setBucketId(0).setReadableSnapshotId(5);
     }
 
     private static void assertAuthoritativeWireMetadata(List<PbBucketMetadata> bucketMetadata) {

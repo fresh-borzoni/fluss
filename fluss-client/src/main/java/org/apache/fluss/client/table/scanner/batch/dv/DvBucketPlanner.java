@@ -26,7 +26,6 @@ import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.SupportsRewritePlanning;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,27 +34,21 @@ import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
- * Plans the parts of a bounded union read of a table with deletion vectors. It pins one cut per
- * bucket on the buckets' leaders, so several parts can read a bucket with the same masks: groups of
- * its lake files and its log. Planning fetches no masks.
+ * Plans the parts of a bounded union read of a table with deletion vectors. A bucket with more lake
+ * files than one part reads is read in several parts, groups of its lake files and its log, and
+ * planning pins one cut on its leader so they all read it with the same masks. A bucket read by one
+ * part is not pinned: its part pins its own cut when it starts. Planning fetches no masks.
  *
- * <p>A cut takes one hold per part of its bucket. Each part releases its hold when it is done
- * ({@link #releasePinnedCuts} of that part alone), and the engine releases the holds of the parts
- * left when the read ends. The leader drops the cut once all its holds are released.
+ * <p>The leader keeps a cut while the parts' requests ask for it. A part that starts after the
+ * leader dropped the cut derives the cut's masks from the keys.
  */
 @Internal
 public class DvBucketPlanner {
@@ -73,7 +66,7 @@ public class DvBucketPlanner {
             ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS.defaultValue();
     private boolean waitForCatchUp =
             ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.defaultValue();
-    private boolean pinSplitBucketsOnly = false;
+    private long requestTimeoutMs = ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue().toMillis();
 
     public DvBucketPlanner(DvAdmin admin, TablePath tablePath, LakeSource<LakeSplit> lakeSource) {
         this.admin = admin;
@@ -98,100 +91,68 @@ public class DvBucketPlanner {
         return this;
     }
 
-    /**
-     * Sets whether only the buckets read in several parts are pinned. A bucket read by one part is
-     * left to that part, which pins its own cut when it starts and releases it when it ends. This
-     * suits an engine that may plan a read more often than it runs it, as Spark does, and has no
-     * hook when the read ends to release the cuts of its planning.
-     */
-    public DvBucketPlanner withPinSplitBucketsOnly(boolean pinSplitBucketsOnly) {
-        this.pinSplitBucketsOnly = pinSplitBucketsOnly;
+    /** Sets how long a pin waits for its leader's answer ({@code client.request-timeout}). */
+    public DvBucketPlanner withRequestTimeout(Duration requestTimeout) {
+        this.requestTimeoutMs = requestTimeout.toMillis();
         return this;
     }
 
     /**
-     * Pins a cut of lake snapshot {@code snapshotId} for the buckets of {@code buckets}, parts that
-     * each read a whole bucket ({@link DvBucketPart#ofBucket}), and splits each pinned bucket into
-     * the parts that read it. Returns those parts by bucket. A bucket that could not be pinned is
-     * read by one part, which fetches masks when it starts: its given part, absent from the result,
-     * or, for a bucket with more lake files than one part reads, a part that plans them when it
-     * starts ({@link DvBucketPart#withLakeSplitsPlannedAtStart()}).
-     *
-     * <p>If planning fails, the cuts it pinned are released.
+     * Pins a cut of lake snapshot {@code snapshotId} for each of {@code buckets} (parts that each
+     * read a whole bucket, {@link DvBucketPart#ofBucket}) with more lake files than one part reads,
+     * and splits the bucket into the parts that read it. Returns those parts by bucket. Any other
+     * bucket is read by its given part, absent from the result, which pins its own cut when it
+     * starts. A bucket whose cut could not be pinned is read by one part too, which carries none of
+     * its lake files and plans them when it starts ({@link
+     * DvBucketPart#withLakeSplitsPlannedAtStart()}).
      *
      * @throws LakeTableRolledBackException if the lake snapshot under {@code snapshotId} is not the
      *     commit the masks were derived for, as after a Paimon rollback that reused the id
      */
     public Map<TableBucket, List<DvBucketPart>> pin(long snapshotId, List<DvBucketPart> buckets)
             throws Exception {
-        List<TableBucket> tableBuckets = new ArrayList<>(buckets.size());
-        Map<TableBucket, Integer> holds = new HashMap<>();
-        Map<TableBucket, Integer> groupCounts = new HashMap<>();
+        List<DvBucketPart> splitBuckets = new ArrayList<>();
+        List<TableBucket> tableBuckets = new ArrayList<>();
         for (DvBucketPart bucket : buckets) {
-            // a bucket of one file group is read by one part
-            int groups = fileGroups(bucket.getLakeSplits()).size();
-            groupCounts.put(bucket.getTableBucket(), groups);
-            if (!pinSplitBucketsOnly || groups > 1) {
+            if (fileGroups(bucket.getLakeSplits()).size() > 1) {
+                splitBuckets.add(bucket);
                 tableBuckets.add(bucket.getTableBucket());
-                // the file groups and the log, at most; a hold the log part does not take is
-                // released once the bucket is split
-                holds.put(bucket.getTableBucket(), groups > 1 ? groups + 1 : 1);
             }
+        }
+        Map<TableBucket, List<DvBucketPart>> parts = new HashMap<>();
+        if (splitBuckets.isEmpty()) {
+            return parts;
         }
         Map<TableBucket, DvCutPinner.PinnedCut> pins =
-                tableBuckets.isEmpty()
-                        ? new HashMap<>()
-                        : new DvCutPinner(admin, tablePath, Thread::sleep, waitForCatchUp)
-                                .pin(snapshotId, tableBuckets, holds);
-        Map<TableBucket, List<DvBucketPart>> parts = new HashMap<>();
+                new DvCutPinner(admin, tablePath, Thread::sleep, waitForCatchUp, requestTimeoutMs)
+                        .pin(snapshotId, tableBuckets);
+        if (!pins.isEmpty()) {
+            checkSnapshotIdentity(snapshotId, pins.values());
+        }
         int partCount = 0;
         int folded = 0;
-        try {
-            if (!pins.isEmpty()) {
-                checkSnapshotIdentity(snapshotId, pins.values());
+        for (DvBucketPart bucket : splitBuckets) {
+            TableBucket tableBucket = bucket.getTableBucket();
+            DvCutPinner.PinnedCut pin = pins.get(tableBucket);
+            if (pin == null) {
+                // one part carrying all lake files of the bucket could exceed what an engine
+                // assigns in one message
+                parts.put(
+                        tableBucket,
+                        Collections.singletonList(bucket.withLakeSplitsPlannedAtStart()));
+                continue;
             }
-            for (DvBucketPart bucket : buckets) {
-                TableBucket tableBucket = bucket.getTableBucket();
-                DvCutPinner.PinnedCut pin = pins.get(tableBucket);
-                if (pin == null) {
-                    if (groupCounts.get(tableBucket) > 1) {
-                        // one part carrying all lake files of the bucket could exceed what an
-                        // engine assigns in one message
-                        parts.put(
-                                tableBucket,
-                                Collections.singletonList(bucket.withLakeSplitsPlannedAtStart()));
-                    }
-                    continue;
-                }
-                List<DvBucketPart> bucketParts = split(bucket, pin);
-                parts.put(tableBucket, bucketParts);
-                int unused = holds.get(tableBucket) - bucketParts.size();
-                if (unused > 0 && !pin.folded) {
-                    releaseHolds(admin, tablePath, bucketParts.get(0), unused);
-                }
-                partCount += bucketParts.size();
-                folded += pin.folded ? 1 : 0;
-            }
-        } catch (Exception | Error e) {
-            // no part reads with the cuts
-            for (Map.Entry<TableBucket, DvCutPinner.PinnedCut> pin : pins.entrySet()) {
-                if (!pin.getValue().folded) {
-                    new DvMaskFetcher(admin, tablePath, Thread::sleep)
-                            .release(
-                                    DvMaskFetcher.releaseRequest(
-                                            pin.getKey(),
-                                            snapshotId,
-                                            pin.getValue().cut,
-                                            holds.get(pin.getKey())));
-                }
-            }
-            throw e;
+            List<DvBucketPart> bucketParts = split(bucket, pin);
+            parts.put(tableBucket, bucketParts);
+            partCount += bucketParts.size();
+            folded += pin.folded ? 1 : 0;
         }
         LOG.info(
-                "Pinned the mask cuts of {} of {} buckets of {} for lake snapshot {} ({} read by"
-                        + " key, their leaders having no masks yet); they are read in {} parts.",
+                "Pinned the mask cuts of {} of {} buckets of {} that are read in several parts,"
+                        + " for lake snapshot {} ({} read by key, their leaders having no masks"
+                        + " yet); they are read in {} parts.",
                 pins.size(),
-                buckets.size(),
+                splitBuckets.size(),
                 tablePath,
                 snapshotId,
                 folded,
@@ -218,86 +179,13 @@ public class DvBucketPlanner {
     }
 
     /**
-     * Releases the holds {@code parts} took of the cuts they were pinned at, one hold per part, in
-     * one release per bucket and cut, as the parts or the read that pinned them end: finished or
-     * cancelled. Best effort, waiting at most {@code timeout}; a cut that is not released is
-     * dropped once no request asks for it within the leader's idle timeout. Parts not pinned at
-     * planning hold none and are skipped.
-     */
-    public static void releasePinnedCuts(
-            DvAdmin admin, TablePath tablePath, Collection<DvBucketPart> parts, Duration timeout) {
-        Map<String, DvBucketPart> cuts = new LinkedHashMap<>();
-        Map<String, Integer> holds = new HashMap<>();
-        for (DvBucketPart part : parts) {
-            // a folded bucket's leader holds no cut
-            if (!part.isPinned()
-                    || part.getMaskLogEndOffset() < 0
-                    || part.getReadMode() == DvBucketPart.ReadMode.FOLDED) {
-                continue;
-            }
-            String cut =
-                    part.getTableBucket()
-                            + "@"
-                            + part.getSnapshotId()
-                            + "/"
-                            + part.getMaskLogEndOffset();
-            cuts.putIfAbsent(cut, part);
-            holds.merge(cut, 1, Integer::sum);
-        }
-        if (cuts.isEmpty()) {
-            return;
-        }
-        List<CompletableFuture<GetDvSnapshotResponse>> sent = new ArrayList<>();
-        for (Map.Entry<String, DvBucketPart> cut : cuts.entrySet()) {
-            sent.add(releaseHolds(admin, tablePath, cut.getValue(), holds.get(cut.getKey())));
-        }
-        try {
-            CompletableFuture.allOf(sent.toArray(new CompletableFuture<?>[0]))
-                    .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-            LOG.info(
-                    "Released {} holds of the mask cuts of {} buckets of {} pinned for the read.",
-                    holds.values().stream().mapToInt(Integer::intValue).sum(),
-                    cuts.size(),
-                    tablePath);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (ExecutionException | TimeoutException e) {
-            LOG.info(
-                    "Could not release all {} mask cuts pinned for a read of {} ({}); the rest are"
-                            + " dropped once they idle.",
-                    cuts.size(),
-                    tablePath,
-                    e.toString());
-        }
-    }
-
-    /**
-     * Releases {@code holds} holds of the cut {@code part} was pinned at, without waiting; best
-     * effort, a failed release is sent once more.
-     */
-    private static CompletableFuture<GetDvSnapshotResponse> releaseHolds(
-            DvAdmin admin, TablePath tablePath, DvBucketPart part, int holds) {
-        return new DvMaskFetcher(admin, tablePath, Thread::sleep)
-                .release(
-                        DvMaskFetcher.releaseRequest(
-                                part.getTableBucket(),
-                                part.getSnapshotId(),
-                                part.getMaskLogEndOffset(),
-                                holds));
-    }
-
-    /**
-     * The parts of a pinned bucket: one, or groups of its lake files and its log. The parts of a
-     * folded bucket all derive their masks of the cut its leader named from the keys, each those of
-     * its lake files and the log from the snapshot's readable offset, so they read one cut.
+     * The parts of a pinned bucket: groups of its lake files and its log. The parts of a folded
+     * bucket all derive their masks of the cut its leader named from the keys, each those of its
+     * lake files and the log from the snapshot's readable offset, so they read one cut.
      */
     private List<DvBucketPart> split(DvBucketPart bucket, DvCutPinner.PinnedCut pin) {
         List<List<LakeSplit>> groups = fileGroups(bucket.getLakeSplits());
         List<DvBucketPart> parts = new ArrayList<>();
-        if (groups.size() <= 1) {
-            parts.add(pinned(bucket, bucket.getLakeSplits(), DvBucketPart.WHOLE_BUCKET, pin));
-            return parts;
-        }
         for (int i = 0; i < groups.size(); i++) {
             parts.add(pinned(bucket, groups.get(i), i, pin));
         }

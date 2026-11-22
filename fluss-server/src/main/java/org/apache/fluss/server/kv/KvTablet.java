@@ -29,6 +29,7 @@ import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.MemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -509,33 +510,25 @@ public final class KvTablet {
                 historicalPartition
                         ? KvValueLayout.TAGGED
                         : KvValueLayout.fromTableConfig(tableConfig);
-        // Deletion vectors keep the log offset of each value's version in the tag, or in the
-        // version offset slot of the versioned layout, which has a slot for row TTL too.
+        // Deletion vectors keep the log offset of each value's version in the version offset slot
+        // of the versioned layout, never in a tag: servers that know only the tagged layout write
+        // a time there.
         boolean deletionVectors = !historicalPartition && tableConfig.isDeletionVectorsEnabled();
-        boolean versionSlot = deletionVectors && kvValueLayout.hasVersionOffsetSlot();
-        boolean versionTags = deletionVectors && !versionSlot;
-        if (versionTags && !kvValueLayout.hasValueTag()) {
+        if (deletionVectors && !kvValueLayout.hasVersionOffsetSlot()) {
             throw new IllegalStateException(
                     String.format(
-                            "Table %s has deletion vectors but its KV value layout %d has no tag"
+                            "Table %s has deletion vectors but its KV value layout %d has no slot"
                                     + " for the offset of a value's version.",
                             tablePath, kvValueLayout.version()));
         }
-        if (versionTags && rowTtl.isPresent()) {
-            throw new IllegalStateException(
-                    String.format(
-                            "Table %s has row TTL and deletion vectors but its KV value layout %d"
-                                    + " has no slot for the TTL timestamp.",
-                            tablePath, kvValueLayout.version()));
-        }
-        // Row TTL stamps each value with its time: in the tag of the tagged layout, which deletion
-        // vectors take for the version offsets, or in the TTL timestamp slot of the versioned
-        // layout.
+        // Row TTL stamps each value with its time: in the tag of the tagged layout, or in the TTL
+        // timestamp slot of the versioned layout. Without row TTL that slot keeps the time that
+        // never expires, and no filter reads it.
         boolean ttlTimestamps =
                 !historicalPartition
                         && (kvValueLayout.hasTtlTimestampSlot()
                                 ? rowTtl.isPresent()
-                                : !versionTags && kvValueLayout.hasValueTag());
+                                : kvValueLayout.hasValueTag());
         @Nullable
         RowTtlTimestampProvider rowTtlTimestampProvider =
                 ttlTimestamps
@@ -622,8 +615,13 @@ public final class KvTablet {
             dvManager.setLogContext(tablePath.getTablePath(), tableBucket);
             if (rowTtlFilterClock != null) {
                 // row TTL removes values without a change in the log, so a replayed insert may
-                // supersede an expired version; the bucket caps the filter's time
-                dvManager.useRowTtl(rowTtl.get(), rowTtlFilterClock);
+                // supersede an expired version; the bucket caps the filter's time. The readable
+                // offset of an Iceberg table only moves forward, that of a Paimon table can move
+                // back below the cap.
+                dvManager.useRowTtl(
+                        rowTtl.get(),
+                        rowTtlFilterClock,
+                        tableConfig.getDataLakeFormat().orElse(null) != DataLakeFormat.ICEBERG);
             }
         }
 
@@ -1706,8 +1704,7 @@ public final class KvTablet {
 
     /**
      * The version offset of the key's value in the pre-write buffer or RocksDB, the log offset of
-     * the change that wrote it, or null if the key has no value. Reads the value's tag, or its
-     * version offset slot in the versioned layout.
+     * the change that wrote it, or null if the key has no value.
      */
     @VisibleForTesting
     @Nullable
@@ -1719,25 +1716,16 @@ public final class KvTablet {
                             kvStateAccessor
                                     .lookupLocal(kvStateAccessor.encodeKey(key, null))
                                     .value();
-                    if (raw == null) {
-                        return null;
-                    }
-                    MemorySegment segment = MemorySegment.wrap(raw);
-                    return kvValueLayout.hasVersionOffsetSlot()
-                            ? kvValueLayout.readVersionOffset(segment, 0)
-                            : kvValueLayout.readValueTag(segment);
+                    return raw == null ? null : decodeVersionOffset(raw);
                 });
     }
 
     /**
      * The version offset a raw value of this KV carries, the log offset of the change that wrote
-     * it: its tag, or its version offset slot in the versioned layout.
+     * it, from the version offset slot of the versioned layout.
      */
     public long decodeVersionOffset(byte[] raw) {
-        MemorySegment segment = MemorySegment.wrap(raw);
-        return kvValueLayout.hasVersionOffsetSlot()
-                ? kvValueLayout.readVersionOffset(segment, 0)
-                : kvValueLayout.readValueTag(segment);
+        return kvValueLayout.readVersionOffset(MemorySegment.wrap(raw), 0);
     }
 
     /** Returns the deletion vector manager of this tablet, or null if they are disabled. */

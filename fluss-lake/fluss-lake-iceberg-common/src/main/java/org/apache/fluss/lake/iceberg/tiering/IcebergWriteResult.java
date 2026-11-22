@@ -17,6 +17,8 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.PreparedDeletionVectors;
+import org.apache.fluss.lake.dv.PreparedDeletionVectorsProvider;
 import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.dv.index.CompactionIndexPartProvider;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
@@ -33,7 +35,10 @@ import java.util.Map;
 
 /** The write result of Iceberg lake writer to pass to committer to commit. */
 public class IcebergWriteResult
-        implements Serializable, StagedIndexPartProvider, CompactionIndexPartProvider {
+        implements Serializable,
+                StagedIndexPartProvider,
+                CompactionIndexPartProvider,
+                PreparedDeletionVectorsProvider {
 
     private static final long serialVersionUID = 1L;
 
@@ -50,6 +55,9 @@ public class IcebergWriteResult
     // the bucket's index part, staged by the writer of a table with deletion vectors
     @Nullable private final StagedIndexPart stagedIndexPart;
 
+    // the deletion vectors the writer prepared for the bucket's round
+    @Nullable private final PreparedDeletionVectorFiles prepared;
+
     public IcebergWriteResult(
             WriteResult writeResult,
             @Nullable Map<Integer, PartitionSpec> specs,
@@ -62,16 +70,43 @@ public class IcebergWriteResult
             @Nullable Map<Integer, PartitionSpec> specs,
             @Nullable RewriteDataFileResult rewriteDataFileResult,
             @Nullable StagedIndexPart stagedIndexPart) {
+        this(writeResult, specs, rewriteDataFileResult, stagedIndexPart, null);
+    }
+
+    IcebergWriteResult(
+            WriteResult writeResult,
+            @Nullable Map<Integer, PartitionSpec> specs,
+            @Nullable RewriteDataFileResult rewriteDataFileResult,
+            @Nullable StagedIndexPart stagedIndexPart,
+            @Nullable PreparedDeletionVectorFiles prepared) {
         this.writeResult = writeResult;
         this.specs = specs;
         this.rewriteDataFileResult = rewriteDataFileResult;
         this.stagedIndexPart = stagedIndexPart;
+        this.prepared = prepared;
+    }
+
+    /** This write result with the deletion vectors its writer prepared. */
+    IcebergWriteResult withPrepared(PreparedDeletionVectorFiles prepared) {
+        return new IcebergWriteResult(
+                writeResult, specs, rewriteDataFileResult, stagedIndexPart, prepared);
     }
 
     @Override
     @Nullable
     public StagedIndexPart stagedIndexPart() {
         return stagedIndexPart;
+    }
+
+    @Override
+    @Nullable
+    public PreparedDeletionVectors preparedDeletionVectors() {
+        return prepared == null ? null : prepared.round;
+    }
+
+    @Nullable
+    PreparedDeletionVectorFiles prepared() {
+        return prepared;
     }
 
     @Override
@@ -110,6 +145,7 @@ public class IcebergWriteResult
                         ? (", rewriteDataFiles=" + rewriteDataFileResult)
                         : "")
                 + (stagedIndexPart != null ? (", stagedIndexPart=" + stagedIndexPart) : "")
+                + (prepared != null ? (", prepared=" + prepared) : "")
                 + '}';
     }
 }

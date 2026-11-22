@@ -55,13 +55,17 @@ final class DvTailLoad extends DvLoad {
         this.replayStart = new DvCheckpointReplay(m);
     }
 
-    /** The tail load the covered snapshot needs, or null if it needs none; an owner step. */
+    /**
+     * The tail load the covered snapshot needs, or null if it needs none, or its row TTL state is
+     * corrupt, as no replay serves masks then ({@link DvRowTtlGuard}); an owner step.
+     */
     @Nullable
     static DvTailLoad ifMissing(DvOwner m, long snapshotId) {
         if (m.closed
                 || m.coveredSnapshotId != snapshotId
                 || m.recoverySource == null
-                || !m.maskState.tailMissing()) {
+                || !m.maskState.tailMissing()
+                || m.rowTtlGuard.corruption(m.snapshotStartOffset) != null) {
             return null; // the union read answers
         }
         return new DvTailLoad(m, m.recoverySource, snapshotId, m.snapshotStartOffset);

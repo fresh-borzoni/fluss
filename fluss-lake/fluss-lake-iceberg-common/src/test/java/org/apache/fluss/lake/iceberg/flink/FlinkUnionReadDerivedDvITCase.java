@@ -76,10 +76,11 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Tests for union reads of tables with deletion vectors ({@code table.deletion-vectors.enabled =
- * true}) on Iceberg v2 (file-scoped position deletes) and v3 (deletion vectors). Rows updated or
- * deleted after they were tiered must not surface, through the union read or in the lake itself.
- * The tiering of these tables is tested in {@link FlinkDerivedDvTieringITCase}.
+ * Tests for union reads of tables with deletion vectors ({@code
+ * table.datalake.deletion-vectors.enabled = true}) on Iceberg v2 (file-scoped position deletes) and
+ * v3 (deletion vectors). Rows updated or deleted after they were tiered must not surface, through
+ * the union read or in the lake itself. The tiering of these tables is tested in {@link
+ * FlinkDerivedDvTieringITCase}.
  */
 class FlinkUnionReadDerivedDvITCase extends FlinkDerivedDvTestBase {
     @ParameterizedTest
@@ -478,7 +479,8 @@ class FlinkUnionReadDerivedDvITCase extends FlinkDerivedDvTestBase {
                                         ConfigOptions.TABLE_DATALAKE_FRESHNESS,
                                         Duration.ofMillis(500))
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                        "true")
                                 .customProperty("iceberg.format-version", "3")
                                 .build());
         // rows large enough that a slow sink backpressures the reader inside the bucket

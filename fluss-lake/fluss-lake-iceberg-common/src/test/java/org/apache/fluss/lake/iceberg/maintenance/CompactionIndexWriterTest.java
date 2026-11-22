@@ -91,7 +91,7 @@ class CompactionIndexWriterTest {
                                         .build())
                         .distributedBy(1, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .build();
         tableInfo =
                 TableInfo.of(

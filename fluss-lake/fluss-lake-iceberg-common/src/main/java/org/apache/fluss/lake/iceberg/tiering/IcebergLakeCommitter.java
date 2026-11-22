@@ -17,6 +17,8 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.LakeBaseChangedException;
 import org.apache.fluss.lake.committer.LakeCommitRejectedException;
@@ -28,7 +30,9 @@ import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
 import org.apache.fluss.lake.iceberg.tiering.writer.IcebergDvFileWriter;
 import org.apache.fluss.lake.iceberg.tiering.writer.IcebergPositionDeleteFileWriter;
+import org.apache.fluss.lake.iceberg.utils.IcebergConversions;
 import org.apache.fluss.lake.iceberg.utils.IcebergSnapshotLineage;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
 import org.apache.iceberg.AppendFiles;
@@ -51,14 +55,14 @@ import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.data.BaseDeleteLoader;
-import org.apache.iceberg.data.DeleteLoader;
+import org.apache.iceberg.deletes.Deletes;
 import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.events.CreateSnapshotEvent;
 import org.apache.iceberg.events.Listener;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
@@ -70,7 +74,10 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -82,8 +89,11 @@ import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.lake.iceberg.tiering.PositionDeletesLoader.positionDeletesOf;
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 import static org.apache.fluss.lake.writer.LakeTieringFactory.FLUSS_LAKE_TIERING_COMMIT_USER;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** Implementation of {@link LakeCommitter} for Iceberg. */
 public class IcebergLakeCommitter
@@ -103,6 +113,10 @@ public class IcebergLakeCommitter
     private final Table icebergTable;
     private final boolean autoExpireSnapshots;
     private final IcebergCommitterState state;
+    // the threads the current deletion vectors of a commit's data files are loaded with, and the
+    // most bytes of them loaded ahead of writing the commit's deletion vectors
+    private final int loadThreads;
+    private final long loadMaxBytes;
     // The table's current snapshot when this committer loaded the table, null if none. The round
     // plans on it, and a commit whose base is not in the lake is fenced on it.
     @Nullable private Long plannedSnapshotId;
@@ -123,20 +137,33 @@ public class IcebergLakeCommitter
                 icebergCatalogProvider,
                 tablePath,
                 false,
-                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS));
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS),
+                new Configuration());
     }
 
     /**
      * Creates the committer of a table. With {@code autoExpireSnapshots}, it expires the table's
      * old snapshots after its commits. It keeps what it learns for the next rounds in {@code
-     * state}.
+     * state}, and loads the current deletion vectors of a commit's data files as the {@code
+     * lake.tiering.deletion-vectors.load-*} options of {@code lakeTieringConfig} say.
      */
     IcebergLakeCommitter(
             IcebergCatalogProvider icebergCatalogProvider,
             TablePath tablePath,
             boolean autoExpireSnapshots,
-            IcebergCommitterState state)
+            IcebergCommitterState state,
+            Configuration lakeTieringConfig)
             throws IOException {
+        this.loadThreads =
+                lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS);
+        checkArgument(
+                loadThreads > 0,
+                "%s must be positive.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS.key());
+        this.loadMaxBytes =
+                lakeTieringConfig
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_MAX_BYTES)
+                        .getBytes();
         this.icebergCatalog = icebergCatalogProvider.get();
         this.icebergTable = getTable(tablePath);
         this.autoExpireSnapshots = autoExpireSnapshots;
@@ -269,14 +296,136 @@ public class IcebergLakeCommitter
      * Commits this round's data files together with the deletes of the base rows they supersede, so
      * every snapshot is consistent at its tiered offsets.
      */
+    /**
+     * Keeps a bucket's prepared deletion vectors if each data file they delete rows in is live in
+     * the base, with the deletion vector they replace as its current one. The round's deletes
+     * depend on the base only through these files: other buckets' files, and this bucket's files
+     * the deletes do not name, may have changed, e.g. by the round's own compaction of other
+     * buckets.
+     */
+    @Override
+    public Set<TableBucket> holdingDeletionVectors(
+            Map<TableBucket, IcebergWriteResult> prepared, long baseSnapshotId) throws IOException {
+        // the caller asks only on a base that Fluss registered
+        icebergTable.refresh();
+        Set<TableBucket> holding =
+                icebergTable.snapshot(baseSnapshotId) == null
+                        ? Collections.emptySet()
+                        : LiveFilesIndex.read(
+                                state.liveFiles,
+                                icebergTable,
+                                baseSnapshotId,
+                                live -> {
+                                    Set<TableBucket> holds = new HashSet<>();
+                                    for (Map.Entry<TableBucket, IcebergWriteResult> e :
+                                            prepared.entrySet()) {
+                                        if (holds(e.getValue(), live)) {
+                                            holds.add(e.getKey());
+                                        }
+                                    }
+                                    return holds;
+                                });
+        int rejected = prepared.size() - holding.size();
+        if (rejected > 0) {
+            LOG.info(
+                    "The prepared deletion vectors of {} buckets of {} do not hold on base snapshot"
+                            + " {}; their rounds' deletes are merged at the committer.",
+                    rejected,
+                    icebergTable.name(),
+                    baseSnapshotId);
+        }
+        return holding;
+    }
+
+    private static boolean holds(IcebergWriteResult writeResult, LiveFilesIndex live) {
+        PreparedDeletionVectorFiles prepared = checkNotNull(writeResult.prepared());
+        for (DeleteFile dv : prepared.deletionVectors) {
+            String dataFile = dv.referencedDataFile();
+            DataFile file = live.file(IcebergConversions.fileName(dataFile));
+            if (file == null || !file.location().equals(dataFile)) {
+                return false;
+            }
+            List<DeleteFile> current = positionDeletesOf(live.deletesOf(dataFile));
+            DeletionVectorId replaced = prepared.replaced.get(dataFile);
+            boolean same =
+                    replaced == null
+                            ? current.isEmpty()
+                            : current.size() == 1 && replaced.isOf(current.get(0));
+            if (!same) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Walks the snapshots from {@code toSnapshotId} back to {@code fromSnapshotId} and reads what
+     * each added and removed: the manifests of the snapshots in between only.
+     */
+    @Override
+    @Nullable
+    public Set<String> changedDataFiles(long fromSnapshotId, long toSnapshotId) {
+        Snapshot to = icebergTable.snapshot(toSnapshotId);
+        if (to == null) {
+            icebergTable.refresh();
+            to = icebergTable.snapshot(toSnapshotId);
+        }
+        List<Snapshot> since =
+                IcebergSnapshotLineage.snapshotsSince(
+                        icebergTable, fromSnapshotId, to, Integer.MAX_VALUE);
+        if (since == null) {
+            return null;
+        }
+        Set<String> changed = new HashSet<>();
+        for (Snapshot s : since) {
+            for (DataFile removed : s.removedDataFiles(icebergTable.io())) {
+                changed.add(IcebergConversions.fileName(removed.location()));
+            }
+            for (DeleteFile delete :
+                    Iterables.concat(
+                            s.addedDeleteFiles(icebergTable.io()),
+                            s.removedDeleteFiles(icebergTable.io()))) {
+                String dataFile = ContentFileUtil.referencedDataFileLocation(delete);
+                if (dataFile == null) {
+                    // e.g. equality deletes, or position deletes of several data files
+                    return null;
+                }
+                changed.add(IcebergConversions.fileName(dataFile));
+            }
+        }
+        return changed;
+    }
+
+    @Override
+    public Set<String> preparedDataFiles(IcebergWriteResult prepared) {
+        Set<String> names = new HashSet<>();
+        for (DeleteFile dv : checkNotNull(prepared.prepared()).deletionVectors) {
+            names.add(IcebergConversions.fileName(dv.referencedDataFile()));
+        }
+        return names;
+    }
+
+    @Override
+    public void discardDeletionVectors(Collection<IcebergWriteResult> prepared) {
+        for (IcebergWriteResult writeResult : prepared) {
+            PreparedDeletionVectorFiles files = writeResult.prepared();
+            if (files != null) {
+                IcebergDeletionVectorPreparer.deleteFiles(icebergTable, files.deletionVectors);
+            }
+        }
+    }
+
     @Override
     public LakeCommitResult commitWithDeletes(
             IcebergCommittable committable,
             Map<String, String> snapshotProperties,
             Map<String, long[]> deletedPositionsByFile,
-            long baseSnapshotId)
+            long baseSnapshotId,
+            Collection<IcebergWriteResult> prepared)
             throws IOException {
         List<DeleteFile> newDvs = new ArrayList<>();
+        // the serialized positions of the deletion vectors the commit writes, by data file
+        Map<String, byte[]> writtenVectors = new HashMap<>();
         boolean commitAttempted = false;
         // the snapshot the commit is fenced on, null for a table without data
         Long fence = plannedSnapshotId;
@@ -321,7 +470,10 @@ public class IcebergLakeCommitter
             List<DeleteFile> superseded = new ArrayList<>();
             List<CharSequence> referenced = new ArrayList<>();
             if (!deletedPositionsByFile.isEmpty()) {
-                if (baseSnapshotId <= 0 || icebergTable.snapshot(baseSnapshotId) == null) {
+                Map<String, DataFile> fileByName = new HashMap<>();
+                Map<String, List<DeleteFile>> existingDvs = new HashMap<>();
+                Set<String> baseFiles = deletedPositionsByFile.keySet();
+                if (!baseExists) {
                     throw new IOException(
                             "Base snapshot "
                                     + baseSnapshotId
@@ -329,47 +481,44 @@ public class IcebergLakeCommitter
                 }
                 // The base's files the deletes reference, with their delete files. The index reads
                 // only the files the snapshots since the last round changed, not the whole base.
-                LiveFilesIndex live =
-                        LiveFilesIndex.of(state.liveFiles, icebergTable, baseSnapshotId);
-                if (!live.hasFiles(deletedPositionsByFile.keySet())) {
-                    // A cached file list may lag behind the base, so plan it again first.
-                    live = LiveFilesIndex.rescan(state.liveFiles, icebergTable, baseSnapshotId);
-                }
-                Map<String, DataFile> fileByBase = new HashMap<>();
-                Map<String, List<DeleteFile>> existingDvs = new HashMap<>();
-                for (String name : deletedPositionsByFile.keySet()) {
-                    DataFile file = live.file(name);
-                    if (file == null) {
-                        // The index of the base holds rows of the base's files only. Committing
-                        // without these deletes would leave the old rows live next to the new.
-                        throw new IOException(
-                                String.format(
-                                        "Cannot commit deletion vectors: the index of base snapshot %d has"
-                                                + " rows in data file %s, which the base does not have; the round is not"
-                                                + " committed.",
-                                        baseSnapshotId, name));
-                    }
-                    fileByBase.put(name, file);
-                    existingDvs.put(file.location(), live.deletesOf(file.location()));
-                }
-                DeleteLoader deleteLoader =
-                        new BaseDeleteLoader(df -> icebergTable.io().newInputFile(df.location()));
-                Function<String, PositionDeleteIndex> loadPrevious =
-                        path -> {
-                            List<DeleteFile> prev = positionDeletesOf(existingDvs.get(path));
-                            return prev.isEmpty()
-                                    ? null
-                                    : deleteLoader.loadPositionDeletes(prev, path);
-                        };
+                LiveFilesIndex.readWithFiles(
+                        state.liveFiles,
+                        icebergTable,
+                        baseSnapshotId,
+                        baseFiles,
+                        live -> {
+                            for (String name : baseFiles) {
+                                DataFile file = live.file(name);
+                                if (file == null) {
+                                    // The index of the base holds rows of the base's files only.
+                                    // Committing without these deletes would leave the old rows
+                                    // live next to the new.
+                                    throw new IOException(
+                                            String.format(
+                                                    "Cannot commit deletion vectors: the index of base snapshot %d has"
+                                                            + " rows in data file %s, which the base does not have; the round is not"
+                                                            + " committed.",
+                                                    baseSnapshotId, name));
+                                }
+                                fileByName.put(name, file);
+                                existingDvs.put(file.location(), live.deletesOf(file.location()));
+                            }
+                            return null;
+                        });
+                Function<String, PositionDeleteIndex> loadPrevious = previousDeletes(existingDvs);
                 // v3 tables get deletion vectors, v2 tables file-scoped position delete files.
                 // Either replaces the data file's previous one, so deletes never pile up.
                 boolean deletionVectors = TableUtil.formatVersion(icebergTable) >= 3;
+                if (deletionVectors && state.deletionVectors.enabled()) {
+                    loadPrevious =
+                            recordingVectors(loadPrevious, deletedPositionsByFile, writtenVectors);
+                }
                 DeleteWriteResult dvResult;
                 if (deletionVectors) {
                     try (IcebergDvFileWriter dvWriter =
                             new IcebergDvFileWriter(icebergTable, 0, loadPrevious)) {
                         for (Map.Entry<String, long[]> e : deletedPositionsByFile.entrySet()) {
-                            DataFile df = fileByBase.get(e.getKey());
+                            DataFile df = fileByName.get(e.getKey());
                             dvWriter.delete(df, e.getValue());
                             referenced.add(df.location());
                         }
@@ -383,7 +532,7 @@ public class IcebergLakeCommitter
                                     loadPrevious,
                                     path -> positionDeletesOf(existingDvs.get(path)))) {
                         for (Map.Entry<String, long[]> e : deletedPositionsByFile.entrySet()) {
-                            DataFile df = fileByBase.get(e.getKey());
+                            DataFile df = fileByName.get(e.getKey());
                             posWriter.delete(df, e.getValue());
                             referenced.add(df.location());
                         }
@@ -393,6 +542,8 @@ public class IcebergLakeCommitter
                 newDvs.addAll(dvResult.deleteFiles());
                 superseded.addAll(dvResult.rewrittenDeleteFiles());
             }
+            int preparedDvs =
+                    addPrepared(rowDelta, prepared, baseSnapshotId, superseded, referenced);
             newDvs.forEach(rowDelta::addDeletes);
             superseded.forEach(rowDelta::removeDeletes);
             List<DeleteFile> dangling = danglingPositionDeletes(baseSnapshotId);
@@ -408,19 +559,28 @@ public class IcebergLakeCommitter
             }
             commitAttempted = true;
             long snapshotId = commit(rowDelta, snapshotProperties);
+            for (DeleteFile dv : newDvs) {
+                byte[] vector = writtenVectors.get(dv.referencedDataFile());
+                // kept only as the deletion vector the commit made current
+                if (vector != null && Long.valueOf(vector.length).equals(dv.contentSizeInBytes())) {
+                    state.deletionVectors.put(dv.referencedDataFile(), dv, vector);
+                }
+            }
             LOG.info(
-                    "Committed snapshot {} on base {}: {} data files, {} deletion vectors"
-                            + " ({} superseded, {} dangling position delete files removed).",
+                    "Committed snapshot {} on base {}: {} data files, {} deletion vectors and {}"
+                            + " prepared by the writers ({} superseded, {} dangling position delete"
+                            + " files removed).",
                     snapshotId,
                     baseSnapshotId,
                     committable.getDataFiles().size(),
                     newDvs.size(),
+                    preparedDvs,
                     superseded.size(),
                     dangling.size());
             protectReadable(snapshotId);
             return LakeCommitResult.unknownReadableSnapshot(snapshotId);
         } catch (LakeCommitRejectedException e) {
-            deleteWrittenDeleteFiles(newDvs);
+            IcebergDeletionVectorPreparer.deleteFiles(icebergTable, newDvs);
             throw e;
         } catch (Exception e) {
             // Like Iceberg's SnapshotProducer with strict cleanup: the delete files written here
@@ -428,7 +588,7 @@ public class IcebergLakeCommitter
             // (CommitStateUnknownException, e.g. a REST 5xx or timeout) the snapshot may be live
             // and reference them.
             if (!commitAttempted || e instanceof CleanableFailure) {
-                deleteWrittenDeleteFiles(newDvs);
+                IcebergDeletionVectorPreparer.deleteFiles(icebergTable, newDvs);
                 String message =
                         "Committing deletion vectors to Iceberg table "
                                 + icebergTable.name()
@@ -453,6 +613,96 @@ public class IcebergLakeCommitter
     }
 
     /**
+     * Adds the prepared deletion vectors to the commit, removing the deletion vectors of the base
+     * they replace, which {@link #holdingDeletionVectors} checked on the same base. Returns how
+     * many it added.
+     */
+    private int addPrepared(
+            RowDelta rowDelta,
+            Collection<IcebergWriteResult> prepared,
+            long baseSnapshotId,
+            List<DeleteFile> superseded,
+            List<CharSequence> referenced)
+            throws IOException {
+        if (prepared.isEmpty()) {
+            return 0;
+        }
+        return LiveFilesIndex.read(
+                state.liveFiles,
+                icebergTable,
+                baseSnapshotId,
+                live -> {
+                    int added = 0;
+                    for (IcebergWriteResult writeResult : prepared) {
+                        PreparedDeletionVectorFiles files = checkNotNull(writeResult.prepared());
+                        for (DeleteFile dv : files.deletionVectors) {
+                            rowDelta.addDeletes(dv);
+                            added++;
+                            // live in the base, as holdingDeletionVectors checked
+                            String dataFile = dv.referencedDataFile();
+                            superseded.addAll(positionDeletesOf(live.deletesOf(dataFile)));
+                            referenced.add(dataFile);
+                        }
+                    }
+                    return added;
+                });
+    }
+
+    /**
+     * Returns the position deletes of a data file by its location, null if it has none: those the
+     * deletion vector cache keeps, and the others loaded within the loader's byte bound ({@link
+     * PositionDeletesLoader#loadAhead}).
+     */
+    private Function<String, PositionDeleteIndex> previousDeletes(
+            Map<String, List<DeleteFile>> deletesByFile) throws IOException {
+        Map<String, PositionDeleteIndex> kept = new HashMap<>();
+        for (Map.Entry<String, List<DeleteFile>> e : deletesByFile.entrySet()) {
+            List<DeleteFile> deletes = positionDeletesOf(e.getValue());
+            PositionDeleteIndex cached =
+                    deletes.isEmpty() ? null : state.deletionVectors.get(e.getKey(), deletes);
+            if (cached != null) {
+                kept.put(e.getKey(), cached);
+            }
+        }
+        return new PositionDeletesLoader(icebergTable, loadThreads, loadMaxBytes)
+                .loadAhead(deletesByFile, kept);
+    }
+
+    /**
+     * Returns {@code loadPrevious}, which also records in {@code vectors} the serialized positions
+     * of each data file's deletion vector the commit writes: its previous positions and the
+     * round's. Records as many as the deletion vector cache keeps.
+     */
+    private Function<String, PositionDeleteIndex> recordingVectors(
+            Function<String, PositionDeleteIndex> loadPrevious,
+            Map<String, long[]> deletedPositionsByFile,
+            Map<String, byte[]> vectors) {
+        long[] recorded = {0};
+        return path -> {
+            PositionDeleteIndex previous = loadPrevious.apply(path);
+            long[] positions = deletedPositionsByFile.get(IcebergConversions.fileName(path));
+            if (positions == null) {
+                return previous;
+            }
+            PositionDeleteIndex written =
+                    Deletes.toPositionIndex(
+                            CloseableIterable.withNoopClose(
+                                    () -> Arrays.stream(positions).iterator()));
+            if (previous != null) {
+                written.merge(previous);
+            }
+            ByteBuffer serialized = written.serialize();
+            if (recorded[0] + serialized.remaining() <= state.deletionVectors.maxBytes()) {
+                byte[] vector = new byte[serialized.remaining()];
+                serialized.get(vector);
+                vectors.put(path, vector);
+                recorded[0] += vector.length;
+            }
+            return previous;
+        };
+    }
+
+    /**
      * Whether the table's current snapshot differs from {@code fence}. For a null {@code fence},
      * whether the table has a snapshot now.
      */
@@ -465,18 +715,6 @@ public class IcebergLakeCommitter
         }
         Snapshot current = icebergTable.currentSnapshot();
         return current == null ? fence != null : !Long.valueOf(current.snapshotId()).equals(fence);
-    }
-
-    private void deleteWrittenDeleteFiles(List<DeleteFile> deleteFiles) {
-        // Deletion vectors of several data files share one Puffin file.
-        List<String> locations =
-                deleteFiles.stream()
-                        .map(ContentFile::location)
-                        .distinct()
-                        .collect(Collectors.toList());
-        if (!locations.isEmpty()) {
-            CatalogUtil.deleteFiles(icebergTable.io(), locations, "delete file", true);
-        }
     }
 
     /**
@@ -498,8 +736,11 @@ public class IcebergLakeCommitter
         }
         Set<String> liveDataFiles =
                 new HashSet<>(
-                        LiveFilesIndex.of(state.liveFiles, icebergTable, baseSnapshotId)
-                                .locations());
+                        LiveFilesIndex.read(
+                                state.liveFiles,
+                                icebergTable,
+                                baseSnapshotId,
+                                LiveFilesIndex::locations));
         List<DeleteFile> dangling = new ArrayList<>();
         for (ManifestFile manifest : base.deleteManifests(icebergTable.io())) {
             try (ManifestReader<DeleteFile> reader =
@@ -540,19 +781,6 @@ public class IcebergLakeCommitter
             s = s.parentId() == null ? null : icebergTable.snapshot(s.parentId());
         }
         return false;
-    }
-
-    /** Returns the position deletes (v2 files or v3 DVs) among a data file's delete files. */
-    private static List<DeleteFile> positionDeletesOf(List<DeleteFile> deletes) {
-        List<DeleteFile> out = new ArrayList<>();
-        if (deletes != null) {
-            for (DeleteFile d : deletes) {
-                if (d.content() == org.apache.iceberg.FileContent.POSITION_DELETES) {
-                    out.add(d);
-                }
-            }
-        }
-        return out;
     }
 
     @Override
@@ -625,11 +853,17 @@ public class IcebergLakeCommitter
      * history.expire.min-snapshots-to-keep} (10 unless the table sets it, as Paimon's {@code
      * snapshot.num-retained.min}). It never expires the snapshots Fluss still needs: the readable
      * ones it tagged, which their tags keep, and {@code keepFromSnapshotId} and those after it,
-     * whatever the clocks of their committers. {@code keepFromSnapshotId} is tagged {@value
-     * #KEEP_FROM_TAG}. Best effort: a failure never fails a commit.
+     * whatever the clocks of their committers.
+     *
+     * <p>Other engines may expire snapshots too, so {@code keepFromSnapshotId} is tagged {@value
+     * #KEEP_FROM_TAG} on every call, also when Fluss does not expire them. Best effort: a failure
+     * never fails a commit.
      */
     @Override
     public void expireSnapshots(@Nullable Long keepFromSnapshotId) {
+        if (keepFromSnapshotId != null) {
+            tagKeepFrom(keepFromSnapshotId);
+        }
         if (!autoExpireSnapshots) {
             return;
         }
@@ -653,7 +887,6 @@ public class IcebergLakeCommitter
             if (keepFromSnapshotId != null) {
                 Snapshot keepFrom = icebergTable.snapshot(keepFromSnapshotId);
                 if (keepFrom != null) {
-                    tagKeepFrom(keepFrom.snapshotId());
                     // Iceberg keeps a branch's history only up to its first snapshot older than
                     // the cut-off, and the clocks of committers differ. So the cut-off is the
                     // oldest timestamp from the current snapshot back to keepFrom.
@@ -684,20 +917,34 @@ public class IcebergLakeCommitter
     /** Tag of the oldest snapshot the index chain needs; expiry keeps tagged snapshots. */
     public static final String KEEP_FROM_TAG = "fluss-keep-from";
 
-    /** Points {@link #KEEP_FROM_TAG} at {@code snapshotId}. */
+    /**
+     * Points {@link #KEEP_FROM_TAG} at {@code snapshotId} if the table still has it. Best effort:
+     * the next round tries again.
+     */
     private void tagKeepFrom(long snapshotId) {
-        org.apache.iceberg.SnapshotRef tag = icebergTable.refs().get(KEEP_FROM_TAG);
-        if (tag != null && tag.snapshotId() == snapshotId) {
-            return;
+        try {
+            icebergTable.refresh();
+            org.apache.iceberg.SnapshotRef tag = icebergTable.refs().get(KEEP_FROM_TAG);
+            if ((tag != null && tag.snapshotId() == snapshotId)
+                    || icebergTable.snapshot(snapshotId) == null) {
+                return;
+            }
+            org.apache.iceberg.ManageSnapshots ms = icebergTable.manageSnapshots();
+            if (tag == null) {
+                ms.createTag(KEEP_FROM_TAG, snapshotId);
+            } else {
+                ms.replaceTag(KEEP_FROM_TAG, snapshotId);
+            }
+            ms.commit();
+            icebergTable.refresh();
+        } catch (Exception e) {
+            LOG.warn(
+                    "Could not tag snapshot {} of {} as {}; the next round tries again.",
+                    snapshotId,
+                    icebergTable.name(),
+                    KEEP_FROM_TAG,
+                    e);
         }
-        org.apache.iceberg.ManageSnapshots ms = icebergTable.manageSnapshots();
-        if (tag == null) {
-            ms.createTag(KEEP_FROM_TAG, snapshotId);
-        } else {
-            ms.replaceTag(KEEP_FROM_TAG, snapshotId);
-        }
-        ms.commit();
-        icebergTable.refresh();
     }
 
     /**

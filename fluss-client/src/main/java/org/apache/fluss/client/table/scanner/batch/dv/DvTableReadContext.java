@@ -40,6 +40,7 @@ import org.apache.fluss.utils.CloseableIterator;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -73,6 +74,8 @@ public class DvTableReadContext implements DvBucketPartReader.Context {
     @Nullable private Map<String, Map<Integer, List<LakeSplit>>> plannedLakeSplits;
     private boolean waitForCatchUp =
             ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.defaultValue();
+    // bounds each request of a part: the RPC layer has none of its own
+    private long requestTimeoutMs = ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue().toMillis();
 
     /**
      * @param projectedFields the fields the read emits, all if null
@@ -103,6 +106,14 @@ public class DvTableReadContext implements DvBucketPartReader.Context {
         return this;
     }
 
+    /**
+     * Sets how long a part waits for the answer to one request ({@code client.request-timeout}).
+     */
+    public DvTableReadContext withRequestTimeout(Duration requestTimeout) {
+        this.requestTimeoutMs = requestTimeout.toMillis();
+        return this;
+    }
+
     @Override
     public boolean waitForCatchUp() {
         return waitForCatchUp;
@@ -115,7 +126,8 @@ public class DvTableReadContext implements DvBucketPartReader.Context {
 
     @Override
     public DvMaskFetcher maskFetcher() {
-        return new DvMaskFetcher(DvAdmin.of(admin.get()), tablePath, Thread::sleep);
+        return new DvMaskFetcher(
+                DvAdmin.of(admin.get()), tablePath, Thread::sleep, requestTimeoutMs);
     }
 
     @Override
@@ -165,7 +177,16 @@ public class DvTableReadContext implements DvBucketPartReader.Context {
 
     @Override
     public LakeSnapshot readableLakeSnapshot() throws Exception {
-        return admin.get().getReadableLakeSnapshot(tablePath).get();
+        Admin admin = this.admin.get();
+        return DvAdmin.of(admin)
+                .await(
+                        admin.getReadableLakeSnapshot(tablePath),
+                        requestTimeoutMs,
+                        () ->
+                                String.format(
+                                        "No answer for the readable lake snapshot of %s within %d"
+                                                + " ms.",
+                                        tablePath, requestTimeoutMs));
     }
 
     @Nullable

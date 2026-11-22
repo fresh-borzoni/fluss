@@ -170,8 +170,8 @@ final class DerivedDvReindexer<WriteResult, Committable> {
         // A new change id per attempt, so two attempts never share files.
         long changeId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
         if (plan.getSplits().isEmpty()) {
-            // Files were only removed: publish at once and run the round again. Its lookups must
-            // not see the removed files.
+            // Files were only removed: publish at once and run the round again. The round's
+            // deletes must not name the removed files.
             publishReindex(
                     tableId,
                     tablePath,

@@ -71,6 +71,7 @@ abstract class AbstractLogFetchCollector<T, R> {
     public R collectFetch(final LogFetchBuffer logFetchBuffer) {
         Map<TableBucket, List<T>> fetched = new HashMap<>();
         Map<TableBucket, Long> consumedUpToOffsets = new HashMap<>();
+        Map<TableBucket, List<long[]>> offsetsWithoutRecords = new HashMap<>();
         int recordsRemaining = maxPollRecords;
 
         try {
@@ -105,11 +106,26 @@ abstract class AbstractLogFetchCollector<T, R> {
 
                     logFetchBuffer.poll();
                 } else {
-                    List<T> records = fetchRecords(nextInLineFetch, recordsRemaining);
                     TableBucket tableBucket = nextInLineFetch.tableBucket;
+                    // A fetch that is not next in line for its bucket, from before a seek or an
+                    // unsubscribe, is drained, and its offsets say nothing of the bucket's
+                    // progress.
+                    Long position = logScannerStatus.getBucketOffset(tableBucket);
+                    boolean inLine =
+                            position != null && nextInLineFetch.nextFetchOffset() == position;
+                    List<T> records = fetchRecords(nextInLineFetch, recordsRemaining);
+                    if (!inLine) {
+                        continue;
+                    }
                     // Always record the advanced next fetch offset for this bucket, even when
                     // the materialized record list is empty.
                     consumedUpToOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
+                    List<long[]> withoutRecords = nextInLineFetch.takeOffsetsWithoutRecords();
+                    if (!withoutRecords.isEmpty()) {
+                        offsetsWithoutRecords
+                                .computeIfAbsent(tableBucket, b -> new ArrayList<>())
+                                .addAll(withoutRecords);
+                    }
                     recordsRemaining -= fetchedRecordCount(nextInLineFetch, records);
                     if (!records.isEmpty()) {
                         List<T> currentRecords = fetched.get(tableBucket);
@@ -143,7 +159,7 @@ abstract class AbstractLogFetchCollector<T, R> {
             throw e;
         }
 
-        return toResult(fetched, consumedUpToOffsets);
+        return toResult(fetched, consumedUpToOffsets, offsetsWithoutRecords);
     }
 
     /** Returns the scanned record count, including records rejected before materialization. */
@@ -306,8 +322,14 @@ abstract class AbstractLogFetchCollector<T, R> {
 
     protected abstract int recordCount(List<T> fetchedRecords);
 
+    /**
+     * The result of a poll: the records and consumed-up-to offsets of the polled buckets, and the
+     * offset ranges [from, to) of the batches without records read of them.
+     */
     protected abstract R toResult(
-            Map<TableBucket, List<T>> fetchedRecords, Map<TableBucket, Long> consumedUpToOffsets);
+            Map<TableBucket, List<T>> fetchedRecords,
+            Map<TableBucket, Long> consumedUpToOffsets,
+            Map<TableBucket, List<long[]>> offsetsWithoutRecords);
 
     /**
      * Release resources held by fetched records on failure. The default implementation is a no-op,

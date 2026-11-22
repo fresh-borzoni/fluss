@@ -248,18 +248,12 @@ public class IcebergLakeSource
             Function<FileScanTask, Integer> bucketOf,
             Function<FileScanTask, List<String>> partitionOf)
             throws IOException {
-        List<Snapshot> since = new ArrayList<>();
-        for (Snapshot s = current; s.snapshotId() != baseSnapshotId; ) {
-            if (since.size() == MAX_REPLAYED_SNAPSHOTS) {
-                return null;
-            }
-            since.add(s);
-            s = s.parentId() == null ? null : table.snapshot(s.parentId());
-            if (s == null) {
-                return null;
-            }
+        List<Snapshot> since =
+                IcebergSnapshotLineage.snapshotsSince(
+                        table, baseSnapshotId, current, MAX_REPLAYED_SNAPSHOTS);
+        if (since == null) {
+            return null;
         }
-        Collections.reverse(since);
         // net changes from the base: a file added and removed in between is in neither
         Map<String, DataFile> added = new LinkedHashMap<>();
         Map<String, DataFile> removed = new LinkedHashMap<>();

@@ -2484,12 +2484,8 @@ class FlussPositionIndexStoreTest {
         Map<Integer, Integer> newIds = new HashMap<>();
         newIds.put(0, 7);
         newIds.put(1, 8);
-        List<String> keys = new ArrayList<>();
         PositionIndexStore.BucketPart part =
-                store.publishStaged(
-                        stagingId, 42, bucket, staged, newIds, k -> keys.add(keyString(k)));
-        // every key, deletes included, in key order
-        assertThat(keys).containsExactly("k1", "k2", "k3", "80 01");
+                store.publishStaged(stagingId, 42, bucket, staged, newIds);
         Map<Integer, String> added = new HashMap<>();
         added.put(7, "a.parquet");
         added.put(8, "b.parquet");
@@ -2512,13 +2508,11 @@ class FlussPositionIndexStoreTest {
         assertThat(deletions(sst)).isEqualTo(1);
 
         // the staged part stays for another attempt of the round, until its staging change goes
-        List<String> again = new ArrayList<>();
-        store.publishStaged(stagingId, 43, bucket, staged, newIds, k -> again.add(keyString(k)));
-        assertThat(again).isEqualTo(keys);
+        assertThat(store.publishStaged(stagingId, 43, bucket, staged, newIds).files)
+                .isEqualTo(part.files);
         store.abortChange(stagingId);
         assertThat(root.resolve("rowPos/" + stagingId)).doesNotExist();
-        assertThatThrownBy(
-                        () -> store.publishStaged(stagingId, 44, bucket, staged, newIds, k -> {}))
+        assertThatThrownBy(() -> store.publishStaged(stagingId, 44, bucket, staged, newIds))
                 .isInstanceOf(IOException.class);
     }
 
@@ -2534,12 +2528,7 @@ class FlussPositionIndexStoreTest {
         assertThatThrownBy(
                         () ->
                                 store.publishStaged(
-                                        stagingId,
-                                        9,
-                                        B0,
-                                        staged,
-                                        Collections.singletonMap(0, 5),
-                                        k -> {}))
+                                        stagingId, 9, B0, staged, Collections.singletonMap(0, 5)))
                 .hasMessageContaining("no new id for file id 3");
     }
 

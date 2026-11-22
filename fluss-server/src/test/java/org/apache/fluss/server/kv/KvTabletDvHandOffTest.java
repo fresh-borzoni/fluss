@@ -126,7 +126,7 @@ class KvTabletDvHandOffTest {
         TestingSchemaGetter schemaGetter =
                 new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, SCHEMA_ID));
         Configuration tableConf = new Configuration();
-        tableConf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        tableConf.set(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true);
         if (rowTtl) {
             // long enough that no value expires during the test
             tableConf.set(ConfigOptions.TABLE_KV_TTL, Duration.ofDays(1));
@@ -158,8 +158,7 @@ class KvTabletDvHandOffTest {
                         DvTestManagers.budget(),
                         DvTestManagers.executors());
         assertThat(kvTablet.isDvEnabled()).isTrue();
-        assertThat(kvTablet.getKvValueLayout())
-                .isEqualTo(rowTtl ? KvValueLayout.VERSIONED : KvValueLayout.TAGGED);
+        assertThat(kvTablet.getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
     }
 
     @AfterEach

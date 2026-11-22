@@ -406,6 +406,7 @@ public class LogFetcher implements Closeable {
         } finally {
             LOG.debug("Removing pending request for node: {}", destination);
             nodesWithPendingFetchRequests.remove(destination);
+            logFetchBuffer.fetchRequestEnded();
         }
     }
 
@@ -509,6 +510,7 @@ public class LogFetcher implements Closeable {
             }
             LOG.debug("Removing pending request for node: {}", destination);
             nodesWithPendingFetchRequests.remove(destination);
+            logFetchBuffer.fetchRequestEnded();
         }
     }
 

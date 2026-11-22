@@ -129,6 +129,8 @@ final class DvPartLakeReader {
                                 DvLakeCalls.readWithPos(reader),
                                 fileMasks,
                                 fileNames,
+                                lakeSplit,
+                                part,
                                 index,
                                 stats);
             }
@@ -190,8 +192,12 @@ final class DvPartLakeReader {
 
         private final CloseableIterator<RowWithPosResult> delegate;
         private final Map<String, Roaring64Bitmap> fileMasks;
+        // a split of one file: its rows need not name it
+        private final boolean singleFile;
         // the only file's mask, for rows that do not name their file
         @Nullable private final Roaring64Bitmap singleFileMask;
+        private final LakeSplit lakeSplit;
+        private final DvBucketPart part;
         private final int index;
         private final ReadStats stats;
         @Nullable private InternalRow nextRow;
@@ -201,14 +207,16 @@ final class DvPartLakeReader {
                 CloseableIterator<RowWithPosResult> delegate,
                 Map<String, Roaring64Bitmap> fileMasks,
                 @Nullable List<String> fileNames,
+                LakeSplit lakeSplit,
+                DvBucketPart part,
                 int index,
                 ReadStats stats) {
             this.delegate = delegate;
             this.fileMasks = fileMasks;
-            this.singleFileMask =
-                    fileNames != null && fileNames.size() == 1
-                            ? fileMasks.get(fileNames.get(0))
-                            : null;
+            this.singleFile = fileNames != null && fileNames.size() == 1;
+            this.singleFileMask = singleFile ? fileMasks.get(fileNames.get(0)) : null;
+            this.lakeSplit = lakeSplit;
+            this.part = part;
             this.index = index;
             this.stats = stats;
         }
@@ -227,7 +235,18 @@ final class DvPartLakeReader {
                 RowWithPosResult result = delegate.next();
                 stats.lakeRowsRead++;
                 String fileName = result.getFileName();
-                Roaring64Bitmap mask = fileName == null ? singleFileMask : fileMasks.get(fileName);
+                Roaring64Bitmap mask;
+                if (fileName != null) {
+                    mask = fileMasks.get(fileName);
+                } else if (singleFile) {
+                    mask = singleFileMask;
+                } else {
+                    throw new IllegalStateException(
+                            String.format(
+                                    "A row of lake split %s of %s does not name its data file,"
+                                            + " by which its masks are keyed.",
+                                    lakeSplit, part.describe()));
+                }
                 if (mask != null && mask.contains(result.getPos())) {
                     stats.lakeRowsMasked++;
                     continue;

@@ -187,7 +187,7 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         Map<String, String> properties = new HashMap<>();
         properties.put(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true");
         properties.put(ConfigOptions.TABLE_DATALAKE_FORMAT.key(), DataLakeFormat.PAIMON.toString());
-        properties.put(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true");
+        properties.put(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true");
         registerTableInZkClient(
                 tablePath, DATA1_SCHEMA_PK, tableId, Collections.emptyList(), properties);
         TableBucket tb = new TableBucket(tableId, 0);

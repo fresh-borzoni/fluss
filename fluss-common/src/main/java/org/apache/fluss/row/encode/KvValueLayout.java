@@ -39,12 +39,16 @@ import static org.apache.fluss.utils.Preconditions.checkState;
  *
  * <p>VERSIONED (version 3): {@code [big-endian long version offset][big-endian long TTL
  * timestamp][little-endian schema id][BinaryRow payload]}. Two fixed slots with fixed meanings, for
- * a table with deletion vectors and row TTL: the version offset is the log offset of the change
- * that wrote the value, and the TTL timestamp is the time row TTL expires the value by, or {@link
- * #NEVER_EXPIRE_TIMESTAMP} for a value that never expires. So row TTL and the version offsets do
- * not share a field, and one read of the value returns both. The TTL timestamp follows the byte
- * order of the tag, so the native TTL compaction filter reads it at its slot as it reads the tag of
- * TAGGED at 0.
+ * every table with deletion vectors: the version offset is the log offset of the change that wrote
+ * the value, and the TTL timestamp is the time row TTL expires the value by, or {@link
+ * #NEVER_EXPIRE_TIMESTAMP} for a value that never expires, as every value of a table without row
+ * TTL. So row TTL and the version offsets do not share a field, and one read of the value returns
+ * both. The TTL timestamp follows the byte order of the tag, so the native TTL compaction filter
+ * reads it at its slot as it reads the tag of TAGGED at 0.
+ *
+ * <p>A table with deletion vectors never takes TAGGED, even without row TTL: servers that know only
+ * PLAIN and TAGGED write a time into the tag, where deletion vectors expect the version offset.
+ * They do not know VERSIONED and refuse such a table instead.
  *
  * <pre>
  *   byte  0                8                16      18
@@ -64,7 +68,8 @@ public final class KvValueLayout {
 
     /**
      * The TTL timestamp of a value row TTL never expires: of a table without row TTL, or of a row
-     * whose TTL time column is null. Adding a TTL to it cannot overflow.
+     * whose TTL time column is null. Adding a TTL to it cannot overflow, and a TTL filter that read
+     * it would keep the value.
      */
     public static final long NEVER_EXPIRE_TIMESTAMP = Long.MAX_VALUE / 2;
 
@@ -119,12 +124,9 @@ public final class KvValueLayout {
         if (tableConfig.getKvValueLayoutVersion().isPresent()) {
             return fromVersion(tableConfig.getKvValueLayoutVersion().get());
         }
-        if (!tableConfig.isDeletionVectorsEnabled()) {
-            return PLAIN;
-        }
-        // Deletion vectors keep the log offset of each value's version in the tag. Row TTL needs a
-        // field of its own then, which only the versioned layout has.
-        return tableConfig.getKvTTL().isPresent() ? VERSIONED : TAGGED;
+        // A table created before the version was persisted has no deletion vectors and is plain.
+        // Deletion vectors take the versioned layout, with or without row TTL.
+        return tableConfig.isDeletionVectorsEnabled() ? VERSIONED : PLAIN;
     }
 
     /** Returns the persisted version of this layout. */

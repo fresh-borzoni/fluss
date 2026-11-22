@@ -67,12 +67,6 @@ final class DvLakeMasks {
         }
     }
 
-    /** The mask of a file, or null; the caller does not change it. */
-    @Nullable
-    Roaring64Bitmap get(int fileId) {
-        return masks.get(fileId);
-    }
-
     /** Removes {@code positions} from the mask of a file; returns how many were in it. */
     long remove(int fileId, Roaring64Bitmap positions) {
         Roaring64Bitmap mask = masks.get(fileId);

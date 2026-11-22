@@ -47,8 +47,10 @@ import static org.apache.fluss.client.tiering.TieringSplit.TIERING_SNAPSHOT_SPLI
  * <ul>
  *   <li><b>Version 0:</b> Initial version.
  *   <li><b>Version 1 (Current):</b> Adds the tiering epoch of the split's round after the round's
- *       timestamp, and the row position split of a re-index. A split of version 0 has no epoch, so
- *       its round's commits are not fenced.
+ *       timestamp, the row position split of a re-index, and after a log split's stopping offset
+ *       whether its leader planned its round, and if so the round's snapshot id and whether the
+ *       caps cut it. A split of version 0 has no epoch, so its round's commits are not fenced, and
+ *       no planned round.
  * </ul>
  */
 public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTieringSplit> {
@@ -132,6 +134,12 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
             out.writeLong(tieringLogSplit.getStartingOffset());
             // write stopping offset
             out.writeLong(tieringLogSplit.getStoppingOffset());
+            // since VERSION_1
+            out.writeBoolean(tieringLogSplit.isPlannedRound());
+            if (tieringLogSplit.isPlannedRound()) {
+                out.writeLong(tieringLogSplit.getRoundSnapshotId());
+                out.writeBoolean(tieringLogSplit.isRoundCapped());
+            }
         }
 
         final byte[] result = out.getCopyOfBuffer();
@@ -219,8 +227,14 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
         } else if (splitKind == TIERING_LOG_SPLIT_FLAG) {
             // deserialize starting offset
             long startingOffset = in.readLong();
-            // deserialize starting offset
+            // deserialize stopping offset
             long stoppingOffset = in.readLong();
+            Long roundSnapshotId = null;
+            boolean roundCapped = false;
+            if (version >= VERSION_1 && in.readBoolean()) {
+                roundSnapshotId = in.readLong();
+                roundCapped = in.readBoolean();
+            }
             tieringSplit =
                     new TieringLogSplit(
                             tablePath,
@@ -231,7 +245,9 @@ public class TieringSplitSerializer implements SimpleVersionedSerializer<FlinkTi
                             numberOfSplits,
                             skipCurrentRound,
                             splitIndex,
-                            tieringRoundTimestamp);
+                            tieringRoundTimestamp,
+                            roundSnapshotId,
+                            roundCapped);
         } else {
             throw new IOException("Unknown split kind " + splitKind);
         }

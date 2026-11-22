@@ -82,7 +82,7 @@ class SpillingKeySortBufferTest {
             assertThat(buffer.spills()).isGreaterThan(SpillingKeySortBuffer.MAX_FAN_IN);
             // the smaller sorted runs are merged, so no merge opens more than the fan-in
             assertThat(buffer.runs()).isLessThan(SpillingKeySortBuffer.MAX_FAN_IN);
-            assertThat(buffer.distinctKeysUpperBound()).isGreaterThanOrEqualTo(expected.size());
+            assertThat(buffer.records()).isGreaterThanOrEqualTo(expected.size());
             assertThat(buffer.spillDir()).exists();
             List<String> expectedEntries = new ArrayList<>();
             for (Map.Entry<String, String> e : expected.entrySet()) {

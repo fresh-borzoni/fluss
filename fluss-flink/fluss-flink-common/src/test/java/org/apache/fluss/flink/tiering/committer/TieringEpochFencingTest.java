@@ -68,6 +68,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -150,7 +151,8 @@ class TieringEpochFencingTest extends TieringTestBase {
                                 .schema(DEFAULT_PK_TABLE_SCHEMA)
                                 .distributedBy(DEFAULT_BUCKET_NUM, "id")
                                 .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                                .property(
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                                 .build());
 
         assertThatThrownBy(
@@ -160,7 +162,7 @@ class TieringEpochFencingTest extends TieringTestBase {
                                                 tableId,
                                                 tablePath,
                                                 roundResults(tableId, tablePath, 10)))
-                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key());
+                .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key());
         assertThat(lakeCommitter.commits).hasValue(0);
         assertThatThrownBy(() -> admin.getLatestLakeSnapshot(tablePath).get())
                 .hasCauseInstanceOf(LakeTableSnapshotNotExistException.class);
@@ -439,7 +441,8 @@ class TieringEpochFencingTest extends TieringTestBase {
                 TestingCommittable committable,
                 Map<String, String> snapshotProperties,
                 Map<String, long[]> deletedPositionsByFile,
-                long baseSnapshotId)
+                long baseSnapshotId,
+                Collection<TestingWriteResult> prepared)
                 throws IOException {
             commitsWithDeletes.incrementAndGet();
             lastDeleteProperties = snapshotProperties;

@@ -18,7 +18,6 @@
 
 package org.apache.fluss.lake.dv.index;
 
-import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.dv.FormatVersions;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
@@ -26,8 +25,6 @@ import org.apache.fluss.lake.dv.index.PositionIndexStore.ChainEntry;
 import org.apache.fluss.metadata.TableBucket;
 
 import javax.annotation.Nullable;
-
-import java.io.IOException;
 
 import static org.apache.fluss.lake.dv.index.IndexFiles.parseInteger;
 import static org.apache.fluss.lake.dv.index.IndexFiles.parseLong;
@@ -75,8 +72,6 @@ final class IndexLayout {
     static final String CHAIN_TRIMMED = ROW_POS_DIR + "/_trimmed";
     static final String TRIMS_DIR = ROW_POS_DIR + "/_trims";
     static final String FILE_IDS_DIR = ROW_POS_DIR + "/_file_ids";
-    // the file-id counter of the layout before write-once files, which this version refuses
-    static final String OLD_NEXT_FILE_ID = ROW_POS_DIR + "/_next_file_id";
     static final String IDENTITIES_DIR = ROW_POS_DIR + "/_identities";
     static final String CKPT_DIR = ROW_POS_DIR + "/_ckpt";
     /** Written first into a change directory: its start time (for removing failed attempts). */
@@ -131,31 +126,6 @@ final class IndexLayout {
 
     IndexLayout(FsPath lakeTableDir) {
         this.lakeTableDir = lakeTableDir;
-    }
-
-    /**
-     * Throws if the table's {@code rowPos/} was written by an older build of this store, whose
-     * layout this version does not read: a file-id counter in one overwritten file, or a trim
-     * record that is a file. Reading such a table as empty would build indexes without its rows.
-     */
-    void checkLayout() throws IOException {
-        FsPath counter = path(OLD_NEXT_FILE_ID);
-        FsPath trimmed = path(CHAIN_TRIMMED);
-        FileSystem fs = counter.getFileSystem();
-        FsPath old = null;
-        if (fs.exists(counter)) {
-            old = counter;
-        } else if (fs.exists(trimmed) && !fs.getFileStatus(trimmed).isDir()) {
-            old = trimmed;
-        }
-        if (old != null) {
-            throw new IllegalStateException(
-                    String.format(
-                            "The position index file %s is of a layout this Fluss version does"
-                                    + " not read. Delete %s and let the tiering service index the"
-                                    + " table again.",
-                            old, path(ROW_POS_DIR)));
-        }
     }
 
     /** A path under the table's remote lake directory, such as {@link #CHAIN_DIR}. */

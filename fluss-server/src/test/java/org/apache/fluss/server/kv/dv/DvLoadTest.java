@@ -71,7 +71,7 @@ class DvLoadTest extends DerivedDvManagerTestBase {
 
         src.identityFailure = null;
         assertThat(manager.ensureCovered(101)).isTrue();
-        assertThat(asStrings(manager.lookup(101, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(101, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F2 + "#0");
         assertIdle(remote);
     }
@@ -103,7 +103,7 @@ class DvLoadTest extends DerivedDvManagerTestBase {
         hooks(manager).setAfterIngest(null);
         assertThat(manager.ensureCovered(102)).isTrue();
         assertThat(manager.indexAhead()).isFalse();
-        assertThat(asStrings(manager.lookup(102, Arrays.asList(key("k1"), key("k2")))))
+        assertThat(asStrings(indexed(102, Arrays.asList(key("k1"), key("k2")))))
                 .containsExactly("k1@" + F2 + "#0", "k2@" + F3 + "#0");
         assertIdle(remote);
     }
@@ -153,7 +153,7 @@ class DvLoadTest extends DerivedDvManagerTestBase {
                                         .failChangeListWrites(new IOException("change list disk")));
         assertThat(manager.ensureCovered(101)).isTrue();
         assertThat(manager.inspect().changeListPresent).isFalse();
-        assertThat(asStrings(manager.lookup(101, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(101, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F2 + "#0");
 
         hooks(manager).setAfterIngest(null);
@@ -288,7 +288,8 @@ class DvLoadTest extends DerivedDvManagerTestBase {
         assertThat(System.currentTimeMillis() - start).isLessThan(CANCEL_WAIT_MS);
         assertThat(cancelled).isTrue();
 
-        assertThat(asStrings(lookupWhenReady(101, Arrays.asList(key("k1"), key("k2")))))
+        assertThat(manager.ensureCovered(101)).isTrue();
+        assertThat(asStrings(indexed(101, Arrays.asList(key("k1"), key("k2")))))
                 .containsExactly("k1@" + F2 + "#0", "k2@" + F1 + "#1");
         assertThat(compactions.get()).isEqualTo(2);
         assertIdle(remote);
@@ -333,7 +334,7 @@ class DvLoadTest extends DerivedDvManagerTestBase {
 
     private void assertServing100(Path remote) throws Exception {
         assertThat(manager.getReadableSnapshotId()).isEqualTo(100L);
-        assertThat(asStrings(manager.lookup(100, Collections.singletonList(key("k1")))))
+        assertThat(asStrings(indexed(100, Collections.singletonList(key("k1")))))
                 .containsExactly("k1@" + F1 + "#0");
         assertIdle(remote);
     }
@@ -393,7 +394,7 @@ class DvLoadTest extends DerivedDvManagerTestBase {
 
         manager.recover(src);
 
-        assertThat(asStrings(lookupWhenReady(300, Arrays.asList(key("k1"), key("k3")))))
+        assertThat(asStrings(indexed(300, Arrays.asList(key("k1"), key("k3")))))
                 .containsExactly("k1@" + F3 + "#0", "k3@" + F2 + "#2");
     }
 }

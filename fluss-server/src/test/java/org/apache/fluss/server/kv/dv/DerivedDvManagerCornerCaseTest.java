@@ -26,7 +26,6 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -220,38 +219,13 @@ class DerivedDvManagerCornerCaseTest extends DerivedDvManagerTestBase {
                     .hasCauseInstanceOf(NotLeaderOrFollowerException.class);
             assertThatThrownBy(() -> DvTestReads.unionRead(manager, 100))
                     .isInstanceOf(NotLeaderOrFollowerException.class);
-            assertThatThrownBy(() -> manager.lookup(100, Collections.singletonList(key("k1"))))
+            assertThatThrownBy(() -> manager.roundDeletes(100, null, 11))
                     .isInstanceOf(NotLeaderOrFollowerException.class);
         } finally {
             gate.countDown();
         }
         // the replay ends once the gate opens and closes the RocksDB
         assertThat(manager.dbClosed().get(30, TimeUnit.SECONDS)).isNull();
-    }
-
-    /**
-     * A tiering lookup during which the bucket's change list was reset, on the covered snapshot,
-     * answers with the positions of that snapshot: it reads one version of the index, which a reset
-     * does not change.
-     */
-    @Test
-    void testLookupWhileTheChangeListResetsAnswersForItsVersion() throws Exception {
-        recoverAtSnapshot100();
-        unionRead(100);
-        AtomicInteger reads = new AtomicInteger();
-        hooks(manager)
-                .setAfterLookupRead(
-                        () -> {
-                            if (reads.incrementAndGet() == 1) {
-                                manager.handOffFailed(new IOException("hand-off failed"));
-                            }
-                        });
-        List<byte[]> keys = Arrays.asList(key("k1"), key("k3"));
-        assertThat(asStrings(manager.lookup(100, keys)))
-                .containsExactly("k1@" + F1 + "#0", "k3@" + F1 + "#2");
-        assertThat(asStrings(manager.lookup(100, keys)))
-                .containsExactly("k1@" + F1 + "#0", "k3@" + F1 + "#2");
-        assertThat(reads).hasValue(2);
     }
 
     /** A switch that ingests several index changes stops between them once the bucket closes. */

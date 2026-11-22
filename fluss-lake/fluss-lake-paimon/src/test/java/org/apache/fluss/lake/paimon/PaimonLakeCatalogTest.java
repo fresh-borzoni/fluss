@@ -66,9 +66,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
-import static org.apache.fluss.config.ConfigOptions.TABLE_DELETION_VECTORS_ENABLED;
 import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE;
 import static org.apache.fluss.config.ConfigOptions.TABLE_MERGE_ENGINE_VERSION_COLUMN;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.LAKESTREAM_ENABLED_OPTION_KEY;
@@ -197,7 +197,7 @@ class PaimonLakeCatalogTest {
                                         descriptor,
                                         new TestingLakeCatalogContext(descriptor)))
                 .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining(
                         "Paimon option 'merge-engine' = 'deduplicate', but it is '"
                                 + paimonMergeEngine
@@ -224,7 +224,7 @@ class PaimonLakeCatalogTest {
                                         .build())
                         .property(TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
-                        .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .customProperty("paimon.sequence.field", "amount")
                         .distributedBy(1, "id")
                         .build();
@@ -235,7 +235,7 @@ class PaimonLakeCatalogTest {
                                         descriptor,
                                         new TestingLakeCatalogContext(descriptor)))
                 .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining("'sequence.field'");
         assertThatThrownBy(
                         () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
@@ -307,7 +307,7 @@ class PaimonLakeCatalogTest {
                                         descriptor,
                                         new TestingLakeCatalogContext(descriptor)))
                 .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining("'ignore-delete'");
         assertThatThrownBy(
                         () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
@@ -332,7 +332,7 @@ class PaimonLakeCatalogTest {
                                         descriptor,
                                         new TestingLakeCatalogContext(descriptor)))
                 .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining("'record-level.expire-time'");
         assertThatThrownBy(
                         () -> flussPaimonCatalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
@@ -367,7 +367,7 @@ class PaimonLakeCatalogTest {
                                             descriptor,
                                             new TestingLakeCatalogContext(descriptor)))
                     .isInstanceOf(InvalidTableException.class)
-                    .hasMessageContaining(TABLE_DELETION_VECTORS_ENABLED.key())
+                    .hasMessageContaining(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                     .hasMessageContaining(reported)
                     .hasMessageContaining("table-default.");
             assertThatThrownBy(() -> catalog.getPaimonCatalog().getTable(toPaimon(tablePath)))
@@ -1521,7 +1521,7 @@ class PaimonLakeCatalogTest {
                                         .build())
                         .property(TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
-                        .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .distributedBy(1, "id");
         if (!"default".equals(flussMergeEngine)) {
             builder.property(TABLE_MERGE_ENGINE.key(), flussMergeEngine);
@@ -1547,7 +1547,7 @@ class PaimonLakeCatalogTest {
                                 .build())
                 .property(TABLE_DATALAKE_ENABLED.key(), "true")
                 .property(TABLE_DATALAKE_FORMAT.key(), "paimon")
-                .property(TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                .property(TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                 .customProperties(customProperties)
                 .distributedBy(1, "id")
                 .build();

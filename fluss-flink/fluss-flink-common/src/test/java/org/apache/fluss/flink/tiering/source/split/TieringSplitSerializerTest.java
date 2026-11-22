@@ -244,6 +244,36 @@ class TieringSplitSerializerTest {
                 .isEqualTo(TieringSplit.UNKNOWN_TIERING_EPOCH);
     }
 
+    /** A log split of a planned round keeps the round's snapshot and whether it is capped. */
+    @Test
+    void testPlannedRoundSerde() throws Exception {
+        for (boolean capped : new boolean[] {false, true}) {
+            long snapshotId = capped ? 42L : -1L;
+            TieringSplit logSplit =
+                    TieringLogSplit.plannedRound(
+                                    partitionedTablePath,
+                                    partitionedTableBucket,
+                                    "1024",
+                                    100L,
+                                    200L,
+                                    snapshotId,
+                                    capped)
+                            .copy(40, 2, 2000L, 7L);
+            TieringSplit deserialized =
+                    serializer
+                            .deserialize(
+                                    serializer.getVersion(),
+                                    serializer.serialize(new FlinkTieringSplit(logSplit)))
+                            .unwrap();
+            assertThat(deserialized).isEqualTo(logSplit);
+            TieringLogSplit split = deserialized.asTieringLogSplit();
+            assertThat(split.isPlannedRound()).isTrue();
+            assertThat(split.getRoundSnapshotId()).isEqualTo(snapshotId);
+            assertThat(split.isRoundCapped()).isEqualTo(capped);
+            assertThat(split.getStoppingOffset()).isEqualTo(200L);
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void testRestoreVersion0Splits(boolean isPartitionedTable) throws Exception {

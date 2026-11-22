@@ -18,6 +18,7 @@
 package org.apache.fluss.client.table.scanner.log;
 
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
+import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.writer.AppendWriter;
@@ -45,7 +46,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -120,6 +123,66 @@ public class LogScannerITCase extends ClientToServerITCaseBase {
 
                 ScanRecords scanRecords = pollUntilProgressOnly(logScanner, tableBucket);
                 assertThat(scanRecords.consumedUpToOffset(tableBucket)).isGreaterThan(0L);
+            }
+        }
+    }
+
+    /**
+     * A bucket subscribed while a fetch request to its leader is out, for a bucket since
+     * unsubscribed, is read once that request ends, though it brings nothing: the poll does not
+     * wait out its timeout.
+     */
+    @Test
+    void testBucketSubscribedWhileAFetchIsOutIsReadWhenItEnds() throws Exception {
+        TablePath tablePath =
+                TablePath.of("test_db_1", "test_log_scanner_subscribe_while_fetching");
+        int buckets = 6;
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(DATA1_SCHEMA)
+                        .distributedBy(buckets, "a")
+                        .logFormat(LogFormat.ARROW)
+                        .build();
+        long tableId = createTable(tablePath, descriptor, false);
+        waitAllReplicasReady(tableId, buckets);
+        // two buckets with one leader: 6 buckets on 3 servers
+        Map<Integer, Integer> bucketByLeader = new HashMap<>();
+        int first = -1;
+        int second = -1;
+        for (int bucket = 0; bucket < buckets && second < 0; bucket++) {
+            Integer other =
+                    bucketByLeader.put(
+                            FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(
+                                    new TableBucket(tableId, bucket)),
+                            bucket);
+            if (other != null) {
+                first = other;
+                second = bucket;
+            }
+        }
+        assertThat(second).isPositive();
+        try (Table table = conn.getTable(tablePath)) {
+            appendRows(table, 1, 100);
+            Map<Integer, Long> ends =
+                    admin.listOffsets(
+                                    tablePath,
+                                    Arrays.asList(first, second),
+                                    new OffsetSpec.LatestSpec())
+                            .all()
+                            .get();
+            assertThat(ends.get(second)).isPositive();
+            try (LogScanner logScanner = createLogScanner(table)) {
+                // a fetch of the first bucket at its end waits at the server for records
+                logScanner.subscribe(first, ends.get(first));
+                assertThat(logScanner.poll(Duration.ofMillis(50)).isEmpty()).isTrue();
+                logScanner.unsubscribe(first);
+                logScanner.subscribe(second, 0);
+
+                long start = System.nanoTime();
+                ScanRecords scanRecords = logScanner.poll(Duration.ofSeconds(30));
+                assertThat(scanRecords.records(new TableBucket(tableId, second))).isNotEmpty();
+                assertThat(Duration.ofNanos(System.nanoTime() - start))
+                        .isLessThan(Duration.ofSeconds(10));
             }
         }
     }

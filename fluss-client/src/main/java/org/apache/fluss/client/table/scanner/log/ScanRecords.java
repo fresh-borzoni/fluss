@@ -47,6 +47,9 @@ public class ScanRecords implements Iterable<ScanRecord> {
     /** The exclusive upper bound of consumed offsets per polled bucket in this round. */
     private final Map<TableBucket, Long> consumedUpToOffsets;
 
+    /** The offset ranges [from, to) of the batches without records per polled bucket. */
+    private final Map<TableBucket, List<long[]>> offsetsWithoutRecords;
+
     public ScanRecords(Map<TableBucket, List<ScanRecord>> records) {
         this(records, Collections.emptyMap());
     }
@@ -54,8 +57,16 @@ public class ScanRecords implements Iterable<ScanRecord> {
     public ScanRecords(
             Map<TableBucket, List<ScanRecord>> records,
             Map<TableBucket, Long> consumedUpToOffsets) {
+        this(records, consumedUpToOffsets, Collections.emptyMap());
+    }
+
+    public ScanRecords(
+            Map<TableBucket, List<ScanRecord>> records,
+            Map<TableBucket, Long> consumedUpToOffsets,
+            Map<TableBucket, List<long[]>> offsetsWithoutRecords) {
         this.records = withProgressOnlyBuckets(records, consumedUpToOffsets);
         this.consumedUpToOffsets = consumedUpToOffsets;
+        this.offsetsWithoutRecords = offsetsWithoutRecords;
     }
 
     /**
@@ -107,6 +118,19 @@ public class ScanRecords implements Iterable<ScanRecord> {
     @Nullable
     public Long consumedUpToOffset(TableBucket bucket) {
         return consumedUpToOffsets.get(bucket);
+    }
+
+    /**
+     * Get the offset ranges [from, to) of the batches without records the scanner read of the given
+     * bucket in this poll round, such as a batch of deletes of keys that did not exist: their
+     * offsets hold no record. Together with the records they cover the consumed offsets.
+     *
+     * @param bucket the bucket to query
+     * @return the ranges, empty if there were none
+     */
+    public List<long[]> offsetsWithoutRecords(TableBucket bucket) {
+        List<long[]> ranges = offsetsWithoutRecords.get(bucket);
+        return ranges == null ? Collections.emptyList() : Collections.unmodifiableList(ranges);
     }
 
     /** The number of records for all buckets. */

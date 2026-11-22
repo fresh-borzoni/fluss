@@ -36,6 +36,8 @@ import org.apache.fluss.lake.committer.LakeCommitRejectedException;
 import org.apache.fluss.lake.dv.FilePos;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.dv.index.StagedIndexPart;
+import org.apache.fluss.lake.dv.index.StagedIndexPartProvider;
 import org.apache.fluss.lake.source.RowPosResult;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
@@ -742,6 +744,42 @@ class DerivedDvRoundTest extends TieringTestBase {
 
     private static boolean exists(FsPath path) throws IOException {
         return path.getFileSystem().exists(path);
+    }
+
+    /**
+     * A writer of a table with deletion vectors that was not given the position index directory
+     * stages no index part. Its round fails before the lake commit, since its rows would commit
+     * without the index entries that let the next round delete them.
+     */
+    @Test
+    void testRoundWhoseWriterStagedNoIndexPartFailsBeforeTheLakeCommit() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "round_without_index_part");
+        long tableId = createTable(tablePath, DEFAULT_PK_TABLE_DESCRIPTOR);
+        snapshotCommitter.fenceOnTieringEpoch(tableId, takeTable(tableId));
+
+        assertThatThrownBy(
+                        () ->
+                                commitRound(
+                                        tablePath,
+                                        results(tableId, tablePath, new WithoutIndexPart(), 10)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("carries no position index part");
+        assertThat(lakeCommitter.commitsWithDeletes).hasValue(0);
+    }
+
+    /** The write result of a writer that staged no position index part. */
+    private static final class WithoutIndexPart extends TestingWriteResult
+            implements StagedIndexPartProvider {
+
+        WithoutIndexPart() {
+            super(1);
+        }
+
+        @Nullable
+        @Override
+        public StagedIndexPart stagedIndexPart() {
+            return null;
+        }
     }
 
     private void mergingLake() {

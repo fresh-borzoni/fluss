@@ -20,9 +20,10 @@ package org.apache.fluss.server.kv.dv;
 import org.apache.fluss.annotation.Internal;
 
 /**
- * A pin of a bucket with row TTL whose masks may miss a version that expired from the KV before it
- * was tiered ({@link DvRowTtlGuard}): the reader reads the bucket by key up to {@link #cut()},
- * whether it waits or not, which is exact whatever expired. No masks are built or pinned for it.
+ * A pin of a bucket with row TTL on Paimon, whose readable offset moved below the offset its TTL
+ * filter was capped for, so its masks may miss a version that expired from the KV before it was
+ * tiered ({@link DvRowTtlGuard}): the reader reads the bucket by key up to {@link #cut()}, whether
+ * it waits or not, which is exact whatever expired. No masks are built or pinned for it.
  */
 @Internal
 public final class DvRowTtlFoldException extends RuntimeException {

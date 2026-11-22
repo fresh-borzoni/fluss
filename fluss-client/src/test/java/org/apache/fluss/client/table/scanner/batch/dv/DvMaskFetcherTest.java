@@ -18,9 +18,11 @@
 package org.apache.fluss.client.table.scanner.batch.dv;
 
 import org.apache.fluss.exception.DeletionVectorsNotReadyException;
+import org.apache.fluss.exception.DisconnectException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.StaleSnapshotException;
+import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.rpc.messages.GetDvSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 
@@ -28,8 +30,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 
 import static org.apache.fluss.client.table.scanner.batch.dv.DvTestBucket.SNAPSHOT;
 import static org.apache.fluss.client.table.scanner.batch.dv.DvTestBucket.TABLE_ID;
@@ -37,7 +37,7 @@ import static org.apache.fluss.client.table.scanner.batch.dv.DvTestBucket.TABLE_
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Tests of {@link DvMaskFetcher}: its retries, the no-wait answers, and releases. */
+/** Tests of {@link DvMaskFetcher}: its retries and the no-wait answers. */
 class DvMaskFetcherTest {
 
     private final DvTestBucket.MaskServer server = new DvTestBucket.MaskServer();
@@ -49,10 +49,6 @@ class DvMaskFetcherTest {
                 .setTableId(TABLE_ID)
                 .setBucketId(0)
                 .setReadableSnapshotId(SNAPSHOT);
-    }
-
-    private static GetDvSnapshotRequest release() {
-        return pin().setLogEndOffset(106L).setReleaseCut(true);
     }
 
     @Test
@@ -104,6 +100,26 @@ class DvMaskFetcherTest {
         assertThat(sleeps).allMatch(ms -> ms <= DvMaskFetcher.MAX_LEADER_BACKOFF_MS);
     }
 
+    /**
+     * The retries of tiering rounds: any retriable error of the leader is retried within the leader
+     * budget, e.g. a request failed as another part's unanswered request dropped the connection,
+     * but an unanswered request is not, as the read falls back to reading by key.
+     */
+    @Test
+    void testRetriableErrorsAreRetriedButATimeoutIsNot() throws Exception {
+        server.answer = request -> DvTestBucket.masks(SNAPSHOT, 100, 106);
+        server.failures.add(new DisconnectException("connection dropped"));
+
+        assertThat(fetcher.fetch(DvMaskFetcherTest::pin).getLogEndOffset()).isEqualTo(106L);
+        assertThat(sleeps).containsExactly(300L);
+
+        sleeps.clear();
+        server.failures.add(new TimeoutException("unanswered"));
+        assertThatThrownBy(() -> fetcher.fetch(DvMaskFetcherTest::pin))
+                .hasRootCauseInstanceOf(TimeoutException.class);
+        assertThat(sleeps).isEmpty();
+    }
+
     @Test
     void testStaleFailsAtOnce() {
         server.failures.add(new StaleSnapshotException(SNAPSHOT + 1, SNAPSHOT));
@@ -131,26 +147,5 @@ class DvMaskFetcherTest {
                             assertThat(stale.getCurrentStartOffset()).isEqualTo(97L);
                         });
         assertThat(sleeps).isEmpty();
-    }
-
-    /** A release that fails is sent once more: a cut not released stays until it idles out. */
-    @Test
-    void testFailedReleaseIsSentAgainOnce() throws Exception {
-        server.releaseFailures.add(new NotLeaderOrFollowerException("moved"));
-
-        fetcher.release(release()).get();
-
-        assertThat(server.requests()).hasSize(2).allMatch(GetDvSnapshotRequest::isReleaseCut);
-    }
-
-    @Test
-    void testReleaseFailingTwiceGivesUp() {
-        server.releaseFailures.add(new NotLeaderOrFollowerException("moved"));
-        server.releaseFailures.add(new NotLeaderOrFollowerException("moved again"));
-
-        CompletableFuture<GetDvSnapshotResponse> released = fetcher.release(release());
-
-        assertThatThrownBy(released::get).isInstanceOf(ExecutionException.class);
-        assertThat(server.requests()).hasSize(2);
     }
 }

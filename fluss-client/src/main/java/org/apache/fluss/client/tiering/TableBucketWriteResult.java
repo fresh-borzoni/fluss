@@ -39,6 +39,9 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
+    /** The log start offset of a result that tiered no log split. */
+    public static final long UNKNOWN_LOG_START_OFFSET = -1L;
+
     private final TablePath tablePath;
 
     private final TableBucket tableBucket;
@@ -48,6 +51,9 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
 
     // will be null when no any data write, such as for tiering an empty log split
     @Nullable private final WriteResult writeResult;
+
+    // the offset the bucket's log split started tiering at
+    private final long logStartOffset;
 
     // the end offset of tiering, should be the last tiered record's offset + 1
     private final long logEndOffset;
@@ -65,13 +71,16 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     // normal write result
     @Nullable private final RowPosResult rowPosResult;
 
-    // whether the bucket's round ended before the end of its split, because its lake writer held
-    // as much as one round may; the next round tiers the rest
+    // whether the bucket's round ended below the bucket's high watermark, as its leader planned it
+    // within the round's caps; the next round tiers the rest
     private final boolean endedEarly;
 
     // the tiering epoch the coordinator assigned the round's table under, which fences the round's
     // commits; TieringSplit.UNKNOWN_TIERING_EPOCH if unknown
     private final long tieringEpoch;
+
+    // the deletes of the bucket's planned round its reader fetched from the leader, or null
+    @Nullable private final RoundDeletes roundDeletes;
 
     public TableBucketWriteResult(
             TablePath tablePath,
@@ -147,16 +156,72 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
             @Nullable RowPosResult rowPosResult,
             boolean endedEarly,
             long tieringEpoch) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                UNKNOWN_LOG_START_OFFSET,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                rowPosResult,
+                endedEarly,
+                tieringEpoch);
+    }
+
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logStartOffset,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            @Nullable RowPosResult rowPosResult,
+            boolean endedEarly,
+            long tieringEpoch) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logStartOffset,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                rowPosResult,
+                endedEarly,
+                tieringEpoch,
+                null);
+    }
+
+    public TableBucketWriteResult(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            @Nullable WriteResult writeResult,
+            long logStartOffset,
+            long logEndOffset,
+            long maxTimestamp,
+            int numberOfWriteResults,
+            @Nullable RowPosResult rowPosResult,
+            boolean endedEarly,
+            long tieringEpoch,
+            @Nullable RoundDeletes roundDeletes) {
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partitionName = partitionName;
         this.writeResult = writeResult;
+        this.logStartOffset = logStartOffset;
         this.logEndOffset = logEndOffset;
         this.maxTimestamp = maxTimestamp;
         this.numberOfWriteResults = numberOfWriteResults;
         this.rowPosResult = rowPosResult;
         this.endedEarly = endedEarly;
         this.tieringEpoch = tieringEpoch;
+        this.roundDeletes = roundDeletes;
     }
 
     /** Returns this write result of a round the coordinator assigned under {@code tieringEpoch}. */
@@ -168,12 +233,55 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
                         tableBucket,
                         partitionName,
                         writeResult,
+                        logStartOffset,
                         logEndOffset,
                         maxTimestamp,
                         numberOfWriteResults,
                         rowPosResult,
                         endedEarly,
-                        tieringEpoch);
+                        tieringEpoch,
+                        roundDeletes);
+    }
+
+    /**
+     * Returns this write result with the deletes its reader fetched for the bucket's round, or
+     * without any if null.
+     */
+    public TableBucketWriteResult<WriteResult> withRoundDeletes(
+            @Nullable RoundDeletes roundDeletes) {
+        return new TableBucketWriteResult<>(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logStartOffset,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                rowPosResult,
+                endedEarly,
+                tieringEpoch,
+                roundDeletes);
+    }
+
+    /**
+     * Returns this write result with {@code writeResult} as the lake's, without the round's
+     * deletes: the lake's write result carries what its writer made of them.
+     */
+    public TableBucketWriteResult<WriteResult> withWriteResult(WriteResult writeResult) {
+        return new TableBucketWriteResult<>(
+                tablePath,
+                tableBucket,
+                partitionName,
+                writeResult,
+                logStartOffset,
+                logEndOffset,
+                maxTimestamp,
+                numberOfWriteResults,
+                rowPosResult,
+                endedEarly,
+                tieringEpoch,
+                null);
     }
 
     public TablePath tablePath() {
@@ -198,6 +306,14 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
         return numberOfWriteResults;
     }
 
+    /**
+     * Returns the offset the bucket's log split started tiering at, or {@link
+     * #UNKNOWN_LOG_START_OFFSET}.
+     */
+    public long logStartOffset() {
+        return logStartOffset;
+    }
+
     public long logEndOffset() {
         return logEndOffset;
     }
@@ -218,8 +334,8 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
     }
 
     /**
-     * Returns whether the bucket's round ended at {@link #logEndOffset()} before the end of its
-     * split, because its lake writer held as much as one round may. The next round tiers the rest.
+     * Returns whether the bucket's round ended at {@link #logEndOffset()} below the bucket's high
+     * watermark, as its leader planned it within the round's caps. The next round tiers the rest.
      */
     public boolean endedEarly() {
         return endedEarly;
@@ -231,6 +347,15 @@ public class TableBucketWriteResult<WriteResult> implements Serializable {
      */
     public long tieringEpoch() {
         return tieringEpoch;
+    }
+
+    /**
+     * Returns the deletes of the bucket's planned round its reader fetched from the leader, or null
+     * if it did not. The committer uses them only if they are of the round on its base snapshot.
+     */
+    @Nullable
+    public RoundDeletes roundDeletes() {
+        return roundDeletes;
     }
 
     /**

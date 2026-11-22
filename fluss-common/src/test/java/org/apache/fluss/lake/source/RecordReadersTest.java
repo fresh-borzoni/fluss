@@ -66,7 +66,7 @@ class RecordReadersTest {
         assertThatThrownBy(() -> RecordReaders.readWithPos(reader))
                 .isInstanceOf(UnsupportedOperationException.class)
                 .hasMessageContaining(SupportsRowPositions.class.getName())
-                .hasMessageContaining("table.deletion-vectors.enabled");
+                .hasMessageContaining("table.datalake.deletion-vectors.enabled");
         assertThat(reader.closes).isEqualTo(1);
     }
 

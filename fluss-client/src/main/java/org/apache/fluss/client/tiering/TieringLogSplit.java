@@ -24,6 +24,8 @@ import javax.annotation.Nullable;
 
 import java.util.Objects;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+
 /** The table split for tiering service. It's used to describe the log data of a table bucket. */
 public class TieringLogSplit extends TieringSplit {
 
@@ -33,6 +35,10 @@ public class TieringLogSplit extends TieringSplit {
 
     private final long startingOffset;
     private final long stoppingOffset;
+    // for a round its bucket's leader planned, of a table with deletion vectors: the lake snapshot
+    // the round is planned on, and whether the round's caps cut it below the high watermark
+    @Nullable private final Long roundSnapshotId;
+    private final boolean roundCapped;
 
     public TieringLogSplit(
             TablePath tablePath,
@@ -117,6 +123,59 @@ public class TieringLogSplit extends TieringSplit {
             boolean skipCurrentRound,
             int splitIndex,
             long tieringRoundTimestamp) {
+        this(
+                tablePath,
+                tableBucket,
+                partitionName,
+                startingOffset,
+                stoppingOffset,
+                numberOfSplits,
+                skipCurrentRound,
+                splitIndex,
+                tieringRoundTimestamp,
+                null,
+                false);
+    }
+
+    /**
+     * A split of a round its bucket's leader planned on lake snapshot {@code roundSnapshotId}, of a
+     * table with deletion vectors: the split stops at the round's planned end, {@code
+     * stoppingOffset}. {@code roundCapped} says the round's caps cut it below the high watermark.
+     */
+    public static TieringLogSplit plannedRound(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            long startingOffset,
+            long stoppingOffset,
+            long roundSnapshotId,
+            boolean roundCapped) {
+        return new TieringLogSplit(
+                tablePath,
+                tableBucket,
+                partitionName,
+                startingOffset,
+                stoppingOffset,
+                UNKNOWN_NUMBER_OF_SPLITS,
+                false,
+                UNKNOWN_SPLIT_INDEX,
+                UNKNOWN_TIERING_ROUND_TIMESTAMP,
+                roundSnapshotId,
+                roundCapped);
+    }
+
+    public TieringLogSplit(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partitionName,
+            long startingOffset,
+            long stoppingOffset,
+            int numberOfSplits,
+            boolean skipCurrentRound,
+            int splitIndex,
+            long tieringRoundTimestamp,
+            @Nullable Long roundSnapshotId,
+            boolean roundCapped) {
         super(
                 tablePath,
                 tableBucket,
@@ -125,8 +184,14 @@ public class TieringLogSplit extends TieringSplit {
                 skipCurrentRound,
                 splitIndex,
                 tieringRoundTimestamp);
+        checkArgument(
+                roundSnapshotId != null || !roundCapped,
+                "Only a planned round is capped: split of %s.",
+                tableBucket);
         this.startingOffset = startingOffset;
         this.stoppingOffset = stoppingOffset;
+        this.roundSnapshotId = roundSnapshotId;
+        this.roundCapped = roundCapped;
     }
 
     @Override
@@ -140,6 +205,26 @@ public class TieringLogSplit extends TieringSplit {
 
     public long getStoppingOffset() {
         return stoppingOffset;
+    }
+
+    /**
+     * Whether the split's round was planned by its bucket's leader, for a table with deletion
+     * vectors on a lake that takes deletes. Such a split is read up to its stopping offset, never
+     * stopped earlier: the round's log mask is exact at that end only.
+     */
+    public boolean isPlannedRound() {
+        return roundSnapshotId != null;
+    }
+
+    /** The lake snapshot a planned round is planned on; -1 for the empty lake. */
+    public long getRoundSnapshotId() {
+        checkArgument(roundSnapshotId != null, "Split %s is not of a planned round.", splitId());
+        return roundSnapshotId;
+    }
+
+    /** Whether the caps cut the planned round below its leader's high watermark. */
+    public boolean isRoundCapped() {
+        return roundCapped;
     }
 
     @Override
@@ -164,6 +249,9 @@ public class TieringLogSplit extends TieringSplit {
                 + splitIndex
                 + ", tieringRoundTimestamp="
                 + tieringRoundTimestamp
+                + (roundSnapshotId == null
+                        ? ""
+                        : ", roundSnapshotId=" + roundSnapshotId + ", roundCapped=" + roundCapped)
                 + '}';
     }
 
@@ -178,7 +266,9 @@ public class TieringLogSplit extends TieringSplit {
                 numberOfSplits,
                 skipCurrentRound,
                 splitIndex,
-                tieringRoundTimestamp);
+                tieringRoundTimestamp,
+                roundSnapshotId,
+                roundCapped);
     }
 
     @Override
@@ -190,11 +280,15 @@ public class TieringLogSplit extends TieringSplit {
             return false;
         }
         TieringLogSplit that = (TieringLogSplit) object;
-        return startingOffset == that.startingOffset && stoppingOffset == that.stoppingOffset;
+        return startingOffset == that.startingOffset
+                && stoppingOffset == that.stoppingOffset
+                && Objects.equals(roundSnapshotId, that.roundSnapshotId)
+                && roundCapped == that.roundCapped;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), startingOffset, stoppingOffset);
+        return Objects.hash(
+                super.hashCode(), startingOffset, stoppingOffset, roundSnapshotId, roundCapped);
     }
 }

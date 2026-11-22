@@ -18,6 +18,7 @@
 
 package org.apache.fluss.lake.iceberg.tiering;
 
+import org.apache.fluss.lake.dv.PreparedDeletionVectors;
 import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.iceberg.maintenance.RewriteDataFileResult;
@@ -50,6 +51,7 @@ import java.util.Map;
 import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.WRITE_RESULT_DIR;
 import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.assertWriteResultEquals;
 import static org.apache.fluss.lake.iceberg.utils.TestingGoldenFiles.goldenWriteResult;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
@@ -199,16 +201,77 @@ class IcebergWriteResultSerializerTest {
                 .isNull();
     }
 
+    /**
+     * The deletion vectors a writer prepared read back with the round they are of and the deletion
+     * vector each data file had before; a write result without them reads back without them.
+     */
+    @Test
+    void testSerializeAndDeserializeWithPreparedDeletionVectors() throws IOException {
+        IcebergWriteResult withoutPrepared = goldenWriteResult();
+        DeleteFile dv1 = createDeletionVector("dv-1.puffin", "data-1.parquet", 4L, 40L);
+        DeleteFile dv2 = createDeletionVector("dv-1.puffin", "data-2.parquet", 44L, 50L);
+        Map<String, DeletionVectorId> replaced = new HashMap<>();
+        replaced.put("data-1.parquet", new DeletionVectorId("dv-0.puffin", 4L, 30L));
+        // the format keeps a replaced delete file without a content offset and size too
+        replaced.put("data-2.parquet", new DeletionVectorId("deletes-2.parquet", null, null));
+        IcebergWriteResult original =
+                withoutPrepared.withPrepared(
+                        new PreparedDeletionVectorFiles(
+                                new PreparedDeletionVectors(11L, 100L, 200L),
+                                Arrays.asList(dv1, dv2),
+                                replaced));
+
+        IcebergWriteResult deserialized =
+                serializer.deserialize(serializer.getVersion(), serializer.serialize(original));
+
+        assertWriteResultEquals(deserialized, withoutPrepared);
+        PreparedDeletionVectorFiles read = deserialized.prepared();
+        assertThat(read).isNotNull();
+        assertThat(deserialized.preparedDeletionVectors()).isNotNull();
+        assertThat(read.round.snapshotId()).isEqualTo(11L);
+        assertThat(read.round.startOffset()).isEqualTo(100L);
+        assertThat(read.round.endOffset()).isEqualTo(200L);
+        assertThat(read.deletionVectors).hasSize(2);
+        for (int i = 0; i < 2; i++) {
+            DeleteFile expected = i == 0 ? dv1 : dv2;
+            DeleteFile actual = read.deletionVectors.get(i);
+            assertThat(actual.location()).isEqualTo(expected.location());
+            assertThat(actual.format()).isEqualTo(FileFormat.PUFFIN);
+            assertThat(actual.referencedDataFile()).isEqualTo(expected.referencedDataFile());
+            assertThat(actual.contentOffset()).isEqualTo(expected.contentOffset());
+            assertThat(actual.contentSizeInBytes()).isEqualTo(expected.contentSizeInBytes());
+            assertThat(DeletionVectorId.of(actual)).isEqualTo(DeletionVectorId.of(expected));
+        }
+        assertThat(read.replaced).isEqualTo(replaced);
+
+        assertThat(
+                        serializer
+                                .deserialize(
+                                        serializer.getVersion(),
+                                        serializer.serialize(withoutPrepared))
+                                .prepared())
+                .isNull();
+    }
+
+    /**
+     * Versions 1 and 2 hold the golden write result; version 3 holds it with the staged index part
+     * and the prepared deletion vectors of a table with deletion vectors.
+     */
     @Test
     void testDeserializeGoldenFiles() throws Exception {
-        IcebergWriteResult expected = goldenWriteResult();
         for (int version = TestingGoldenFiles.firstReadableVersion();
                 version <= serializer.getVersion();
                 version++) {
             IcebergWriteResult actual =
                     serializer.deserialize(
                             version, TestingGoldenFiles.read(WRITE_RESULT_DIR, version));
-            assertWriteResultEquals(actual, expected);
+            assertWriteResultEquals(actual, goldenWriteResult());
+            if (version < 3) {
+                assertThat(actual.stagedIndexPart()).isNull();
+                assertThat(actual.prepared()).isNull();
+            } else {
+                assertDeletionVectorsOfGolden(actual);
+            }
         }
     }
 
@@ -219,7 +282,7 @@ class IcebergWriteResultSerializerTest {
                 .as("the golden files were written with another Iceberg version")
                 .isTrue();
         // the current format must not change without bumping the version
-        assertThat(serializer.serialize(goldenWriteResult()))
+        assertThat(serializer.serialize(goldenWriteResultWithDeletionVectors()))
                 .isEqualTo(TestingGoldenFiles.read(WRITE_RESULT_DIR, serializer.getVersion()));
     }
 
@@ -228,10 +291,74 @@ class IcebergWriteResultSerializerTest {
         assumeThat(TestingGoldenFiles.shouldRegenerate())
                 .as("golden files are only regenerated on request")
                 .isTrue();
-        IcebergWriteResult goldenWriteResult = goldenWriteResult();
-        TestingGoldenFiles.write(WRITE_RESULT_DIR, 1, serializeV1(goldenWriteResult));
+        TestingGoldenFiles.write(WRITE_RESULT_DIR, 1, serializeV1(goldenWriteResult()));
         TestingGoldenFiles.write(
-                WRITE_RESULT_DIR, serializer.getVersion(), serializer.serialize(goldenWriteResult));
+                WRITE_RESULT_DIR,
+                serializer.getVersion(),
+                serializer.serialize(goldenWriteResultWithDeletionVectors()));
+    }
+
+    /**
+     * The golden write result of a table with deletion vectors: with the index part its writer
+     * staged and the deletion vectors it prepared.
+     */
+    private static IcebergWriteResult goldenWriteResultWithDeletionVectors() {
+        IcebergWriteResult golden = goldenWriteResult();
+        Map<Integer, String> files = new HashMap<>();
+        files.put(0, "data-1.parquet");
+        files.put(1, "data-2.parquet");
+        Map<String, DeletionVectorId> replaced = new HashMap<>();
+        replaced.put("data-1.parquet", new DeletionVectorId("dv-0.puffin", 4L, 30L));
+        replaced.put("data-2.parquet", new DeletionVectorId("deletes-2.parquet", null, null));
+        return new IcebergWriteResult(
+                        golden.getWriteResult(),
+                        golden.specs(),
+                        golden.rewriteDataFileResult(),
+                        new StagedIndexPart(
+                                -77L,
+                                Arrays.asList("w1_sst_0.sst", "w1_sst_1.sst"),
+                                Arrays.asList(100L, 200L),
+                                files,
+                                30L,
+                                4L))
+                .withPrepared(
+                        new PreparedDeletionVectorFiles(
+                                new PreparedDeletionVectors(11L, 100L, 200L),
+                                Arrays.asList(
+                                        TestingGoldenFiles.deletionVector(
+                                                "dv-1.puffin", "data-1.parquet", 4L, 40L),
+                                        TestingGoldenFiles.deletionVector(
+                                                "dv-1.puffin", "data-2.parquet", 44L, 50L)),
+                                replaced));
+    }
+
+    /** Asserts the staged index part and prepared deletion vectors of the version 3 golden. */
+    private static void assertDeletionVectorsOfGolden(IcebergWriteResult actual) {
+        IcebergWriteResult expected = goldenWriteResultWithDeletionVectors();
+        StagedIndexPart part = actual.stagedIndexPart();
+        StagedIndexPart expectedPart = checkNotNull(expected.stagedIndexPart());
+        assertThat(part).isNotNull();
+        assertThat(part.stagingId()).isEqualTo(expectedPart.stagingId());
+        assertThat(part.sstFileNames()).isEqualTo(expectedPart.sstFileNames());
+        assertThat(part.sstFileSizes()).isEqualTo(expectedPart.sstFileSizes());
+        assertThat(part.files()).isEqualTo(expectedPart.files());
+        assertThat(part.keys()).isEqualTo(expectedPart.keys());
+        assertThat(part.deletes()).isEqualTo(expectedPart.deletes());
+
+        PreparedDeletionVectorFiles prepared = actual.prepared();
+        PreparedDeletionVectorFiles expectedPrepared = checkNotNull(expected.prepared());
+        assertThat(prepared).isNotNull();
+        assertThat(prepared.round.snapshotId()).isEqualTo(expectedPrepared.round.snapshotId());
+        assertThat(prepared.round.startOffset()).isEqualTo(expectedPrepared.round.startOffset());
+        assertThat(prepared.round.endOffset()).isEqualTo(expectedPrepared.round.endOffset());
+        assertThat(prepared.deletionVectors).hasSameSizeAs(expectedPrepared.deletionVectors);
+        for (int i = 0; i < expectedPrepared.deletionVectors.size(); i++) {
+            assertThat(DeletionVectorId.of(prepared.deletionVectors.get(i)))
+                    .isEqualTo(DeletionVectorId.of(expectedPrepared.deletionVectors.get(i)));
+            assertThat(prepared.deletionVectors.get(i).referencedDataFile())
+                    .isEqualTo(expectedPrepared.deletionVectors.get(i).referencedDataFile());
+        }
+        assertThat(prepared.replaced).isEqualTo(expectedPrepared.replaced);
     }
 
     @Test
@@ -285,6 +412,21 @@ class IcebergWriteResultSerializerTest {
                 .withRecordCount(recordCount)
                 .withFormat(FileFormat.PARQUET)
                 .ofPositionDeletes()
+                .build();
+    }
+
+    private DeleteFile createDeletionVector(
+            String path, String dataFile, long contentOffset, long contentSize) {
+        return FileMetadata.deleteFileBuilder(spec)
+                .withPath(path)
+                .withFileSizeInBytes(1024)
+                .withPartition(partitionData)
+                .withRecordCount(3)
+                .withFormat(FileFormat.PUFFIN)
+                .ofPositionDeletes()
+                .withReferencedDataFile(dataFile)
+                .withContentOffset(contentOffset)
+                .withContentSizeInBytes(contentSize)
                 .build();
     }
 

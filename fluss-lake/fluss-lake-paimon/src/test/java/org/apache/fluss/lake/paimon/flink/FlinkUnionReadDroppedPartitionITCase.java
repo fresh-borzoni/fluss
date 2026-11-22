@@ -139,7 +139,8 @@ class FlinkUnionReadDroppedPartitionITCase extends FlinkUnionReadTestBase {
                                         ConfigOptions.TABLE_DATALAKE_FRESHNESS,
                                         Duration.ofMillis(500))
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                        "true")
                                 // a compaction makes each round readable at its tiered offsets
                                 .property(
                                         ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true")

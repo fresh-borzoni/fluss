@@ -19,6 +19,7 @@ package org.apache.fluss.lake.iceberg.tiering;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.exception.LakeTableExternallyModifiedException;
 import org.apache.fluss.exception.LakeTableRolledBackException;
 import org.apache.fluss.fs.FsPath;
@@ -33,6 +34,7 @@ import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.CompactionIndexPart;
 import org.apache.fluss.lake.dv.index.FlussPositionIndexStore;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
+import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.lake.iceberg.IcebergLakeCatalog;
 import org.apache.fluss.lake.iceberg.maintenance.CompactionIndexWriter;
 import org.apache.fluss.lake.iceberg.maintenance.IcebergRewriteDataFiles;
@@ -44,6 +46,7 @@ import org.apache.fluss.lake.iceberg.testutils.ExternalWrites;
 import org.apache.fluss.lake.iceberg.tiering.writer.TaskWriterFactory;
 import org.apache.fluss.lake.lakestorage.TestingLakeCatalogContext;
 import org.apache.fluss.lake.source.DataDeltaPlan;
+import org.apache.fluss.lake.writer.DeletionVectorPreparer;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
 import org.apache.fluss.metadata.Schema;
@@ -81,9 +84,11 @@ import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.BaseDeleteLoader;
 import org.apache.iceberg.data.IcebergGenericReader;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.encryption.EncryptionManager;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.hadoop.HadoopCatalog;
@@ -123,6 +128,7 @@ import java.util.stream.Stream;
 
 import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -131,6 +137,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * IcebergLakeCommitter}'s commits of rounds with deletion vectors.
  */
 class IcebergDerivedCommitTest {
+
+    private static final TableBucket BUCKET = new TableBucket(0, 0);
 
     private static final String FAIL_COMMIT = "fail-commit";
     // a snapshot property that makes FailingCatalog fail the commit before it applies it
@@ -175,7 +183,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.singletonMap(fileName, new long[] {0L}),
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeCommitRejectedException.class)
                     .hasMessageContaining("on base snapshot " + base);
         }
@@ -209,7 +218,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             deletes,
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeCommitRejectedException.class)
                     .hasStackTraceContaining("not-in-the-base.parquet");
         }
@@ -250,7 +260,8 @@ class IcebergDerivedCommitTest {
                                             Collections.singletonMap(ROUND_PROPERTY, "1"),
                                             Collections.singletonMap(
                                                     fileName(fileOfFirst), new long[] {0L}),
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeBaseChangedException.class)
                     .hasMessageContaining("on base snapshot " + base)
                     .rootCause()
@@ -307,7 +318,8 @@ class IcebergDerivedCommitTest {
                                     Collections.singletonMap(ROUND_PROPERTY, "1"),
                                     Collections.singletonMap(
                                             fileName(fileOfFirst), new long[] {0L}),
-                                    base)
+                                    base,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
         } finally {
             CommitHookCatalog.disarm("iceberg." + tablePath.getTableName());
@@ -346,7 +358,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.singletonMap(FAIL_COMMIT, "true"),
                                             Collections.singletonMap(fileName, new long[] {0L}),
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(IOException.class)
                     .isNotInstanceOf(LakeCommitRejectedException.class)
                     .hasCauseInstanceOf(CommitStateUnknownException.class);
@@ -393,7 +406,8 @@ class IcebergDerivedCommitTest {
                                             committable,
                                             Collections.singletonMap(FAIL_BEFORE_COMMIT, "true"),
                                             Collections.singletonMap(fileName, new long[] {0L}),
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(IOException.class)
                     .isNotInstanceOf(LakeCommitRejectedException.class)
                     .hasCauseInstanceOf(CommitStateUnknownException.class);
@@ -551,7 +565,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     deletes,
-                                    third)
+                                    third,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
         }
 
@@ -914,7 +929,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     properties,
                                     Collections.emptyMap(),
-                                    -1)
+                                    -1,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             // committed on the expired snapshot and never registered: missing
             assertThat(committer.getMissingLakeSnapshot(expired))
@@ -944,7 +960,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     properties,
                                     Collections.emptyMap(),
-                                    -1)
+                                    -1,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
 
             assertThatThrownBy(() -> committer.getMissingLakeSnapshot(expired))
@@ -974,7 +991,8 @@ class IcebergDerivedCommitTest {
                                     first.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.emptyMap(),
-                                    -1)
+                                    -1,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThatThrownBy(
                             () ->
@@ -982,7 +1000,8 @@ class IcebergDerivedCommitTest {
                                             second.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.emptyMap(),
-                                            -1))
+                                            -1,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeBaseChangedException.class);
             assertThat(refreshed(table).currentSnapshot().snapshotId()).isEqualTo(landed);
         }
@@ -1007,7 +1026,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.emptyMap(),
-                                            expired))
+                                            expired,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeBaseChangedException.class);
             assertThat(refreshed(table).currentSnapshot().snapshotId()).isEqualTo(other);
         }
@@ -1019,7 +1039,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.emptyMap(),
-                                    expired)
+                                    expired,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThat(refreshed(table).snapshot(landed).parentId()).isEqualTo(other);
         }
@@ -1043,7 +1064,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.singletonMap(fileName, new long[] {0L}),
-                                    first)
+                                    first,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
         }
         List<DeleteFile> positionDeletes = liveDeleteFiles(refreshed(table));
@@ -1065,7 +1087,8 @@ class IcebergDerivedCommitTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
-                    rewrite);
+                    rewrite,
+                    Collections.emptyList());
         }
         assertThat(liveDeleteFiles(refreshed(table))).isEmpty();
         assertThat(countRows(table)).isEqualTo(2);
@@ -1122,14 +1145,16 @@ class IcebergDerivedCommitTest {
                                         IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
                 long scansBefore = state.liveFiles.scans();
                 try (IcebergLakeCommitter committer =
-                        new IcebergLakeCommitter(catalogProvider, tablePath, false, state)) {
+                        new IcebergLakeCommitter(
+                                catalogProvider, tablePath, false, state, new Configuration())) {
                     base =
                             committer
                                     .commitWithDeletes(
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.singletonMap(file, new long[] {1L}),
-                                            base)
+                                            base,
+                                            Collections.emptyList())
                                     .getCommittedSnapshotId();
                 }
                 scans[cached] += state.liveFiles.scans() - scansBefore;
@@ -1143,6 +1168,538 @@ class IcebergDerivedCommitTest {
             deleted.add(fileName(ContentFileUtil.referencedDataFileLocation(delete)));
         }
         assertThat(deleted).containsExactlyInAnyOrderElementsOf(files.subList(0, 2 * rounds));
+    }
+
+    /**
+     * The current deletes of a commit's data files are loaded several files at once, those that fit
+     * in the byte limit ahead and the others while the deletes are written, and each file's new
+     * deletes are its earlier ones and the round's, as with one loader: every round merges every
+     * earlier round's deletes.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {2, 3})
+    void testParallelLoadsMergeLikeOneLoader(int formatVersion) throws Exception {
+        Table table = createTable(formatVersion);
+        int threads = ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS.defaultValue();
+        int files = 2 * threads;
+        int rows = 5;
+        List<String> names = new ArrayList<>();
+        Set<Integer> live = new HashSet<>();
+        long base = 0;
+        for (int f = 0; f < files; f++) {
+            base = commitRows(f * rows, rows);
+            names.add(fileName(addedDataFile(refreshed(table), base)));
+            for (int key = f * rows; key < (f + 1) * rows; key++) {
+                live.add(key);
+            }
+        }
+        // {threads, bytes loaded ahead}: all ahead, one by one, none ahead, some ahead
+        long[][] loads = {
+            {threads, Long.MAX_VALUE}, {1, Long.MAX_VALUE}, {threads, 0}, {threads, 1024}
+        };
+        for (int round = 0; round < loads.length; round++) {
+            Map<String, long[]> deletes = new HashMap<>();
+            for (int f = 0; f < files; f++) {
+                deletes.put(names.get(f), new long[] {round});
+                live.remove(f * rows + round);
+            }
+            Configuration conf = new Configuration();
+            conf.set(
+                    ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS,
+                    (int) loads[round][0]);
+            conf.set(
+                    ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_MAX_BYTES,
+                    new MemorySize(loads[round][1]));
+            try (IcebergLakeCommitter committer =
+                    new IcebergLakeCommitter(
+                            catalogProvider,
+                            tablePath,
+                            false,
+                            new IcebergCommitterState(
+                                    IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS),
+                            conf)) {
+                base =
+                        committer
+                                .commitWithDeletes(
+                                        committer.toCommittable(Collections.emptyList()),
+                                        Collections.emptyMap(),
+                                        deletes,
+                                        base,
+                                        Collections.emptyList())
+                                .getCommittedSnapshotId();
+            }
+            assertThat(liveKeys(refreshed(table))).containsExactlyInAnyOrderElementsOf(live);
+            // the round's deletes replaced each file's earlier ones
+            assertThat(liveDeleteFiles(refreshed(table))).hasSize(files);
+        }
+    }
+
+    /**
+     * A round takes the deletion vectors the round before wrote from the committers' cache instead
+     * of reading them, and the cached positions are those of the deletion vectors in the table. A
+     * new committer state, as after a restart of the tiering job, starts empty.
+     */
+    @Test
+    void testDeletionVectorCacheHitsAreTheVectorsInTheTable() throws Exception {
+        Table table = createTable(3);
+        List<String> files = commitFiles(table, 4, 5);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long base = refreshed(table).currentSnapshot().snapshotId();
+        base = commitDeletes(state, files, 0, base);
+        assertThat(state.deletionVectors.hits()).isZero();
+        base = commitDeletes(state, files, 1, base);
+        assertThat(state.deletionVectors.hits()).isEqualTo(files.size());
+        for (String location : locationsOf(refreshed(table), files)) {
+            List<DeleteFile> live = liveDeletesOf(table, location);
+            assertThat(positionsOf(state.deletionVectors.get(location, live)))
+                    .containsExactly(0L, 1L)
+                    .isEqualTo(positionsOf(loadDeletes(table, location, live)));
+        }
+
+        IcebergCommitterState restarted =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        commitDeletes(restarted, files, 2, base);
+        assertThat(restarted.deletionVectors.hits()).isZero();
+        assertThat(liveKeys(refreshed(table))).hasSize(files.size() * 2);
+    }
+
+    /**
+     * After a rollback, the table's deletion vectors are not those the cache holds, which it does
+     * not hand out: the round reads them, and deletes what it deletes on top of them.
+     */
+    @Test
+    void testDeletionVectorCacheMissesAfterARollback() throws Exception {
+        Table table = createTable(3);
+        List<String> files = commitFiles(table, 2, 5);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long first =
+                commitDeletes(state, files, 0, refreshed(table).currentSnapshot().snapshotId());
+        commitDeletes(state, files, 1, first);
+        long hits = state.deletionVectors.hits();
+        refreshed(table).manageSnapshots().rollbackTo(first).commit();
+
+        commitDeletes(state, files, 2, first);
+
+        assertThat(state.deletionVectors.hits()).isEqualTo(hits);
+        for (String location : locationsOf(refreshed(table), files)) {
+            assertThat(positionsOf(loadDeletes(table, location, liveDeletesOf(table, location))))
+                    .containsExactly(0L, 2L);
+        }
+    }
+
+    /** A commit the lake refused leaves the cache as it was. */
+    @Test
+    void testDeletionVectorCacheKeepsNothingOfARejectedCommit() throws Exception {
+        Table table = createTable(3);
+        List<String> files = commitFiles(table, 2, 5);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long base = commitDeletes(state, files, 0, refreshed(table).currentSnapshot().snapshotId());
+        long bytes = state.deletionVectors.bytes();
+        // another engine appends a data file after the base, so the fence refuses the commit
+        table.newAppend().appendFile(writeExternalDataFile(table, 100)).commit();
+
+        assertThatThrownBy(() -> commitDeletes(state, files, 1, base))
+                .isInstanceOf(LakeCommitRejectedException.class);
+
+        assertThat(state.deletionVectors.bytes()).isEqualTo(bytes);
+        for (String location : locationsOf(refreshed(table), files)) {
+            assertThat(
+                            positionsOf(
+                                    state.deletionVectors.get(
+                                            location, liveDeletesOf(table, location))))
+                    .containsExactly(0L);
+        }
+    }
+
+    /**
+     * A writer prepares its bucket's deletion vectors on the base: the round's deletes there merged
+     * into the current deletion vector of their data file, in one Puffin file. They hold on the
+     * base and are committed as they are. With no bytes to load ahead, the writer loads the current
+     * deletion vector while it merges.
+     */
+    @ParameterizedTest
+    @ValueSource(longs = {0L, Long.MAX_VALUE})
+    void testWriterPreparedDeletionVectorsAreCommitted(long loadMaxBytes) throws Exception {
+        Table table = createTable(3);
+        String file = commitFiles(table, 1, 5).get(0);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long base =
+                commitDeletes(
+                        state,
+                        Collections.singletonList(file),
+                        0,
+                        refreshed(table).currentSnapshot().snapshotId());
+        String location = locationsOf(refreshed(table), Collections.singletonList(file)).get(0);
+        DeleteFile current = liveDeletesOf(table, location).get(0);
+        // keys 10..12 in the round's own file
+        IcebergWriteResult round = staged(writeRows(10, 3).get(0));
+
+        IcebergWriteResult prepared;
+        Configuration lakeConfig = new Configuration();
+        lakeConfig.set(
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_MAX_BYTES,
+                new MemorySize(loadMaxBytes));
+        try (DeletionVectorPreparer<IcebergWriteResult> preparer = preparer(lakeConfig)) {
+            // read ahead while the round would be read: the live files once per snapshot, and the
+            // deletion vector the round's deletes replace once they arrive
+            preparer.prefetch(base);
+            preparer.prefetch(base);
+            preparer.prefetch(BUCKET, base, Collections.singleton(file));
+            prepared =
+                    preparer.prepare(
+                            round,
+                            BUCKET,
+                            base,
+                            0L,
+                            8L,
+                            Collections.singletonMap(file, new long[] {2L}));
+        }
+
+        assertThat(prepared).isNotNull();
+        PreparedDeletionVectorFiles files = prepared.prepared();
+        assertThat(files).isNotNull();
+        assertThat(files.deletionVectors).hasSize(1);
+        assertThat(files.replaced).containsOnlyKeys(location);
+        assertThat(files.replaced.get(location)).isEqualTo(DeletionVectorId.of(current));
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, false, state, new Configuration())) {
+            assertThat(
+                            committer.holdingDeletionVectors(
+                                    Collections.singletonMap(BUCKET, prepared), base))
+                    .containsExactly(BUCKET);
+            committer.commitWithDeletes(
+                    committer.toCommittable(Collections.singletonList(prepared)),
+                    Collections.emptyMap(),
+                    Collections.emptyMap(),
+                    base,
+                    Collections.singletonList(prepared));
+        }
+        assertThat(liveKeys(refreshed(table))).containsExactlyInAnyOrder(1, 3, 4, 10, 11, 12);
+        List<DeleteFile> live = liveDeletesOf(table, location);
+        assertThat(live).hasSize(1);
+        assertThat(live.get(0).location()).isEqualTo(files.deletionVectors.get(0).location());
+        assertThat(positionsOf(loadDeletes(table, location, live))).containsExactly(0L, 2L);
+    }
+
+    /**
+     * The deletion vectors a writer prepared for a round that is not committed are deleted through
+     * the committer, as a discarded round does: their Puffin file is gone.
+     */
+    @Test
+    void testDiscardedPreparedDeletionVectorsAreDeleted() throws Exception {
+        Table table = createTable(3);
+        String file = commitFiles(table, 1, 5).get(0);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long base =
+                commitDeletes(
+                        state,
+                        Collections.singletonList(file),
+                        0,
+                        refreshed(table).currentSnapshot().snapshotId());
+        IcebergWriteResult prepared;
+        try (DeletionVectorPreparer<IcebergWriteResult> preparer = preparer()) {
+            prepared =
+                    preparer.prepare(
+                            staged(writeRows(10, 3).get(0)),
+                            BUCKET,
+                            base,
+                            0L,
+                            8L,
+                            Collections.singletonMap(file, new long[] {2L}));
+        }
+        assertThat(prepared).isNotNull();
+        List<DeleteFile> vectors = checkNotNull(prepared.prepared()).deletionVectors;
+        assertThat(vectors).hasSize(1);
+        String puffin = vectors.get(0).location();
+        assertThat(table.io().newInputFile(puffin).exists()).isTrue();
+
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, false, state, new Configuration())) {
+            committer.discardDeletionVectors(Collections.singletonList(prepared));
+        }
+
+        assertThat(table.io().newInputFile(puffin).exists()).isFalse();
+    }
+
+    /**
+     * Prepared deletion vectors hold only while each data file they delete rows in is live on the
+     * committer's base with the deletion vector they replace: not after another commit replaced
+     * that deletion vector, nor after another engine rewrote the file. Those buckets' deletes are
+     * merged at the committer instead.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testPreparedDeletionVectorsNoLongerHoldOnAChangedFile(boolean rewritten) throws Exception {
+        Table table = createTable(3);
+        List<String> names = commitFiles(table, 2, 5);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long base = commitDeletes(state, names, 0, refreshed(table).currentSnapshot().snapshotId());
+        String first =
+                locationsOf(refreshed(table), Collections.singletonList(names.get(0))).get(0);
+        TableBucket other = new TableBucket(0, 1);
+        Map<TableBucket, IcebergWriteResult> prepared = new HashMap<>();
+        try (DeletionVectorPreparer<IcebergWriteResult> preparer = preparer()) {
+            // read ahead for other files than the round's deletes name: prepared without it
+            preparer.prefetch(other, base, Collections.singleton(names.get(0)));
+            for (int f = 0; f < 2; f++) {
+                TableBucket bucket = f == 0 ? BUCKET : other;
+                prepared.put(
+                        bucket,
+                        preparer.prepare(
+                                staged(writeRows(100 + 10 * f, 2).get(0)),
+                                bucket,
+                                base,
+                                0L,
+                                8L,
+                                Collections.singletonMap(names.get(f), new long[] {1L})));
+            }
+        }
+        long moved =
+                rewritten
+                        ? rewriteDataFile(refreshed(table), first)
+                        : commitDeletes(state, names.subList(0, 1), 3, base);
+
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, false, state, new Configuration())) {
+            // on the base both hold; after the change only the other file's bucket does
+            assertThat(committer.holdingDeletionVectors(prepared, base))
+                    .containsExactlyInAnyOrder(BUCKET, other);
+            assertThat(committer.holdingDeletionVectors(prepared, moved)).containsExactly(other);
+        }
+    }
+
+    /**
+     * A writer does not prepare the deletion vectors of a round without a staged index part, or
+     * whose deletes name a data file the base does not have; a version 2 table gets no preparer.
+     */
+    @Test
+    void testDeletionVectorsAreNotPreparedWithoutWhatTheyNeed() throws Exception {
+        Table table = createTable(3);
+        String file = commitFiles(table, 1, 5).get(0);
+        long base = refreshed(table).currentSnapshot().snapshotId();
+        try (DeletionVectorPreparer<IcebergWriteResult> preparer = preparer()) {
+            assertThat(
+                            preparer.prepare(
+                                    writeRows(10, 2).get(0),
+                                    BUCKET,
+                                    base,
+                                    0L,
+                                    8L,
+                                    Collections.singletonMap(file, new long[] {0L})))
+                    .isNull();
+            assertThat(
+                            preparer.prepare(
+                                    staged(writeRows(20, 2).get(0)),
+                                    BUCKET,
+                                    base,
+                                    0L,
+                                    8L,
+                                    Collections.singletonMap("missing.parquet", new long[] {0L})))
+                    .isNull();
+        }
+        createTable(2);
+        assertThat(tieringFactory.createDeletionVectorPreparer(tableInfo, new Configuration()))
+                .isNull();
+    }
+
+    /** Discarding prepared deletion vectors, at the writer or the committer, deletes their file. */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testDiscardedPreparedDeletionVectorsAreDeleted(boolean atTheWriter) throws Exception {
+        Table table = createTable(3);
+        String file = commitFiles(table, 1, 5).get(0);
+        long base = refreshed(table).currentSnapshot().snapshotId();
+        IcebergWriteResult prepared;
+        try (DeletionVectorPreparer<IcebergWriteResult> preparer = preparer()) {
+            prepared =
+                    preparer.prepare(
+                            staged(writeRows(10, 2).get(0)),
+                            BUCKET,
+                            base,
+                            0L,
+                            8L,
+                            Collections.singletonMap(file, new long[] {0L}));
+            assertThat(prepared).isNotNull();
+            String puffin = checkNotNull(prepared.prepared()).deletionVectors.get(0).location();
+            assertThat(table.io().newInputFile(puffin).exists()).isTrue();
+            if (atTheWriter) {
+                preparer.discard(prepared);
+            } else {
+                try (IcebergLakeCommitter committer =
+                        new IcebergLakeCommitter(catalogProvider, tablePath)) {
+                    committer.discardDeletionVectors(Collections.singletonList(prepared));
+                }
+            }
+            assertThat(table.io().newInputFile(puffin).exists()).isFalse();
+        }
+    }
+
+    /**
+     * The data files the snapshots after one up to another changed: those a rewrite removed, and
+     * those whose deletion vectors a round added or replaced, by name. Not known for a snapshot
+     * that is not an ancestor.
+     */
+    @Test
+    void testChangedDataFilesSinceASnapshot() throws Exception {
+        Table table = createTable(3);
+        List<String> names = commitFiles(table, 3, 5);
+        long first = refreshed(table).currentSnapshot().snapshotId();
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        long deleted = commitDeletes(state, names.subList(0, 1), 0, first);
+        long replaced = commitDeletes(state, names.subList(0, 1), 1, deleted);
+        String third =
+                locationsOf(refreshed(table), Collections.singletonList(names.get(2))).get(0);
+        long rewritten = rewriteDataFile(refreshed(table), third);
+
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(catalogProvider, tablePath)) {
+            assertThat(committer.changedDataFiles(first, rewritten))
+                    .containsExactlyInAnyOrder(names.get(0), names.get(2));
+            assertThat(committer.changedDataFiles(deleted, replaced)).containsExactly(names.get(0));
+            assertThat(committer.changedDataFiles(replaced, rewritten))
+                    .containsExactly(names.get(2));
+            assertThat(committer.changedDataFiles(rewritten, rewritten)).isEmpty();
+            assertThat(committer.changedDataFiles(rewritten, first)).isNull();
+        }
+    }
+
+    private DeletionVectorPreparer<IcebergWriteResult> preparer() throws IOException {
+        return preparer(new Configuration());
+    }
+
+    private DeletionVectorPreparer<IcebergWriteResult> preparer(Configuration lakeConfig)
+            throws IOException {
+        return checkNotNull(tieringFactory.createDeletionVectorPreparer(tableInfo, lakeConfig));
+    }
+
+    /**
+     * The current deletes of the first files that fit in the loader's bound are loaded ahead, the
+     * others when asked for; each comes out as the table has it.
+     */
+    @Test
+    void testPositionDeletesAreLoadedAheadWithinTheBound() throws Exception {
+        Table table = createTable(3);
+        List<String> names = commitFiles(table, 2, 5);
+        IcebergCommitterState state =
+                new IcebergCommitterState(IcebergCommitterState.DEFAULT_EXPIRE_INTERVAL_MS);
+        commitDeletes(state, names, 1, refreshed(table).currentSnapshot().snapshotId());
+        Map<String, List<DeleteFile>> deletesByFile = new HashMap<>();
+        for (String location : locationsOf(refreshed(table), names)) {
+            deletesByFile.put(location, liveDeletesOf(table, location));
+        }
+        long oneVector = deletesByFile.values().iterator().next().get(0).contentSizeInBytes();
+
+        // {bound, files loaded ahead}
+        long[][] bounds = {{0, 0}, {oneVector, 1}, {Long.MAX_VALUE, 2}};
+        for (long[] bound : bounds) {
+            PositionDeletesLoader.LoadedDeletes loaded =
+                    new PositionDeletesLoader(table, 2, bound[0])
+                            .loadAhead(deletesByFile, Collections.emptyMap());
+            assertThat(loaded.loadedAhead()).as("bound %s", bound[0]).isEqualTo(bound[1]);
+            for (Map.Entry<String, List<DeleteFile>> e : deletesByFile.entrySet()) {
+                assertThat(positionsOf(loaded.apply(e.getKey())))
+                        .isEqualTo(positionsOf(loadDeletes(table, e.getKey(), e.getValue())));
+            }
+            assertThat(loaded.apply("no-deletes.parquet")).isNull();
+        }
+    }
+
+    /**
+     * The write result with the staged index part its writer would have staged, naming its one data
+     * file.
+     */
+    private static IcebergWriteResult staged(IcebergWriteResult writeResult) {
+        DataFile[] files = writeResult.getWriteResult().dataFiles();
+        assertThat(files).hasSize(1);
+        return new IcebergWriteResult(
+                writeResult.getWriteResult(),
+                writeResult.specs(),
+                null,
+                new StagedIndexPart(
+                        1L,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        Collections.singletonMap(0, fileName(files[0].location())),
+                        files[0].recordCount(),
+                        0));
+    }
+
+    /** Tiers {@code count} data files of {@code rows} rows each; returns their names. */
+    private List<String> commitFiles(Table table, int count, int rows) throws Exception {
+        List<String> names = new ArrayList<>();
+        for (int f = 0; f < count; f++) {
+            long snapshot = commitRows(f * rows, rows);
+            names.add(fileName(addedDataFile(refreshed(table), snapshot)));
+        }
+        return names;
+    }
+
+    /** Deletes the row at {@code position} of every file on {@code base}; returns the snapshot. */
+    private long commitDeletes(
+            IcebergCommitterState state, List<String> files, long position, long base)
+            throws Exception {
+        Map<String, long[]> deletes = new HashMap<>();
+        for (String file : files) {
+            deletes.put(file, new long[] {position});
+        }
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, false, state, new Configuration())) {
+            return committer
+                    .commitWithDeletes(
+                            committer.toCommittable(Collections.emptyList()),
+                            Collections.emptyMap(),
+                            deletes,
+                            base,
+                            Collections.emptyList())
+                    .getCommittedSnapshotId();
+        }
+    }
+
+    private static List<String> locationsOf(Table table, List<String> names) throws IOException {
+        List<String> locations = new ArrayList<>();
+        for (DataFile file : dataFiles(table)) {
+            if (names.contains(fileName(file.location()))) {
+                locations.add(file.location());
+            }
+        }
+        assertThat(locations).hasSameSizeAs(names);
+        return locations;
+    }
+
+    private static List<DeleteFile> liveDeletesOf(Table table, String location) throws IOException {
+        table.refresh();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                if (task.file().location().equals(location)) {
+                    return task.deletes();
+                }
+            }
+        }
+        throw new AssertionError("No data file " + location);
+    }
+
+    private static PositionDeleteIndex loadDeletes(
+            Table table, String location, List<DeleteFile> deletes) {
+        return new BaseDeleteLoader(df -> table.io().newInputFile(df.location()))
+                .loadPositionDeletes(deletes, location);
+    }
+
+    private static List<Long> positionsOf(PositionDeleteIndex index) {
+        List<Long> positions = new ArrayList<>();
+        index.forEach(positions::add);
+        Collections.sort(positions);
+        return positions;
     }
 
     /**
@@ -1168,7 +1725,8 @@ class IcebergDerivedCommitTest {
                     committer.toCommittable(Collections.emptyList()),
                     Collections.emptyMap(),
                     Collections.singletonMap(fileName(inputs.get(1)), new long[] {1L}),
-                    third);
+                    third,
+                    Collections.emptyList());
         }
         Map<Integer, List<Long>> before = lineage(refreshed(table));
         assertThat(before).hasSize(8).doesNotContainKey(4);
@@ -1253,7 +1811,8 @@ class IcebergDerivedCommitTest {
         TableDescriptor withDeletionVectors =
                 plain.withProperties(
                         Collections.singletonMap(
-                                ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true"));
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                "true"));
         TableInfo dvTableInfo =
                 TableInfo.of(tablePath, 0, 1, withDeletionVectors, DEFAULT_REMOTE_DATA_DIR, 1L, 1L);
 
@@ -1295,7 +1854,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.emptyMap(),
-                                            base))
+                                            base,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeBaseChangedException.class);
         }
 
@@ -1315,7 +1875,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.emptyMap(),
-                                    current)
+                                    current,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThat(refreshed(table).snapshot(landed).parentId()).isEqualTo(current);
         }
@@ -1366,7 +1927,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             Collections.emptyMap(),
-                                            -1))
+                                            -1,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeCommitRejectedException.class)
                     .hasRootCauseInstanceOf(LakeTableExternallyModifiedException.class)
                     .rootCause()
@@ -1394,7 +1956,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.emptyMap(),
-                                    -1)
+                                    -1,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThat(refreshed(table).snapshot(landed).parentId()).isEqualTo(tiered);
         }
@@ -1418,7 +1981,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     roundProperties(-1),
                                     Collections.emptyMap(),
-                                    -1)
+                                    -1,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
         }
         long lost;
@@ -1430,7 +1994,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     roundProperties(registered),
                                     Collections.emptyMap(),
-                                    registered)
+                                    registered,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThat(committer.getMissingLakeSnapshot(registered))
                     .isNotNull()
@@ -1450,7 +2015,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     roundProperties(registered),
                                     Collections.emptyMap(),
-                                    registered)
+                                    registered,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
             assertThat(refreshed(loadTable()).snapshot(next).parentId()).isEqualTo(registered);
         }
@@ -1477,7 +2043,8 @@ class IcebergDerivedCommitTest {
                                     committer.toCommittable(Collections.emptyList()),
                                     Collections.emptyMap(),
                                     Collections.singletonMap(broken, new long[] {0L}),
-                                    second)
+                                    second,
+                                    Collections.emptyList())
                             .getCommittedSnapshotId();
         }
         // the delete file of the second data file is lost
@@ -1500,7 +2067,8 @@ class IcebergDerivedCommitTest {
                                             committer.toCommittable(Collections.emptyList()),
                                             Collections.emptyMap(),
                                             deleted,
-                                            withDeletes))
+                                            withDeletes,
+                                            Collections.emptyList()))
                     .isInstanceOf(LakeCommitRejectedException.class);
         }
         assertThat(refreshed(table).currentSnapshot().snapshotId()).isEqualTo(withDeletes);
@@ -1532,7 +2100,11 @@ class IcebergDerivedCommitTest {
 
         try (IcebergLakeCommitter committer =
                 new IcebergLakeCommitter(
-                        catalogProvider, tablePath, true, new IcebergCommitterState(0))) {
+                        catalogProvider,
+                        tablePath,
+                        true,
+                        new IcebergCommitterState(0),
+                        new Configuration())) {
             committer.expireSnapshots(keepFrom);
         }
 
@@ -1544,7 +2116,77 @@ class IcebergDerivedCommitTest {
         assertThat(countRows(table)).isEqualTo(12);
     }
 
+    /**
+     * With automatic expiry off, Fluss expires nothing, but still tags the snapshot the index chain
+     * starts at, so an expiry another engine runs keeps it.
+     */
+    @Test
+    void testChainStartIsTaggedWhenAutoExpiryIsOff() throws Exception {
+        Table table = createTable(3);
+        long older = commitRows(0, 3);
+        long keepFrom = commitRows(3, 3);
+        long head = commitRows(6, 3);
+
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider,
+                        tablePath,
+                        false,
+                        new IcebergCommitterState(0),
+                        new Configuration())) {
+            committer.expireSnapshots(keepFrom);
+        }
+        assertThat(refreshed(table).snapshot(older)).isNotNull();
+
+        expireAsAnotherEngine(table);
+
+        table = refreshed(table);
+        assertThat(table.snapshot(keepFrom)).isNotNull();
+        assertThat(table.snapshot(older)).isNull();
+        assertThat(table.snapshot(head)).isNotNull();
+        assertThat(table.refs().get(IcebergLakeCommitter.KEEP_FROM_TAG).snapshotId())
+                .isEqualTo(keepFrom);
+    }
+
+    /** The tag follows the chain's start after every round, not only when Fluss's expiry runs. */
+    @Test
+    void testChainStartTagMovesBeforeTheNextExpiryIsDue() throws Exception {
+        Table table = createTable(3);
+        long first = commitRows(0, 3);
+        long keepFrom = commitRows(3, 3);
+        commitRows(6, 3);
+
+        IcebergCommitterState state = new IcebergCommitterState(Long.MAX_VALUE);
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, true, state, new Configuration())) {
+            committer.expireSnapshots(first);
+        }
+        // a trim moved the chain's start to keepFrom; the next expiry is not due yet
+        try (IcebergLakeCommitter committer =
+                new IcebergLakeCommitter(
+                        catalogProvider, tablePath, true, state, new Configuration())) {
+            committer.expireSnapshots(keepFrom);
+        }
+
+        expireAsAnotherEngine(table);
+
+        table = refreshed(table);
+        assertThat(table.snapshot(keepFrom)).isNotNull();
+        assertThat(table.refs().get(IcebergLakeCommitter.KEEP_FROM_TAG).snapshotId())
+                .isEqualTo(keepFrom);
+    }
+
     // ------------------------------------------------------------------------------------------
+
+    /** Expires every snapshot but the current and the tagged ones, as another engine can. */
+    private void expireAsAnotherEngine(Table table) {
+        refreshed(table)
+                .expireSnapshots()
+                .expireOlderThan(System.currentTimeMillis() + 1)
+                .retainLast(1)
+                .commit();
+    }
 
     /** The snapshot properties of a round on {@code base}, as the tiering committer sets them. */
     private static Map<String, String> roundProperties(long base) {
@@ -1597,7 +2239,7 @@ class IcebergDerivedCommitTest {
                                         .build())
                         .distributedBy(1, "c1")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .customProperty("iceberg.format-version", String.valueOf(formatVersion))
                         .build();
         try (IcebergLakeCatalog catalog = new IcebergLakeCatalog(configuration)) {
@@ -1695,6 +2337,29 @@ class IcebergDerivedCommitTest {
         rewrite.commit();
         table.refresh();
         return table.currentSnapshot().snapshotId();
+    }
+
+    /** Writes rows with keys [from, from + count) in one data file, uncommitted. */
+    private List<IcebergWriteResult> writeRows(int from, int count) throws Exception {
+        List<IcebergWriteResult> writeResults = new ArrayList<>();
+        try (LakeWriter<IcebergWriteResult> writer = createWriter()) {
+            for (int key = from; key < from + count; key++) {
+                writer.write(insert(key, key, "v" + key));
+            }
+            writeResults.add(writer.complete());
+        }
+        return writeResults;
+    }
+
+    private static List<Integer> liveKeys(Table table) throws Exception {
+        table.refresh();
+        List<Integer> keys = new ArrayList<>();
+        try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
+            for (Record record : records) {
+                keys.add((Integer) record.getField("c1"));
+            }
+        }
+        return keys;
     }
 
     private Table refreshed(Table table) {

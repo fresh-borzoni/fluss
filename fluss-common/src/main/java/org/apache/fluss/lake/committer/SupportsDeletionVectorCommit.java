@@ -23,8 +23,8 @@ import java.io.IOException;
 
 /**
  * A {@link LakeCommitter} that can commit the tiering rounds of tables with deletion vectors
- * ({@code table.deletion-vectors.enabled}). Fluss checks a committer of such a table for this
- * capability before a round commits, and fails the round with a clear error otherwise.
+ * ({@code table.datalake.deletion-vectors.enabled}). Fluss checks a committer of such a table for
+ * this capability before a round commits, and fails the round with a clear error otherwise.
  *
  * <p>A lake implements one of two ways to commit such a round, chosen by {@link
  * org.apache.fluss.lake.writer.SupportsDeletionVectorTiering#mergesByPrimaryKey()}: Fluss resolves

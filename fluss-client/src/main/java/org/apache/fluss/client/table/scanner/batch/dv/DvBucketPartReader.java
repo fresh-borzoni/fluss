@@ -58,10 +58,10 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * cut from the leader at once. If the masks stay unavailable, the bucket is planned again on the
  * coordinator's readable snapshot and read by key up to the planned stopping offset.
  *
- * <p>A part that reads its whole bucket pins its own cut when it starts, unless planning pinned
- * one, and fetches all masks of the cut at once. If the leader loses the cut before they are
- * fetched, after a leader change or as it evicts cuts, the part pins again, and in the end reads
- * the bucket by key up to the last cut it pinned.
+ * <p>A part that reads its whole bucket pins its own cut when it starts and fetches all masks of
+ * the cut at once. If the leader loses the cut before they are fetched, after a leader change or as
+ * it evicts cuts, the part pins again, and in the end reads the bucket by key up to the last cut it
+ * pinned.
  *
  * <p>A part restored after it emitted rows reads with the masks it kept, of the cut it was read
  * with: masks of another cut would emit rows twice or lose them.
@@ -160,8 +160,7 @@ public class DvBucketPartReader implements BatchScanner {
         this.part = part;
         this.bucket = part.getTableBucket();
         this.context = context;
-        this.machine =
-                new DvPartMachine(part, context.tablePath(), stats, new DvOwnPin(part, context));
+        this.machine = new DvPartMachine(part, context.tablePath(), stats);
         this.resolver = new DvPartResolver(machine, context, stats);
     }
 

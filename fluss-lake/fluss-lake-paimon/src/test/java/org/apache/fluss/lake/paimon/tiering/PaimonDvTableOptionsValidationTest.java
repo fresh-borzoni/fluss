@@ -104,7 +104,7 @@ class PaimonDvTableOptionsValidationTest {
         // Checked before anything is tiered, too.
         assertThatThrownBy(() -> validator().validateDeletionVectorTable(tableInfo(true), null))
                 .isInstanceOf(InvalidTableException.class)
-                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining(reported)
                 .hasMessageContaining(TABLE_PATH.toString());
     }
@@ -127,7 +127,9 @@ class PaimonDvTableOptionsValidationTest {
                                         .build())
                         .distributedBy(1)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, deletionVectors)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED,
+                                deletionVectors)
                         .build(),
                 "/remote",
                 System.currentTimeMillis(),

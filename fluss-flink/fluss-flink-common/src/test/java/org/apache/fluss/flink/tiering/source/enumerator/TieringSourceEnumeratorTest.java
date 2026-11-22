@@ -42,7 +42,10 @@ import org.apache.fluss.flink.tiering.event.RowPosRequestEvent;
 import org.apache.fluss.flink.tiering.event.TieringReachMaxDurationEvent;
 import org.apache.fluss.flink.tiering.source.TieringTestBase;
 import org.apache.fluss.flink.tiering.source.split.FlinkTieringSplit;
+import org.apache.fluss.lake.committer.CommittedLakeSnapshot;
 import org.apache.fluss.lake.committer.CommitterInitContext;
+import org.apache.fluss.lake.committer.LakeCommitResult;
+import org.apache.fluss.lake.committer.LakeCommitter.CommitContext;
 import org.apache.fluss.lake.committer.PartitionMarkDoneCommitter;
 import org.apache.fluss.lake.committer.SupportsPositionDeleteCommit;
 import org.apache.fluss.lake.source.LakeSource;
@@ -56,6 +59,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.rpc.messages.PbLakeTableOffsetForBucket;
 import org.apache.fluss.rpc.messages.PbLakeTableSnapshotInfo;
 import org.apache.fluss.utils.concurrent.FutureUtils;
@@ -100,7 +104,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.withSettings;
 
 /** Unit tests for {@link TieringSourceEnumerator} and {@link TieringSplitGenerator}. */
 class TieringSourceEnumeratorTest extends TieringTestBase {
@@ -259,6 +262,99 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             assertThatThrownBy(() -> generator.generateTableSplits(tableInfo, partitions))
                     .isInstanceOf(IllegalStateException.class);
         }
+    }
+
+    /**
+     * The rounds of a table with deletion vectors are planned at the buckets' leaders: from the
+     * bucket's offset in the latest lake snapshot, or from 0 for a bucket the snapshot does not
+     * have, up to the end the leader picked. Buckets with nothing past their start are not planned,
+     * and a bucket whose leader has nothing to tier gets no split. Without a planner the rounds end
+     * at the high watermark, as on a lake that merges by key.
+     */
+    @Test
+    void testRoundsOfDeletionVectorTablesArePlannedAtTheirLeaders() throws Exception {
+        TableInfo tableInfo = pkTableInfo(true);
+        long tableId = tableInfo.getTableId();
+        Map<Integer, CompletableFuture<Long>> offsets = new HashMap<>();
+        for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
+            offsets.put(bucket, CompletableFuture.completedFuture(50L));
+        }
+        AtomicReference<LakeSnapshot> lakeSnapshot = new AtomicReference<>();
+        Admin tieringAdmin =
+                new TestAdminAdapter() {
+                    @Override
+                    public CompletableFuture<LakeSnapshot> getLatestLakeSnapshot(TablePath path) {
+                        return lakeSnapshot.get() == null
+                                ? FutureUtils.completedExceptionally(
+                                        new LakeTableSnapshotNotExistException("No lake snapshot"))
+                                : CompletableFuture.completedFuture(lakeSnapshot.get());
+                    }
+
+                    @Override
+                    public ListOffsetsResult listOffsets(
+                            TablePath path, Collection<Integer> buckets, OffsetSpec spec) {
+                        return new ListOffsetsResult(offsets);
+                    }
+                };
+        // {snapshot id, bucket, start} of each bucket planned
+        List<List<Object>> planned = new ArrayList<>();
+        TieringSplitGenerator generator =
+                new TieringSplitGenerator(tieringAdmin, 20, 1 << 20) {
+                    @Override
+                    protected Map<TableBucket, GetDvSnapshotResponse> planRounds(
+                            TablePath path, long snapshotId, Map<TableBucket, Long> starts) {
+                        Map<TableBucket, GetDvSnapshotResponse> plans = new HashMap<>();
+                        for (Map.Entry<TableBucket, Long> start : starts.entrySet()) {
+                            int bucket = start.getKey().getBucket();
+                            planned.add(Arrays.asList(snapshotId, bucket, start.getValue()));
+                            // bucket 1's leader has nothing past the start; the others cap at 20
+                            long end =
+                                    bucket == 1
+                                            ? start.getValue()
+                                            : Math.min(start.getValue() + 20, 50);
+                            plans.put(
+                                    start.getKey(),
+                                    new GetDvSnapshotResponse()
+                                            .setRoundEndOffset(end)
+                                            .setRoundCapped(end < 50));
+                        }
+                        return plans;
+                    }
+                };
+        TablePath path = tableInfo.getTablePath();
+        TableBucket bucket0 = new TableBucket(tableId, 0);
+        TableBucket bucket1 = new TableBucket(tableId, 1);
+        TableBucket bucket2 = new TableBucket(tableId, 2);
+
+        // nothing tiered yet: every round starts at 0, on the empty lake
+        assertThat(generator.generateTableSplits(tableInfo, Collections.emptyList()))
+                .containsExactlyInAnyOrder(
+                        TieringLogSplit.plannedRound(path, bucket0, null, 0, 20, -1, true),
+                        TieringLogSplit.plannedRound(path, bucket2, null, 0, 20, -1, true));
+        assertThat(planned)
+                .containsExactlyInAnyOrder(
+                        Arrays.asList(-1L, 0, 0L),
+                        Arrays.asList(-1L, 1, 0L),
+                        Arrays.asList(-1L, 2, 0L));
+
+        // bucket 0 tiered up to its high watermark, bucket 1 to 40, bucket 2 not in the snapshot
+        planned.clear();
+        Map<TableBucket, Long> tiered = new HashMap<>();
+        tiered.put(bucket0, 50L);
+        tiered.put(bucket1, 40L);
+        lakeSnapshot.set(new LakeSnapshot(7, tiered));
+        assertThat(generator.generateTableSplits(tableInfo, Collections.emptyList()))
+                .containsExactly(TieringLogSplit.plannedRound(path, bucket2, null, 0, 20, 7, true));
+        assertThat(planned)
+                .containsExactlyInAnyOrder(Arrays.asList(7L, 1, 40L), Arrays.asList(7L, 2, 0L));
+
+        // without the caps the round of a bucket ends at its high watermark
+        assertThat(
+                        new TieringSplitGenerator(tieringAdmin)
+                                .generateTableSplits(tableInfo, Collections.emptyList()))
+                .containsExactlyInAnyOrder(
+                        new TieringLogSplit(path, bucket1, null, 40, 50),
+                        new TieringLogSplit(path, bucket2, null, EARLIEST_OFFSET, 50));
     }
 
     @ParameterizedTest
@@ -795,6 +891,7 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             // mock tiering fail by send tiering fail event
             context.getSplitsAssignmentSequence().clear();
             enumerator.handleSourceEvent(1, new FailedTieringEvent(tableId, "test_reason"));
+            assertThat(enumerator.getConsecutiveFailedRounds(tableId)).isEqualTo(1);
 
             // request tiering table splits, should get splits
             for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
@@ -805,6 +902,19 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             context.getSplitsAssignmentSequence()
                     .forEach(a -> a.assignment().values().forEach(actualAssignment1::addAll));
             assertTieringSplitsMatch(actualAssignment1, expectedAssignment);
+
+            // the table's next round fails too, then one finishes
+            enumerator.handleSourceEvent(1, new FailedTieringEvent(tableId, "test_reason"));
+            assertThat(enumerator.getConsecutiveFailedRounds(tableId)).isEqualTo(2);
+            assertThat(enumerator.maxConsecutiveFailedRounds()).isEqualTo(2);
+            context.getSplitsAssignmentSequence().clear();
+            for (int subtaskId = 0; subtaskId < numSubtasks; subtaskId++) {
+                enumerator.handleSplitRequest(subtaskId, "localhost-" + subtaskId);
+            }
+            waitUntilTieringTableSplitAssignmentReady(context, DEFAULT_BUCKET_NUM, 500L);
+            enumerator.handleSourceEvent(1, new FinishedTieringEvent(tableId));
+            assertThat(enumerator.getConsecutiveFailedRounds(tableId)).isZero();
+            assertThat(enumerator.maxConsecutiveFailedRounds()).isZero();
         }
     }
 
@@ -991,7 +1101,7 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                         .distributedBy(4, "id")
                         .build();
         TablePath tablePath1 = TablePath.of(DEFAULT_DB, "tiering-failover-test-log-table1");
-        createTable(tablePath1, tableDescriptor);
+        long tableId1 = createTable(tablePath1, tableDescriptor);
         appendRow(tablePath1, tableDescriptor, 0, 10);
 
         TablePath tablePath2 = TablePath.of(DEFAULT_DB, "tiering-failover-test-log-table2");
@@ -1022,6 +1132,9 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
             // readers failover: Enumerator marks tablePath1 as failed and clears its splits
             // register readers and handle split requests (attempt 1)
             registerReaderAndHandleSplitRequests(context, enumerator, 3, 1);
+            // the failover is a failed round of the table, which the enumerator counts across
+            // the failovers that restart the committer
+            assertThat(enumerator.getConsecutiveFailedRounds(tableId1)).isEqualTo(1);
 
             // Only tablePath2 splits are assigned; the pending tablePath1 split was cleared.
             verifyTieringSplitAssignment(context, 3, tablePath2);
@@ -1240,7 +1353,7 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                                         new TestingLakeTieringFactory(), dvTable, null))
                 .isInstanceOf(UnsupportedOperationException.class)
                 .hasMessageContaining(SupportsDeletionVectorTiering.class.getName())
-                .hasMessageContaining(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key())
+                .hasMessageContaining(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key())
                 .hasMessageContaining(dvTable.getTablePath().toString());
         // a table without deletion vectors passes
         TieringSourceEnumerator.validateTable(
@@ -1281,11 +1394,7 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                 .hasMessageContaining(SupportsPositionDeleteCommit.class.getName())
                 .hasMessageContaining(dvTable.getTablePath().toString());
 
-        @SuppressWarnings("unchecked")
-        PartitionMarkDoneCommitter<TestingWriteResult, TestingCommittable> takesDeletes =
-                mock(
-                        PartitionMarkDoneCommitter.class,
-                        withSettings().extraInterfaces(SupportsPositionDeleteCommit.class));
+        PositionDeleteCommitter takesDeletes = new PositionDeleteCommitter();
         TieringSourceEnumerator.checkDeletionVectorCommitter(
                 new DvTestingLakeTieringFactory(new ArrayList<>()) {
                     @Override
@@ -1307,11 +1416,79 @@ class TieringSourceEnumeratorTest extends TieringTestBase {
                         .schema(DEFAULT_PK_TABLE_SCHEMA)
                         .distributedBy(DEFAULT_BUCKET_NUM, "id")
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, deletionVectors)
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED,
+                                deletionVectors)
                         .build(),
                 "/remote",
                 1L,
                 1L);
+    }
+
+    /** A lake committer that takes deletes by row position; the check only creates it. */
+    private static final class PositionDeleteCommitter
+            implements PartitionMarkDoneCommitter<TestingWriteResult, TestingCommittable>,
+                    SupportsPositionDeleteCommit<TestingWriteResult, TestingCommittable> {
+
+        @Override
+        public TestingCommittable toCommittable(List<TestingWriteResult> writeResults) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public LakeCommitResult commit(TestingCommittable committable, CommitContext context) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public LakeCommitResult commitWithDeletes(
+                TestingCommittable committable,
+                Map<String, String> snapshotProperties,
+                Map<String, long[]> deletedPositionsByFile,
+                long baseSnapshotId,
+                Collection<TestingWriteResult> prepared) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Long commitPendingRewrite(TestingCommittable committable) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void expireSnapshots(@Nullable Long keepFromSnapshotId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void checkCurrentSnapshotDescendsFrom(long snapshotId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void protectReadableSnapshot(long snapshotId) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean preparePartitionMarkDone(TestingCommittable committable) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void abort(TestingCommittable committable) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Nullable
+        @Override
+        public CommittedLakeSnapshot getMissingLakeSnapshot(
+                @Nullable Long latestLakeSnapshotIdOfFluss) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void close() {}
     }
 
     /** A testing lake that tiers tables with deletion vectors, recording its validations. */

@@ -27,6 +27,7 @@ import org.apache.fluss.lake.writer.DeletionVectorWriterInitContext;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.SupportsRecordBatchWrite;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
@@ -110,6 +111,7 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
                                 partitionKeys,
                                 flussRowType,
                                 writerInitContext.ioTmpDirs(),
+                                sharedWriterMemory(writerInitContext),
                                 paimonIncludingSystemColumns,
                                 historicalPartition);
         boolean autoCompaction =
@@ -138,6 +140,20 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult>, Supports
                                 writerInitContext.tieringRoundTimestamp(),
                                 localTmpDir(writerInitContext.ioTmpDirs()))
                         : null;
+    }
+
+    /**
+     * The memory of the tiering task, whose capacity bounds the write buffer its writers of tables
+     * with deletion vectors share; null for other tables, whose writers each buffer Paimon's
+     * 'write-buffer-size'.
+     */
+    @Nullable
+    private static WriterMemoryPool sharedWriterMemory(WriterInitContext writerInitContext) {
+        if (!writerInitContext.tableInfo().isDeletionVectorsEnabled()
+                || !(writerInitContext instanceof DeletionVectorWriterInitContext)) {
+            return null;
+        }
+        return ((DeletionVectorWriterInitContext) writerInitContext).writerMemoryPool();
     }
 
     @Nullable

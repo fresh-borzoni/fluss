@@ -361,7 +361,8 @@ class FlinkDerivedDvTieringFencingITCase extends FlinkUnionReadTestBase {
                         .distributedBy(BUCKETS)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .customProperty("iceberg.format-version", "3")
                         .build();
         return createTable(tablePath, descriptor);

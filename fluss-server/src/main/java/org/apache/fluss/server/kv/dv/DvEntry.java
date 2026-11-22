@@ -27,7 +27,7 @@ public class DvEntry {
     private final long recordOffset;
     private final long versionOffset;
     private final boolean insert;
-    // the offset of the version the change supersedes, the tag of the key's KV value, or -1
+    // the offset of the version the change supersedes, which the key's KV value carries, or -1
     private final long previousVersionOffset;
 
     /**
@@ -38,8 +38,8 @@ public class DvEntry {
      * @param insert whether the key had no live version before the change. A lake snapshot whose
      *     readable offset is at or before the change then has no row of the key either.
      * @param previousVersionOffset the offset of the version the change supersedes, which the key's
-     *     KV value is tagged with, or -1 if there is none or it is not known: a version before the
-     *     log tail, in the lake
+     *     KV value carries, or -1 if there is none or it is not known: a version before the log
+     *     tail, in the lake
      */
     public DvEntry(
             byte[] key,

@@ -273,9 +273,9 @@ class LakeSplitGeneratorTest {
 
     // ---- Non-partitioned PK table with DV enabled ----
 
-    /** Planning pins one cut per bucket without asking for masks. The splits carry only the cut. */
+    /** Planning pins no bucket one split reads: the split pins its own cut when it starts. */
     @Test
-    void testPlanningPinsOneCutPerBucketWithoutMasks() throws Exception {
+    void testBucketsReadByOneSplitAreNotPinned() throws Exception {
         Map<TableBucket, Long> lakeOffsets = new HashMap<>();
         Map<Integer, Long> stoppingOffsets = new HashMap<>();
         for (int b = 0; b < BUCKET_COUNT; b++) {
@@ -288,22 +288,13 @@ class LakeSplitGeneratorTest {
                 createGenerator(true, false, admin, stoppingOffsets)
                         .generateHybridLakeFlussSplits();
 
-        assertThat(admin.dvRequests)
-                .hasSize(BUCKET_COUNT)
-                .allSatisfy(
-                        request -> {
-                            assertThat(request.hasPinRequestId()).isTrue();
-                            assertThat(request.hasLogEndOffset()).isFalse();
-                            assertThat(request.getLakeDvFileNamesCount()).isZero();
-                            assertThat(request.hasLogDvFromOffset()).isFalse();
-                        });
+        assertThat(admin.dvRequests).isEmpty();
         assertThat(splits).hasSize(BUCKET_COUNT);
         for (int b = 0; b < BUCKET_COUNT; b++) {
             DvBucketSplit split = findDvSplitForBucket(splits, b);
-            assertThat(split.isPinned()).isTrue();
-            assertThat(split.sharesBucket()).isFalse();
-            assertThat(split.getMaskLogEndOffset()).isEqualTo(TestAdmin.cutOf(b));
-            assertThat(split.getPinnedLogStartOffset()).isEqualTo(100L * (b + 1));
+            assertThat(split.isPinned()).isFalse();
+            assertThat(split.getFileGroup()).isEqualTo(DvBucketSplit.WHOLE_BUCKET);
+            assertThat(split.getSnapshotLogOffset()).isEqualTo(100L * (b + 1));
             assertThat(split.getLakeSplits()).hasSize(1);
             assertThat(split.readsLog()).isTrue();
             assertThat(split.getMaskState()).isNull();
@@ -322,29 +313,26 @@ class LakeSplitGeneratorTest {
         }
         TestAdmin admin = new TestAdmin(lakeOffsets, stoppingOffsets);
         admin.responseDelayMs = 20;
-        TableInfo tableInfo = createTableInfo(true, false);
-        List<PartitionInfo> partitions =
-                Collections.singletonList(
-                        new PartitionInfo(
-                                0L,
-                                new ResolvedPartitionSpec(
-                                        Collections.emptyList(), Collections.emptyList()),
-                                null,
-                                buckets));
+        // two lake files per bucket, each a split of its own
+        List<LakeSplit> lakeSplits = new ArrayList<>();
+        for (int b = 0; b < buckets; b++) {
+            lakeSplits.add(rowsSplit(b, 3));
+            lakeSplits.add(rowsSplit(b, 3));
+        }
         LakeSplitGenerator generator =
                 new LakeSplitGenerator(
-                        tableInfo,
+                        createTableInfo(true, false),
                         admin,
-                        new TestingLakeSource(buckets, partitions),
+                        TestingLakeSource.fromSplits(lakeSplits),
                         new ZeroOffsetsRetriever(),
                         (partitionName, bucketIds, retriever) -> stoppingOffsets,
                         buckets,
                         Collections::emptySet);
+        generator.setFileGroupRows(3);
 
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
         assertThat(splits)
-                .hasSize(buckets)
                 .allMatch(split -> split instanceof DvBucketSplit)
                 .allMatch(split -> ((DvBucketSplit) split).isPinned());
         assertThat(admin.dvRequests).hasSize(buckets);
@@ -397,62 +385,29 @@ class LakeSplitGeneratorTest {
         assertThat(bucket0)
                 .allSatisfy(
                         split -> {
-                            assertThat(split.sharesBucket()).isTrue();
+                            assertThat(split.isPinned()).isTrue();
                             assertThat(split.getMaskLogEndOffset()).isEqualTo(TestAdmin.cutOf(0));
                         });
         assertThat(bucket0).extracting(DvBucketSplit::lakeSplitCount).containsExactly(2, 2, 1, 0);
+        // the splits share the one cut pinned for the bucket, without its masks
+        assertThat(admin.dvRequests)
+                .singleElement()
+                .satisfies(
+                        request -> {
+                            assertThat(request.getBucketId()).isZero();
+                            assertThat(request.hasPinRequestId()).isTrue();
+                            assertThat(request.hasLogEndOffset()).isFalse();
+                            assertThat(request.getLakeDvFileNamesCount()).isZero();
+                            assertThat(request.hasLogDvFromOffset()).isFalse();
+                        });
         assertThat(bucket0)
                 .extracting(DvBucketSplit::readsLog)
                 .containsExactly(false, false, false, true);
         assertThat(bucket0).extracting(SourceSplitBase::splitId).doesNotHaveDuplicates();
         DvBucketSplit bucket1 = findDvSplitForBucket(splits, 1);
-        assertThat(bucket1.sharesBucket()).isFalse();
+        assertThat(bucket1.isPinned()).isFalse();
         assertThat(bucket1.lakeSplitCount()).isEqualTo(1);
         assertThat(splits).noneMatch(split -> split.getTableBucket().getBucket() == 2);
-    }
-
-    /**
-     * A bucket's cut takes a hold per split, which the enumerator releases as each split is read:
-     * the file groups and the log of a split bucket, one for a bucket read by one split.
-     */
-    @Test
-    void testPinnedCutTakesAHoldPerSplit() throws Exception {
-        Map<TableBucket, Long> lakeOffsets = new HashMap<>();
-        lakeOffsets.put(new TableBucket(TABLE_ID, 0), 100L);
-        lakeOffsets.put(new TableBucket(TABLE_ID, 1), 200L);
-        Map<Integer, Long> stoppingOffsets = new HashMap<>();
-        stoppingOffsets.put(0, 150L);
-        stoppingOffsets.put(1, 250L);
-        stoppingOffsets.put(2, 0L);
-        TestAdmin admin = new TestAdmin(lakeOffsets, stoppingOffsets);
-        List<LakeSplit> lakeSplits = new ArrayList<>();
-        for (int i = 0; i < 5; i++) {
-            lakeSplits.add(rowsSplit(0, 3));
-        }
-        lakeSplits.add(rowsSplit(1, 3));
-        LakeSplitGenerator generator =
-                new LakeSplitGenerator(
-                        createTableInfo(true, false),
-                        admin,
-                        TestingLakeSource.fromSplits(lakeSplits),
-                        new ZeroOffsetsRetriever(),
-                        (partitionName, bucketIds, retriever) -> stoppingOffsets,
-                        BUCKET_COUNT,
-                        Collections::emptySet);
-        generator.setFileGroupRows(6);
-
-        List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
-
-        assertThat(splits.stream().filter(split -> split.getTableBucket().getBucket() == 0))
-                .hasSize(4);
-        assertThat(admin.dvRequests)
-                .filteredOn(request -> request.getBucketId() == 0)
-                .singleElement()
-                .satisfies(pin -> assertThat(pin.getHolds()).isEqualTo(4));
-        assertThat(admin.dvRequests)
-                .filteredOn(request -> request.getBucketId() == 1)
-                .singleElement()
-                .satisfies(pin -> assertThat(pin.hasHolds()).isFalse());
     }
 
     /**
@@ -471,7 +426,6 @@ class LakeSplitGeneratorTest {
         stoppingOffsets.put(2, 0L);
         TestAdmin admin = new TestAdmin(lakeOffsets, stoppingOffsets);
         admin.stalePins.add(0);
-        admin.stalePins.add(1);
         List<LakeSplit> lakeSplits = new ArrayList<>();
         for (int i = 0; i < 5; i++) {
             lakeSplits.add(rowsSplit(0, 3));
@@ -539,9 +493,8 @@ class LakeSplitGeneratorTest {
         assertThat(logOnly.getSnapshotLogOffset()).isEqualTo(-1L);
         assertThat(logOnly.getStoppingOffset()).isEqualTo(30L);
         assertThat(splits).noneMatch(split -> split.getTableBucket().getBucket() == 2);
-        // planning pins cuts, but asks for no masks
-        assertThat(admin.dvRequests)
-                .allSatisfy(request -> assertThat(request.getLakeDvFileNamesCount()).isZero());
+        // a bucket one split reads is not pinned
+        assertThat(admin.dvRequests).isEmpty();
     }
 
     /** Nothing tiered yet: the read is planned on the empty lake, its whole log masked. */
@@ -564,9 +517,8 @@ class LakeSplitGeneratorTest {
             assertThat(dvSplit.getSnapshotId()).isEqualTo(-1L);
             assertThat(dvSplit.getLakeSplits()).isNull();
         }
-        // planning pins cuts, but asks for no masks
-        assertThat(admin.dvRequests)
-                .allSatisfy(request -> assertThat(request.getLakeDvFileNamesCount()).isZero());
+        // a bucket one split reads is not pinned
+        assertThat(admin.dvRequests).isEmpty();
     }
 
     @Test
@@ -667,9 +619,8 @@ class LakeSplitGeneratorTest {
                 createPartitionedGenerator(true, admin, partitionInfos, BUCKET_COUNT);
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
-        // planning pins cuts, but asks for no masks
-        assertThat(admin.dvRequests)
-                .allSatisfy(request -> assertThat(request.getLakeDvFileNamesCount()).isZero());
+        // a bucket one split reads is not pinned
+        assertThat(admin.dvRequests).isEmpty();
         // a split per bucket with tiered data; bucket 2 of each partition has nothing to read
         assertThat(splits).hasSize(4).allMatch(split -> split instanceof DvBucketSplit);
         DvBucketSplit p1b0 = (DvBucketSplit) only(splitsOf(splits, partition1Id, 0));
@@ -747,9 +698,8 @@ class LakeSplitGeneratorTest {
 
         List<SourceSplitBase> splits = generator.generateHybridLakeFlussSplits();
 
-        // planning pins cuts, but asks for no masks
-        assertThat(admin.dvRequests)
-                .allSatisfy(request -> assertThat(request.getLakeDvFileNamesCount()).isZero());
+        // a bucket one split reads is not pinned
+        assertThat(admin.dvRequests).isEmpty();
         List<SourceSplitBase> droppedSplits = new ArrayList<>();
         for (SourceSplitBase split : splits) {
             if ("2025-01-01".equals(split.getPartitionName())) {
@@ -922,7 +872,7 @@ class LakeSplitGeneratorTest {
                 TableDescriptor.builder()
                         .schema(schemaBuilder.build())
                         .distributedBy(BUCKET_COUNT, "id")
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, dvEnabled);
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, dvEnabled);
         if (isPartitioned) {
             descriptorBuilder.partitionedBy("dt");
         }
@@ -1012,17 +962,6 @@ class LakeSplitGeneratorTest {
                         inFlight.decrementAndGet();
                         return response;
                     });
-        }
-
-        @Override
-        public CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
-                TablePath tablePath,
-                long tableId,
-                @Nullable Long partitionId,
-                int bucketId,
-                long snapshotId,
-                List<byte[]> keys) {
-            throw new UnsupportedOperationException("lookupDvPositions");
         }
     }
 }

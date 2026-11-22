@@ -963,7 +963,7 @@ public class RemoteLogITCase {
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true)
+                        .property(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true)
                         .property(ConfigOptions.TABLE_LOG_TTL, Duration.ofHours(1))
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(100))
                         .build();
@@ -1016,7 +1016,7 @@ public class RemoteLogITCase {
         // A compaction makes snapshot 2 readable from the start of a middle segment.
         int mid = segments.size() / 2;
         long readable = segments.get(mid).remoteLogStartOffset();
-        writeIndexChange(leaderServer, tablePath, tb, 2L);
+        writeIndexChange(leaderServer, leaderReplica, 2L);
         commitLakeSnapshot(tableId, tieringEpoch, tb, 2, logEnd, readable);
         retry(
                 Duration.ofMinutes(1),
@@ -1155,14 +1155,17 @@ public class RemoteLogITCase {
     }
 
     /** Publishes the position index change of a snapshot as the first one of the chain. */
-    private static void writeIndexChange(
-            TabletServer server, TablePath tablePath, TableBucket tb, long snapshotId)
+    private static void writeIndexChange(TabletServer server, Replica leader, long snapshotId)
             throws Exception {
+        TableBucket tb = leader.getTableBucket();
+        // The cluster spreads tables over several remote data directories, and the leader reads
+        // the index under the table's own one, where the tiering writes it.
         PositionIndexStore index =
                 PositionIndexStore.forTable(
-                        server.getReplicaManager().getKvSnapshotContext().getRemoteDataDir(),
-                        tablePath,
-                        tb.getTableId(),
+                        PositionIndexStore.lakeTableDirOf(
+                                leader.getTableInfo(),
+                                server.getReplicaManager().getKvSnapshotContext()
+                                        ::getRemoteDataDir),
                         null);
         byte[] key = ("k" + snapshotId).getBytes(StandardCharsets.UTF_8);
         index.commitChange(

@@ -209,7 +209,7 @@ public class TableConfig {
 
     /** Returns true if deletion vectors are enabled for the table. */
     public boolean isDeletionVectorsEnabled() {
-        return config.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
+        return config.get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED);
     }
 
     /** Gets the Arrow compression type and compression level of the table. */

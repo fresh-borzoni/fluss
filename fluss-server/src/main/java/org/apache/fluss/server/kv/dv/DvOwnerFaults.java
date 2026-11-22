@@ -103,7 +103,10 @@ final class DvOwnerFaults {
         }
     }
 
-    /** Drops the change list after a hand-off failed or overflowed. */
+    /**
+     * Drops the change list after a hand-off failed or overflowed, or a switch found the bucket's
+     * row TTL state corrupt.
+     */
     void changeListLost(Throwable cause) {
         poisonFinalPass();
         o.maskState.renew(KeepReady.SAME_SNAPSHOT);

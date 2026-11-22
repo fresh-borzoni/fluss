@@ -169,14 +169,12 @@ public class DvBucketSplit extends SourceSplitBase {
         return new DvBucketSplit(part.withMaskState(maskState));
     }
 
-    /** Whether the split reads with a cut pinned at planning. */
+    /**
+     * Whether the split reads with a cut pinned at planning, which the other splits of its bucket
+     * read too.
+     */
     public boolean isPinned() {
         return part.isPinned();
-    }
-
-    /** Whether other splits read other parts of the bucket with the same pinned cut. */
-    public boolean sharesBucket() {
-        return part.sharesBucket();
     }
 
     /** The group of the bucket's lake files the split reads, or {@link #WHOLE_BUCKET}. */

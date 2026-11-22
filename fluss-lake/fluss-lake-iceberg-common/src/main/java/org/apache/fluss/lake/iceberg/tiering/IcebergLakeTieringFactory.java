@@ -26,8 +26,10 @@ import org.apache.fluss.lake.iceberg.source.IcebergLakeSource;
 import org.apache.fluss.lake.iceberg.utils.IcebergSnapshotLineage;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.writer.DeletionVectorPreparer;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.lake.writer.LakeWriter;
+import org.apache.fluss.lake.writer.SupportsDeletionVectorPreparation;
 import org.apache.fluss.lake.writer.SupportsDeletionVectorTiering;
 import org.apache.fluss.lake.writer.TieringTableValidator;
 import org.apache.fluss.lake.writer.WriterInitContext;
@@ -49,9 +51,14 @@ import static org.apache.fluss.lake.iceberg.utils.IcebergConversions.toIceberg;
 public class IcebergLakeTieringFactory
         implements LakeTieringFactory<IcebergWriteResult, IcebergCommittable>,
                 TieringTableValidator,
-                SupportsDeletionVectorTiering {
+                SupportsDeletionVectorTiering,
+                SupportsDeletionVectorPreparation<IcebergWriteResult> {
 
     private static final long serialVersionUID = 1L;
+
+    // the live files of the tables tiered here, which the committer and the deletion vector
+    // preparers of a TaskManager share: a round's preparations and commit index the same base
+    private static final LiveFilesIndex.Cache LIVE_FILES = new LiveFilesIndex.Cache();
 
     private final Configuration icebergConfig;
     private final IcebergCatalogProvider icebergCatalogProvider;
@@ -75,6 +82,31 @@ public class IcebergLakeTieringFactory
     public LakeWriter<IcebergWriteResult> createLakeWriter(WriterInitContext writerInitContext)
             throws IOException {
         return new IcebergLakeWriter(icebergCatalogProvider, writerInitContext);
+    }
+
+    /**
+     * Creates the preparer of a table with deletion vectors on format version 3. A version 2 table
+     * has file-scoped position delete files, which the committer merges.
+     */
+    @Override
+    @Nullable
+    public DeletionVectorPreparer<IcebergWriteResult> createDeletionVectorPreparer(
+            TableInfo tableInfo, Configuration lakeTieringConfig) throws IOException {
+        // The preparers of the TaskManager share the table and its catalog.
+        SharedIcebergTables.Handle table =
+                SharedIcebergTables.INSTANCE.acquire(
+                        icebergCatalogProvider, toIceberg(tableInfo.getLakeTablePath()));
+        if (TableUtil.formatVersion(table.table()) < 3) {
+            table.close();
+            return null;
+        }
+        return new IcebergDeletionVectorPreparer(
+                table,
+                LIVE_FILES,
+                lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_THREADS),
+                lakeTieringConfig
+                        .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_LOAD_MAX_BYTES)
+                        .getBytes());
     }
 
     @Override
@@ -133,7 +165,7 @@ public class IcebergLakeTieringFactory
                             icebergTable.name(),
                             formatVersion,
                             tableInfo.getTablePath(),
-                            ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key()));
+                            ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key()));
         }
     }
 
@@ -158,12 +190,19 @@ public class IcebergLakeTieringFactory
                                 || committerInitContext
                                         .lakeTieringConfig()
                                         .get(ConfigOptions.LAKE_TIERING_AUTO_EXPIRE_SNAPSHOT)),
-                committerState());
+                committerState(committerInitContext.lakeTieringConfig()),
+                committerInitContext.lakeTieringConfig());
     }
 
-    private synchronized IcebergCommitterState committerState() {
+    private synchronized IcebergCommitterState committerState(Configuration lakeTieringConfig) {
         if (committerState == null) {
-            committerState = new IcebergCommitterState(expireIntervalMs);
+            committerState =
+                    new IcebergCommitterState(
+                            expireIntervalMs,
+                            lakeTieringConfig
+                                    .get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_CACHE_SIZE)
+                                    .getBytes(),
+                            LIVE_FILES);
         }
         return committerState;
     }

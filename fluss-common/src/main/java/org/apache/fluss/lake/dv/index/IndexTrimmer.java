@@ -197,7 +197,6 @@ final class IndexTrimmer {
             int maxBuilds,
             long maxBuildMillis)
             throws IOException {
-        layout.checkLayout();
         TrimRecords.Record previous = finishInterruptedTrim();
         // A barrier, not the chain the cut uses, which is listed after the checkpoints: the buckets
         // with data are read only after it, so a caller that reads them from Fluss's registration

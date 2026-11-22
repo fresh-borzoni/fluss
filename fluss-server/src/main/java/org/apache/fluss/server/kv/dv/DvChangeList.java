@@ -33,10 +33,10 @@ import java.util.List;
  * The change list of the covered snapshot: the changes the high watermark has not passed, the
  * updates and deletes the high watermark passed, and the versions they superseded.
  *
- * <p>Each change names the version it supersedes, the offset its KV value is tagged with. A change
- * whose superseded version is in the change list masks that version in the log. One whose
- * superseded version is before the change list, in the lake, masks the key's lake row, so its key
- * is looked up in the index. Applying a change therefore reads nothing.
+ * <p>Each change names the version it supersedes, the offset its KV value carries. A change whose
+ * superseded version is in the change list masks that version in the log. One whose superseded
+ * version is before the change list, in the lake, masks the key's lake row, so its key is looked up
+ * in the index. Applying a change therefore reads nothing.
  *
  * <p>The updates and deletes are kept in log order in the bucket's RocksDB ({@link
  * DvChangeListStore}) until a newer lake snapshot holds them, to find the keys whose lake rows that
@@ -105,11 +105,6 @@ final class DvChangeList {
      */
     long lastApplied() {
         return lastApplied;
-    }
-
-    /** The pending changes and the changes waiting for the high watermark. */
-    long size() {
-        return pendingCount + queue.size();
     }
 
     /** The bytes of the pending changes on disk, before compression. */

@@ -112,6 +112,7 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
     private final Histogram dvMaskBuildHistogram;
     private final Counter dvMaskFrontierCount;
     private final Counter dvRowTtlFoldCount;
+    private final Counter dvRowTtlCorruptCount;
     private final Counter kvTruncateAsDuplicatedCount;
     private final Counter kvTruncateAsErrorCount;
 
@@ -255,6 +256,8 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
         meter(MetricNames.DV_MASK_FRONTIER_RATE, new MeterView(dvMaskFrontierCount));
         dvRowTtlFoldCount = new SimpleCounter();
         meter(MetricNames.DV_ROW_TTL_FOLD_RATE, new MeterView(dvRowTtlFoldCount));
+        dvRowTtlCorruptCount = new SimpleCounter();
+        meter(MetricNames.DV_ROW_TTL_CORRUPT_RATE, new MeterView(dvRowTtlCorruptCount));
         kvTruncateAsDuplicatedCount = new SimpleCounter();
         meter(
                 MetricNames.KV_PRE_WRITE_BUFFER_TRUNCATE_AS_DUPLICATED_RATE,
@@ -554,6 +557,10 @@ public class TabletServerMetricGroup extends AbstractMetricGroup {
 
     public Counter dvRowTtlFoldCount() {
         return dvRowTtlFoldCount;
+    }
+
+    public Counter dvRowTtlCorruptCount() {
+        return dvRowTtlCorruptCount;
     }
 
     public Counter kvTruncateAsDuplicatedCount() {

@@ -17,17 +17,20 @@
 
 package org.apache.fluss.client.tiering;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.initializer.BucketOffsetsRetrieverImpl;
 import org.apache.fluss.client.initializer.OffsetsInitializer.BucketOffsetsRetriever;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.messages.GetDvSnapshotResponse;
 import org.apache.fluss.utils.ExceptionUtils;
 
 import org.slf4j.Logger;
@@ -37,6 +40,7 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,6 +49,7 @@ import java.util.stream.IntStream;
 
 import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** A generator for lake splits. */
@@ -53,9 +58,51 @@ public class TieringSplitGenerator {
     private static final Logger LOG = LoggerFactory.getLogger(TieringSplitGenerator.class);
 
     private final Admin flussAdmin;
+    // the caps of the rounds of tables with deletion vectors, which their leaders plan, on a lake
+    // that takes deletes; 0 if the lake does not tier such tables that way
+    private final long dvRoundMaxRecords;
+    private final long dvRoundMaxBytes;
+    // how long a plan of a round waits for its leader's answer
+    private final long requestTimeoutMs;
 
+    /** A generator whose splits of tables with deletion vectors end at the high watermark. */
     public TieringSplitGenerator(Admin flussAdmin) {
         this.flussAdmin = flussAdmin;
+        this.dvRoundMaxRecords = 0;
+        this.dvRoundMaxBytes = 0;
+        this.requestTimeoutMs = ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue().toMillis();
+    }
+
+    /**
+     * A generator whose splits of tables with deletion vectors are rounds their buckets' leaders
+     * plan, with at most {@code dvRoundMaxRecords} log records and {@code dvRoundMaxBytes} log
+     * bytes each. Both caps must be positive: a round without a cap would not be planned.
+     */
+    public TieringSplitGenerator(Admin flussAdmin, long dvRoundMaxRecords, long dvRoundMaxBytes) {
+        this(
+                flussAdmin,
+                dvRoundMaxRecords,
+                dvRoundMaxBytes,
+                ConfigOptions.CLIENT_REQUEST_TIMEOUT.defaultValue().toMillis());
+    }
+
+    /** A generator as above whose plans wait for their leaders at most {@code requestTimeoutMs}. */
+    public TieringSplitGenerator(
+            Admin flussAdmin, long dvRoundMaxRecords, long dvRoundMaxBytes, long requestTimeoutMs) {
+        checkArgument(
+                dvRoundMaxRecords > 0,
+                "'%s' must be positive, but is %s.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_RECORDS_PER_BUCKET.key(),
+                dvRoundMaxRecords);
+        checkArgument(
+                dvRoundMaxBytes > 0,
+                "'%s' must be positive, but is %s bytes.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_MAX_ROUND_BYTES_PER_BUCKET.key(),
+                dvRoundMaxBytes);
+        this.flussAdmin = flussAdmin;
+        this.dvRoundMaxRecords = dvRoundMaxRecords;
+        this.dvRoundMaxBytes = dvRoundMaxBytes;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     public List<TieringSplit> generateTableSplits(TableInfo tableInfo) throws Exception {
@@ -132,7 +179,8 @@ public class TieringSplitGenerator {
             Map<Long, String> partitionNameById,
             Map<Long, Integer> bucketCountById,
             BucketOffsetsRetriever bucketOffsetsRetriever,
-            @Nullable LakeSnapshot lakeSnapshotInfo) {
+            @Nullable LakeSnapshot lakeSnapshotInfo)
+            throws Exception {
         List<TieringSplit> splits = new ArrayList<>();
         for (Map.Entry<Long, String> partitionNameByIdEntry : partitionNameById.entrySet()) {
             long partitionId = partitionNameByIdEntry.getKey();
@@ -160,7 +208,8 @@ public class TieringSplitGenerator {
     private List<TieringSplit> generateNonPartitionedTableSplit(
             TableInfo tableInfo,
             BucketOffsetsRetriever bucketOffsetsRetriever,
-            @Nullable LakeSnapshot lakeSnapshotInfo) {
+            @Nullable LakeSnapshot lakeSnapshotInfo)
+            throws Exception {
         Map<Integer, Long> latestBucketsOffset =
                 bucketOffsetsRetriever.latestOffsets(
                         null,
@@ -182,9 +231,19 @@ public class TieringSplitGenerator {
             @Nullable String partitionName,
             int numBuckets,
             @Nullable LakeSnapshot lakeSnapshotInfo,
-            Map<Integer, Long> latestBucketsOffset) {
+            Map<Integer, Long> latestBucketsOffset)
+            throws Exception {
         List<TieringSplit> splits = new ArrayList<>();
 
+        if (tableInfo.isDeletionVectorsEnabled() && dvRoundMaxRecords > 0) {
+            return plannedDvRoundSplits(
+                    tableInfo,
+                    partitionId,
+                    partitionName,
+                    numBuckets,
+                    lakeSnapshotInfo,
+                    latestBucketsOffset);
+        }
         if (tableInfo.hasPrimaryKey()) {
             // it's primary key table
             // Historical partitions have no local KV snapshots and only tier retained WAL.
@@ -258,6 +317,72 @@ public class TieringSplitGenerator {
         }
 
         return splits;
+    }
+
+    /**
+     * The splits of a table with deletion vectors whose rounds the buckets' leaders plan. A round
+     * starts at the bucket's offset in the latest lake snapshot, or at 0 if the snapshot does not
+     * have the bucket, where the deletion vectors of a bucket the lake lacks start too. Its end is
+     * the leader's, within the round's caps; a bucket whose leader has nothing past the start gets
+     * no split. A table with deletion vectors is tiered from its log only, never from a KV
+     * snapshot: its index is updated from the round's changes, deletes included.
+     */
+    private List<TieringSplit> plannedDvRoundSplits(
+            TableInfo tableInfo,
+            @Nullable Long partitionId,
+            @Nullable String partitionName,
+            int numBuckets,
+            @Nullable LakeSnapshot lakeSnapshotInfo,
+            Map<Integer, Long> latestBucketsOffset)
+            throws Exception {
+        Map<TableBucket, Long> starts = new LinkedHashMap<>();
+        for (int bucket = 0; bucket < numBuckets; bucket++) {
+            TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucket);
+            Long tiered =
+                    lakeSnapshotInfo != null
+                            ? lakeSnapshotInfo.getTableBucketsOffset().get(tableBucket)
+                            : null;
+            long start = tiered == null ? 0 : tiered;
+            // the leader is asked only if the bucket has anything past the start
+            if (latestBucketsOffset.get(bucket) > start) {
+                starts.put(tableBucket, start);
+            }
+        }
+        if (starts.isEmpty()) {
+            return Collections.emptyList();
+        }
+        long snapshotId = lakeSnapshotInfo == null ? -1L : lakeSnapshotInfo.getSnapshotId();
+        Map<TableBucket, GetDvSnapshotResponse> plans =
+                planRounds(tableInfo.getTablePath(), snapshotId, starts);
+        List<TieringSplit> splits = new ArrayList<>();
+        for (Map.Entry<TableBucket, Long> start : starts.entrySet()) {
+            GetDvSnapshotResponse plan = plans.get(start.getKey());
+            checkState(plan != null, "No round is planned for bucket %s.", start.getKey());
+            if (plan.getRoundEndOffset() > start.getValue()) {
+                splits.add(
+                        TieringLogSplit.plannedRound(
+                                tableInfo.getTablePath(),
+                                start.getKey(),
+                                partitionName,
+                                start.getValue(),
+                                plan.getRoundEndOffset(),
+                                snapshotId,
+                                plan.hasRoundCapped() && plan.isRoundCapped()));
+            }
+        }
+        return splits;
+    }
+
+    /**
+     * Plans the rounds of the buckets from their start offsets on the lake snapshot at their
+     * leaders, within the caps; returns each leader's answer.
+     */
+    @VisibleForTesting
+    protected Map<TableBucket, GetDvSnapshotResponse> planRounds(
+            TablePath tablePath, long snapshotId, Map<TableBucket, Long> startOffsets)
+            throws Exception {
+        return new DvRoundRequests(flussAdmin, tablePath, Thread::sleep, requestTimeoutMs)
+                .planRounds(snapshotId, startOffsets, dvRoundMaxRecords, dvRoundMaxBytes);
     }
 
     private KvSnapshots fetchLatestKvSnapshots(

@@ -21,7 +21,6 @@ package org.apache.fluss.lake.dv.index;
 import org.apache.fluss.lake.dv.FilePos;
 import org.apache.fluss.lake.dv.RowPosSstIndex;
 import org.apache.fluss.lake.dv.index.PositionIndexStore.BucketData;
-import org.apache.fluss.lake.dv.index.PositionIndexStore.KeyConsumer;
 
 import io.github.fluss_contrib.rocksdb.EnvOptions;
 import io.github.fluss_contrib.rocksdb.IngestExternalFileOptions;
@@ -134,9 +133,9 @@ final class IndexSsts {
 
     /**
      * Copies a staged SST into an index SST: a staged delete becomes a tombstone, and every
-     * position gets the new id of its file; passes every key to {@code keys}.
+     * position gets the new id of its file.
      */
-    static void publishSst(File source, File target, Map<Integer, Integer> newIds, KeyConsumer keys)
+    static void publishSst(File source, File target, Map<Integer, Integer> newIds)
             throws IOException {
         try (Options options = new Options();
                 EnvOptions envOptions = new EnvOptions();
@@ -163,7 +162,6 @@ final class IndexSsts {
                         }
                         writer.put(key, new FilePos(id, pos.rowPosition()).encode());
                     }
-                    keys.accept(key);
                 }
                 it.status();
             }

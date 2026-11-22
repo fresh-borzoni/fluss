@@ -27,6 +27,7 @@ import java.io.Serializable;
 import java.util.List;
 import java.util.Objects;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
@@ -197,8 +198,7 @@ public final class DvBucketPart implements Serializable {
 
     /**
      * Creates a part read with a cut pinned at planning: a group of the bucket's lake files ({@code
-     * fileGroup} from 0), its log ({@link #BUCKET_LOG}), or all of the bucket ({@link
-     * #WHOLE_BUCKET}) when one part reads it.
+     * fileGroup} from 0) or its log ({@link #BUCKET_LOG}).
      */
     public static DvBucketPart pinned(
             TableBucket tableBucket,
@@ -224,7 +224,7 @@ public final class DvBucketPart implements Serializable {
                 LOG_NOT_STARTED,
                 null,
                 true,
-                fileGroup,
+                sharedFileGroup(fileGroup),
                 logStartOffset,
                 false);
     }
@@ -257,9 +257,17 @@ public final class DvBucketPart implements Serializable {
                 LOG_NOT_STARTED,
                 null,
                 true,
-                fileGroup,
+                sharedFileGroup(fileGroup),
                 snapshotLogOffset,
                 false);
+    }
+
+    /** A part pinned at planning shares the cut with the other parts of its bucket. */
+    private static int sharedFileGroup(int fileGroup) {
+        checkArgument(
+                fileGroup != WHOLE_BUCKET,
+                "A part pinned at planning reads a group of its bucket's lake files or its log.");
+        return fileGroup;
     }
 
     /**
@@ -376,14 +384,12 @@ public final class DvBucketPart implements Serializable {
         return partitionName;
     }
 
-    /** Whether the part reads with a cut pinned at planning. */
+    /**
+     * Whether the part reads with a cut pinned at planning, which the other parts of its bucket
+     * read too.
+     */
     public boolean isPinned() {
         return pinned;
-    }
-
-    /** Whether other parts read the rest of the bucket with the same pinned cut. */
-    public boolean sharesBucket() {
-        return pinned && fileGroup != WHOLE_BUCKET;
     }
 
     /** The group of the bucket's lake files the part reads, or {@link #WHOLE_BUCKET}. */

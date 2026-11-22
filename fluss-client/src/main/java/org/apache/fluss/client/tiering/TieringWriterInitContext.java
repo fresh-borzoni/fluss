@@ -41,6 +41,7 @@ public class TieringWriterInitContext implements DeletionVectorWriterInitContext
     @Nullable private final String[] ioTmpDirs;
     @Nullable private final String positionIndexDir;
     @Nullable private final WriterMemoryPool writerMemoryPool;
+    private final boolean roundMasked;
 
     public TieringWriterInitContext(
             TablePath tablePath,
@@ -61,7 +62,8 @@ public class TieringWriterInitContext implements DeletionVectorWriterInitContext
                 bucketCount,
                 ioTmpDirs,
                 null,
-                null);
+                null,
+                false);
     }
 
     public TieringWriterInitContext(
@@ -74,9 +76,11 @@ public class TieringWriterInitContext implements DeletionVectorWriterInitContext
             @Nullable Integer bucketCount,
             @Nullable String[] ioTmpDirs,
             @Nullable String positionIndexDir,
-            @Nullable WriterMemoryPool writerMemoryPool) {
+            @Nullable WriterMemoryPool writerMemoryPool,
+            boolean roundMasked) {
         this.positionIndexDir = positionIndexDir;
         this.writerMemoryPool = writerMemoryPool;
+        this.roundMasked = roundMasked;
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partition = partition;
@@ -151,5 +155,10 @@ public class TieringWriterInitContext implements DeletionVectorWriterInitContext
     @Override
     public int bucketCount() {
         return bucketCount;
+    }
+
+    @Override
+    public boolean roundMasked() {
+        return roundMasked;
     }
 }

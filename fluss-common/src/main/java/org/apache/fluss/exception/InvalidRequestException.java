@@ -21,8 +21,8 @@ import org.apache.fluss.annotation.PublicEvolving;
 
 /**
  * Thrown when a request is malformed or names values beyond the bounds the server accepts, for
- * example a deletion vector request that pins a cut with more holds than allowed or looks up more
- * keys than one request may name. Retrying the same request fails the same way.
+ * example a deletion vector request that asks for an empty log mask page or looks up more keys than
+ * one request may name. Retrying the same request fails the same way.
  */
 @PublicEvolving
 public class InvalidRequestException extends ApiException {

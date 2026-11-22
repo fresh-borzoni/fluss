@@ -18,9 +18,11 @@
 package org.apache.fluss.lake.paimon.tiering.mergetree;
 
 import org.apache.fluss.lake.paimon.tiering.RecordWriter;
+import org.apache.fluss.lake.writer.WriterMemoryPool;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.IOUtils;
 
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.data.BinaryRow;
@@ -45,6 +47,14 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
 
     private final IOManager ioManager;
 
+    // the buffer this writer shares with the other writers of its tiering task; null if it has
+    // its own
+    @Nullable private final SharedWriteBuffers.Lease writeBuffer;
+
+    /**
+     * A writer that buffers in the write buffer the writers of its tiering task share, of the
+     * capacity of {@code taskMemory}, or in its own of the table's 'write-buffer-size' if null.
+     */
     public MergeTreeWriter(
             FileStoreTable fileStoreTable,
             TableBucket tableBucket,
@@ -52,11 +62,16 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
             List<String> partitionKeys,
             RowType flussRowType,
             @Nullable String[] ioTmpDirs,
+            @Nullable WriterMemoryPool taskMemory,
             boolean paimonIncludingSystemColumns,
             boolean historicalPartition) {
         this(
                 fileStoreTable,
                 createIOManager(ioTmpDirs),
+                taskMemory == null
+                        ? null
+                        : SharedWriteBuffers.acquire(
+                                taskMemory, fileStoreTable.coreOptions().pageSize()),
                 tableBucket,
                 partition,
                 partitionKeys,
@@ -65,9 +80,10 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
                 historicalPartition);
     }
 
-    MergeTreeWriter(
+    private MergeTreeWriter(
             FileStoreTable fileStoreTable,
             IOManager ioManager,
+            @Nullable SharedWriteBuffers.Lease writeBuffer,
             TableBucket tableBucket,
             @Nullable String partition,
             List<String> partitionKeys,
@@ -75,7 +91,7 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
             boolean paimonIncludingSystemColumns,
             boolean historicalPartition) {
         super(
-                createTableWrite(fileStoreTable, ioManager),
+                createTableWrite(fileStoreTable, ioManager, writeBuffer),
                 fileStoreTable.rowType(),
                 tableBucket,
                 partition,
@@ -85,6 +101,7 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
                 historicalPartition);
         this.rowKeyExtractor = fileStoreTable.createRowKeyExtractor();
         this.ioManager = ioManager;
+        this.writeBuffer = writeBuffer;
     }
 
     private static IOManager createIOManager(@Nullable String[] ioTmpDirs) {
@@ -99,19 +116,21 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
     }
 
     private static TableWriteImpl<KeyValue> createTableWrite(
-            FileStoreTable fileStoreTable, IOManager ioManager) {
+            FileStoreTable fileStoreTable,
+            IOManager ioManager,
+            @Nullable SharedWriteBuffers.Lease writeBuffer) {
         //noinspection unchecked
-        return (TableWriteImpl<KeyValue>)
-                fileStoreTable.newWrite(FLUSS_LAKE_TIERING_COMMIT_USER).withIOManager(ioManager);
+        TableWriteImpl<KeyValue> write =
+                (TableWriteImpl<KeyValue>)
+                        fileStoreTable
+                                .newWrite(FLUSS_LAKE_TIERING_COMMIT_USER)
+                                .withIOManager(ioManager);
+        return writeBuffer == null ? write : write.withMemoryPoolFactory(writeBuffer.factory());
     }
 
     @Override
     public void close() throws Exception {
-        try {
-            super.close();
-        } finally {
-            ioManager.close();
-        }
+        IOUtils.closeAll(super::close, ioManager, writeBuffer);
     }
 
     @Override

@@ -89,7 +89,7 @@ class DerivedDvFailurePathTest extends DerivedDvManagerTestBase {
         assertThat(db.fileDict().getFilePath(1)).isEqualTo(F1);
         assertThat(db.fileDict().getFilePath(2)).isEqualTo(F2);
         assertThat(lakeMasks(unionRead(100))).isEqualTo(before);
-        assertThat(asStrings(lookupWhenReady(100, Arrays.asList(key("k0"), key("k1")))))
+        assertThat(asStrings(indexed(100, Arrays.asList(key("k0"), key("k1")))))
                 .containsExactly("k0@" + F1 + "#0", "k1@" + F2 + "#0");
 
         hooks(manager).setBeforeFileDrop(null);
@@ -216,7 +216,7 @@ class DerivedDvFailurePathTest extends DerivedDvManagerTestBase {
         src.append("b", 1, 1, true);
         highWatermark.set(10);
         manager.recover(src);
-        assertThat(asStrings(lookupWhenReady(100, Arrays.asList(key("a"), key("b")))))
+        assertThat(asStrings(indexed(100, Arrays.asList(key("a"), key("b")))))
                 .containsExactly("a@" + F1 + "#0", "b@" + F1 + "#1");
 
         // b is deleted at 12; snapshot 200 covers [0, 20) and deletes it, and b is inserted again
@@ -234,7 +234,7 @@ class DerivedDvFailurePathTest extends DerivedDvManagerTestBase {
 
         assertThat(manager.ensureCovered(200)).isTrue();
         assertThat(src.downloadedCheckpoints).containsExactly(200L);
-        assertThat(asStrings(lookupWhenReady(200, Arrays.asList(key("a"), key("b")))))
+        assertThat(asStrings(indexed(200, Arrays.asList(key("a"), key("b")))))
                 .containsExactly("a@" + F1 + "#0");
         DvSnapshot masks = unionRead(200);
         assertThat(lakeMasks(masks).getOrDefault(F1, Collections.emptySet())).doesNotContain(1L);

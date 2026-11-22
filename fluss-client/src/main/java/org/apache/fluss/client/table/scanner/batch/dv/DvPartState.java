@@ -20,14 +20,14 @@ package org.apache.fluss.client.table.scanner.batch.dv;
 import org.apache.fluss.annotation.Internal;
 
 /**
- * The state of the read of one {@link DvBucketPart}. {@link DvPartMachine} holds it and changes it
+ * The state of the read of one {@link DvBucketPart}. {@link DvPartMachine} keeps it and changes it
  * on each answer of the bucket's leader, lake or log; its javadoc has the transitions. A part's own
  * pin is the cut its leader pinned for it when it started unpinned at planning.
  */
 @Internal
 enum DvPartState {
 
-    /** Reads a lake snapshot from its readable offset, and holds no cut: pins one. */
+    /** Reads a lake snapshot from its readable offset, and has no cut: pins one. */
     PLANNED,
 
     /**
@@ -37,10 +37,10 @@ enum DvPartState {
      */
     REPLANNING,
 
-    /** Holds its own pin of a cut, and fetches the masks of the cut. */
+    /** Pinned its own cut, and fetches the masks of the cut. */
     PINNED,
 
-    /** Reads with a cut pinned at planning, which the engine holds, and fetches its masks. */
+    /** Reads with a cut pinned at planning, and fetches its masks. */
     PINNED_AT_PLANNING,
 
     /** Derives the masks of a cut from the keys of its lake files and of the log. */
@@ -49,10 +49,7 @@ enum DvPartState {
     /** Restored with the masks it kept: checks they are of its cut and snapshot commit. */
     RESUMING,
 
-    /**
-     * Has its masks, fetched, derived or kept, or reads its lake files only. Holds its own pin if
-     * it read with masks of that pin.
-     */
+    /** Has its masks, fetched, derived or kept, or reads its lake files only. */
     READY,
 
     /** Returns the rows of its lake files that the masks do not hide. */
@@ -83,11 +80,6 @@ enum DvPartState {
             default:
                 return false;
         }
-    }
-
-    /** Whether the part returns rows or is about to. */
-    boolean isReading() {
-        return this == READY || this == READING_LAKE || this == READING_LOG;
     }
 
     /** Whether the part's read ended. */

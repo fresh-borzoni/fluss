@@ -119,7 +119,6 @@ import org.apache.fluss.server.entity.ProduceLogDataForBucket;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
-import org.apache.fluss.server.kv.dv.DerivedDvManager;
 import org.apache.fluss.server.kv.dv.DerivedDvRequestExecutor;
 import org.apache.fluss.server.kv.dv.DvMaskRequest;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
@@ -900,30 +899,47 @@ public final class TabletService extends RpcServiceBase
                                     + " readable_snapshot_id."));
             return refused;
         }
-        // Union reads read the table's rows through their masks, and a lookup tells whether a key
-        // exists; the tiering service reads the table anyway.
+        // Union reads read the table's rows through their masks, and a round's deletes tell
+        // whether a key exists; the tiering service reads the table anyway.
         authorizeTable(READ, request.getTableId());
         Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
-        if (request.getLookupKeysCount() > 0) {
-            // Tiering resolves the positions of its base snapshot by key.
-            if (request.getLookupKeysCount() > DerivedDvManager.MAX_LOOKUP_KEYS) {
-                CompletableFuture<GetDvSnapshotResponse> refused = new CompletableFuture<>();
-                refused.completeExceptionally(
-                        DerivedDvManager.tooManyLookupKeys(request.getLookupKeysCount()));
-                return refused;
-            }
-            List<byte[]> keys = new ArrayList<>(request.getLookupKeysCount());
-            for (int i = 0; i < request.getLookupKeysCount(); i++) {
-                keys.add(request.getLookupKeyAt(i));
-            }
+        try {
+            ServerRpcMessageUtils.checkDvSnapshotRequest(request);
+        } catch (InvalidRequestException e) {
+            CompletableFuture<GetDvSnapshotResponse> refused = new CompletableFuture<>();
+            refused.completeExceptionally(e);
+            return refused;
+        }
+        if (request.hasRoundStartOffset()) {
+            // Tiering plans the end of its round from the leader's log.
+            long tableId = request.getTableId();
+            int bucketId = request.getBucketId();
+            long start = request.getRoundStartOffset();
+            long maxRecords = request.getRoundMaxRecords();
+            long maxBytes = request.getRoundMaxBytes();
             return dvRequests.submit(
                     () ->
-                            replicaManager.lookupDvPositions(
-                                    request.getTableId(),
+                            replicaManager.planDvRound(
+                                    tableId, partitionId, bucketId, start, maxRecords, maxBytes));
+        }
+        if (request.hasRoundEndOffset()) {
+            // Tiering takes the log mask and the deletes of its round from the change list.
+            long tableId = request.getTableId();
+            int bucketId = request.getBucketId();
+            long snapshotId = request.getReadableSnapshotId();
+            Long from = request.hasRoundFromOffset() ? request.getRoundFromOffset() : null;
+            long end = request.getRoundEndOffset();
+            boolean logMask = request.hasRoundLogMask() && request.isRoundLogMask();
+            return dvRequests.submit(
+                    () ->
+                            replicaManager.roundPart(
+                                    tableId,
                                     partitionId,
-                                    request.getBucketId(),
-                                    request.getReadableSnapshotId(),
-                                    keys));
+                                    bucketId,
+                                    snapshotId,
+                                    from,
+                                    end,
+                                    logMask));
         }
         // The masks of a union read, or parts of a cut one pinned.
         DvMaskRequest masks;

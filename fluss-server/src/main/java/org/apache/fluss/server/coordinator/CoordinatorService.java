@@ -1087,15 +1087,17 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                         String.valueOf(CURRENT_KV_FORMAT_VERSION));
             }
 
-            // Row TTL tags a value with its time; deletion vectors tag it with the log offset of
-            // its version. Both together take the versioned layout, which has a slot for each.
+            // Row TTL alone tags a value with its time. Deletion vectors keep the log offset of
+            // the value's version in the versioned layout, row TTL or not: a server that knows
+            // only the tagged layout would write a time where they read the offset, and it refuses
+            // a layout it does not know.
             boolean rowTtl = newTableConf.getOptional(ConfigOptions.TABLE_KV_TTL).isPresent();
             boolean deletionVectors =
-                    newTableConf.get(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED);
+                    newTableConf.get(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED);
             int layoutVersion =
-                    rowTtl && deletionVectors
+                    deletionVectors
                             ? KvValueLayout.VERSIONED.version()
-                            : rowTtl || deletionVectors
+                            : rowTtl
                                     ? KvValueLayout.TAGGED.version()
                                     : KvValueLayout.PLAIN.version();
             newProperties.put(

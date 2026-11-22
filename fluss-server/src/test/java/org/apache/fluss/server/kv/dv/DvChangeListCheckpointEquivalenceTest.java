@@ -362,7 +362,9 @@ class DvChangeListCheckpointEquivalenceTest extends DvCheckpointTestBase {
             handOverAsWritten(live, w, exported);
             DvChangeListHandle part = export(live, 1, x);
             Leader rebuilt = leader("rebuilt", w, o, w.end());
-            rebuilt.manager.useRowTtl(Duration.ofMillis(w.ttlMs), new ManualClock(w.now()));
+            // on Paimon, whose readable offset can move back below the filter's cap, the bucket
+            // keeps its change list there and union reads fold it by key
+            rebuilt.manager.useRowTtl(Duration.ofMillis(w.ttlMs), new ManualClock(w.now()), true);
             // the workload's filter is not capped: its snapshot holds no state of it
             rebuilt.manager.restoredRowTtlFilter(x, null);
             rebuilt.src.restored = restored(part, x, view(w.kvAt.get(x)));

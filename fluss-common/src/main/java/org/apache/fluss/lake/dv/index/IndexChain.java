@@ -263,8 +263,6 @@ final class IndexChain {
     }
 
     void checkRegistrable(long parentSnapshotId, long changeId) throws IOException {
-        // before a round's lake commit, so an index of an older build fails it, not a later read
-        layout.checkLayout();
         checkCommitted(changeId);
         // as register() would see the chain once it resolved a fork at the end
         List<ChainEntry> chain = list(parentSnapshotId);
@@ -278,7 +276,6 @@ final class IndexChain {
             long changeId,
             @Nullable String snapshotIdentity)
             throws IOException {
-        layout.checkLayout();
         checkCommitted(changeId);
         resolveFork(parentSnapshotId, snapshotId);
         List<ChainEntry> chain = list();

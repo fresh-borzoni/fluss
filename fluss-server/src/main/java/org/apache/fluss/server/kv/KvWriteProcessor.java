@@ -424,10 +424,11 @@ public final class KvWriteProcessor {
         long previousOffset = -1;
         BinaryValue oldValue;
         if (dvManager != null && historicalValueLookup == null) {
-            // the tag of the old value is the offset of the version the delete supersedes
-            KvStateAccessor.TaggedValue tagged = stateAccessor.lookupTagged(key, valueDecoder);
-            oldValue = tagged == null ? null : tagged.value;
-            previousOffset = tagged == null ? -1 : tagged.tag;
+            // the old value carries the offset of the version the delete supersedes
+            KvStateAccessor.VersionedValue versioned =
+                    stateAccessor.lookupVersioned(key, valueDecoder);
+            oldValue = versioned == null ? null : versioned.value;
+            previousOffset = versioned == null ? -1 : versioned.versionOffset;
         } else {
             oldValue = getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
         }
@@ -484,9 +485,9 @@ public final class KvWriteProcessor {
             @Nullable HistoricalValueLookup historicalValueLookup,
             List<DvEntry> dvEntries)
             throws Exception {
-        // Deletion vectors need the old value's tag, the offset of the version it supersedes.
-        boolean versionTags = dvManager != null;
-        if (!versionTags && canSkipOldValueLookup(currentMerger, autoIncrementUpdater)) {
+        // Deletion vectors need the old value's version offset, the version it supersedes.
+        boolean versionOffsets = dvManager != null;
+        if (!versionOffsets && canSkipOldValueLookup(currentMerger, autoIncrementUpdater)) {
             long nextOffset =
                     applyUpdate(
                             key,
@@ -501,11 +502,12 @@ public final class KvWriteProcessor {
 
         long previousOffset = -1;
         BinaryValue oldValue;
-        if (versionTags && historicalValueLookup == null) {
-            // the tag of the old value is the offset of the version the change supersedes
-            KvStateAccessor.TaggedValue tagged = stateAccessor.lookupTagged(key, valueDecoder);
-            oldValue = tagged == null ? null : tagged.value;
-            previousOffset = tagged == null ? -1 : tagged.tag;
+        if (versionOffsets && historicalValueLookup == null) {
+            // the old value carries the offset of the version the change supersedes
+            KvStateAccessor.VersionedValue versioned =
+                    stateAccessor.lookupVersioned(key, valueDecoder);
+            oldValue = versioned == null ? null : versioned.value;
+            previousOffset = versioned == null ? -1 : versioned.versionOffset;
         } else {
             oldValue = getPreviousValue(key, primaryKey, stateAccessor, historicalValueLookup);
         }
@@ -593,10 +595,11 @@ public final class KvWriteProcessor {
      * not be named by the write, and masks would keep it next to the new version. The bucket caps
      * the clock of its TTL filter ({@code RowTtlFilterClock}) below the TTL of every version at or
      * after the covered snapshot's readable offset, by processing or event time, so no such version
-     * expires before it is tiered. A KV whose filter was not capped for that offset, as one
-     * restored from a KV snapshot without the filter's offset, has union reads read the bucket by
-     * key ({@code DvRowTtlGuard}), which is exact. (A log replay names an expired version exactly,
-     * from its map of last versions.)
+     * expires before it is tiered. A KV whose filter was capped for a later offset, as on Paimon
+     * after the readable offset moved back, has union reads read the bucket by key, which is exact;
+     * on Iceberg such a bucket's TTL state is corrupt, and it serves no masks ({@code
+     * DvRowTtlGuard}). (A log replay names an expired version exactly, from its map of last
+     * versions.)
      */
     private void addInsertDvEntry(
             List<DvEntry> dvEntries, KvPreWriteBuffer.Key key, long logOffset) {

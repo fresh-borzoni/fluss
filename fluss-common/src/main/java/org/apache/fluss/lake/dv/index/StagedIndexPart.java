@@ -35,9 +35,8 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
  * the writer wrote.
  *
  * <p>The part numbers its data files from 0. The committer gives them ids from the table's counter
- * when it publishes the part into the round's change ({@link PositionIndexStore#publishStaged}),
- * and looks up the superseded rows of the part's keys while doing so. A write result carries only
- * this reference, whatever the size of the round.
+ * when it publishes the part into the round's change ({@link PositionIndexStore#publishStaged}). A
+ * write result carries only this reference, whatever the size of the round.
  */
 @Internal
 public final class StagedIndexPart implements Serializable {

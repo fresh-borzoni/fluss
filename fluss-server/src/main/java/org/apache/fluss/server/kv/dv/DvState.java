@@ -27,24 +27,24 @@ final class DvState {
 
     /** The state kinds; see {@link DvOwner} for the transitions. */
     enum Kind {
-        // a new leader that has not taken over yet: reads and lookups are not ready
+        // a new leader that has not taken over yet: reads are not ready
         UNRECOVERED,
         // A recovery or FULL load runs or is queued. Serves the covered version, if any; without
-        // one, reads that do not wait read by key, and the empty lake still answers lookups.
+        // one, reads that do not wait read by key.
         REBUILDING,
         // serves the covered version
         COVERING,
         // serves the covered version while a SWITCH load reaches a newer one
         SWITCHING,
-        // Serves the covered version's lookups while a TAIL load replays its change list, and
-        // masks once it is installed; reads that do not wait read by key meanwhile.
+        // A TAIL load replays the change list of the covered version, which serves masks once it
+        // is installed; reads that do not wait read by key meanwhile, and rounds wait.
         REPLAYING,
         // the bucket closed: requests go to the new leader, and jobs stop at their next unit
         CLOSED
     }
 
     final Kind kind;
-    // the covered version, which lookups read; null once closed
+    // the covered version, which switch loads read; null once closed
     @Nullable final DvVersion version;
     // the covered snapshot, -1 for the empty lake, and where its change list starts
     final long coveredSnapshotId;

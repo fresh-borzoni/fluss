@@ -57,6 +57,7 @@ public final class DerivedDvMetrics {
                 new SimpleCounter(),
                 new SimpleCounter(),
                 new SimpleCounter(),
+                new SimpleCounter(),
                 new MaskRequestHistograms(
                         new DescriptiveStatisticsHistogram(1),
                         new DescriptiveStatisticsHistogram(1),
@@ -98,6 +99,7 @@ public final class DerivedDvMetrics {
                 group.dvPinnedCutExpirationCount(),
                 group.dvMaskFrontierCount(),
                 group.dvRowTtlFoldCount(),
+                group.dvRowTtlCorruptCount(),
                 new MaskRequestHistograms(
                         group.dvMaskRequestHistogram(),
                         group.dvMaskWaitSwitchHistogram(),
@@ -146,8 +148,11 @@ public final class DerivedDvMetrics {
     private final Counter pinnedCutExpirations;
     // reads that do not wait served below the high watermark as lookups were pending
     private final Counter frontierReads;
-    // union read answers that read the bucket by key, as row TTL may have removed a version
+    // on Paimon, union read answers that read the bucket by key, as row TTL may have removed a
+    // version below the offset its filter was capped for
     private final Counter rowTtlFolds;
+    // buckets whose saved row TTL state was found corrupt
+    private final Counter rowTtlCorruptions;
     private final MaskRequestHistograms maskRequests;
     private final ChangeListCheckpoints changeListCheckpoints;
 
@@ -175,6 +180,7 @@ public final class DerivedDvMetrics {
             Counter pinnedCutExpirations,
             Counter frontierReads,
             Counter rowTtlFolds,
+            Counter rowTtlCorruptions,
             MaskRequestHistograms maskRequests,
             ChangeListCheckpoints changeListCheckpoints) {
         this.catchUps = catchUps;
@@ -200,6 +206,7 @@ public final class DerivedDvMetrics {
         this.pinnedCutExpirations = pinnedCutExpirations;
         this.frontierReads = frontierReads;
         this.rowTtlFolds = rowTtlFolds;
+        this.rowTtlCorruptions = rowTtlCorruptions;
         this.maskRequests = maskRequests;
         this.changeListCheckpoints = changeListCheckpoints;
     }
@@ -381,13 +388,22 @@ public final class DerivedDvMetrics {
         return frontierReads.getCount();
     }
 
-    /** Records a union read answer that reads the bucket by key, for row TTL. */
+    /** Records a union read answer that reads a Paimon bucket by key, for row TTL. */
     void rowTtlFold() {
         rowTtlFolds.inc();
     }
 
     long rowTtlFolds() {
         return rowTtlFolds.getCount();
+    }
+
+    /** Records a bucket whose saved row TTL state was found corrupt. */
+    void rowTtlCorrupt() {
+        rowTtlCorruptions.inc();
+    }
+
+    long rowTtlCorruptions() {
+        return rowTtlCorruptions.getCount();
     }
 
     /** Records the steps of a union read's mask request, each in ms. */

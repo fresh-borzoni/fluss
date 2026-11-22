@@ -48,12 +48,12 @@ import java.util.function.ToLongFunction;
  * from o as without a checkpoint, and logs why. Correctness never depends on the checkpoint.
  *
  * <p>Tables with row TTL use it too. TTL compaction may remove from the KV snapshot a version that
- * a later write supersedes, which only a full replay names. A version written at or after o that
- * has expired makes the bucket TTL-unsafe ({@link DvRowTtlGuard}): it expired at its write time
- * plus the TTL, after the first write at or after o plus the TTL, so union reads read the bucket by
- * key and use no masks. While the bucket is safe, nothing written since o has expired, and the KV
- * at X names every version the checkpoint's replay asks it for; a version before o that expired is
- * looked up in the lake by the TTL rule for inserts, as in a full replay.
+ * a later write supersedes, which only a full replay names. A version written at or after o can
+ * have expired only if o is below P, the offset the TTL filter was capped for ({@link
+ * DvRowTtlGuard}): on Paimon union reads then read the bucket by key, and on Iceberg the bucket's
+ * TTL state is corrupt and it serves no masks. While o is at least P, nothing written since o has
+ * expired, and the KV at X names every version the checkpoint's replay asks it for; a version
+ * before o that expired is looked up in the lake by the TTL rule for inserts, as in a full replay.
  *
  * <p>Thread-safe: the bucket's loads, its close and the expiry timer call it.
  */

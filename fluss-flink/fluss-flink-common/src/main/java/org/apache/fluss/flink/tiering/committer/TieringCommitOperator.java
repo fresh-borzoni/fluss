@@ -524,7 +524,9 @@ public class TieringCommitOperator<WriteResult, Committable>
                     results.stream().anyMatch(TableBucketWriteResult::endedEarly));
             return;
         }
-        // Registered before the request is sent, so no result arrives without its held round.
+        // Registered before the request is sent, so no result arrives without its held round. The
+        // round resumes on the re-index's snapshot, where the deletes its readers fetched on the
+        // base before still hold for the buckets whose files the rewrite left alone.
         heldRounds.put(tableId, new HeldRound<>(results, reindex));
         long epoch = TableBucketWriteResult.tieringEpochOf(results);
         for (RowPosRequestEvent request : reindex.requests) {
@@ -562,8 +564,8 @@ public class TieringCommitOperator<WriteResult, Committable>
     }
 
     /**
-     * Reports a committed round. {@code moreToTier} is set if a bucket's round ended early, so the
-     * table is tiered again at once.
+     * Reports a committed round. {@code moreToTier} is set if the caps ended a bucket's round below
+     * its high watermark, so the table is tiered again at once.
      */
     private void reportFinished(
             long tableId,

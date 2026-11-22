@@ -23,6 +23,7 @@ import org.apache.fluss.lake.source.SupportsDataFiles;
 import org.apache.fluss.lake.source.SupportsRewritePlanning;
 import org.apache.fluss.lake.source.TestingLakeSource;
 import org.apache.fluss.lake.source.TestingLakeSplit;
+import org.apache.fluss.lake.source.TestingPlainLakeSource;
 import org.apache.fluss.metadata.TablePath;
 
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,6 @@ import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.mock;
 
 /** Tests for {@link DeletionVectorCapabilities}. */
 class DeletionVectorCapabilitiesTest {
@@ -51,13 +51,12 @@ class DeletionVectorCapabilitiesTest {
 
     @Test
     void testAnObjectWithoutTheCapabilityIsRefusedWithTheTableAndTheOption() {
-        @SuppressWarnings("unchecked")
-        LakeSource<LakeSplit> plain = mock(LakeSource.class);
+        LakeSource<LakeSplit> plain = new TestingPlainLakeSource();
         assertThatThrownBy(() -> DeletionVectorCapabilities.rewritePlanning(plain, TABLE_PATH))
                 .isInstanceOf(UnsupportedOperationException.class)
                 .hasMessageContaining("lake source " + plain.getClass().getName())
                 .hasMessageContaining(SupportsRewritePlanning.class.getName())
-                .hasMessageContaining("'table.deletion-vectors.enabled'")
+                .hasMessageContaining("'table.datalake.deletion-vectors.enabled'")
                 .hasMessageContaining(TABLE_PATH.toString());
     }
 

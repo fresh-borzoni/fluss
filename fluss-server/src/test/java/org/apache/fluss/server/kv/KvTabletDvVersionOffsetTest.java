@@ -21,6 +21,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.RetriableException;
+import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.KvFormat;
@@ -57,6 +58,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
 
+import javax.annotation.Nullable;
+
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -73,11 +76,13 @@ import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESS
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * The two KV value layouts of a table with deletion vectors, the tagged one without row TTL and the
- * versioned one with row TTL, hand the same changes to the deletion vectors and give the same
- * masks, whether the superseded version is in the pre-write buffer or in RocksDB.
+ * A table with deletion vectors keeps each value's version offset in the versioned layout, with row
+ * TTL or without. Both hand the same changes to the deletion vectors and give the same masks,
+ * whether the superseded version is in the pre-write buffer or in RocksDB. A tablet refuses the
+ * tagged layout for such a table.
  */
 class KvTabletDvVersionOffsetTest {
 
@@ -102,19 +107,22 @@ class KvTabletDvVersionOffsetTest {
 
     /**
      * The same random batches of inserts, updates and deletes, with random flushes in between, go
-     * to a bucket of each layout. Both hand over the same changes, each naming the version the
-     * model of the log gives, keep the same values and version offsets, and serve the same masks.
-     * The row TTL is long enough that no value expires; an insert into the table with row TTL names
-     * its superseded version as unknown, as a value may have expired.
+     * to a bucket without row TTL and one with row TTL. Both hand over the same changes, each
+     * naming the version the model of the log gives, keep the same values and version offsets, and
+     * serve the same masks. The row TTL is long enough that no value expires; an insert into the
+     * table with row TTL names its superseded version as unknown, as a value may have expired.
+     * Without row TTL every value keeps the TTL timestamp that never expires.
      */
     @ParameterizedTest
     @CsvSource({"FULL, 1", "FULL, 7", "FULL, 42", "WAL, 1", "WAL, 7", "WAL, 42"})
-    void testBothLayoutsNameTheSameVersions(ChangelogImage image, long seed) throws Exception {
-        Bucket tag = open(false, image);
-        Bucket versioned = open(true, image);
-        assertThat(tag.kv.getKvValueLayout()).isEqualTo(KvValueLayout.TAGGED);
-        assertThat(versioned.kv.getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
-        List<Bucket> all = Arrays.asList(tag, versioned);
+    void testWithAndWithoutRowTtlNameTheSameVersions(ChangelogImage image, long seed)
+            throws Exception {
+        Bucket noTtl = open(false, image);
+        Bucket withTtl = open(true, image);
+        assertThat(noTtl.kv.getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
+        assertThat(withTtl.kv.getKvValueLayout()).isEqualTo(KvValueLayout.VERSIONED);
+        assertThat(noTtl.kv.getDvManager().rowTtlFilterClock()).isNull();
+        List<Bucket> all = Arrays.asList(noTtl, withTtl);
 
         Random random = new Random(seed);
         // key -> the offset of its live version, from the changes handed over
@@ -133,17 +141,17 @@ class KvTabletDvVersionOffsetTest {
                                 : records.ofRecord(
                                         key(k), new Object[] {k, "v" + random.nextInt(1000)}));
             }
-            int before = tag.entries.size();
+            int before = noTtl.entries.size();
             for (Bucket b : all) {
                 b.kv.putAsLeader(batches.ofRecords(batch), null);
-                assertThat(b.log.localLogEndOffset()).isEqualTo(tag.log.localLogEndOffset());
+                assertThat(b.log.localLogEndOffset()).isEqualTo(noTtl.log.localLogEndOffset());
             }
-            assertThat(describe(versioned.entries, true)).isEqualTo(describe(tag.entries, true));
-            assertThat(versioned.entries.subList(before, versioned.entries.size()))
+            assertThat(describe(withTtl.entries, true)).isEqualTo(describe(noTtl.entries, true));
+            assertThat(withTtl.entries.subList(before, withTtl.entries.size()))
                     .allSatisfy(e -> assertThat(e.isInsert()).isFalse());
 
             // each change names the version the model gives
-            for (DvEntry e : tag.entries.subList(before, tag.entries.size())) {
+            for (DvEntry e : noTtl.entries.subList(before, noTtl.entries.size())) {
                 int k = keyOf(e.getKey());
                 Long previous = model.get(k);
                 assertThat(e.getPreviousVersionOffset())
@@ -169,13 +177,13 @@ class KvTabletDvVersionOffsetTest {
             }
             if (step % 10 == 9) {
                 assertSameState(all, model);
-                long leo = tag.log.localLogEndOffset();
+                long leo = noTtl.log.localLogEndOffset();
                 for (Bucket b : all) {
                     b.log.updateHighWatermark(leo);
                 }
-                List<Long> tagMask = deadVersions(unionRead(tag.manager));
-                assertThat(deadVersions(unionRead(versioned.manager))).isEqualTo(tagMask);
-                assertThat(tagMask).containsExactlyElementsOf(superseded);
+                List<Long> noTtlMask = deadVersions(unionRead(noTtl.manager));
+                assertThat(deadVersions(unionRead(withTtl.manager))).isEqualTo(noTtlMask);
+                assertThat(noTtlMask).containsExactlyElementsOf(superseded);
                 compared++;
             }
         }
@@ -188,6 +196,26 @@ class KvTabletDvVersionOffsetTest {
             flushAndWait(b.kv, leo);
         }
         assertSameState(all, model);
+        for (int k : model.keySet()) {
+            byte[] raw = noTtl.kv.getRocksDBKv().get(key(k));
+            assertThat(KvValueLayout.VERSIONED.readVersionOffset(MemorySegment.wrap(raw), 0))
+                    .isEqualTo(model.get(k));
+            assertThat(KvValueLayout.VERSIONED.readTtlTimestamp(MemorySegment.wrap(raw), 0))
+                    .isEqualTo(KvValueLayout.NEVER_EXPIRE_TIMESTAMP);
+        }
+    }
+
+    /**
+     * A tablet of a table with deletion vectors refuses the tagged layout, with row TTL or without:
+     * its tag holds no version offset.
+     */
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void testTaggedLayoutIsRefused(boolean rowTtl) {
+        assertThatThrownBy(() -> open(rowTtl, ChangelogImage.FULL, KvValueLayout.TAGGED.version()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("deletion vectors")
+                .hasMessageContaining("layout " + KvValueLayout.TAGGED.version());
     }
 
     /** The buckets serve the same value bodies and keep the version offsets of the model. */
@@ -263,7 +291,13 @@ class KvTabletDvVersionOffsetTest {
      * over.
      */
     private Bucket open(boolean rowTtl, ChangelogImage image) throws Exception {
-        String name = (rowTtl ? "versioned" : "tagged") + "_" + image.name().toLowerCase();
+        return open(rowTtl, image, null);
+    }
+
+    /** Like {@link #open(boolean, ChangelogImage)}, with the persisted layout version if set. */
+    private Bucket open(boolean rowTtl, ChangelogImage image, @Nullable Integer layoutVersion)
+            throws Exception {
+        String name = (rowTtl ? "row_ttl" : "no_row_ttl") + "_" + image.name().toLowerCase();
         File logDir = new File(tempDir, name + "-log");
         File kvDir = new File(tempDir, name + "-kv");
         assertThat(logDir.mkdirs() && kvDir.mkdirs()).isTrue();
@@ -288,38 +322,47 @@ class KvTabletDvVersionOffsetTest {
                         SystemClock.getInstance(),
                         true);
         Configuration tableConf = new Configuration();
-        tableConf.set(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED, true);
+        tableConf.set(ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED, true);
         if (rowTtl) {
             // long enough that no value expires during the test
             tableConf.set(ConfigOptions.TABLE_KV_TTL, Duration.ofDays(1));
         }
         tableConf.set(ConfigOptions.TABLE_CHANGELOG_IMAGE, image);
+        if (layoutVersion != null) {
+            tableConf.set(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION, layoutVersion);
+        }
         TableConfig tableConfig = new TableConfig(tableConf);
-        KvTablet kv =
-                KvTablet.create(
-                        path,
-                        log.getTableBucket(),
-                        log,
-                        kvDir,
-                        conf,
-                        TestingMetricGroups.TABLET_SERVER_METRICS,
-                        new RootAllocator(Long.MAX_VALUE),
-                        new TestingMemorySegmentPool(10 * 1024),
-                        KvFormat.COMPACTED,
-                        RowMerger.create(tableConfig, KvFormat.COMPACTED, schemaGetter),
-                        DEFAULT_COMPRESSION,
-                        schemaGetter,
-                        tableConfig.getChangelogImage(),
-                        KvManager.getDefaultRateLimiter(),
-                        new AutoIncrementManager(
-                                schemaGetter,
-                                path.getTablePath(),
-                                new TableConfig(new Configuration()),
-                                new TestingSequenceGeneratorFactory()),
-                        SystemClock.getInstance(),
-                        tableConfig,
-                        DvTestManagers.budget(),
-                        DvTestManagers.executors());
+        KvTablet kv;
+        try {
+            kv =
+                    KvTablet.create(
+                            path,
+                            log.getTableBucket(),
+                            log,
+                            kvDir,
+                            conf,
+                            TestingMetricGroups.TABLET_SERVER_METRICS,
+                            new RootAllocator(Long.MAX_VALUE),
+                            new TestingMemorySegmentPool(10 * 1024),
+                            KvFormat.COMPACTED,
+                            RowMerger.create(tableConfig, KvFormat.COMPACTED, schemaGetter),
+                            DEFAULT_COMPRESSION,
+                            schemaGetter,
+                            tableConfig.getChangelogImage(),
+                            KvManager.getDefaultRateLimiter(),
+                            new AutoIncrementManager(
+                                    schemaGetter,
+                                    path.getTablePath(),
+                                    new TableConfig(new Configuration()),
+                                    new TestingSequenceGeneratorFactory()),
+                            SystemClock.getInstance(),
+                            tableConfig,
+                            DvTestManagers.budget(),
+                            DvTestManagers.executors());
+        } catch (Throwable t) {
+            log.close();
+            throw t;
+        }
         Bucket bucket = new Bucket(log, kv);
         buckets.add(bucket);
         bucket.manager = recordingManager(bucket);

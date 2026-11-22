@@ -48,7 +48,6 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.{Duration => ScalaDuration}
-import scala.util.Try
 
 /**
  * Union reads of primary key tables with deletion vectors: lake rows minus the masks of the rows
@@ -74,6 +73,14 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
   protected def mergesWithoutDeletionVectors: Boolean
 
   private var tieringJob: JobClient = _
+
+  override protected def flussConf: Configuration = {
+    val conf = super.flussConf
+    conf.set(
+      ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT,
+      SparkLakeDvUnionReadTestBase.PinnedCutIdleTimeout)
+    conf
+  }
 
   // Each test tiers its table with a job of its own, cancelled before the table is dropped: a job
   // re-indexing the files of a dropped table fails.
@@ -151,7 +158,9 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
       .distributedBy(Buckets)
       .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
       .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(), "500ms")
-      .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), deletionVectors.toString)
+      .property(
+        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+        deletionVectors.toString)
     variant.properties.foreach {
       case (k, v) =>
         if (k.startsWith("table.")) builder.property(k, v) else builder.customProperty(k, v)
@@ -307,7 +316,10 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
         if (kvTablet == null) -1L else kvTablet.getDvManager.getReadableSnapshotId
     }
 
-  /** The cuts the leaders of the table's buckets hold for union reads. */
+  /** How long a test waits for the cuts of an ended read to idle out, with the sweep after. */
+  private val CutExpiryWait = SparkLakeDvUnionReadTestBase.PinnedCutIdleTimeout.multipliedBy(6)
+
+  /** The cuts the leaders of the table's buckets keep for union reads. */
   private def pinnedCuts(tablePath: TablePath): Int =
     highWatermarks(tablePath).keys.toSeq.map {
       bucket =>
@@ -567,10 +579,10 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
     }
   }
 
-  test("Spark DV union read: a split bucket's cut is released as its parts end") {
+  test("Spark DV union read: a split bucket's cut is pinned once and idles out after the read") {
     assume(keepsFilesOfRounds, s"$dataLakeFormat plans a bucket's files as one split")
     val variant = variants.head
-    val tableName = "dv_split_bucket_release"
+    val tableName = "dv_split_bucket_idle_out"
     withTable(tableName) {
       val tablePath = createDvTable(tableName, variant, partitioned = false)
       val rows = new TableRows(false)
@@ -590,21 +602,19 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
         SparkFlussConf.SPARK_FLUSS_CONF_PREFIX +
           ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_FILE_GROUP_ROWS.key() -> "1") {
         val df = sql(s"SELECT * FROM $DEFAULT_DATABASE.$tableName")
-        // planning pins each split bucket's cut once, however often Spark plans the scan
+        // planning pins each split bucket's cut once, however often Spark plans the scan: a
+        // planning at the same high watermark shares the cut
         val parts = lakeInputPartitions(df).toSeq.collect {
           case p: FlussLakeDvInputPartition => p.part
         }
-        assert(parts.exists(p => p.isPinned && p.sharesBucket), s"no split bucket: $parts")
+        assert(parts.exists(_.isPinned), s"no split bucket: $parts")
         val pinned = pinnedCuts(tablePath)
         assert(pinned > 0)
         assert(lakeInputPartitions(df).length == parts.length)
         assert(pinnedCuts(tablePath) == pinned)
 
         assert(df.collect().map(_.toString).sorted.toSeq == rows.expected.map(_.toString).sorted)
-        // each part released its hold as its task succeeded: no cut is left to idle out
-        waitUntil("the read released the cuts of its split buckets", Duration.ofSeconds(30)) {
-          pinnedCuts(tablePath) == 0
-        }
+        waitUntil("the cuts of the read idled out", CutExpiryWait)(pinnedCuts(tablePath) == 0)
       }
     }
   }
@@ -644,9 +654,9 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
     }
   }
 
-  test("Spark DV union read: the cuts a read pinned are released when its tasks end") {
+  test("Spark DV union read: the cuts of a finished read idle out") {
     val variant = variants.head
-    val tableName = "dv_released_cuts"
+    val tableName = "dv_idle_cuts"
     withTable(tableName) {
       val tablePath = createDvTable(tableName, variant, partitioned = false)
       val rows = new TableRows(false)
@@ -661,28 +671,11 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
       assert(pinnedCuts(tablePath) == 0)
       implicit val ec: ExecutionContext = ExecutionContext.global
 
-      // a read holds the cuts of its buckets while it runs, and releases them as its tasks end,
-      // long before the leaders' idle timeout
+      // its cuts idle out once its tasks stopped asking for them
       val finished = Future(slowRead(tableName, 100))
       waitUntil("the read pinned its cuts", Duration.ofMinutes(1))(pinnedCuts(tablePath) > 0)
       assert(Await.result(finished, ScalaDuration(2, TimeUnit.MINUTES)).sorted == expected)
-      waitUntil("the finished read released its cuts", Duration.ofSeconds(30)) {
-        pinnedCuts(tablePath) == 0
-      }
-
-      // a cancelled read releases them too
-      val cancelled = Future {
-        spark.sparkContext.setJobGroup("dv-cancelled-read", "cancelled", interruptOnCancel = true)
-        try {
-          slowRead(tableName, 1000)
-        } finally {
-          spark.sparkContext.clearJobGroup()
-        }
-      }
-      waitUntil("the read pinned its cuts", Duration.ofMinutes(1))(pinnedCuts(tablePath) > 0)
-      spark.sparkContext.cancelJobGroup("dv-cancelled-read")
-      assert(Try(Await.result(cancelled, ScalaDuration(2, TimeUnit.MINUTES))).isFailure)
-      waitUntil("the cancelled read released its cuts", Duration.ofSeconds(30)) {
+      waitUntil("the cuts of the finished read idled out", CutExpiryWait) {
         pinnedCuts(tablePath) == 0
       }
     }
@@ -763,6 +756,12 @@ abstract class SparkLakeDvUnionReadTestBase extends SparkLakeTableReadTestBase {
           .forall(_ != DvBucketPart.ReadMode.FOLDED))
     }
   }
+}
+
+object SparkLakeDvUnionReadTestBase {
+
+  /** Short, so the tests see the cuts of ended reads idle out; far longer than a read's parts. */
+  val PinnedCutIdleTimeout: Duration = Duration.ofSeconds(10)
 }
 
 @SparkLakeTest

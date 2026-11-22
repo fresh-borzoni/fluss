@@ -128,6 +128,9 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
@@ -142,6 +145,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeAlterDatabaseRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeAlterTableRequest;
@@ -169,6 +173,9 @@ import static org.apache.fluss.utils.StringUtils.isNullOrWhitespaceOnly;
  */
 public class FlussAdmin implements Admin, DvAdmin {
 
+    private static final Logger LOG = LoggerFactory.getLogger(FlussAdmin.class);
+
+    private final RpcClient client;
     private final AdminGateway gateway;
     private final AdminReadOnlyGateway readOnlyGateway;
 
@@ -183,6 +190,13 @@ public class FlussAdmin implements Admin, DvAdmin {
     private final MetadataUpdater metadataUpdater;
 
     /**
+     * The server each deletion vector or readable lake snapshot request in flight went to, the last
+     * one if it was retried, so that a caller that gives up on its answer drops the connection.
+     */
+    private final Map<CompletableFuture<?>, AtomicReference<ServerNode>> serversInFlight =
+            new ConcurrentHashMap<>();
+
+    /**
      * Single-thread executor that runs the metadata-refresh callback for {@link
      * RetryableGatewayClientProxy}.
      */
@@ -191,6 +205,7 @@ public class FlussAdmin implements Admin, DvAdmin {
                     1, new ExecutorThreadFactory("fluss-admin-metadata-refresh"));
 
     public FlussAdmin(RpcClient client, MetadataUpdater metadataUpdater) {
+        this.client = client;
         AdminGateway rawGateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, client, AdminGateway.class);
@@ -743,9 +758,25 @@ public class FlussAdmin implements Admin, DvAdmin {
                 .setDatabaseName(tablePath.getDatabaseName())
                 .setTableName(tablePath.getTableName());
         request.setReadable(true);
-        return readOnlyGateway
-                .getLakeSnapshot(request)
-                .thenApply(ClientRpcMessageUtils::toLakeTableSnapshotInfo);
+        // like the read-only gateway, but it keeps the server it sends to for abandon()
+        AtomicReference<ServerNode> server = new AtomicReference<>();
+        AdminReadOnlyGateway gateway =
+                RetryableGatewayClientProxy.createRetryableGatewayProxy(
+                        GatewayClientProxy.createGatewayProxy(
+                                () -> {
+                                    ServerNode node = metadataUpdater.getRandomTabletServer();
+                                    server.set(node);
+                                    return node;
+                                },
+                                client,
+                                AdminReadOnlyGateway.class),
+                        metadataUpdater::refreshClusterUntilAvailable,
+                        refreshExecutor,
+                        AdminReadOnlyGateway.class);
+        return inFlight(
+                gateway.getLakeSnapshot(request)
+                        .thenApply(ClientRpcMessageUtils::toLakeTableSnapshotInfo),
+                server);
     }
 
     @Override
@@ -1226,48 +1257,17 @@ public class FlussAdmin implements Admin, DvAdmin {
                 .thenApply(ClientRpcMessageUtils::toClusterDescription);
     }
 
-    @Override
-    public CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(
-            TablePath tablePath, GetDvSnapshotRequest request) {
-        Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
-        return sendDvSnapshotRequest(
-                tablePath, request.getTableId(), partitionId, request.getBucketId(), request);
-    }
-
-    @Override
-    public CompletableFuture<GetDvSnapshotResponse> lookupDvPositions(
-            TablePath tablePath,
-            long tableId,
-            @Nullable Long partitionId,
-            int bucketId,
-            long snapshotId,
-            List<byte[]> keys) {
-        GetDvSnapshotRequest request =
-                new GetDvSnapshotRequest()
-                        .setTableId(tableId)
-                        .setBucketId(bucketId)
-                        .setReadableSnapshotId(snapshotId);
-        if (partitionId != null) {
-            request.setPartitionId(partitionId);
-        }
-        for (byte[] key : keys) {
-            request.addLookupKey(key);
-        }
-        return sendDvSnapshotRequest(tablePath, tableId, partitionId, bucketId, request);
-    }
-
     /**
      * Sends a deletion vector request to the bucket's leader. On a leader error, including a leader
      * whose server is not in the metadata cache (e.g. it restarted), the cached bucket metadata is
      * dropped so that a retry resolves the leader and the servers again.
      */
-    private CompletableFuture<GetDvSnapshotResponse> sendDvSnapshotRequest(
-            TablePath tablePath,
-            long tableId,
-            @Nullable Long partitionId,
-            int bucketId,
-            GetDvSnapshotRequest request) {
-        TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+    @Override
+    public CompletableFuture<GetDvSnapshotResponse> getDvSnapshot(
+            TablePath tablePath, GetDvSnapshotRequest request) {
+        long tableId = request.getTableId();
+        Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
+        TableBucket tb = new TableBucket(tableId, partitionId, request.getBucketId());
         if (partitionId != null) {
             // Partition metadata can only be fetched once the table is cached.
             metadataUpdater.checkAndUpdateTableMetadata(Collections.singleton(tablePath));
@@ -1280,17 +1280,44 @@ public class FlussAdmin implements Admin, DvAdmin {
                     new LeaderNotAvailableException(
                             "Server " + leader + " is not found in metadata cache."));
         }
-        return tsGateway
-                .getDvSnapshot(request)
-                .whenComplete(
-                        (resp, t) -> {
-                            if (t != null
-                                    && ExceptionUtils.findThrowable(
-                                                    t, InvalidMetadataException.class)
-                                            .isPresent()) {
-                                invalidateBucketMetadata(tablePath, tableId, partitionId);
-                            }
-                        });
+        return inFlight(
+                tsGateway
+                        .getDvSnapshot(request)
+                        .whenComplete(
+                                (resp, t) -> {
+                                    if (t != null
+                                            && ExceptionUtils.findThrowable(
+                                                            t, InvalidMetadataException.class)
+                                                    .isPresent()) {
+                                        invalidateBucketMetadata(tablePath, tableId, partitionId);
+                                    }
+                                }),
+                new AtomicReference<>(metadataUpdater.getCluster().getTabletServer(leader)));
+    }
+
+    /** Keeps the server of a request in flight until it is answered; see {@link #abandon}. */
+    private <T> CompletableFuture<T> inFlight(
+            CompletableFuture<T> answer, AtomicReference<ServerNode> server) {
+        serversInFlight.put(answer, server);
+        answer.whenComplete((r, t) -> serversInFlight.remove(answer));
+        return answer;
+    }
+
+    /**
+     * Gives up on the answer of a deletion vector or readable lake snapshot request: cancels it and
+     * drops the connection to the server the request went to. Other answers are only cancelled.
+     */
+    @Override
+    public void abandon(CompletableFuture<?> answer) {
+        AtomicReference<ServerNode> server = serversInFlight.remove(answer);
+        answer.cancel(false);
+        ServerNode node = server == null ? null : server.get();
+        if (node != null) {
+            LOG.warn(
+                    "Server {} did not answer a request in time; dropping the connection to it.",
+                    node);
+            client.disconnect(node);
+        }
     }
 
     /** Drops the cached bucket leaders so the next request resolves them again. */

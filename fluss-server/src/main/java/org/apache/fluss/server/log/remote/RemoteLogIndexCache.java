@@ -39,6 +39,7 @@ import com.github.benmanes.caffeine.cache.RemovalCause;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.Closeable;
@@ -189,6 +190,17 @@ public class RemoteLogIndexCache implements Closeable {
                         getIndexEntry(remoteLogDir, remoteLogSegment)
                                 .lookupOffset(offset)
                                 .getPosition());
+    }
+
+    /**
+     * Get the first offset index entry at or above the given offset in the remote log segment, or
+     * null if there is none.
+     */
+    @Nullable
+    public OffsetPosition lookupIndexCeiling(
+            FsPath remoteLogDir, RemoteLogSegment remoteLogSegment, long offset) {
+        return inReadLock(
+                lock, () -> getIndexEntry(remoteLogDir, remoteLogSegment).lookupCeiling(offset));
     }
 
     /**
@@ -596,6 +608,19 @@ public class RemoteLogIndexCache implements Closeable {
                             throw new IllegalStateException("This entry is marked for cleanup.");
                         } else {
                             return offsetIndex.lookup(targetOffset);
+                        }
+                    });
+        }
+
+        @Nullable
+        public OffsetPosition lookupCeiling(long targetOffset) {
+            return inReadLock(
+                    entryLock,
+                    () -> {
+                        if (markedForCleanup) {
+                            throw new IllegalStateException("This entry is marked for cleanup.");
+                        } else {
+                            return offsetIndex.lookupCeiling(targetOffset);
                         }
                     });
         }

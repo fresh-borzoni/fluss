@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
 
 /**
  * Thrown when a deletion vector request names a lake snapshot other than the one the tablet
- * server's position index currently covers, or a cut the server no longer holds.
+ * server's position index currently covers, or a cut the server no longer keeps.
  *
  * <p>The reader plans the bucket again on the snapshot the server covers. A read that does not wait
  * for the server gets the same answer in its response instead; when the server still switches to

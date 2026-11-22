@@ -29,10 +29,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-import javax.annotation.concurrent.GuardedBy;
 
-import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -60,7 +59,7 @@ public class DvCutPinner {
         final long logStartOffset;
         @Nullable final String lakeSnapshotIdentity;
         // the leader had nothing to serve: the bucket is read by key up to the cut, which the
-        // leader holds no masks of
+        // leader keeps no masks of
         final boolean folded;
 
         PinnedCut(long cut, long logStartOffset, @Nullable String lakeSnapshotIdentity) {
@@ -84,152 +83,71 @@ public class DvCutPinner {
         }
     }
 
-    /** A leader's answer to a pin: the pinned cut's response, or a cut to read by key. */
-    private static final class Answer {
-        @Nullable final GetDvSnapshotResponse response;
-        final long foldCut;
-
-        Answer(@Nullable GetDvSnapshotResponse response, long foldCut) {
-            this.response = response;
-            this.foldCut = foldCut;
-        }
-    }
-
     private final DvAdmin admin;
     private final TablePath tablePath;
     private final DvMaskFetcher.Sleeper sleeper;
     // false: a bucket whose leader still switches to the snapshot is not waited for; its part
     // reads the snapshot the leader covers
     private final boolean waitForCatchUp;
+    private final long requestTimeoutMs;
 
     DvCutPinner(
             DvAdmin admin,
             TablePath tablePath,
             DvMaskFetcher.Sleeper sleeper,
-            boolean waitForCatchUp) {
+            boolean waitForCatchUp,
+            long requestTimeoutMs) {
         this.admin = admin;
         this.tablePath = tablePath;
         this.sleeper = sleeper;
         this.waitForCatchUp = waitForCatchUp;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     /**
      * Pins a cut of lake snapshot {@code snapshotId} for each bucket, at most {@link
-     * #MAX_CONCURRENT_PINS} at a time, with the bucket's number of {@code holds} (1 if absent). A
-     * bucket that cannot be pinned is absent; its reader fetches masks when its part starts.
+     * #MAX_CONCURRENT_PINS} at a time. A bucket that cannot be pinned is absent; its reader fetches
+     * masks when its part starts.
      *
-     * <p>If pinning fails or the calling thread is interrupted, no cut is returned, so none is
-     * read: the cuts pinned so far are released, those of pins in flight once their leaders answer,
-     * and pins not sent yet are not sent.
+     * <p>If pinning fails or the calling thread is interrupted, no cut is returned and pins not
+     * sent yet are not sent. The cuts pinned so far idle out on their leaders.
      */
-    Map<TableBucket, PinnedCut> pin(
-            long snapshotId, List<TableBucket> buckets, Map<TableBucket, Integer> holds)
-            throws Exception {
+    Map<TableBucket, PinnedCut> pin(long snapshotId, List<TableBucket> buckets) throws Exception {
         if (buckets.isEmpty()) {
             return new HashMap<>();
         }
-        Pins pins = new Pins(snapshotId, holds);
         ExecutorService executor =
                 Executors.newFixedThreadPool(Math.min(MAX_CONCURRENT_PINS, buckets.size()));
-        List<Future<?>> futures = new ArrayList<>(buckets.size());
-        boolean pinned = false;
+        Map<TableBucket, Future<PinnedCut>> pinning = new LinkedHashMap<>();
         try {
             for (TableBucket bucket : buckets) {
-                futures.add(executor.submit(() -> pins.pin(bucket)));
+                pinning.put(bucket, executor.submit(() -> pinOne(snapshotId, bucket)));
             }
-            for (Future<?> future : futures) {
-                future.get();
+            Map<TableBucket, PinnedCut> pins = new HashMap<>();
+            for (Map.Entry<TableBucket, Future<PinnedCut>> pin : pinning.entrySet()) {
+                PinnedCut cut = pin.getValue().get();
+                if (cut != null) {
+                    pins.put(pin.getKey(), cut);
+                }
             }
-            pinned = true;
-            return pins.taken();
+            return pins;
         } finally {
-            if (!pinned) {
-                for (Future<?> future : futures) {
-                    future.cancel(false);
-                }
-                pins.abandon();
+            // stops the pins still in flight if planning failed: no read waits for their cuts
+            for (Future<PinnedCut> pin : pinning.values()) {
+                pin.cancel(true);
             }
-            // pins in flight finish, so their cuts are released
             executor.shutdown();
-        }
-    }
-
-    /** The cuts pinned for the buckets of one planning. */
-    private final class Pins {
-        private final long snapshotId;
-        private final Map<TableBucket, Integer> holds;
-
-        @GuardedBy("this")
-        private final Map<TableBucket, PinnedCut> taken = new HashMap<>();
-
-        // the planning ended without the cuts: the pins are released
-        @GuardedBy("this")
-        private boolean abandoned;
-
-        Pins(long snapshotId, Map<TableBucket, Integer> holds) {
-            this.snapshotId = snapshotId;
-            this.holds = holds;
-        }
-
-        @Nullable
-        Void pin(TableBucket bucket) throws Exception {
-            Answer answer = pinOne(snapshotId, bucket, holdsOf(bucket));
-            if (answer == null) {
-                return null;
-            }
-            PinnedCut cut =
-                    answer.response == null
-                            ? PinnedCut.folded(answer.foldCut)
-                            : toPin(answer.response);
-            synchronized (this) {
-                if (!abandoned) {
-                    taken.put(bucket, cut);
-                    return null;
-                }
-            }
-            release(bucket, cut);
-            return null;
-        }
-
-        synchronized Map<TableBucket, PinnedCut> taken() {
-            return new HashMap<>(taken);
-        }
-
-        void abandon() {
-            Map<TableBucket, PinnedCut> released;
-            synchronized (this) {
-                abandoned = true;
-                released = new HashMap<>(taken);
-                taken.clear();
-            }
-            for (Map.Entry<TableBucket, PinnedCut> e : released.entrySet()) {
-                release(e.getKey(), e.getValue());
-            }
-        }
-
-        private int holdsOf(TableBucket bucket) {
-            return holds.getOrDefault(bucket, 1);
-        }
-
-        private void release(TableBucket bucket, PinnedCut cut) {
-            // a folded bucket's leader holds no cut
-            if (!cut.folded) {
-                new DvMaskFetcher(admin, tablePath, sleeper)
-                        .release(
-                                DvMaskFetcher.releaseRequest(
-                                        bucket, snapshotId, cut.cut, holdsOf(bucket)));
-            }
         }
     }
 
     /** Pins the bucket's cut; null if the bucket cannot be pinned now. */
     @Nullable
-    private Answer pinOne(long snapshotId, TableBucket bucket, int holds) throws Exception {
+    private PinnedCut pinOne(long snapshotId, TableBucket bucket) throws Exception {
         // the same in every retry of this pin, so a retry the leader took pins nothing more
         long pinRequestId = ThreadLocalRandom.current().nextLong();
         try {
             GetDvSnapshotResponse response =
-                    new DvMaskFetcher(admin, tablePath, sleeper)
+                    new DvMaskFetcher(admin, tablePath, sleeper, requestTimeoutMs)
                             .fetch(
                                     () -> {
                                         GetDvSnapshotRequest request =
@@ -244,12 +162,9 @@ public class DvCutPinner {
                                         if (!waitForCatchUp) {
                                             request.setWaitForCatchUp(false);
                                         }
-                                        if (holds > 1) {
-                                            request.setHolds(holds);
-                                        }
                                         return request;
                                     });
-            return new Answer(response, -1L);
+            return toPin(response);
         } catch (InterruptedException e) {
             throw e;
         } catch (Exception e) {
@@ -262,7 +177,7 @@ public class DvCutPinner {
                         tablePath,
                         snapshotId,
                         foldCut);
-                return new Answer(null, foldCut);
+                return PinnedCut.folded(foldCut);
             }
             // e.g. the leader covers another snapshot or the partition was dropped: the reader
             // resolves the bucket when its part starts

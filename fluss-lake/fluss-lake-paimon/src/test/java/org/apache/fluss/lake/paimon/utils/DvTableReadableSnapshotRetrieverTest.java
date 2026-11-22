@@ -293,7 +293,7 @@ class DvTableReadableSnapshotRetrieverTest {
 
     /**
      * Runs the flow on a table with Paimon deletion vectors, and on one whose Fluss table also has
-     * {@code table.deletion-vectors.enabled}. They differ in step 9 only.
+     * {@code table.datalake.deletion-vectors.enabled}. They differ in step 9 only.
      */
     @ParameterizedTest(name = "flussDeletionVectors={0}")
     @ValueSource(booleans = {false, true})
@@ -307,14 +307,15 @@ class DvTableReadableSnapshotRetrieverTest {
                 TablePath.of(DEFAULT_DB, "test_dv_flow" + (flussDeletionVectors ? "_fluss" : ""));
         tableId = createDvTable(tablePath, 3);
         if (flussDeletionVectors) {
-            // As Fluss mirrors table.deletion-vectors.enabled of a table it creates with it. The
+            // As Fluss mirrors table.datalake.deletion-vectors.enabled of a table it creates with
+            // it. The
             // table itself is created without, as this test registers snapshots without the
             // tiering epoch such a table needs.
             paimonCatalog.alterTable(
                     toPaimon(tablePath),
                     SchemaChange.setOption(
                             PaimonConversions.FLUSS_CONF_PREFIX
-                                    + ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(),
+                                    + ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
                             "true"),
                     false);
         }

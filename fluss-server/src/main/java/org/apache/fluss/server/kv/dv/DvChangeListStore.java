@@ -26,6 +26,7 @@ import io.github.fluss_contrib.rocksdb.RocksIterator;
 import io.github.fluss_contrib.rocksdb.Snapshot;
 import io.github.fluss_contrib.rocksdb.WriteBatch;
 import io.github.fluss_contrib.rocksdb.WriteOptions;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
 
 import javax.annotation.Nullable;
 
@@ -146,8 +147,28 @@ public class DvChangeListStore {
         boolean nextLakeKeys(
                 int max, long startOffset, @Nullable Predicate<byte[]> filter, List<byte[]> out)
                 throws IOException {
+            return read(max, Integer.MAX_VALUE, startOffset, filter, out) > 0;
+        }
+
+        /**
+         * As {@link #nextLakeKeys(int, long, List)}, and stops once it added {@code maxKeys} keys.
+         * Returns the number of changes read, 0 once there are none left.
+         */
+        int nextLakeKeys(int max, int maxKeys, long startOffset, List<byte[]> out)
+                throws IOException {
+            return read(max, maxKeys, startOffset, null, out);
+        }
+
+        private int read(
+                int max,
+                int maxKeys,
+                long startOffset,
+                @Nullable Predicate<byte[]> filter,
+                List<byte[]> out)
+                throws IOException {
             int read = 0;
-            while (read < max && it.isValid()) {
+            int keys = 0;
+            while (read < max && keys < maxKeys && it.isValid()) {
                 if (compareUnsigned(it.key(), end) >= 0) {
                     break;
                 }
@@ -156,6 +177,7 @@ public class DvChangeListStore {
                     byte[] key = Arrays.copyOfRange(value, Long.BYTES, value.length);
                     if (filter == null || filter.test(key)) {
                         out.add(key);
+                        keys++;
                     }
                 }
                 read++;
@@ -166,7 +188,33 @@ public class DvChangeListStore {
             } catch (RocksDBException e) {
                 throw new IOException("Failed to iterate a change list", e);
             }
-            return read > 0;
+            return read;
+        }
+
+        /**
+         * Reads the next at most {@code max} changes and adds the versions they supersede at or
+         * after {@code startOffset}, which are in the log, to {@code out}. Returns the number of
+         * changes read, 0 once there are none left.
+         */
+        int nextLogVersions(int max, long startOffset, Roaring64Bitmap out) throws IOException {
+            int read = 0;
+            while (read < max && it.isValid()) {
+                if (compareUnsigned(it.key(), end) >= 0) {
+                    break;
+                }
+                long previous = ByteBuffer.wrap(it.value()).getLong();
+                if (previous >= startOffset) {
+                    out.addLong(previous);
+                }
+                read++;
+                it.next();
+            }
+            try {
+                it.status();
+            } catch (RocksDBException e) {
+                throw new IOException("Failed to iterate a change list", e);
+            }
+            return read;
         }
 
         /**

@@ -65,7 +65,7 @@ public final class WriterMemoryPool {
         this.capacity = capacityBytes;
     }
 
-    @VisibleForTesting
+    /** The bytes the owners may hold together. */
     public long capacity() {
         return capacity;
     }

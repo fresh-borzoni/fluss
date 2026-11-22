@@ -23,6 +23,7 @@ import org.apache.fluss.lake.iceberg.utils.IcebergCatalogUtils;
 import org.apache.iceberg.catalog.Catalog;
 
 import java.io.Serializable;
+import java.util.Map;
 
 /** A provider for Iceberg catalog. */
 public class IcebergCatalogProvider implements Serializable {
@@ -36,5 +37,10 @@ public class IcebergCatalogProvider implements Serializable {
 
     public Catalog get() {
         return IcebergCatalogUtils.createIcebergCatalog(icebergConfig);
+    }
+
+    /** The configuration of the catalogs it provides; providers of equal ones provide alike. */
+    Map<String, String> catalogProperties() {
+        return icebergConfig.toMap();
     }
 }

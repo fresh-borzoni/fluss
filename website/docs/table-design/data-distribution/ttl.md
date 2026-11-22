@@ -124,7 +124,7 @@ Existing remote snapshot files have separate retention, controlled by
 
 ### Row TTL with Deletion Vectors
 
-A lakehouse table with deletion vectors (`table.deletion-vectors.enabled`) can use row TTL by
+A lakehouse table with deletion vectors (`table.datalake.deletion-vectors.enabled`) can use row TTL by
 processing time or by event time (`table.kv.ttl.time-column`). Its KV values keep the log offset
 of their version and their TTL time in two fields of their own;
 Fluss picks this value layout when the table is created. Row TTL cleanup writes nothing to the
@@ -146,16 +146,20 @@ changelog, while the lake can still hold a row of an expired key, so union reads
   which never expires. The metric `dvRowTtlCapLagMs`, and `dvRowTtlCapLagMsMax` per table, show
   how far a bucket's expiry lags the clock, and the leader logs a warning when it lags by more
   than the TTL.
-- **A new leader takes the cap over with the KV snapshot it restores.** The snapshot records the
-  readable offset the old leader capped its filter for and the oldest TTL times below the
+- **A new leader takes the cap over with the KV snapshot it restores.** Every KV snapshot records
+  the readable offset the old leader capped its filter for and the oldest TTL times below the
   snapshot's offset, so the restored KV holds every version after that offset and the new
-  leader's cap covers the rows it restores. A KV snapshot saved without them, for example by an
-  older version, was compacted by a filter the new leader did not cap: until the bucket covers a
-  lake snapshot readable from the KV snapshot's offset, the filter expires nothing, and union
-  reads read the bucket by key, as when it rebuilds: the lake files and the log after the readable
-  offset, folded to the last change of each key. That is exact but reads all lake keys of the
-  bucket, so it is slower, and the metric `dvRowTtlFoldPerSecond` counts it. The same holds while
-  a bucket covers an older lake snapshot than its filter was capped for.
+  leader's cap covers the rows it restores. A KV snapshot without that state, or with it out of
+  order, is corrupt, and the new leader takes the snapshot's offset as the one its filter was
+  capped for. On Iceberg the readable offset only moves forward, so a bucket covers a lake
+  snapshot readable below the offset its filter was capped for only if its state is corrupt.
+  Corrupt state is logged at ERROR and counted by the metric `dvRowTtlCorruptPerSecond`, and such
+  an Iceberg bucket serves no masks: union reads read it by key, as when it rebuilds (the lake
+  files and the log after the readable offset, folded to the last change of each key, which is
+  exact but reads all lake keys of the bucket, so it is slower), and its tiering rounds wait. On
+  Paimon, whose readable snapshot is its latest compacted one, a bucket can cover an older lake
+  snapshot than its filter was capped for: union reads read it by key until the readable offset
+  passes that offset again, and the metric `dvRowTtlFoldPerSecond` counts them.
 - **Deleting a key whose row has expired is a no-op**, as for any table with row TTL: nothing is
   written to the changelog, so a row of the key that was tiered stays in the lake and visible in
   union reads.

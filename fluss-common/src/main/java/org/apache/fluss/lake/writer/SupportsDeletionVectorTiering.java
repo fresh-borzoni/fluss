@@ -33,8 +33,8 @@ import java.io.IOException;
 
 /**
  * A {@link LakeTieringFactory} of a lake that can tier tables with deletion vectors ({@code
- * table.deletion-vectors.enabled}). Fluss refuses to tier such a table if the factory lacks this
- * capability.
+ * table.datalake.deletion-vectors.enabled}). Fluss refuses to tier such a table if the factory
+ * lacks this capability.
  *
  * <p>A factory with this capability promises, for tables with deletion vectors:
  *

@@ -71,7 +71,8 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
     // Each round's keys, including those of the rows that only advance the readable snapshot, lie
     // in a range of their own, so files of different rounds do not overlap.
     private static final int ROUND_KEY_SPAN = 2000;
-    private static final String IDLE_TIMEOUT = "kv.deletion-vectors.pinned-cut-idle-timeout";
+    // short, so later splits find the cut gone
+    private static final Duration SHORT_IDLE = Duration.ofSeconds(1);
 
     @BeforeAll
     protected static void beforeAll() {
@@ -104,8 +105,9 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
 
     /**
      * A read that does not wait for its leaders while writes go on. A bucket whose lookups are
-     * pending is read with the masks ready below the high watermark, and its log up to their cut.
-     * The read is exact.
+     * pending is read with the masks ready below the high watermark, and its log up to their cut,
+     * or with its lake snapshot alone if its leader built no masks since it switched to it. The
+     * read is exact as of those cuts, which may be below writes acknowledged before it.
      */
     @Test
     void testReadThatDoesNotWaitWhileWritesGoOn() throws Exception {
@@ -115,11 +117,40 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
 
         new UnionReadUnderWrites(clientConf, tablePath)
                 .withHint(FILE_GROUP_ROWS, "1")
-                .withHint(
-                        ConfigOptions.CLIENT_SCANNER_DELETION_VECTORS_WAIT_FOR_CATCH_UP.key(),
-                        "false")
                 .withMillisPerRow(2)
-                .readAndCheck(before, everyNth(before, 7), Duration.ofMinutes(5));
+                .readWithoutWaitingAndCheck(everyNth(before, 7), Duration.ofMinutes(5));
+    }
+
+    /**
+     * A read that does not wait while the leaders have not looked up the lake positions of the log
+     * tail. Each bucket is read exactly as of a cut below its tail: without its updates, and with
+     * the lake rows of the keys it deletes.
+     */
+    @Test
+    void testReadThatDoesNotWaitWhileLookupsArePending() throws Exception {
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "pinned_parts_lookups_pending");
+        long tableId = createDerivedTable(tablePath);
+        Map<Integer, String> tiered = tierRounds(tablePath, tableId);
+
+        FLUSS_CLUSTER_EXTENSION.pauseDvResolves(true);
+        try {
+            Map<Integer, String> withTail = writeLogTail(tablePath, tiered);
+            Map<Integer, String> read =
+                    new UnionReadUnderWrites(clientConf, tablePath)
+                            .withHint(FILE_GROUP_ROWS, "1")
+                            .withMillisPerRow(2)
+                            .readWithoutWaitingAndCheck(
+                                    everyNth(withTail, 7), Duration.ofMinutes(5));
+            // none of the tail is read, nor any write after it
+            assertThat(read.values()).allMatch(v -> v.startsWith("v_") || v.equals("tick"));
+            Map<Integer, String> deletedLakeRows = new TreeMap<>(tiered);
+            deletedLakeRows.keySet().removeAll(withTail.keySet());
+            deletedLakeRows.values().removeIf(v -> !v.startsWith("v_"));
+            assertThat(deletedLakeRows).isNotEmpty();
+            assertThat(read).containsAllEntriesOf(deletedLakeRows);
+        } finally {
+            FLUSS_CLUSTER_EXTENSION.pauseDvResolves(false);
+        }
     }
 
     /**
@@ -131,7 +162,7 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
     @Test
     void testSplitsDeriveTheMasksOfACutTheLeaderDropped() throws Exception {
         Configuration shortIdle = new Configuration();
-        shortIdle.setString(IDLE_TIMEOUT, "1s");
+        shortIdle.set(ConfigOptions.KV_DELETION_VECTORS_PINNED_CUT_IDLE_TIMEOUT, SHORT_IDLE);
         restartTabletServers(shortIdle);
         try {
             TablePath tablePath = TablePath.of(DEFAULT_DB, "pinned_parts_dropped_cut");
@@ -180,7 +211,8 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
                                         ConfigOptions.TABLE_DATALAKE_FRESHNESS,
                                         Duration.ofMillis(500))
                                 .property(
-                                        ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                                        ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(),
+                                        "true")
                                 .property(
                                         ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true")
                                 .build());
@@ -280,6 +312,15 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
      * of updates and deletes. Returns the table's rows.
      */
     private Map<Integer, String> tierInRounds(TablePath tablePath, long tableId) throws Exception {
+        return writeLogTail(tablePath, tierRounds(tablePath, tableId));
+    }
+
+    /**
+     * Writes rounds of new keys, each readable in the lake before the next, until the readable
+     * snapshot holds {@link #FILES_PER_BUCKET} lake splits of every bucket. Returns the table's
+     * rows.
+     */
+    private Map<Integer, String> tierRounds(TablePath tablePath, long tableId) throws Exception {
         Map<Integer, String> rows = new TreeMap<>();
         Map<Integer, Integer> lakeSplits = new TreeMap<>();
         JobClient tiering = buildTieringJob(execEnv);
@@ -306,7 +347,16 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
                 .as("lake splits per bucket of %s: %s", tablePath, lakeSplits)
                 .hasSize(BUCKETS)
                 .allMatch(n -> n >= FILES_PER_BUCKET);
-        // a log tail, whose keys' lake versions the masks hide
+        return rows;
+    }
+
+    /**
+     * Writes a log tail of updates and deletes of the keys of {@code tiered}, whose lake versions
+     * the masks hide. Returns the table's rows after it.
+     */
+    private Map<Integer, String> writeLogTail(TablePath tablePath, Map<Integer, String> tiered)
+            throws Exception {
+        Map<Integer, String> rows = new TreeMap<>(tiered);
         List<Integer> keys = new ArrayList<>(rows.keySet());
         try (Table table = conn.getTable(tablePath)) {
             UpsertWriter writer = table.newUpsert().createWriter();
@@ -392,7 +442,8 @@ class FlinkUnionReadPinnedCutITCase extends FlinkUnionReadTestBase {
                         .distributedBy(BUCKETS)
                         .property(ConfigOptions.TABLE_DATALAKE_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_FRESHNESS, Duration.ofMillis(500))
-                        .property(ConfigOptions.TABLE_DELETION_VECTORS_ENABLED.key(), "true")
+                        .property(
+                                ConfigOptions.TABLE_DATALAKE_DELETION_VECTORS_ENABLED.key(), "true")
                         .property(ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(), "true")
                         // a split per data file, so a bucket's files make several groups
                         .customProperty("paimon.source.split.target-size", "1 b")

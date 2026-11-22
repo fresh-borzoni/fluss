@@ -17,34 +17,38 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
-import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.metadata.LakeSnapshot;
+import org.apache.fluss.client.tiering.DvRoundRequests;
+import org.apache.fluss.client.tiering.RoundDeletes;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.dv.index.PositionIndexStore;
 import org.apache.fluss.lake.dv.index.StagedIndexPart;
 import org.apache.fluss.metadata.TableBucket;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.Semaphore;
+
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** What publishing the writers' parts produced. */
 final class PublishedParts {
-
-    static final int LOOKUP_CHUNK = 50_000;
-    // Lookup chunks in flight at once across all buckets of a round; bounds the keys held.
-    @VisibleForTesting static final int LOOKUPS_IN_FLIGHT = 8;
-    // Buckets whose parts are published at once.
-    static final int PUBLISH_THREADS = 8;
 
     private static final Comparator<TableBucket> BUCKET_ORDER =
             Comparator.comparingLong(
@@ -56,23 +60,38 @@ final class PublishedParts {
     final DeletedPositions deleted = new DeletedPositions();
     long keys;
     long deletes;
-    long found;
+    long deletedRows;
+    // buckets in the base committed from the deletion vectors their writers prepared, and those
+    // whose deletes the committer merged: from their write results, or from their leaders
+    int vectorsFromWriters;
+    int deletesFromReaders;
+    int deletesFromLeaders;
 
     private PublishedParts() {}
 
     /**
-     * Publishes every bucket's staged part under change {@code indexId}, buckets in parallel, with
-     * file ids from the table's counter. While it streams a part's keys, it looks up their base
-     * positions in chunks of {@link #LOOKUP_CHUNK} keys, at most {@link #LOOKUPS_IN_FLIGHT} chunks
-     * at a time. Each found position goes into its data file's bitmap. A bucket not in the base has
-     * nothing to look up.
+     * Publishes every bucket's staged part under change {@code indexId}, {@code threads} buckets at
+     * once, with file ids from the table's counter, and collects the positions of the base's rows
+     * the round deletes, as a bitmap per data file. A bucket in the base takes them from its
+     * leader, which derives them from its change list from the base's offset, where the bucket's
+     * round starts ({@code roundStarts}), up to its round end ({@code roundEnds}). Deletes the
+     * bucket's reader fetched ({@code prefetched}) are used if they hold on the base (see {@link
+     * #holdOnBase}); otherwise they are fetched while the bucket's part is published. A bucket not
+     * in the base deletes nothing, and neither does a bucket whose writer prepared its deletion
+     * vectors ({@code preparedByWriters}), which hold its round's deletes.
      */
     static PublishedParts publish(
             PositionIndexStore store,
             long indexId,
             @Nullable LakeSnapshot baseSnapshot,
             Map<TableBucket, StagedIndexPart> parts,
-            DerivedDvLookups.PositionLookup lookup)
+            Map<TableBucket, Long> roundStarts,
+            Map<TableBucket, Long> roundEnds,
+            Map<TableBucket, RoundDeletes> prefetched,
+            ChangedDataFiles changedDataFiles,
+            Set<TableBucket> preparedByWriters,
+            DvRoundRequests.Fetcher roundDeletes,
+            int threads)
             throws Exception {
         PublishedParts out = new PublishedParts();
         if (parts.isEmpty()) {
@@ -80,6 +99,42 @@ final class PublishedParts {
         }
         List<TableBucket> order = new ArrayList<>(parts.keySet());
         order.sort(BUCKET_ORDER);
+        long base = baseSnapshot == null ? -1L : baseSnapshot.getSnapshotId();
+        Map<TableBucket, Long> inBase =
+                base > 0 ? baseSnapshot.getTableBucketsOffset() : Collections.emptyMap();
+        Map<TableBucket, RoundDeletes> usable = new HashMap<>();
+        // by the snapshot deletes were fetched on, the data files the snapshots since changed
+        Map<Long, Optional<Set<String>>> changedSince = new HashMap<>();
+        for (TableBucket tb : order) {
+            Long baseOffset = inBase.get(tb);
+            if (baseOffset == null) {
+                continue;
+            }
+            // the leader derives the deletes from the base's offset on, where the writer starts
+            Long start = roundStarts.get(tb);
+            checkState(
+                    start != null && start.longValue() == baseOffset,
+                    "The round of bucket %s starts at offset %s, not at offset %s of base"
+                            + " snapshot %s.",
+                    tb,
+                    start,
+                    baseOffset,
+                    base);
+            Long end = roundEnds.get(tb);
+            checkState(end != null, "The round of bucket %s has no end offset.", tb);
+            if (preparedByWriters.contains(tb)) {
+                out.vectorsFromWriters++;
+                continue;
+            }
+            RoundDeletes fetched = prefetched.get(tb);
+            if (fetched != null
+                    && holdOnBase(fetched, base, baseOffset, end, changedSince, changedDataFiles)) {
+                usable.put(tb, fetched);
+                out.deletesFromReaders++;
+            } else {
+                out.deletesFromLeaders++;
+            }
+        }
         // File ids come from the table's persisted counter; a colliding id masks the wrong file.
         int files = 0;
         for (StagedIndexPart part : parts.values()) {
@@ -99,52 +154,186 @@ final class PublishedParts {
             newIds.put(tb, ids);
             addedFiles.put(tb, added);
         }
-        long base = baseSnapshot == null ? -1L : baseSnapshot.getSnapshotId();
-        Map<TableBucket, Long> inBase =
-                base > 0 ? baseSnapshot.getTableBucketsOffset() : Collections.emptyMap();
-        ExecutorService publishers =
-                Executors.newFixedThreadPool(Math.min(PUBLISH_THREADS, order.size()));
-        ExecutorService lookups = Executors.newFixedThreadPool(LOOKUPS_IN_FLIGHT);
-        Semaphore inFlight = new Semaphore(LOOKUPS_IN_FLIGHT);
+        ExecutorService publishers = Executors.newFixedThreadPool(Math.min(threads, order.size()));
+        // a publisher waits for its bucket's fetch, so each has a thread of its own
+        ExecutorService fetchers =
+                out.deletesFromLeaders == 0
+                        ? null
+                        : Executors.newFixedThreadPool(Math.min(threads, out.deletesFromLeaders));
         try {
-            Map<TableBucket, Future<BucketLookups>> futures = new HashMap<>();
+            Map<TableBucket, Future<PublishedBucket>> futures = new HashMap<>();
             for (TableBucket tb : order) {
                 StagedIndexPart part = parts.get(tb);
-                BucketLookups bucketLookups =
-                        new BucketLookups(
-                                tb, base, inBase.containsKey(tb), lookup, lookups, inFlight);
+                Long baseOffset = preparedByWriters.contains(tb) ? null : inBase.get(tb);
+                RoundDeletes known = usable.get(tb);
                 futures.put(
                         tb,
                         publishers.submit(
                                 () -> {
-                                    bucketLookups.published =
+                                    Future<DeletedPositions> fetched =
+                                            baseOffset == null || known != null
+                                                    ? null
+                                                    : checkNotNull(fetchers)
+                                                            .submit(
+                                                                    () ->
+                                                                            leaderDeletes(
+                                                                                    tb,
+                                                                                    base,
+                                                                                    baseOffset,
+                                                                                    roundEnds.get(
+                                                                                            tb),
+                                                                                    roundDeletes));
+                                    PositionIndexStore.BucketPart published =
                                             store.publishStaged(
                                                     part.stagingId(),
                                                     indexId,
                                                     tb,
                                                     part.part(),
-                                                    newIds.get(tb),
-                                                    bucketLookups::accept);
-                                    bucketLookups.finish();
-                                    return bucketLookups;
+                                                    newIds.get(tb));
+                                    DeletedPositions deleted =
+                                            known != null
+                                                    ? DeletedPositions.of(known)
+                                                    : fetched != null
+                                                            ? join(fetched)
+                                                            : new DeletedPositions();
+                                    return new PublishedBucket(published, deleted);
                                 }));
             }
             for (TableBucket tb : order) {
-                BucketLookups done = futures.get(tb).get();
+                PublishedBucket done = join(futures.get(tb));
                 StagedIndexPart part = parts.get(tb);
                 out.changes.put(
                         tb,
                         new PositionIndexStore.BucketChange(
-                                done.published, addedFiles.get(tb), Collections.emptyList()));
+                                done.part, addedFiles.get(tb), Collections.emptyList()));
                 out.deleted.addAll(done.deleted);
                 out.keys += part.keys();
                 out.deletes += part.deletes();
-                out.found += done.found;
             }
         } finally {
             publishers.shutdownNow();
-            lookups.shutdownNow();
+            if (fetchers != null) {
+                fetchers.shutdownNow();
+            }
         }
+        out.deletedRows = out.deleted.positions();
         return out;
+    }
+
+    /**
+     * Whether a bucket's deletes its reader fetched hold on the base: they are of the bucket's
+     * round from the base's offset, and fetched on the base or on a snapshot before it, after which
+     * no snapshot changed the rows or the deletes of a data file they name. The round's keys then
+     * keep their base rows in those files, at the same positions, and the base's index, which
+     * re-indexed only rewritten files since, has them there too: the bucket's leader would answer
+     * the same deletes on the base. This holds whoever changed the other files, e.g. the round's
+     * own compaction or another engine's rewrite of other buckets.
+     */
+    private static boolean holdOnBase(
+            RoundDeletes fetched,
+            long base,
+            long baseOffset,
+            long roundEnd,
+            Map<Long, Optional<Set<String>>> changedSince,
+            ChangedDataFiles changedDataFiles)
+            throws IOException {
+        if (fetched.startOffset() != baseOffset || fetched.endOffset() != roundEnd) {
+            return false;
+        }
+        long snapshotId = fetched.snapshotId();
+        if (snapshotId == base) {
+            return true;
+        }
+        Optional<Set<String>> changed = changedSince.get(snapshotId);
+        if (changed == null) {
+            changed = Optional.ofNullable(changedDataFiles.since(snapshotId));
+            changedSince.put(snapshotId, changed);
+        }
+        if (!changed.isPresent()) {
+            return false;
+        }
+        for (RoundDeletes.File file : fetched.files()) {
+            if (changed.get().contains(file.path())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Takes the deletes of a bucket whose writer prepared its deletion vectors at the committer
+     * instead, from its leader on the base.
+     */
+    void addCentrally(
+            TableBucket tb,
+            long base,
+            long baseOffset,
+            long roundEnd,
+            DvRoundRequests.Fetcher roundDeletes)
+            throws Exception {
+        deleted.addAll(leaderDeletes(tb, base, baseOffset, roundEnd, roundDeletes));
+        vectorsFromWriters--;
+        deletesFromLeaders++;
+        deletedRows = deleted.positions();
+    }
+
+    /**
+     * The publish threads of the round's index parts, from {@code
+     * lake.tiering.deletion-vectors.publish-threads}.
+     */
+    static int publishThreads(Configuration lakeTieringConfig) {
+        int threads =
+                lakeTieringConfig.get(ConfigOptions.LAKE_TIERING_DELETION_VECTORS_PUBLISH_THREADS);
+        checkArgument(
+                threads > 0,
+                "%s must be positive.",
+                ConfigOptions.LAKE_TIERING_DELETION_VECTORS_PUBLISH_THREADS.key());
+        return threads;
+    }
+
+    /**
+     * The base positions a bucket's round deletes, from its leader, whatever their size; kept as
+     * bitmaps only.
+     */
+    private static DeletedPositions leaderDeletes(
+            TableBucket tb,
+            long base,
+            long baseOffset,
+            long roundEnd,
+            DvRoundRequests.Fetcher roundDeletes)
+            throws Exception {
+        return DeletedPositions.of(
+                RoundDeletes.fetch(tb, base, baseOffset, roundEnd, Long.MAX_VALUE, roundDeletes));
+    }
+
+    private static <T> T join(Future<T> future) throws Exception {
+        try {
+            return future.get();
+        } catch (ExecutionException e) {
+            throw e.getCause() instanceof Exception ? (Exception) e.getCause() : e;
+        }
+    }
+
+    /**
+     * The data files the lake snapshots after a snapshot up to the round's base changed the rows or
+     * the deletes of, by name; see {@link
+     * org.apache.fluss.lake.committer.SupportsPositionDeleteCommit#changedDataFiles}.
+     */
+    @FunctionalInterface
+    interface ChangedDataFiles {
+        /** The changed data files, or null if they are not known. */
+        @Nullable
+        Set<String> since(long snapshotId) throws IOException;
+    }
+
+    /** A bucket's published part and the base positions its round deletes. */
+    private static final class PublishedBucket {
+        final PositionIndexStore.BucketPart part;
+        final DeletedPositions deleted;
+
+        PublishedBucket(PositionIndexStore.BucketPart part, DeletedPositions deleted) {
+            this.part = part;
+            this.deleted = deleted;
+        }
     }
 }

@@ -17,10 +17,12 @@
 
 package org.apache.fluss.flink.tiering.committer;
 
-import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.tiering.RoundDeletes;
 
-import org.roaringbitmap.longlong.Roaring64NavigableMap;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.HashMap;
@@ -36,30 +38,50 @@ import java.util.Set;
  * array only when the committer reads its entry. Besides the bitmaps, only the arrays of the file
  * the committer is at exist.
  */
-final class DeletedPositions extends AbstractMap<String, long[]> {
+public final class DeletedPositions extends AbstractMap<String, long[]> {
 
-    private final Map<String, Roaring64NavigableMap> byFile = new HashMap<>();
+    private final Map<String, Roaring64Bitmap> byFile = new HashMap<>();
 
-    void add(String file, long position) {
-        byFile.computeIfAbsent(file, f -> new Roaring64NavigableMap()).addLong(position);
+    /** The positions a bucket's round deletes in the base. */
+    public static DeletedPositions of(RoundDeletes deletes) throws IOException {
+        DeletedPositions positions = new DeletedPositions();
+        positions.addAll(deletes);
+        return positions;
+    }
+
+    /** Adds the positions of a file, serialized as a {@link Roaring64Bitmap}. */
+    void addSerialized(String file, byte[] positions) throws IOException {
+        Roaring64Bitmap bitmap = new Roaring64Bitmap();
+        bitmap.deserialize(ByteBuffer.wrap(positions));
+        addAll(file, bitmap);
+    }
+
+    private void addAll(String file, Roaring64Bitmap positions) {
+        Roaring64Bitmap mine = byFile.get(file);
+        if (mine == null) {
+            byFile.put(file, positions);
+        } else {
+            mine.or(positions);
+        }
+    }
+
+    /** Adds the positions a bucket's round deletes in the base. */
+    void addAll(RoundDeletes deletes) throws IOException {
+        for (RoundDeletes.File file : deletes.files()) {
+            addSerialized(file.path(), file.positions());
+        }
     }
 
     void addAll(DeletedPositions other) {
-        for (Map.Entry<String, Roaring64NavigableMap> e : other.byFile.entrySet()) {
-            Roaring64NavigableMap mine = byFile.get(e.getKey());
-            if (mine == null) {
-                byFile.put(e.getKey(), e.getValue());
-            } else {
-                mine.or(e.getValue());
-            }
+        for (Map.Entry<String, Roaring64Bitmap> e : other.byFile.entrySet()) {
+            addAll(e.getKey(), e.getValue());
         }
     }
 
     /** The number of positions of all files. */
-    @VisibleForTesting
     long positions() {
         long n = 0;
-        for (Roaring64NavigableMap bitmap : byFile.values()) {
+        for (Roaring64Bitmap bitmap : byFile.values()) {
             n += bitmap.getLongCardinality();
         }
         return n;
@@ -77,7 +99,7 @@ final class DeletedPositions extends AbstractMap<String, long[]> {
 
     @Override
     public long[] get(Object file) {
-        Roaring64NavigableMap bitmap = byFile.get(file);
+        Roaring64Bitmap bitmap = byFile.get(file);
         return bitmap == null ? null : bitmap.toArray();
     }
 
@@ -86,8 +108,7 @@ final class DeletedPositions extends AbstractMap<String, long[]> {
         return new AbstractSet<Entry<String, long[]>>() {
             @Override
             public Iterator<Entry<String, long[]>> iterator() {
-                Iterator<Map.Entry<String, Roaring64NavigableMap>> it =
-                        byFile.entrySet().iterator();
+                Iterator<Map.Entry<String, Roaring64Bitmap>> it = byFile.entrySet().iterator();
                 return new Iterator<Entry<String, long[]>>() {
                     @Override
                     public boolean hasNext() {
@@ -96,7 +117,7 @@ final class DeletedPositions extends AbstractMap<String, long[]> {
 
                     @Override
                     public Entry<String, long[]> next() {
-                        Map.Entry<String, Roaring64NavigableMap> e = it.next();
+                        Map.Entry<String, Roaring64Bitmap> e = it.next();
                         return new Entry<String, long[]>() {
                             @Override
                             public String getKey() {

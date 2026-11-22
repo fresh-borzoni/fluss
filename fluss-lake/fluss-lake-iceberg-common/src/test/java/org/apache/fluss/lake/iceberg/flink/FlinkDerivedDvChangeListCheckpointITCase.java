@@ -372,17 +372,9 @@ class FlinkDerivedDvChangeListCheckpointITCase extends FlinkDerivedDvTestBase {
                                         .isNotEqualTo(RowTtlFilterClock.EXPIRES_NOTHING));
             }
         }
-        long folds = rowTtlFolds();
         assertUnionRead(safePath, safe);
         assertUnionRead(shortPath, expected);
-        FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(true);
-        try {
-            assertUnionRead(safePath, safe);
-            assertUnionRead(shortPath, expected);
-        } finally {
-            FLUSS_CLUSTER_EXTENSION.ignoreDvRowTtlExpiry(false);
-        }
-        assertThat(rowTtlFolds()).isEqualTo(folds);
+        assertThat(rowTtlCorruptions()).isZero();
     }
 
     /**
@@ -415,24 +407,24 @@ class FlinkDerivedDvChangeListCheckpointITCase extends FlinkDerivedDvTestBase {
                 assertThat(snapshot.getKvSnapshotHandle().getRowTtl()).isNotNull();
             }
             moveLeaders(tableId, off);
-            long folds = rowTtlFolds();
             assertUnionRead(tablePath, expected);
-            assertThat(rowTtlFolds()).isEqualTo(folds);
+            assertThat(rowTtlCorruptions()).isZero();
         } finally {
             restartAll(new org.apache.fluss.config.Configuration());
         }
     }
 
-    private static long rowTtlFolds() {
-        long folds = 0;
+    /** Buckets whose saved row TTL state was found corrupt, on the running tablet servers. */
+    private static long rowTtlCorruptions() {
+        long corruptions = 0;
         for (TabletServer server : FLUSS_CLUSTER_EXTENSION.getTabletServers()) {
-            folds +=
+            corruptions +=
                     server.getReplicaManager()
                             .getServerMetricGroup()
-                            .dvRowTtlFoldCount()
+                            .dvRowTtlCorruptCount()
                             .getCount();
         }
-        return folds;
+        return corruptions;
     }
 
     // ---------------------------------------------------------------------------------------------

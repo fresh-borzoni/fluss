@@ -54,14 +54,14 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Commits the tiering rounds of tables with deletion vectors.
  *
- * <p>A round looks up the lake positions of the rows it supersedes in the base's index, on the
- * buckets' leaders. It publishes its index change and commits data and deletes in one lake commit,
- * so every lake snapshot is consistent at its tiered offsets. The round's own compaction hands the
- * index the new positions of the rows it rewrote ({@link CompactionIndexPart}), so its rewrite
- * needs no re-index. Files rewritten since the base by another engine, or by a compaction that
- * could not hand its positions over, are re-indexed first. The round is then held ({@link
- * RoundOutcome#held}) until the tiering readers report the re-index; {@link #resumeRound} resumes
- * it.
+ * <p>A round takes the lake positions of the rows it supersedes from the buckets' leaders, which
+ * derive them from their change lists. It publishes its index change and commits data and deletes
+ * in one lake commit, so every lake snapshot is consistent at its tiered offsets. The round's own
+ * compaction hands the index the new positions of the rows it rewrote ({@link
+ * CompactionIndexPart}), so its rewrite needs no re-index. Files rewritten since the base by
+ * another engine, or by a compaction that could not hand its positions over, are re-indexed first.
+ * The round is then held ({@link RoundOutcome#held}) until the tiering readers report the re-index;
+ * {@link #resumeRound} resumes it.
  *
  * <p>The base fence lets the lake commit land only on the base, or on snapshots after it that
  * changed no data file ({@link DerivedDvRound}), so a registered change from the base always covers
@@ -253,6 +253,7 @@ final class DerivedDvTieringCommitter<WriteResult, Committable> {
                                     context.lakeTieringConfig,
                                     context.flussConfig))) {
                 lakeCommitter.abort(lakeCommitter.toCommittable(data));
+                DerivedDvRound.discardPreparedDeletionVectors(lakeCommitter, writeResults);
             }
             LOG.info("Deleted the data files of a dropped round of {}.", tablePath);
         } catch (Exception e) {

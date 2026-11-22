@@ -53,22 +53,18 @@ final class DvHandOff {
     /** The changes of one appended batch, or a failure to hand them over. */
     static final class Batch {
         final List<DvEntry> entries;
-        // the log end after the batch, or -1 if not known
-        final long logEnd;
         // the write path failed to hand the batch's changes over
         @Nullable final Throwable failure;
 
-        private Batch(List<DvEntry> entries, long logEnd, @Nullable Throwable failure) {
+        private Batch(List<DvEntry> entries, @Nullable Throwable failure) {
             this.entries = entries;
-            this.logEnd = logEnd;
             this.failure = failure;
         }
     }
 
     private final ConcurrentLinkedQueue<Batch> queue = new ConcurrentLinkedQueue<>();
-    // the changes queued, for the write path's backstop and the heap budget
+    // the changes queued, for the write path's backstop
     private final AtomicLong queuedEntries = new AtomicLong();
-    private final AtomicLong queuedBytes = new AtomicLong();
     // The log end after the last batch handed over, -1 if none: reads take their floor from it.
     // It moves on while batches are dropped, as they are in the log.
     private volatile long appendedEnd = -1;
@@ -108,13 +104,8 @@ final class DvHandOff {
             return entries.isEmpty();
         }
         if (!entries.isEmpty()) {
-            long bytes = 0;
-            for (DvEntry e : entries) {
-                bytes += DvChangeList.queuedBytes(e.getKey());
-            }
-            queue.add(new Batch(entries, logEnd, null));
+            queue.add(new Batch(entries, null));
             queuedEntries.addAndGet(entries.size());
-            queuedBytes.addAndGet(bytes);
         }
         if (logEnd > queuedEnd) {
             queuedEnd = logEnd;
@@ -129,7 +120,7 @@ final class DvHandOff {
     /** Queues a failure to hand a batch over: the owner drops the change list. */
     void fail(Throwable cause) {
         failures.incrementAndGet();
-        queue.add(new Batch(Collections.emptyList(), -1, cause));
+        queue.add(new Batch(Collections.emptyList(), cause));
         signal();
     }
 
@@ -153,11 +144,6 @@ final class DvHandOff {
                 failuresTaken++;
             }
             queuedEntries.addAndGet(-b.entries.size());
-            long bytes = 0;
-            for (DvEntry e : b.entries) {
-                bytes += DvChangeList.queuedBytes(e.getKey());
-            }
-            queuedBytes.addAndGet(-bytes);
             sink.accept(b);
         }
         if (writerWaiting) {
@@ -258,11 +244,6 @@ final class DvHandOff {
                 failuresTaken++;
             }
             queuedEntries.addAndGet(-b.entries.size());
-            long bytes = 0;
-            for (DvEntry e : b.entries) {
-                bytes += DvChangeList.queuedBytes(e.getKey());
-            }
-            queuedBytes.addAndGet(-bytes);
             if (b.failure == null) {
                 released++;
             }
@@ -301,10 +282,5 @@ final class DvHandOff {
     /** The changes queued and not drained yet. */
     long queuedEntries() {
         return queuedEntries.get();
-    }
-
-    /** Estimated heap bytes of the changes queued and not drained yet. */
-    long queuedBytes() {
-        return queuedBytes.get();
     }
 }

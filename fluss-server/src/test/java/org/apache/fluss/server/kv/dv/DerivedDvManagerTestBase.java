@@ -163,25 +163,15 @@ abstract class DerivedDvManagerTestBase {
         }
     }
 
-    /** A tiering lookup, retried while the bucket is not ready, as the tiering service retries. */
-    List<Object[]> lookupWhenReady(long snapshotId, List<byte[]> keys) throws Exception {
-        long deadline = System.currentTimeMillis() + 30_000;
-        while (true) {
-            try {
-                return manager.lookup(snapshotId, keys);
-            } catch (RetriableException e) {
-                if (System.currentTimeMillis() > deadline) {
-                    throw e;
-                }
-                Thread.sleep(20);
-            }
-        }
+    /** The positions of {@code keys} in the index of {@code snapshotId}, once the bucket has it. */
+    List<Object[]> indexed(long snapshotId, List<byte[]> keys) throws Exception {
+        return DvTestReads.indexed(manager, snapshotId, keys);
     }
 
-    /** The positions of a lookup, as key@file#position. */
-    static List<String> asStrings(List<Object[]> lookups) {
+    /** The positions found in the index, as key@file#position. */
+    static List<String> asStrings(List<Object[]> found) {
         List<String> out = new ArrayList<>();
-        for (Object[] r : lookups) {
+        for (Object[] r : found) {
             out.add(new String((byte[]) r[0], StandardCharsets.UTF_8) + "@" + r[1] + "#" + r[2]);
         }
         return out;
